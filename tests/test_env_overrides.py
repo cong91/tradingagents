@@ -137,3 +137,81 @@ def test_unknown_env_var_is_ignored(monkeypatch):
         TRADINGAGENTS_NONEXISTENT_KEY="oops",
     )
     assert "nonexistent_key" not in config
+
+
+# --- L2: risk guard limits and multi-exchange config -----------------------
+
+
+def test_risk_and_execution_defaults(monkeypatch):
+    config = _config_with_env(monkeypatch)
+    assert config["risk_max_daily_loss_pct"] == 5.0
+    assert config["risk_max_position_pct_per_asset"] == 25.0
+    assert config["risk_max_total_exposure_pct"] == 80.0
+    assert config["risk_max_consecutive_loss_count"] == 3
+    assert isinstance(config["risk_max_consecutive_loss_count"], int)
+    assert config["risk_max_derivatives_leverage"] == 1.0
+    assert config["risk_max_derivatives_exposure_pct"] == 0.0
+    assert config["exec_exchange_id"] == "binance"
+    assert config["exec_symbol_overrides"] == {}
+    assert config["exec_watchlist"] == ["BTC-USD", "ETH-USD"]
+    assert config["exec_auto_confirm"] is False
+    assert config["exec_derivatives"] is False
+
+
+def test_risk_float_and_int_coercion(monkeypatch):
+    config = _config_with_env(
+        monkeypatch,
+        TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT="2.5",
+        TRADINGAGENTS_RISK_MAX_POSITION_PCT_PER_ASSET="10",
+        TRADINGAGENTS_RISK_MAX_TOTAL_EXPOSURE_PCT="60.5",
+        TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT="5",
+        TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE="3",
+        TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT="40.0",
+        TRADINGAGENTS_EXEC_EXCHANGE_ID="okx",
+    )
+    assert config["risk_max_daily_loss_pct"] == 2.5
+    assert isinstance(config["risk_max_daily_loss_pct"], float)
+    assert config["risk_max_position_pct_per_asset"] == 10.0
+    assert config["risk_max_total_exposure_pct"] == 60.5
+    assert config["risk_max_consecutive_loss_count"] == 5
+    assert isinstance(config["risk_max_consecutive_loss_count"], int)
+    assert config["risk_max_derivatives_leverage"] == 3.0
+    assert config["risk_max_derivatives_exposure_pct"] == 40.0
+    assert config["exec_exchange_id"] == "okx"
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT",
+        "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT",
+    ],
+)
+def test_invalid_risk_value_raises(monkeypatch, env_var):
+    """Garbage numeric risk values must fail loudly at import."""
+    monkeypatch.setenv(env_var, "not-a-number")
+    with pytest.raises(ValueError, match=env_var):
+        default_config_module.build_default_config()
+
+
+def test_exchange_id_accepts_any_string(monkeypatch):
+    config = _config_with_env(monkeypatch, TRADINGAGENTS_EXEC_EXCHANGE_ID="not-a-number")
+    assert config["exec_exchange_id"] == "not-a-number"
+
+
+def test_execution_gates_and_structured_keys_are_not_env_overridable(monkeypatch):
+    """exec_auto_confirm/exec_derivatives follow the exec_live pattern (fail-closed
+    call-time reads, never folded into config), and _coerce cannot build the
+    dict/list keys, so none of them may be env-overridable."""
+    from copy import deepcopy
+
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_WATCHLIST", "SOL-USD")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_SYMBOL_OVERRIDES", "garbage")
+    config = deepcopy(default_config_module.DEFAULT_CONFIG)
+    default_config_module._apply_env_overrides(config)
+    assert config["exec_auto_confirm"] is False
+    assert config["exec_derivatives"] is False
+    assert config["exec_watchlist"] == ["BTC-USD", "ETH-USD"]
+    assert config["exec_symbol_overrides"] == {}
