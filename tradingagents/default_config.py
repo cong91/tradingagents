@@ -202,6 +202,13 @@ def build_default_config() -> dict:
             ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
             "":     "SPY",         # default for US-listed tickers (no suffix)
         },
+        # Execution bridge (L1 ccxt, Binance spot). Live requires BOTH this gate —
+        # armed as a literal True in code, never via env — and the
+        # TRADINGAGENTS_EXEC_LIVE env flag, re-read at execute time, fail-closed.
+        # Keeping the halves independent means no single switch arms live trading.
+        "exec_live": False,
+        "exec_log_path": os.getenv("TRADINGAGENTS_EXEC_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "execution", "audit.jsonl"),
+        "exec_quote_currency": "USDT",
 
     })
 
