@@ -55,6 +55,45 @@ def test_client_sends_connection_close_for_fresh_connections():
 
 
 @pytest.mark.unit
+def test_api_mode_chat_keeps_gpt6_on_chat_completions():
+    # LangChain auto-routes GPT-6 + tools to /responses; a third-party relay
+    # that only implements Chat Completions drops that request. Default mode
+    # "chat" must keep the GPT-6 client on Chat Completions even with tools.
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    llm = create_llm_client(
+        provider="openai_compatible", model="gpt-6-sol",
+        base_url="http://localhost:8000/v1",
+        **build_llm_kwargs({"llm_wire_protocol": "chat"}),
+    ).get_llm()
+    assert getattr(llm, "use_responses_api", False) in (False, None)
+    payload = {"tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]}
+    assert llm._use_responses_api(payload) is False
+
+
+@pytest.mark.unit
+def test_api_mode_responses_switches_endpoint():
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    llm = create_llm_client(
+        provider="openai_compatible", model="gpt-6-sol",
+        base_url="http://localhost:8000/v1",
+        **build_llm_kwargs({"llm_wire_protocol": "responses"}),
+    ).get_llm()
+    assert llm.use_responses_api is True
+    payload = {"tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]}
+    assert llm._use_responses_api(payload) is True
+
+
+@pytest.mark.unit
+def test_api_mode_invalid_value_fails_loudly():
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    with pytest.raises(ValueError, match="llm_wire_protocol"):
+        build_llm_kwargs({"llm_wire_protocol": "completions"})
+
+
+@pytest.mark.unit
 def test_optional_key_from_env(monkeypatch):
     monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-relay-123")
     llm = create_llm_client(

@@ -16,6 +16,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_THINK_BACKEND_URL":    "deep_think_backend_url",
     "TRADINGAGENTS_QUICK_THINK_BACKEND_URL":   "quick_think_backend_url",
     "TRADINGAGENTS_LLM_BACKEND_URL":      "backend_url",
+    # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
+    # Chat Completions; "responses" switches to /responses for endpoints that
+    # implement it. Validated in build_llm_kwargs.
+    "TRADINGAGENTS_LLM_WIRE_PROTOCOL":         "llm_wire_protocol",
     "TRADINGAGENTS_OUTPUT_LANGUAGE":      "output_language",
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
@@ -118,6 +122,11 @@ def build_default_config() -> dict:
         # provider-specific URL here would leak (e.g. OpenAI's /v1 was previously
         # being forwarded to Gemini, producing malformed request URLs).
         "backend_url": None,
+        # Wire protocol for OpenAI-compatible endpoints: "chat" (Chat Completions,
+        # the wide-compatibility default) or "responses" (/responses for endpoints
+        # that implement it). Native OpenAI ignores this -- it already prefers
+        # Responses for models that support it.
+        "llm_wire_protocol": "chat",
         # A tier may name its own provider and endpoint (#1440): the quick tier serves
         # the analysts, researchers, debaters and trader, the deep tier the managers.
         # None means the tier uses llm_provider and backend_url.
