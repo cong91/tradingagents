@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -11,6 +12,36 @@ from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
 from .validators import validate_model
+
+logger = logging.getLogger(__name__)
+
+# Connection-level retry for community relays that drop connections
+# intermittently. The openai SDK only retries HTTP status codes; a server
+# that disconnects before sending headers produces an APIConnectionError
+# with no status, so the SDK gives up on the first attempt.
+_CONNECTION_RETRIES = 5
+_CONNECTION_RETRY_WAIT = 2.0  # seconds; linear backoff: 2, 4, 6, 8, 10
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """Whether an exception is a network/connection failure worth retrying."""
+    # Walk the cause chain: langchain wraps the openai SDK's exceptions.
+    current = exc
+    for _ in range(5):
+        name = type(current).__name__
+        if name in (
+            "APIConnectionError", "APIConnectionErrorWrapper",
+            "OpenAIConnectionError", "RemoteProtocolError",
+            "ConnectError", "ConnectionError",
+        ):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__cause__", None)
+        if cause is None:
+            cause = getattr(current, "__cause__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -77,14 +108,44 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
 
         LangChain auto-selects ``/responses`` for GPT-6 when tools are bound;
         a third-party OpenAI-compatible endpoint may advertise GPT-6 models
-        while only implementing Chat Completions (probed on token.v-claw.org:
-        /responses drops large tool payloads mid-pipeline). An explicit
-        ``use_responses_api`` (from ``TRADINGAGENTS_LLM_API_MODE=responses``)
-        still wins over this default.
+        while only implementing Chat Completions. An explicit
+        ``use_responses_api`` (from ``llm_wire_protocol=responses``) still
+        wins over this default.
         """
         if isinstance(self.use_responses_api, bool):
             return self.use_responses_api
         return False
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        """Retry on connection errors that the openai SDK does not retry.
+
+        Community relays drop connections intermittently (~50% per request
+        during bad windows). The openai SDK's ``_should_retry`` only checks
+        HTTP status codes (408/409/429/5xx); ``APIConnectionError`` from a
+        server that disconnects before sending headers has no status code,
+        so the SDK gives up immediately. Retry here with short backoff.
+        """
+        import time as _time
+
+        last_exc = None
+        for attempt in range(_CONNECTION_RETRIES):
+            try:
+                return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            except Exception as exc:
+                # Only retry connection-level errors, not bad requests
+                if not _is_connection_error(exc):
+                    raise
+                last_exc = exc
+                if attempt < _CONNECTION_RETRIES - 1:
+                    wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
+                    logger.warning(
+                        "relay connection dropped (attempt %d/%d, %s); "
+                        "retrying in %.1fs",
+                        attempt + 1, _CONNECTION_RETRIES,
+                        type(exc).__name__, wait,
+                    )
+                    _time.sleep(wait)
+        raise last_exc
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         resolved = method or get_capabilities(self.model_name).preferred_structured_method
