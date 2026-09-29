@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 # intermittently. The openai SDK only retries HTTP status codes; a server
 # that disconnects before sending headers produces an APIConnectionError
 # with no status, so the SDK gives up on the first attempt.
-_CONNECTION_RETRIES = 5
-_CONNECTION_RETRY_WAIT = 2.0  # seconds; linear backoff: 2, 4, 6, 8, 10
+_CONNECTION_RETRIES = 10
+_CONNECTION_RETRY_WAIT = 5.0  # seconds; linear: 5, 10, 15, ... 50 (total ~5min)
 
 
 def _is_connection_error(exc: Exception) -> bool:
