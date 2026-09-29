@@ -32,6 +32,7 @@ class FakeGraph:
 
     def __init__(self, config=None, **kwargs):
         self.config = config
+        self.selected_analysts = kwargs.get("selected_analysts")
         FakeGraph.constructed.append(self)
 
     def propagate(self, coin, trade_date, asset_type="stock", portfolio=None):
@@ -70,6 +71,16 @@ def offline(monkeypatch, tmp_path):
         "tradingagents.graph.trading_graph.TradingAgentsGraph", FakeGraph
     )
     yield
+
+
+def test_graph_runs_the_crypto_analyst_set_without_fundamentals(tmp_path):
+    # The daily runner is crypto-only: the fundamentals analyst must be
+    # dropped exactly like the CLI's filter_analysts_for_asset_type does
+    # (Yahoo has no quoteSummary fundamentals for crypto symbols, so running
+    # it only burns LLM calls on an empty report).
+    run_daily(["BTC-USD"], config=make_config(tmp_path))
+    graph = FakeGraph.constructed[0]
+    assert graph.selected_analysts == ("market", "social", "news")
 
 
 def make_config(tmp_path, **extra):

@@ -130,7 +130,14 @@ def run_daily(
     for coin in coins:
         result = DailyResult(ticker=coin)
         try:
-            graph = TradingAgentsGraph(config=bridge.config)
+            # The daily runner is crypto-only (symbol_for rejects anything
+            # else), so the fundamentals analyst is dropped here exactly like
+            # the CLI's filter_analysts_for_asset_type does for crypto: Yahoo
+            # has no quoteSummary fundamentals for crypto symbols, and running
+            # that analyst only burns LLM calls on an empty report.
+            graph = TradingAgentsGraph(
+                config=bridge.config, selected_analysts=("market", "social", "news")
+            )
             _, signal = graph.propagate(coin, today, asset_type="crypto")
             result.signal = signal
             portfolio = bridge.sync_portfolio()
