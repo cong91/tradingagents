@@ -11,7 +11,7 @@ from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.llm_clients.validators import validate_model
 
-# Note: assert by class NAME, not isinstance — other tests reload the
+# Note: assert by class NAME, not isinstance â€” other tests reload the
 # openai_client module, which would otherwise create a second class identity.
 
 
@@ -54,6 +54,45 @@ def test_client_sends_connection_close_for_fresh_connections():
         provider="openai_compatible", model="m", base_url="http://localhost:8000/v1"
     ).get_llm()
     assert llm.default_headers.get("Connection") == "close"
+
+
+@pytest.mark.unit
+def test_api_mode_chat_keeps_gpt6_on_chat_completions():
+    # LangChain auto-routes GPT-6 + tools to /responses; a third-party relay
+    # that only implements Chat Completions drops that request. Default mode
+    # "chat" must keep the GPT-6 client on Chat Completions even with tools.
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    llm = create_llm_client(
+        provider="openai_compatible", model="gpt-6-sol",
+        base_url="http://localhost:8000/v1",
+        **build_llm_kwargs({"llm_wire_protocol": "chat"}),
+    ).get_llm()
+    assert getattr(llm, "use_responses_api", False) in (False, None)
+    payload = {"tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]}
+    assert llm._use_responses_api(payload) is False
+
+
+@pytest.mark.unit
+def test_api_mode_responses_switches_endpoint():
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    llm = create_llm_client(
+        provider="openai_compatible", model="gpt-6-sol",
+        base_url="http://localhost:8000/v1",
+        **build_llm_kwargs({"llm_wire_protocol": "responses"}),
+    ).get_llm()
+    assert llm.use_responses_api is True
+    payload = {"tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]}
+    assert llm._use_responses_api(payload) is True
+
+
+@pytest.mark.unit
+def test_api_mode_invalid_value_fails_loudly():
+    from tradingagents.llm_clients.factory import build_llm_kwargs
+
+    with pytest.raises(ValueError, match="llm_wire_protocol"):
+        build_llm_kwargs({"llm_wire_protocol": "completions"})
 
 
 @pytest.mark.unit
