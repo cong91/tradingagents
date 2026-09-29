@@ -71,6 +71,21 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
         headers.setdefault("Connection", "close")
         super().__init__(default_headers=headers, **kwargs)
 
+    def _use_responses_api(self, payload: dict) -> bool:
+        """Keep generic endpoints on Chat Completions by default, even for
+        GPT-6 + tools.
+
+        LangChain auto-selects ``/responses`` for GPT-6 when tools are bound;
+        a third-party OpenAI-compatible endpoint may advertise GPT-6 models
+        while only implementing Chat Completions (probed on token.v-claw.org:
+        /responses drops large tool payloads mid-pipeline). An explicit
+        ``use_responses_api`` (from ``TRADINGAGENTS_LLM_API_MODE=responses``)
+        still wins over this default.
+        """
+        if isinstance(self.use_responses_api, bool):
+            return self.use_responses_api
+        return False
+
     def with_structured_output(self, schema, *, method=None, **kwargs):
         resolved = method or get_capabilities(self.model_name).preferred_structured_method
         if resolved == "function_calling":
@@ -176,6 +191,7 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature", "max_tokens",
     "api_key", "callbacks", "http_client", "http_async_client",
+    "use_responses_api",
 )
 
 # OpenAI's ``reasoning_effort`` is only accepted by reasoning models — GPT-5 and

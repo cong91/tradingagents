@@ -2,8 +2,8 @@ import os
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 
-# Single source of truth for env-var → config-key overrides. To expose
-# a new config key for environment-based override, add a row here — no
+# Single source of truth for env-var â†’ config-key overrides. To expose
+# a new config key for environment-based override, add a row here â€” no
 # entry-point script changes required. Coercion is driven by the type
 # of the existing default, so users can keep writing plain strings in
 # their .env file.
@@ -12,6 +12,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
     "TRADINGAGENTS_LLM_BACKEND_URL":      "backend_url",
+    # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
+    # Chat Completions; "responses" switches to /responses for endpoints that
+    # implement it. Validated in build_llm_kwargs.
+    "TRADINGAGENTS_LLM_WIRE_PROTOCOL":         "llm_wire_protocol",
     "TRADINGAGENTS_OUTPUT_LANGUAGE":      "output_language",
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
@@ -27,13 +31,13 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
     # Execution bridge (L1 ccxt): quote currency only. TRADINGAGENTS_EXEC_LIVE
-    # is deliberately NOT here — it is the env half of the FR5 double gate and
+    # is deliberately NOT here â€” it is the env half of the FR5 double gate and
     # its only consumer is the fail-closed execute-time read in the bridge;
     # folding it into config at import would collapse the two gates into one.
     "TRADINGAGENTS_EXEC_QUOTE_CURRENCY":    "exec_quote_currency",
     # Risk guard limits (L2, FR-K): percentages coerce as floats, the streak
     # cap as an int. exec_symbol_overrides/exec_watchlist are deliberately NOT
-    # here — _coerce cannot build a dict or list, so an env row would inject a
+    # here â€” _coerce cannot build a dict or list, so an env row would inject a
     # raw string where structured data is expected.
     "TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT":           "risk_max_daily_loss_pct",
     "TRADINGAGENTS_RISK_MAX_POSITION_PCT_PER_ASSET":   "risk_max_position_pct_per_asset",
@@ -57,7 +61,7 @@ def _coerce(value: str, reference):
     """Coerce env-var string to the type of the existing default value.
 
     Invalid values raise ``ValueError`` rather than silently falling back to a
-    default — a misspelled boolean (e.g. ``treu``) or non-numeric int should fail
+    default â€” a misspelled boolean (e.g. ``treu``) or non-numeric int should fail
     loudly at startup, not quietly misconfigure an unattended run.
     """
     if isinstance(reference, bool):
@@ -107,6 +111,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # provider-specific URL here would leak (e.g. OpenAI's /v1 was previously
     # being forwarded to Gemini, producing malformed request URLs).
     "backend_url": None,
+    # Wire protocol for OpenAI-compatible endpoints: "chat" (Chat Completions,
+    # the wide-compatibility default) or "responses" (/responses for endpoints
+    # that implement it). Native OpenAI ignores this -- it already prefers
+    # Responses for models that support it.
+    "llm_wire_protocol": "chat",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
@@ -152,7 +161,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category).
-    # The configured value is the exact vendor chain — requests are NOT silently
+    # The configured value is the exact vendor chain â€” requests are NOT silently
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
     "data_vendors": {
@@ -190,8 +199,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
         "":     "SPY",         # default for US-listed tickers (no suffix)
     },
-    # Execution bridge (L1 ccxt, Binance spot). Live requires BOTH this gate —
-    # armed as a literal True in code, never via env — and the
+    # Execution bridge (L1 ccxt, Binance spot). Live requires BOTH this gate â€”
+    # armed as a literal True in code, never via env â€” and the
     # TRADINGAGENTS_EXEC_LIVE env flag, re-read at execute time, fail-closed.
     # Keeping the halves independent means no single switch arms live trading.
     "exec_live": False,
@@ -199,8 +208,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "exec_quote_currency": "USDT",
     # Risk guard limits (L2, FR-K). Percent limits are fail-open by design:
     # when equity cannot be computed (no cash and nothing to mark) the check
-    # is skipped and logged. The consecutive-loss cap is absolute — no
-    # denominator — but it only enforces while the audit log is READABLE:
+    # is skipped and logged. The consecutive-loss cap is absolute â€” no
+    # denominator â€” but it only enforces while the audit log is READABLE:
     # execute-time re-checks fail closed on an unreadable log (refuse the
     # order), plan-time checks stay fail-open.
     # risk_max_derivatives_exposure_pct defaults to 0: derivatives notional
