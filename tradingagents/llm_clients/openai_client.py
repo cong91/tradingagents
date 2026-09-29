@@ -53,13 +53,23 @@ class NormalizedChatOpenAI(ChatOpenAI):
 
 class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
     """OpenAI-compatible client for arbitrary local servers (LM Studio, vLLM,
-    llama.cpp via the generic ``openai_compatible`` provider).
+    llama.cpp via the generic ``openai_compatible`` provider) and community
+    relays.
 
     Their tool-calling support varies, and many reject the object-form
     ``tool_choice`` langchain sends for function-calling structured output. Bind
     the schema as a tool but don't force tool_choice, so structured output works
     across local servers regardless of the model ID's capabilities (#1057).
     """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Community relays often abort keep-alive connections mid-pipeline
+        # ("Server disconnected without sending a response" on the second and
+        # later requests of a pooled connection). One fresh connection per
+        # request is what survives them; local servers don't mind.
+        headers = dict(kwargs.pop("default_headers", None) or {})
+        headers.setdefault("Connection", "close")
+        super().__init__(default_headers=headers, **kwargs)
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         resolved = method or get_capabilities(self.model_name).preferred_structured_method
