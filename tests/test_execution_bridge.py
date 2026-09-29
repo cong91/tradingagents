@@ -615,6 +615,56 @@ def test_default_factory_reads_credentials_from_env(monkeypatch):
     assert captured == {"apiKey": "env-key", "secret": "env-secret", "enableRateLimit": True}
 
 
+def test_default_factory_sandbox_routes_to_testnet(monkeypatch):
+    # exec_sandbox=True must reach ccxt's set_sandbox_mode(True) -- testnet
+    # credentials only authenticate there, never on production. The default
+    # (False) must not call it at all.
+    import tradingagents.execution.bridge as bridge_module
+
+    calls = []
+
+    class FakeBinance(ccxt.Exchange):
+        def __init__(self, options):
+            pass
+
+        def set_sandbox_mode(self, enabled):
+            calls.append(enabled)
+
+    monkeypatch.setattr(ccxt, "binance", FakeBinance)
+    client = bridge_module._default_exchange_factory("binance", sandbox=True)
+    assert isinstance(client, FakeBinance)
+    assert calls == [True]
+    bridge_module._default_exchange_factory("binance")
+    assert calls == [True]  # unchanged: default stays on production
+
+
+def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
+    # The exec_sandbox config key (env-overridable via
+    # TRADINGAGENTS_EXEC_SANDBOX) flows into the default factory; the FR5
+    # live gates are independent of it.
+    calls = []
+
+    class FakeBinance(ccxt.Exchange):
+        def __init__(self, options):
+            pass
+
+        def set_sandbox_mode(self, enabled):
+            calls.append(enabled)
+
+    monkeypatch.setattr(ccxt, "binance", FakeBinance)
+    bridge = ExchangeBridge(
+        config={
+            "exec_sandbox": True,
+            "exec_log_path": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    bridge._exchange_or_raise()
+    assert calls == [True]
+    plain = ExchangeBridge(config={"exec_log_path": str(tmp_path / "audit2.jsonl")})
+    plain._exchange_or_raise()
+    assert calls == [True]  # default bridge stays on production
+
+
 def test_default_factory_selects_exchange_class_by_id(monkeypatch):
     # Two fake exchange ids: each resolves its own ccxt class and its own
     # {ID}_API_KEY / {ID}_SECRET env names (generalized from the L1 Binance
@@ -677,8 +727,8 @@ def test_bridge_uses_exchange_id_override(tmp_path, monkeypatch):
 
     seen = []
 
-    def fake_factory(exchange_id):
-        seen.append(exchange_id)
+    def fake_factory(exchange_id, sandbox=False):
+        seen.append((exchange_id, sandbox))
         return FakeExchange()
 
     monkeypatch.setattr(bridge_module, "_default_exchange_factory", fake_factory)
@@ -687,7 +737,7 @@ def test_bridge_uses_exchange_id_override(tmp_path, monkeypatch):
         exchange_id="kraken",
     )
     bridge._exchange_or_raise()
-    assert seen == ["kraken"]
+    assert seen == [("kraken", False)]
 
 
 def test_bridge_defaults_exchange_id_from_config(tmp_path, monkeypatch):

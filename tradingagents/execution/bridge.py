@@ -65,13 +65,15 @@ def credential_env_names(exchange_id: str) -> tuple[str, str]:
     return f"{upper}_API_KEY", f"{upper}_SECRET"
 
 
-def _default_exchange_factory(exchange_id: str) -> Any:
+def _default_exchange_factory(exchange_id: str, sandbox: bool = False) -> Any:
     """Build the configured ccxt client lazily; credentials from env only.
 
     ``exchange_id`` must name a ``ccxt.Exchange`` subclass (e.g. "binance",
     "okx"); anything else raises before any network call. ccxt is imported
     here, not at module level, so importing tradingagents.execution stays
-    cheap and tests can inject fakes.
+    cheap and tests can inject fakes. ``sandbox`` routes the client to the
+    exchange's testnet via ccxt's set_sandbox_mode -- testnet credentials
+    only authenticate there, never on production.
     """
     import ccxt
 
@@ -81,11 +83,14 @@ def _default_exchange_factory(exchange_id: str) -> Any:
             f"exec_exchange_id {exchange_id!r} does not name a ccxt exchange class"
         )
     key_env, secret_env = credential_env_names(exchange_id)
-    return klass({
+    client = klass({
         "apiKey": os.environ.get(key_env, ""),
         "secret": os.environ.get(secret_env, ""),
         "enableRateLimit": True,
     })
+    if sandbox:
+        client.set_sandbox_mode(True)
+    return client
 
 
 class PreTradeRejection(RuntimeError):
@@ -132,7 +137,9 @@ class ExchangeBridge:
         if exchange_factory is not None:
             self._exchange_factory = exchange_factory
         else:
-            self._exchange_factory = lambda: _default_exchange_factory(self.exchange_id)
+            self._exchange_factory = lambda: _default_exchange_factory(
+                self.exchange_id, sandbox=self.config.get("exec_sandbox") is True
+            )
         self.rules = rules if rules is not None else SizingRules()
         self._exchange: Any | None = None
         self.risk_guard = risk_guard if risk_guard is not None else self._build_risk_guard()
