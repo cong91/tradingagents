@@ -42,6 +42,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE":     "risk_max_derivatives_leverage",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT": "risk_max_derivatives_exposure_pct",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
+    # Sandbox routes the client to the exchange's testnet (ccxt
+    # set_sandbox_mode); safe direction, so env-overridable is fine -- unlike
+    # exec_live it can never send orders to real-money venues by itself.
+    "TRADINGAGENTS_EXEC_SANDBOX":                      "exec_sandbox",
 }
 
 
@@ -213,6 +217,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # (e.g. {"BTC-USD": "BTC/USDC"}), bypassing the closed crypto set.
     "exec_exchange_id": "binance",
     "exec_symbol_overrides": {},
+    # Route the ccxt client to the exchange's testnet (ccxt set_sandbox_mode).
+    # Testnet credentials only authenticate there, never on production; the
+    # FR5 live gates still apply on top.
+    "exec_sandbox": False,
     # Default coin list for the daily runner (pipeline ticker form).
     "exec_watchlist": ["BTC-USD", "ETH-USD"],
     # L2 FR5-style gates. Deliberately NOT in _ENV_OVERRIDES (same reasoning
