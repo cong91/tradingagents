@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -54,6 +55,11 @@ from pydantic import BaseModel
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.portfolio import PortfolioContext
+
+# Seconds before the first propagate retry (then linear: +wait per attempt).
+# Relay outages are usually short windows; backoff lets them pass instead of
+# burning all attempts inside one bad window.
+_PROPAGATE_RETRY_WAIT = 20.0
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +141,27 @@ def run_daily(
             # the CLI's filter_analysts_for_asset_type does for crypto: Yahoo
             # has no quoteSummary fundamentals for crypto symbols, and running
             # that analyst only burns LLM calls on an empty report.
-            graph = TradingAgentsGraph(
-                config=bridge.config, selected_analysts=("market", "social", "news")
-            )
-            _, signal = graph.propagate(coin, today, asset_type="crypto")
+            # Relay relapses: a fresh graph per attempt, because a failed
+            # propagate can leave LangGraph checkpoint state mid-pipeline.
+            signal = None
+            for attempt in range(3):
+                try:
+                    graph = TradingAgentsGraph(
+                        config=bridge.config,
+                        selected_analysts=("market", "social", "news"),
+                    )
+                    _, signal = graph.propagate(coin, today, asset_type="crypto")
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    wait = _PROPAGATE_RETRY_WAIT * (attempt + 1)
+                    logger.warning(
+                        "run_daily: %s propagate failed (attempt %d, %s: %s); "
+                        "retrying in %.0fs",
+                        coin, attempt + 1, type(exc).__name__, exc, wait,
+                    )
+                    time.sleep(wait)
             result.signal = signal
             portfolio = bridge.sync_portfolio()
             plan = bridge.plan_order(coin, signal, portfolio=portfolio)
