@@ -67,6 +67,7 @@ def offline(monkeypatch, tmp_path):
     FakeGraph.constructed = []
     FakeGraph.propagated = []
     FakeGraph.error_on = None
+    monkeypatch.setattr(daily_module, "_PROPAGATE_RETRY_WAIT", 0.0)  # no real backoff in tests
     monkeypatch.setattr(
         "tradingagents.graph.trading_graph.TradingAgentsGraph", FakeGraph
     )
@@ -212,7 +213,8 @@ def test_coin_failure_is_isolated(tmp_path):
     assert results[0].plan is not None  # first coin went through its policy
     assert results[1].plan is None
     assert "vendor outage" in results[1].reason
-    assert len(FakeGraph.constructed) == 2  # a fresh graph per coin
+    # a fresh graph per propagate ATTEMPT: BTC 1, ETH initial + 2 retries
+    assert len(FakeGraph.constructed) == 4
 
 
 def test_propagate_runs_the_crypto_pipeline_with_utc_today(tmp_path):
