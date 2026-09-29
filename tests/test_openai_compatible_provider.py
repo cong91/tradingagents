@@ -46,6 +46,17 @@ def test_keyless_local_uses_placeholder_and_chat_completions(monkeypatch):
 
 
 @pytest.mark.unit
+def test_client_sends_connection_close_for_fresh_connections():
+    # Community relays abort keep-alive connections mid-pipeline ("server
+    # disconnected without sending a response" on pooled-connection reuse);
+    # the client must force one fresh connection per request.
+    llm = create_llm_client(
+        provider="openai_compatible", model="m", base_url="http://localhost:8000/v1"
+    ).get_llm()
+    assert llm.default_headers.get("Connection") == "close"
+
+
+@pytest.mark.unit
 def test_optional_key_from_env(monkeypatch):
     monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-relay-123")
     llm = create_llm_client(
