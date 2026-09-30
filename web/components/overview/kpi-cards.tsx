@@ -5,23 +5,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { formatPercent } from "@/lib/format";
+import { formatPercent, formatSignedNumber } from "@/lib/format";
 import { outcomeOf, OUTCOME_LABEL, type DecisionSummary } from "./summary";
-
-// Dấu trừ toán học (U+2212), đồng bộ với lib/format.ts:11.
-const MINUS_SIGN = "−";
-const percentFormat = new Intl.NumberFormat("vi-VN", {
-  minimumFractionDigits: 1,
-  maximumFractionDigits: 1,
-});
-
-/** Phần trăm luôn kèm dấu: "+1,2" / "−0,4" / "0,0" (điểm %). */
-function signedPercent(value: number): string {
-  const abs = percentFormat.format(Math.abs(value));
-  if (value > 0) return `+${abs}`;
-  if (value < 0) return `${MINUS_SIGN}${abs}`;
-  return abs;
-}
 
 const TONE_TEXT_CLASS = { profit: "text-profit", loss: "text-loss", flat: "" } as const;
 
@@ -39,9 +24,9 @@ export function KpiCards({ summary }: { summary: DecisionSummary }) {
           <CardDescription>Alpha tích luỹ</CardDescription>
           <CardTitle
             className={`text-2xl tabular-nums ${TONE_TEXT_CLASS[outcome]}`}
-            aria-label={`Alpha tích luỹ ${signedPercent(summary.totalAlphaPct)} phần trăm — ${OUTCOME_LABEL[outcome]}`}
+            aria-label={`Alpha tích luỹ ${formatSignedNumber(summary.totalAlphaPct, 1)} phần trăm — ${OUTCOME_LABEL[outcome]}`}
           >
-            {signedPercent(summary.totalAlphaPct)}&nbsp;%
+            {formatSignedNumber(summary.totalAlphaPct, 1)}&nbsp;%
           </CardTitle>
           {/* Tín hiệu không chỉ dựa vào màu: dấu +/− trong số và chữ "Lãi/Lỗ" bên ngoài màu (WCAG 1.4.1). */}
           <Badge variant={outcome === "loss" ? "destructive" : "secondary"}>
@@ -56,7 +41,7 @@ export function KpiCards({ summary }: { summary: DecisionSummary }) {
           <CardTitle
             className={`text-2xl tabular-nums ${TONE_TEXT_CLASS[outcomeOf(summary.meanAlphaPct)]}`}
           >
-            {signedPercent(summary.meanAlphaPct)}&nbsp;%
+            {formatSignedNumber(summary.meanAlphaPct, 1)}&nbsp;%
           </CardTitle>
           <CardDescription>trên {summary.resolvedCount} quyết định đã chốt</CardDescription>
         </CardHeader>

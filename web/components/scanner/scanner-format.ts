@@ -1,38 +1,37 @@
-// Định dạng hiển thị cho màn M3. Số tiền luôn kèm đơn vị; dòng tiền lệnh
-// luôn kèm dấu +/− (bán = tiền vào "+", mua = tiền ra "−") và nhãn chữ —
-// màu không bao giờ là tín hiệu duy nhất (WCAG 1.4.1).
+// Định dạng hiển thị riêng cho màn Scanner. Dòng tiền lệnh luôn kèm dấu +/−
+// (bán = tiền vào "+", mua = tiền ra "−") và nhãn chữ — màu không bao giờ là
+// tín hiệu duy nhất (WCAG 1.4.1). Primitive số/giá/thời gian dùng chung ở
+// lib/format.ts.
 
-const usdFormat = new Intl.NumberFormat("vi-VN", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
+import {
+  baseAssetOf,
+  formatQuantityValue,
+  formatTimestampVi,
+  formatUsdPrice,
+} from "@/lib/format";
 
-const qtyFormat = new Intl.NumberFormat("vi-VN", {
-  maximumFractionDigits: 8,
-});
-
-const MINUS_SIGN = "\u2212";
+export { formatTimestampVi as formatTimestamp };
 
 /** "BTC-USD" → "BTC" (đơn vị của quantity). */
 export function baseAsset(ticker: string): string {
-  return ticker.split("-")[0] ?? ticker;
+  return baseAssetOf(null, ticker) ?? ticker;
 }
 
 /** Giá ước tính: "83.078,00 USD" (không phải dòng tiền nên không có dấu). */
 export function formatUsd(value: number): string {
-  return `${usdFormat.format(value)} USD`;
+  return formatUsdPrice(value);
 }
 
 /** Số lượng kèm tài sản gốc: "0,0012 BTC". */
 export function formatQty(value: number, ticker: string): string {
-  return `${qtyFormat.format(value)} ${baseAsset(ticker)}`;
+  return `${formatQuantityValue(value)} ${baseAsset(ticker)}`;
 }
 
 /** Dòng tiền của lệnh: "−99,69 USD" (mua) / "+99,69 USD" (bán). */
 export function formatCashFlow(side: string, cost: number): string {
-  const abs = usdFormat.format(Math.abs(cost));
-  if (side.toLowerCase() === "sell") return `+${abs} USD`;
-  return `${MINUS_SIGN}${abs} USD`;
+  const abs = formatUsdPrice(Math.abs(cost));
+  if (side.toLowerCase() === "sell") return `+${abs}`;
+  return `\u2212${abs}`;
 }
 
 export function cashFlowLabel(side: string): string {
@@ -41,17 +40,6 @@ export function cashFlowLabel(side: string): string {
 
 export function sideLabel(side: string): string {
   return side.toLowerCase() === "sell" ? "Bán" : "Mua";
-}
-
-const addedAtFormat = new Intl.DateTimeFormat("vi-VN", {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
-
-export function formatTimestamp(iso: string): string {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return iso;
-  return addedAtFormat.format(date);
 }
 
 export function elapsedLabel(fromIso: string, nowMs: number): string {

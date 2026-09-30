@@ -1,31 +1,23 @@
-// Định dạng hiển thị riêng cho màn M6. Số tiền luôn kèm đơn vị; phần trăm
-// lãi/lỗ luôn kèm dấu +/−; dấu trừ là U+2212 (tách khỏi gạch nối) qua
-// lib/format.ts. Màu không bao giờ là tín hiệu duy nhất.
+// Định dạng hiển thị riêng cho màn Audit. Phần trăm lãi/lỗ luôn kèm dấu +/−;
+// dấu trừ là U+2212 (tách khỏi gạch nối) qua lib/format.ts. Màu không bao giờ
+// là tín hiệu duy nhất. Primitive giá/khối lượng/thời gian dùng chung ở
+// lib/format.ts.
 
-import { formatSignedNumber } from "@/lib/format";
-
-const priceFormat = new Intl.NumberFormat("vi-VN", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
-
-const qtyFormat = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 8 });
+import {
+  formatAssetQuantity,
+  formatDateTime,
+  formatSignedNumber,
+  formatUsdPrice,
+} from "@/lib/format";
 
 const percentFormat = new Intl.NumberFormat("vi-VN", {
   style: "percent",
   maximumFractionDigits: 1,
 });
 
-const dateTimeFormat = new Intl.DateTimeFormat("vi-VN", {
-  dateStyle: "short",
-  timeStyle: "medium",
-  hour12: false,
-});
-
 /** Giá ước tính — luôn kèm đơn vị tiền: "83.078,00 USD". */
 export function formatPriceEst(price: number | null | undefined): string {
-  if (price == null || Number.isNaN(price)) return "—";
-  return `${priceFormat.format(price)} USD`;
+  return formatUsdPrice(price);
 }
 
 /** Khối lượng theo tài sản gốc của cặp (BTC-USD → BTC): "0,0012 BTC". */
@@ -33,9 +25,7 @@ export function formatQty(
   qty: number | null | undefined,
   ticker?: string | null
 ): string {
-  if (qty == null || Number.isNaN(qty)) return "—";
-  const unit = (ticker ?? "").split("-")[0];
-  return unit ? `${qtyFormat.format(qty)} ${unit}` : qtyFormat.format(qty);
+  return formatAssetQuantity(qty, ticker);
 }
 
 /** Chuỗi % ghi trong log ("+1.2%") → hiển thị vi-VN có dấu ("+1,2%"). */
@@ -63,12 +53,7 @@ export function formatHitRate(rate: number | null | undefined): string {
   return percentFormat.format(rate);
 }
 
-export function formatDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) return iso;
-  return dateTimeFormat.format(parsed);
-}
+export { formatDateTime };
 
 /** Dấu hiệu hướng màu cho chuỗi đã có dấu: "+1,2%" → profit; "−0,4%" → loss. */
 export function signedTextTone(text: string): string {
