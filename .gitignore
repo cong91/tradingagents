@@ -225,3 +225,10 @@ reports/
 # AI-agent tooling state (local metadata, lock files, session memory)
 .beads/
 .zcode/
+
+# Next.js control panel (web/)
+web/node_modules/
+web/.next/
+
+# Control-panel server state (watchlist, approval queue, server audit trail)
+server/data/
