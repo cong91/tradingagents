@@ -99,15 +99,21 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
     # Wire protocol for OpenAI-compatible endpoints (#relay-api-mode): "chat"
     # (default) speaks Chat Completions; "responses" switches the client to
     # /responses for endpoints that implement it (some relays advertise GPT-6
-    # models but drop large Chat payloads, and vice versa). Native OpenAI
-    # ignores this -- it already prefers Responses for capable models.
+    # models but drop large Chat payloads, and vice versa). It is meaningless
+    # for native non-OpenAI APIs, so it only applies to the OpenAI-compatible
+    # family; the config-level value is still validated for either tier.
     wire_protocol = config.get("llm_wire_protocol")
     if wire_protocol not in (None, "", "chat"):
         if wire_protocol != "responses":
             raise ValueError(
                 f"llm_wire_protocol must be 'chat' or 'responses', got {wire_protocol!r}"
             )
-        kwargs["use_responses_api"] = True
+        from .openai_client import is_openai_compatible
+
+        # Only the OpenAI-compatible family can speak /responses; a Google,
+        # Azure, or Bedrock tier must never receive the unknown kwarg.
+        if is_openai_compatible(provider):
+            kwargs["use_responses_api"] = True
 
     if provider == "google":
         thinking_level = config.get("google_thinking_level")

@@ -225,3 +225,14 @@ reports/
 # AI-agent tooling state (local metadata, lock files, session memory)
 .beads/
 .zcode/
+
+# Next.js control panel (web/)
+web/node_modules/
+web/.next/
+
+# Control-panel server state (watchlist, approval queue, server audit trail)
+server/data/
+
+# Windows reserved-device name recreated by POSIX-style `> nul` redirects
+# from agent shells; committing it breaks clones on Windows.
+nul

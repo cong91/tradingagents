@@ -88,3 +88,21 @@ def test_the_tier_settings_are_read_from_the_environment(monkeypatch):
     assert config["deep_think_provider"] == "anthropic"
     assert config["quick_think_backend_url"] == "http://localhost:8000/v1"
     assert config["quick_think_provider"] is None
+
+
+@pytest.mark.unit
+def test_wire_protocol_responses_reaches_only_openai_compatible_tiers(monkeypatch):
+    """``llm_wire_protocol=responses`` applies to the OpenAI-compatible family;
+    a Google or Anthropic tier must never receive the unknown kwarg."""
+    made = _captured(monkeypatch)
+    config = _config(quick_think_provider="google", quick_think_llm="gemini-3.8-flash",
+                     llm_wire_protocol="responses")
+
+    factory.create_tier_client(config, "quick")
+    factory.create_tier_client(_config(quick_think_provider="openai_compatible",
+                                       quick_think_backend_url="http://localhost:8000/v1",
+                                       quick_think_llm="local-model",
+                                       llm_wire_protocol="responses"), "quick")
+
+    assert "use_responses_api" not in made[0][3]
+    assert made[1][3]["use_responses_api"] is True
