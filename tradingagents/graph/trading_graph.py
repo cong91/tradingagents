@@ -40,6 +40,22 @@ def _validate_trade_date(trade_date) -> str:
     return value
 
 
+def _tier_llm_settings(config: dict, tier: str) -> tuple[str, str | None]:
+    """(provider, base_url) for the ``quick``/``deep`` tier.
+
+    Each tier falls back to the global ``llm_provider`` / ``backend_url`` when
+    its per-tier key is unset, so a single-provider run behaves exactly as
+    before, while ``TRADINGAGENTS_QUICK_PROVIDER``/``DEEP_PROVIDER`` (and the
+    matching ``*_BACKEND_URL``) let the tiers use different providers with
+    their own API keys.
+    """
+    provider = config.get(f"{tier}_provider") or config["llm_provider"]
+    base_url = config.get(f"{tier}_backend_url")
+    if base_url is None:
+        base_url = config.get("backend_url")
+    return str(provider).lower(), base_url
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -67,22 +83,26 @@ class TradingAgentsGraph:
         os.makedirs(self.config["data_cache_dir"], exist_ok=True)
         os.makedirs(self.config["results_dir"], exist_ok=True)
 
-        llm_kwargs = build_llm_kwargs(self.config)
+        deep_provider, deep_base_url = _tier_llm_settings(self.config, "deep")
+        quick_provider, quick_base_url = _tier_llm_settings(self.config, "quick")
+        deep_kwargs = build_llm_kwargs(self.config, deep_provider)
+        quick_kwargs = build_llm_kwargs(self.config, quick_provider)
 
         if self.callbacks:
-            llm_kwargs["callbacks"] = self.callbacks
+            deep_kwargs["callbacks"] = self.callbacks
+            quick_kwargs["callbacks"] = self.callbacks
 
         deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
+            provider=deep_provider,
             model=self.config["deep_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            base_url=deep_base_url,
+            **deep_kwargs,
         )
         quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
+            provider=quick_provider,
             model=self.config["quick_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            base_url=quick_base_url,
+            **quick_kwargs,
         )
 
         self.deep_thinking_llm = deep_client.get_llm()

@@ -38,9 +38,13 @@ export type SettingMeta = {
 
 export const SETTING_META: Record<string, SettingMeta> = {
   llm_provider: { label: "Nhà cung cấp LLM", hint: "openai, google, anthropic hoặc endpoint tương thích." },
+  quick_provider: { label: "Provider tầng nhanh", hint: "Bỏ trống = theo Nhà cung cấp LLM. Dùng cho analyst/trader/risk." },
+  deep_provider: { label: "Provider tầng sâu", hint: "Bỏ trống = theo Nhà cung cấp LLM. Dùng cho Research Manager/Portfolio Manager." },
   deep_think_llm: { label: "Mô hình suy luận sâu" },
   quick_think_llm: { label: "Mô hình suy luận nhanh" },
   backend_url: { label: "URL backend LLM", hint: "Bỏ trống để dùng endpoint mặc định của nhà cung cấp." },
+  quick_backend_url: { label: "URL backend tầng nhanh", hint: "Bỏ trống = theo URL backend LLM." },
+  deep_backend_url: { label: "URL backend tầng sâu", hint: "Bỏ trống = theo URL backend LLM." },
   llm_wire_protocol: { label: "Giao thức gọi LLM", hint: "chat (Chat Completions) hoặc responses (/responses)." },
   output_language: { label: "Ngôn ngữ đầu ra", hint: "Ví dụ: Vietnamese, English." },
   max_debate_rounds: { label: "Số vòng tranh luận nghiên cứu" },
@@ -96,9 +100,13 @@ export const SETTING_GROUPS: readonly SettingGroup[] = [
       "Nhà cung cấp, mô hình, vòng tranh luận và tham số suy luận. Áp dụng cho phiên phân tích mới.",
     keys: [
       "llm_provider",
+      "quick_provider",
+      "deep_provider",
       "deep_think_llm",
       "quick_think_llm",
       "backend_url",
+      "quick_backend_url",
+      "deep_backend_url",
       "llm_wire_protocol",
       "output_language",
       "max_debate_rounds",
