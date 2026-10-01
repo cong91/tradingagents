@@ -56,6 +56,17 @@ export function ResolvedList({ items }: { items: ApprovalItem[] }) {
                     : "—"}
                 </span>
                 <ApprovalStatusBadge status={item.status} />
+                {/* Kết quả thực thi (contract §4 rev 3): order_id từ sàn khi
+                    live; dry-fill hiển thị mode để phân biệt với lệnh thật. */}
+                {item.order_id ? (
+                  <span className="text-xs text-muted-foreground">
+                    order {item.order_id}
+                  </span>
+                ) : item.status === "executed" && item.mode === "dry" ? (
+                  <span className="text-xs text-muted-foreground">
+                    dry-fill (chưa gửi sàn)
+                  </span>
+                ) : null}
                 <span className="text-xs text-muted-foreground">
                   {item.resolved_at ? formatDateTime(item.resolved_at) : ""}
                 </span>

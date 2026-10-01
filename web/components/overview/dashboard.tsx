@@ -19,83 +19,31 @@ import {
   fetchAudit,
   fetchHealth,
   fetchHistory,
-  FetchError,
+  fetchPortfolio,
   type AuditPayload,
   type HistoryPayload,
 } from "./contract";
 import { summarizeHistory } from "./summary";
+import { usePoll, type ReadyPanel } from "./use-panel";
 import { KpiCards } from "./kpi-cards";
 import { AlphaChart } from "./alpha-chart";
 import { OrderTable } from "./order-table";
 import { EmptyState } from "./empty-state";
+import { PortfolioCard } from "./portfolio-card";
 
-// Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8):
-// audit 10s, health 15s, history 60s. GET không đổi trạng thái nên không cần CSRF.
+// Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8/§9):
+// audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6).
 const HEALTH_INTERVAL_MS = 15_000;
 const AUDIT_INTERVAL_MS = 10_000;
 const HISTORY_INTERVAL_MS = 60_000;
+const PORTFOLIO_INTERVAL_MS = 30_000;
 const AUDIT_PAGE_SIZE = 200;
 const HISTORY_LIMIT = 200;
 
 const loadHealth = () => fetchHealth();
 const loadHistory = () => fetchHistory(HISTORY_LIMIT);
 const loadAudit = () => fetchAudit(AUDIT_PAGE_SIZE);
-
-/**
- * Trạng thái một panel dữ liệu (hợp đồng §0.2):
- *  loading — chưa có gì; ready — có dữ liệu tươi; stale — có dữ liệu cũ kèm
- *  lỗi poll gần nhất (không xoá UI khi poll lỗi); error — chưa từng có dữ liệu.
- */
-type PanelState<T> =
-  | { status: "loading" }
-  | { status: "ready"; data: T; fetchedAt: number }
-  | { status: "stale"; data: T; fetchedAt: number; message: string; code: string }
-  | { status: "error"; message: string; code: string };
-
-type ReadyPanel<T> = Extract<PanelState<T>, { status: "ready" | "stale" }>;
-
-function usePoll<T>(
-  fetcher: () => Promise<T>,
-  intervalMs: number,
-  staleAfterMs: number,
-  clock: number
-): { state: PanelState<T>; refresh: () => void; stale: boolean } {
-  const [state, setState] = useState<PanelState<T>>({ status: "loading" });
-
-  const load = useCallback(() => {
-    fetcher().then(
-      (data) => setState({ status: "ready", data, fetchedAt: Date.now() }),
-      (err: unknown) => {
-        const message = err instanceof Error ? err.message : "Lỗi không xác định";
-        const code = err instanceof FetchError ? err.code : "unknown_error";
-        setState((prev) => {
-          if (prev.status === "ready" || prev.status === "stale") {
-            return {
-              status: "stale",
-              data: prev.data,
-              fetchedAt: prev.fetchedAt,
-              message,
-              code,
-            };
-          }
-          return { status: "error", message, code };
-        });
-      }
-    );
-  }, [fetcher]);
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, intervalMs);
-    return () => clearInterval(id);
-  }, [load, intervalMs]);
-
-  const stale =
-    (state.status === "ready" || state.status === "stale") &&
-    clock - state.fetchedAt > staleAfterMs;
-
-  return { state, refresh: load, stale };
-}
+const loadPortfolio = () => fetchPortfolio();
 
 function PanelSkeleton() {
   return (
@@ -221,28 +169,32 @@ export function OverviewDashboard() {
   const health = usePoll(loadHealth, HEALTH_INTERVAL_MS, HEALTH_INTERVAL_MS, clock);
   const history = usePoll(loadHistory, HISTORY_INTERVAL_MS, HISTORY_INTERVAL_MS, clock);
   const audit = usePoll(loadAudit, AUDIT_INTERVAL_MS, AUDIT_INTERVAL_MS, clock);
+  const portfolio = usePoll(loadPortfolio, PORTFOLIO_INTERVAL_MS, PORTFOLIO_INTERVAL_MS, clock);
   // refresh của từng hook là callback ổn định — destructure để deps của refreshAll ổn định.
   const { refresh: refreshHealth } = health;
   const { refresh: refreshHistory } = history;
   const { refresh: refreshAudit } = audit;
+  const { refresh: refreshPortfolio } = portfolio;
 
   const refreshAll = useCallback(() => {
     refreshHealth();
     refreshHistory();
     refreshAudit();
-  }, [refreshHealth, refreshHistory, refreshAudit]);
+    refreshPortfolio();
+  }, [refreshHealth, refreshHistory, refreshAudit, refreshPortfolio]);
 
   const allLoading =
     health.state.status === "loading" &&
     history.state.status === "loading" &&
-    audit.state.status === "loading";
+    audit.state.status === "loading" &&
+    portfolio.state.status === "loading";
 
-  const latestFetchedAt = [health.state, history.state, audit.state]
+  const latestFetchedAt = [health.state, history.state, audit.state, portfolio.state]
     .map((s) => (s.status === "ready" || s.status === "stale" ? s.fetchedAt : null))
     .filter((t): t is number => t !== null)
     .reduce<number | null>((max, t) => (max === null || t > max ? t : max), null);
 
-  const anyStale = health.stale || history.stale || audit.stale;
+  const anyStale = health.stale || history.stale || audit.stale || portfolio.stale;
 
   const halted = health.state.status !== "loading" && health.state.status !== "error"
     ? health.state.data.halted_today === true
@@ -303,6 +255,16 @@ export function OverviewDashboard() {
         </Card>
       ) : (
         <>
+          {/* Danh mục tự xử lý mọi trạng thái (kể cả 404 khi backend chưa có
+              §6) — lỗi của card này không được chạm tới các panel còn lại. */}
+          <div className="mb-4">
+            <PortfolioCard
+              state={portfolio.state}
+              stale={portfolio.stale}
+              onRetry={portfolio.refresh}
+            />
+          </div>
+
           <Card>
             <CardHeader>
               <CardTitle>Hiệu suất quyết định</CardTitle>

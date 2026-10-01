@@ -1,4 +1,4 @@
-"""History & backtest: GET /api/history and GET /api/backtest (§7).
+"""History & backtest: GET /api/history and GET /api/backtest (§8).
 
 Both read-only, built on the engine's own decision-log parser
 (``TradingMemoryLog._parse_entry``) so the API can never drift from what runs

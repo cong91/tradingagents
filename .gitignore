@@ -232,3 +232,7 @@ web/.next/
 
 # Control-panel server state (watchlist, approval queue, server audit trail)
 server/data/
+
+# Windows reserved-device name recreated by POSIX-style `> nul` redirects
+# from agent shells; committing it breaks clones on Windows.
+nul

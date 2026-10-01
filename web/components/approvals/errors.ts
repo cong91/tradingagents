@@ -22,6 +22,8 @@ export function describeActionError(error: ActionError): string {
     }
     case "conflict":
       return "Kế hoạch đã được xử lý nơi khác (tab khác đã duyệt/từ chối). Danh sách sẽ được làm mới.";
+    case "mock_not_executable":
+      return "Kế hoạch sinh từ job quét chế độ mô phỏng (mock) — dữ liệu tổng hợp không thể thành lệnh thật. Hãy từ chối kế hoạch này thay vì duyệt.";
     case "expired":
       return "Kế hoạch đã quá hạn duyệt (24 giờ) và không còn hiệu lực.";
     case "audit_log_unreadable":

@@ -13,6 +13,11 @@ export type ApprovalItem = {
   id: string;
   created_at: string;
   run_id: string | null;
+  /** Job POST /api/daily đã sinh kế hoạch này (contract §4 rev 3) — optional
+   * vì backend đang hiện thực song song; hiển thị khi có. */
+  daily_job_id?: string | null;
+  /** created_at + 24h; quá hạn trên item còn pending → badge suy ra (§4). */
+  expires_at?: string | null;
   ticker: string | null;
   ccxt_symbol: string | null;
   signal: string | null;
@@ -24,9 +29,15 @@ export type ApprovalItem = {
   leverage: number | null;
   mode_at_plan: string | null;
   plan_reason: string | null;
+  /** Kế hoạch demo từ job mock — approve bị server từ chối (409). */
+  mock?: boolean;
   status: ApprovalStatus;
   resolved_at: string | null;
   resolution: string | null;
+  /** Điền khi approve resolve (contract §4): live → true, dry-fill → false. */
+  executed?: boolean | null;
+  mode?: string | null;
+  order_id?: string | null;
 };
 
 export type ApprovalsResponse = {

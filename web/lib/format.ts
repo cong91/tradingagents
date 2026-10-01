@@ -74,6 +74,15 @@ export function formatUsdPrice(value: number | null | undefined): string {
   return `${usdFormat.format(value)} USD`;
 }
 
+/** Tiền theo đơn vị danh mục server trả (vd "USDT"): "9.500,00 USDT"; null/NaN → "—". */
+export function formatMoney(
+  value: number | null | undefined,
+  currency: string
+): string {
+  if (value == null || Number.isNaN(value)) return "—";
+  return `${usdFormat.format(value)} ${currency}`;
+}
+
 /** Tài sản gốc của cặp: "BTC/USDT" hoặc "BTC-USD" → "BTC"; không parse được → nguyên văn/null. */
 export function baseAssetOf(
   ccxtSymbol: string | null,

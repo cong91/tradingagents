@@ -1,4 +1,4 @@
-"""Health: GET /api/health (docs/ui-api-contract.md §8).
+"""Health: GET /api/health (docs/ui-api-contract.md §9).
 
 One glance at gate state, audit readability, key configuration and what the
 server is currently doing. Never returns a key value — only booleans.

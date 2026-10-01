@@ -73,3 +73,22 @@ export function PlanModeBadge({ mode }: { mode: string | null }) {
   }
   return null;
 }
+
+/** Kế hoạch demo từ job mock (contract §4 rev 3) — không bao giờ thành lệnh thật. */
+export function MockPlanBadge() {
+  return (
+    <Badge variant="outline" className="border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+      Kế hoạch mô phỏng (mock)
+    </Badge>
+  );
+}
+
+/** Badge suy ra (contract §4): item còn pending nhưng expires_at đã qua —
+ * server không lưu trạng thái "expired", nó trả 410 khi cố resolve. */
+export function ExpiredBadge() {
+  return (
+    <Badge variant="outline" className="border-border text-muted-foreground">
+      Quá hạn duyệt
+    </Badge>
+  );
+}

@@ -427,6 +427,11 @@ async def create_run(request: Request):
         active = _active_run()
         if active is not None:
             raise ApiError(409, "conflict", "another run is already active", {"run_id": active.run_id})
+        from server import daily as daily_jobs  # lazy: daily imports this module
+
+        busy_job = daily_jobs._active_job()  # the lock is shared with POST /api/daily (§3, §5)
+        if busy_job is not None:
+            raise ApiError(409, "conflict", "a daily job is already active", {"job_id": busy_job.job_id})
         run = RunState(
             run_id=_new_run_id(ticker), ticker=ticker, trade_date=trade_date,
             asset_type=asset_type, mode=mode, checkpoint=checkpoint,

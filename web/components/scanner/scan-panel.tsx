@@ -53,14 +53,25 @@ const SIGNAL_VARIANT: Record<string, "default" | "secondary" | "destructive" | "
 };
 
 function ResultRow({ item }: { item: DailyResultItem }) {
-  const plan = item.plan_summary;
+  const plan = item.plan;
   return (
     <tr className="align-top">
-      <td className="py-2 pr-3 font-mono font-medium">{item.ticker}</td>
+      <td className="py-2 pr-3 font-mono font-medium">
+        {item.ticker}
+        {item.mock_source ? (
+          <Badge variant="outline" className="ml-2 align-middle text-xs">
+            Mock
+          </Badge>
+        ) : null}
+      </td>
       <td className="py-2 pr-3">
-        <Badge variant={SIGNAL_VARIANT[item.signal] ?? "outline"}>
-          {item.signal}
-        </Badge>
+        {item.signal ? (
+          <Badge variant={SIGNAL_VARIANT[item.signal] ?? "outline"}>
+            {item.signal}
+          </Badge>
+        ) : (
+          "—"
+        )}
       </td>
       <td className="py-2 pr-3">
         {plan ? (
@@ -85,16 +96,11 @@ function ResultRow({ item }: { item: DailyResultItem }) {
         )}
       </td>
       <td className="max-w-xs py-2 pr-3">
-        {item.executed ? (
-          <span>
-            Đã tự thực thi
-            {item.order_id ? ` (order ${item.order_id})` : ""}
-          </span>
-        ) : (
-          <span className="line-clamp-2" title={item.reason}>
-            {item.reason}
-          </span>
-        )}
+        {/* Job UI không bao giờ tự thực thi (bất biến §5) — cột này chỉ mang
+            lý do nghiệp vụ hoặc lỗi hệ thống của coin. */}
+        <span className="line-clamp-2" title={item.error ?? item.reason ?? undefined}>
+          {item.error ?? item.reason ?? "—"}
+        </span>
       </td>
       <td className="py-2">
         {item.approval_id ? (
@@ -256,8 +262,9 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
             <p className="text-sm text-destructive">{error.message}</p>
             {error.status === 404 ? (
               <p className="text-sm text-muted-foreground">
-                Backend hiện chưa hiện thực POST /api/daily (hợp đồng §5) — hãy
-                cập nhật server rồi thử lại.
+                Chưa có endpoint /api/daily trên backend (hợp đồng §5) hoặc job
+                đã mất khi server restart (job là state in-memory). Lỗi sẽ hết
+                sau khi backend cập nhật — bấm “Quét ngay” để tạo job mới.
               </p>
             ) : null}
             <Button variant="outline" className="min-touch" onClick={resumePolling}>
@@ -294,6 +301,23 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
                 phần đã chạy được.
               </p>
             ) : null}
+          </div>
+        ) : null}
+
+        {job && isTerminal && !busy ? (
+          // Job xong → dẫn thẳng sang màn Duyệt lệnh nơi kế hoạch đang chờ.
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-dashed p-3 text-sm">
+            <span>
+              Job {STATUS_VI[job.status].toLowerCase()} —{" "}
+              {job.results.filter((r) => r.approval_id).length} kế hoạch trong
+              hàng đợi duyệt.
+            </span>
+            <Link
+              href="/approvals"
+              className="min-touch inline-flex items-center rounded-lg border px-3 text-sm font-medium hover:bg-muted"
+            >
+              Xem trong Duyệt lệnh
+            </Link>
           </div>
         ) : null}
 

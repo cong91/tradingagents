@@ -51,6 +51,14 @@ def ensure_seeded() -> None:
         _save_state([{"symbol": str(t), "added_at": utc_now_iso()} for t in DEFAULT_CONFIG.get("exec_watchlist", [])])
 
 
+def current_symbols() -> list[str]:
+    """The watchlist as the API layer tracks it — the source POST /api/daily
+    defaults to (contract §5: "exec_watchlist hiện hành"; ``get_config`` holds
+    a frozen copy, so the file state is the authoritative one)."""
+    items, _warning = _load_state()
+    return [item["symbol"] for item in items]
+
+
 def _payload(items: list[dict], warning: str | None = None) -> dict:
     payload = {"generated_at": utc_now_iso(), "symbols": items}
     if warning:

@@ -1,8 +1,9 @@
 // M1 "Tổng quan lợi nhuận" — tầng dữ liệu của màn: types + fetch theo đúng
-// docs/ui-api-contract.md. Màn này chỉ ĐỌC ba endpoint có trong hợp đồng:
-//   GET /api/health  (§8)   — exec_mode, halted_today, pending_approvals
-//   GET /api/history (§7)   — decision log: rating / pending / alpha (chuỗi "+1.2%")
-//   GET /api/audit   (§6)   — nhật ký thực thi: lệnh buy/sell, qty, price_est
+// docs/ui-api-contract.md. Màn này chỉ ĐỌC bốn endpoint có trong hợp đồng:
+//   GET /api/health    (§9)   — exec_mode, halted_today, pending_approvals
+//   GET /api/history   (§8)   — decision log: rating / pending / alpha (chuỗi "+1.2%")
+//   GET /api/audit     (§7)   — nhật ký thực thi: lệnh buy/sell, qty, price_est
+//   GET /api/portfolio (§6)   — positions + realized P&L (replay FIFO)
 // Không tự chế endpoint ngoài hợp đồng; mọi response mang `generated_at`.
 import { parseErrorResponse } from "@/lib/api";
 
@@ -46,7 +47,7 @@ async function fetchJson<T>(url: string): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/health — docs/ui-api-contract.md §8 (server/health.py:44-56)
+// GET /api/health — docs/ui-api-contract.md §9 (server/health.py:44-56)
 
 export type HealthPayload = {
   generated_at: string;
@@ -58,7 +59,7 @@ export type HealthPayload = {
 };
 
 // ---------------------------------------------------------------------------
-// GET /api/history — docs/ui-api-contract.md §7 (server/history.py:57-100).
+// GET /api/history — docs/ui-api-contract.md §8 (server/history.py:57-100).
 // Chỉ type hoá các field màn này dùng; payload thật có thêm field khác.
 
 export type HistoryItem = {
@@ -79,7 +80,7 @@ export type HistoryPayload = {
 };
 
 // ---------------------------------------------------------------------------
-// GET /api/audit — docs/ui-api-contract.md §6 (server/audit.py:135-147).
+// GET /api/audit — docs/ui-api-contract.md §7 (server/audit.py:135-147).
 
 export type AuditItem = {
   timestamp: string | null;
@@ -104,6 +105,46 @@ export type AuditPayload = {
 };
 
 // ---------------------------------------------------------------------------
+// GET /api/portfolio — docs/ui-api-contract.md §6 (positions từ sync_portfolio
+// + realized P&L bằng replay FIFO của audit log).
+
+export type PortfolioPosition = {
+  ticker: string;
+  quantity: number;
+  /** Trung bình có trọng số lot FIFO còn mở; null = basis không xác định. */
+  average_price: number | null;
+  /** "fifo" khi log có lot khớp; null khi không. */
+  basis_source: string | null;
+  marked_price: number | null;
+  market_value: number | null;
+  /** Chỉ tính khi có basis + mark; ngược lại null (thiếu sót trung thực §6). */
+  unrealized_pnl: number | null;
+};
+
+export type RealizedPnl = {
+  total: number;
+  /** Chỉ closed trade của UTC hôm nay (khác con số guard — guard cộng thêm
+   * unrealized của lot mở hôm nay; UI ghi chú khác biệt này). */
+  today: number;
+  by_ticker: Record<string, number>;
+  closed_trades: number;
+  unknown_basis_closes: number;
+  consecutive_losses: number;
+};
+
+export type PortfolioPayload = {
+  generated_at: string;
+  currency: string;
+  cash: number | null;
+  equity_est: number | null;
+  positions: PortfolioPosition[];
+  realized_pnl: RealizedPnl;
+  halted_today: boolean;
+  warnings: string[];
+  stale_after: number;
+};
+
+// ---------------------------------------------------------------------------
 
 export function fetchHealth(): Promise<HealthPayload> {
   return fetchJson<HealthPayload>("/api/health");
@@ -115,6 +156,10 @@ export function fetchHistory(limit: number): Promise<HistoryPayload> {
 
 export function fetchAudit(pageSize: number): Promise<AuditPayload> {
   return fetchJson<AuditPayload>(`/api/audit?page_size=${pageSize}`);
+}
+
+export function fetchPortfolio(): Promise<PortfolioPayload> {
+  return fetchJson<PortfolioPayload>("/api/portfolio");
 }
 
 /**

@@ -10,7 +10,7 @@ localhost, which is limited to CORS-safelisted content types — so POST/PUT/
 DELETE must speak ``application/json`` and may not carry a foreign ``Origin``
 or ``Sec-Fetch-Site: cross-site``. GET and SSE never change state and are
 exempt. This is not authentication: bind beyond 127.0.0.1 only after adding a
-token (contract §0, §10.12).
+token (contract §0, §11.12).
 """
 
 from collections.abc import AsyncIterator
@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
-from server import approvals, audit, health, history, runs, settings, watchlist
+from server import approvals, audit, daily, health, history, portfolio, runs, settings, watchlist
 from server.contract import error_response, install_error_handlers
 
 # Origins allowed to drive state-changing requests: the server itself, the
@@ -69,6 +69,8 @@ for _router in (
     settings.router,
     watchlist.router,
     runs.router,
+    daily.router,
+    portfolio.router,
     approvals.router,
     audit.router,
     history.router,
