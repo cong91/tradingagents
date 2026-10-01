@@ -79,6 +79,14 @@ Vòng lặp: quét → duyệt → xem kết quả → (điều chỉnh ngưỡn
 
 ### 2.1 Khởi động hệ thống
 
+**Cách nhanh nhất — nháy đúp `start.bat` ở thư mục gốc repo.** File này tự làm
+đủ mọi thứ: kiểm tra venv, tự `npm install` lần đầu nếu thiếu, khởi động backend
+và frontend (mỗi tiến trình một cửa sổ log riêng), **tái sử dụng instance đang
+chạy** nếu port 8000/3000 đã có người nghe, chờ backend sẵn sàng rồi tự mở
+trình duyệt ở `http://localhost:3000`.
+
+Cách thủ công (khi cần xem log trực tiếp hoặc debug):
+
 Cài lần đầu (máy mới): cần Python venv của repo với extra `web` (cấp FastAPI +
 uvicorn — `pyproject.toml:42-45`) và Node.js cho frontend:
 
@@ -105,8 +113,9 @@ npm run dev
 
 Mở **http://localhost:3000** trong trình duyệt.
 
-> Kiểm chứng đã thực hiện (2026-10-01, chính máy này): lệnh backend trên khởi động
-> thành công; `GET http://127.0.0.1:8000/api/health` trả HTTP 200 với
+> Kiểm chứng đã thực hiện (2026-10-01, chính máy này): `start.bat` chạy trọn
+> vẹn — khởi động mới lẫn tái sử dụng instance đang chạy, health trả 200, giao
+> diện port 3000 trả HTTP 200; lệnh thủ công trên cũng khởi động thành công với
 > `exec_mode:"dry"`. Xem §5.
 
 Khi backend khởi động xong, nó tự seed watchlist mặc định lần đầu (lấy từ cấu hình
