@@ -12,6 +12,16 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
     "TRADINGAGENTS_LLM_BACKEND_URL":      "backend_url",
+    # Per-tier provider overrides: each tier (quick = analysts/researchers/
+    # trader/risk voices, deep = research manager/portfolio manager) defaults
+    # to llm_provider / backend_url when unset, so one run can mix providers
+    # (e.g. a cheap OpenAI-compatible relay for analysis, a stronger native
+    # API for decisions). API keys resolve per provider through
+    # api_key_env.PROVIDER_API_KEY_ENV, so both keys coexist in .env.
+    "TRADINGAGENTS_QUICK_PROVIDER":       "quick_provider",
+    "TRADINGAGENTS_DEEP_PROVIDER":        "deep_provider",
+    "TRADINGAGENTS_QUICK_BACKEND_URL":    "quick_backend_url",
+    "TRADINGAGENTS_DEEP_BACKEND_URL":     "deep_backend_url",
     # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
     # Chat Completions; "responses" switches to /responses for endpoints that
     # implement it. Validated in build_llm_kwargs.
@@ -111,6 +121,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # provider-specific URL here would leak (e.g. OpenAI's /v1 was previously
     # being forwarded to Gemini, producing malformed request URLs).
     "backend_url": None,
+    # Per-tier provider overrides (None = follow llm_provider / backend_url),
+    # so quick and deep tiers can use different providers with their own API
+    # keys (keys resolve per provider via api_key_env.PROVIDER_API_KEY_ENV).
+    "quick_provider": None,
+    "deep_provider": None,
+    "quick_backend_url": None,
+    "deep_backend_url": None,
     # Wire protocol for OpenAI-compatible endpoints: "chat" (Chat Completions,
     # the wide-compatibility default) or "responses" (/responses for endpoints
     # that implement it). Native OpenAI ignores this -- it already prefers

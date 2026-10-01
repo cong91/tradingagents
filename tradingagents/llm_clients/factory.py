@@ -87,23 +87,34 @@ def _coerce_max_tokens(value):
     return n
 
 
-def build_llm_kwargs(config: dict) -> dict[str, Any]:
-    """Keyword arguments for ``create_llm_client`` from a TradingAgents config."""
+def build_llm_kwargs(config: dict, provider: str | None = None) -> dict[str, Any]:
+    """Keyword arguments for ``create_llm_client`` from a TradingAgents config.
+
+    ``provider`` is the tier's provider (quick/deep may differ from the global
+    ``llm_provider``); when omitted it falls back to ``config["llm_provider"]``
+    exactly as before, so a single-provider run builds one shared kwargs dict.
+    """
     kwargs = {}
-    provider = config.get("llm_provider", "").lower()
+    provider = (provider or config.get("llm_provider", "")).lower()
 
     # Wire protocol for OpenAI-compatible endpoints (#relay-api-mode): "chat"
     # (default) speaks Chat Completions; "responses" switches the client to
     # /responses for endpoints that implement it (some relays advertise GPT-6
-    # models but drop large Chat payloads, and vice versa). Native OpenAI
-    # ignores this -- it already prefers Responses for capable models.
+    # models but drop large Chat payloads, and vice versa). It is meaningless
+    # for native non-OpenAI APIs, so it only applies to the OpenAI-compatible
+    # family; the config-level value is still validated for either tier.
     wire_protocol = config.get("llm_wire_protocol")
     if wire_protocol not in (None, "", "chat"):
         if wire_protocol != "responses":
             raise ValueError(
                 f"llm_wire_protocol must be 'chat' or 'responses', got {wire_protocol!r}"
             )
-        kwargs["use_responses_api"] = True
+        from .openai_client import is_openai_compatible
+
+        # An empty provider (legacy bare-config call) keeps the old behavior
+        # of applying the flag; a known tier provider is checked explicitly.
+        if not provider or is_openai_compatible(provider):
+            kwargs["use_responses_api"] = True
 
     if provider == "google":
         thinking_level = config.get("google_thinking_level")
