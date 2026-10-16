@@ -2,10 +2,12 @@ import hashlib
 import json
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from langchain_core.callbacks import BaseCallbackHandler
 
 import tradingagents
 from tradingagents.agents.context import build_instrument_context, resolve_instrument_identity
@@ -14,6 +16,7 @@ from tradingagents.dataflows.config import run_config, run_config_context, set_c
 from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.diagnostics import diagnostic_scope
 from tradingagents.llm_clients import create_tier_client, tier_provider
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
@@ -180,13 +183,32 @@ class TradingAgentsGraph:
         ``tradingagents.agents.rating.is_review`` before mapping it to the
         PortfolioRating enum.
         """
-        trade_date = _validate_trade_date(trade_date)
+        return TradingAgentsGraph._propagate(self, company_name, trade_date, asset_type, portfolio)
 
-        with run_config(self.config), \
+    def propagate_with_telemetry(
+        self, company_name, trade_date, asset_type="stock", *, telemetry, portfolio=None
+    ):
+        """Run the graph while reporting node timings to an observer."""
+        return self._propagate(
+            company_name, trade_date, asset_type, portfolio, telemetry=telemetry
+        )
+
+    def _propagate(self, company_name, trade_date, asset_type, portfolio, telemetry=None):
+        trade_date = _validate_trade_date(trade_date)
+        if telemetry is None:
+            with run_config(self.config), \
+                    self.checkpoint_scope(company_name, trade_date, asset_type, portfolio) as thread_id_value:
+                return self._run_graph(
+                    company_name, trade_date, asset_type=asset_type,
+                    checkpoint_thread_id=thread_id_value, portfolio=portfolio,
+                )
+
+        with diagnostic_scope(telemetry), run_config(self.config), \
                 self.checkpoint_scope(company_name, trade_date, asset_type, portfolio) as thread_id_value:
             return self._run_graph(
                 company_name, trade_date, asset_type=asset_type,
                 checkpoint_thread_id=thread_id_value, portfolio=portfolio,
+                telemetry=telemetry,
             )
 
     def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock", portfolio=None) -> str | None:
@@ -371,19 +393,55 @@ class TradingAgentsGraph:
         )
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   checkpoint_thread_id: str | None = None, portfolio=None):
+                   checkpoint_thread_id: str | None = None, portfolio=None,
+                   telemetry=None):
         """Execute the graph and write the resulting state to disk and memory log."""
-        init_agent_state = self.create_run_state(company_name, trade_date, asset_type, portfolio)
-        args = self.propagator.get_graph_args()
+        prepare_span = (
+            telemetry.span("prepare_state", company_name)
+            if telemetry is not None and callable(getattr(telemetry, "span", None))
+            else nullcontext()
+        )
+        with prepare_span:
+            init_agent_state = self.create_run_state(company_name, trade_date, asset_type, portfolio)
+            args = self.propagator.get_graph_args()
 
-        # Inject the checkpoint thread_id (from checkpoint_scope) so the same
-        # ticker+date+graph-shape resumes; a different one starts fresh (#1089).
-        if checkpoint_thread_id is not None:
-            args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = checkpoint_thread_id
+            # Inject the checkpoint thread_id (from checkpoint_scope) so the same
+            # ticker+date+graph-shape resumes; a different one starts fresh (#1089).
+            if checkpoint_thread_id is not None:
+                args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = checkpoint_thread_id
 
-        # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
-        graph_input = self.checkpoint_input(init_agent_state)
-        if self.debug:
+            # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
+            graph_input = self.checkpoint_input(init_agent_state)
+
+        if telemetry is not None:
+            args["stream_mode"] = ["values", "debug"]
+            if isinstance(telemetry, BaseCallbackHandler):
+                callbacks = args.setdefault("config", {}).setdefault("callbacks", [])
+                if telemetry not in callbacks:
+                    callbacks.append(telemetry)
+            final_state = {}
+            for mode, chunk in self.graph.stream(graph_input, **args):
+                if mode == "values":
+                    final_state = chunk
+                elif mode == "debug":
+                    details = chunk.get("payload") if isinstance(chunk, dict) else None
+                    if (
+                        chunk.get("type") in {"task", "task_result"}
+                        and isinstance(details, dict)
+                        and isinstance(details.get("name"), str)
+                    ):
+                        telemetry.graph_event(chunk, company_name)
+            finalize_span = (
+                telemetry.span("finalize_state", company_name)
+                if callable(getattr(telemetry, "span", None))
+                else nullcontext()
+            )
+            with finalize_span:
+                # record_decision logs the state and stores the decision.
+                self.record_decision(company_name, trade_date, final_state)
+                self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
+            return final_state, run_rating(final_state)
+        elif self.debug:
             # A state repeats the messages before it, so each prints once (#1027).
             final_state, printed = {}, set()
             for messages, state in self.stream_run(graph_input, **args):

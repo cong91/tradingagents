@@ -52,6 +52,7 @@ export const SETTING_META: Record<string, SettingMeta> = {
   checkpoint_enabled: { label: "Bật checkpoint", hint: "Lưu trạng thái sau mỗi bước để chạy lại khi gặp sự cố." },
   benchmark_ticker: { label: "Ticker benchmark", hint: "Bỏ trống để tự dò theo sàn niêm yết (mặc định SPY)." },
   temperature: { label: "Temperature", hint: "Bỏ trống để dùng mặc định của nhà cung cấp." },
+  llm_timeout: { label: "Timeout LLM (giây)", hint: "Thời gian tối đa cho một request; phải lớn hơn 0." },
   llm_max_retries: { label: "Số lần thử lại LLM", hint: "Bỏ trống để dùng mặc định của SDK." },
   max_tokens: { label: "Giới hạn token đầu ra", hint: "Bỏ trống để không giới hạn." },
   google_thinking_level: { label: "Mức tư duy Google", hint: "Ví dụ: high, minimal. Bỏ trống = mặc định." },
@@ -65,7 +66,8 @@ export const SETTING_META: Record<string, SettingMeta> = {
   risk_max_derivatives_exposure_pct: { label: "Phơi nhiễm phái sinh tối đa", unit: "%", hint: "0 = chặn hoàn toàn giao dịch phái sinh." },
   exec_exchange_id: { label: "ID sàn (ccxt)", hint: "Ví dụ: binance." },
   exec_quote_currency: { label: "Đồng tiền báo giá", hint: "Ví dụ: USDT." },
-  exec_sandbox: { label: "Chế độ sandbox (testnet)", hint: "Chuyển kết nối sang testnet của sàn — hướng an toàn." },
+  exec_base_url: { label: "URL sàn đang dùng", hint: "Chỉ đọc. Đổi endpoint và đúng cặp API key/secret trong .env rồi khởi động lại backend để chuyển Demo/production." },
+  exec_sandbox: { label: "Sandbox cho sàn khác Binance", hint: "Binance chọn Demo hoặc production bằng URL phía trên; chế độ này chỉ áp dụng các sàn khác." },
 };
 
 export const PATH_LABELS: Record<string, string> = {
@@ -114,6 +116,7 @@ export const SETTING_GROUPS: readonly SettingGroup[] = [
       "checkpoint_enabled",
       "benchmark_ticker",
       "temperature",
+      "llm_timeout",
       "llm_max_retries",
       "max_tokens",
       "google_thinking_level",
@@ -139,8 +142,8 @@ export const SETTING_GROUPS: readonly SettingGroup[] = [
     id: "exec",
     title: "Thực thi & Sàn",
     description:
-      "Sàn, đồng tiền báo giá và sandbox. Công tắc LIVE là cổng chỉ-đọc — xem thẻ “Cổng thực thi”.",
-    keys: ["exec_exchange_id", "exec_quote_currency", "exec_sandbox"],
+      "Sàn, đồng tiền báo giá và venue URL. Binance mặc định dùng Demo; chuyển sang production phải đổi URL cùng cặp key/secret trong .env. Công tắc LIVE là cổng riêng, chỉ-đọc ở đây.",
+    keys: ["exec_exchange_id", "exec_quote_currency", "exec_base_url", "exec_sandbox"],
   },
 ];
 

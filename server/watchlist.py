@@ -8,6 +8,7 @@ to Yahoo pipeline form (strip + uppercase); an empty watchlist is valid.
 """
 
 import json
+import re
 
 from fastapi import APIRouter, Request
 
@@ -16,6 +17,21 @@ from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.default_config import DEFAULT_CONFIG
 
 router = APIRouter(prefix="/api", tags=["watchlist"])
+
+_SYMBOL_RE = re.compile(r"^[A-Z0-9._=+^\-]+$")
+
+
+def _validate_symbol(raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ApiError(400, "validation_error", '"symbol" must be a non-empty string')
+    symbol = raw.strip().upper()
+    if "," in symbol or not _SYMBOL_RE.fullmatch(symbol):
+        raise ApiError(
+            400,
+            "validation_error",
+            '"symbol" must contain exactly one ticker, not a comma-separated list',
+        )
+    return symbol
 
 
 def _load_state() -> tuple[list[dict], str | None]:
@@ -29,10 +45,21 @@ def _load_state() -> tuple[list[dict], str | None]:
         symbols = data.get("symbols", [])
         if not isinstance(symbols, list):
             raise ValueError("symbols must be a list")
-        items = [{"symbol": str(entry["symbol"]), "added_at": str(entry.get("added_at"))} for entry in symbols]
+        items = []
+        for entry in symbols:
+            if not isinstance(entry, dict):
+                raise ValueError("watchlist entries must be objects")
+            symbol = _validate_symbol(entry.get("symbol"))
+            items.append({"symbol": symbol, "added_at": str(entry.get("added_at"))})
         return items, None
     except (OSError, ValueError, KeyError, TypeError):
-        fallback = [{"symbol": str(t), "added_at": utc_now_iso()} for t in DEFAULT_CONFIG.get("exec_watchlist", [])]
+        fallback = []
+        for raw in DEFAULT_CONFIG.get("exec_watchlist", []):
+            try:
+                symbol = _validate_symbol(raw)
+            except ApiError:
+                continue
+            fallback.append({"symbol": symbol, "added_at": utc_now_iso()})
         return fallback, "watchlist state file was unreadable; recovered from engine defaults"
 
 
@@ -75,10 +102,7 @@ def get_watchlist():
 @router.post("/watchlist", status_code=201)
 async def add_watchlist_symbol(request: Request):
     body = await json_body(request)
-    symbol = body.get("symbol")
-    if not isinstance(symbol, str) or not symbol.strip():
-        raise ApiError(400, "validation_error", '"symbol" must be a non-empty string')
-    symbol = symbol.strip().upper()
+    symbol = _validate_symbol(body.get("symbol"))
     items, warning = _load_state()
     if any(item["symbol"].upper() == symbol for item in items):
         raise ApiError(409, "conflict", f"symbol {symbol} is already on the watchlist", {"symbol": symbol})

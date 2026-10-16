@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -179,11 +180,19 @@ def _handle_plan(
     plan: Any,
     portfolio: PortfolioContext,
     result: DailyResult,
+    execute_guard: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> None:
-    """Apply the confirm policy to one planned order, recording the outcome."""
+    """Apply the confirm policy to one plan, recording the outcome."""
+    def execute() -> Any:
+        return bridge.execute_order(plan, confirm=True, portfolio=portfolio)
+
+    def execute_once() -> Any:
+        return execute_guard(execute) if execute_guard is not None else execute()
+
     if plan.side is None:
         result.reason = plan.reason  # Hold, REVIEW, sizing refusal or risk rejection
         return
+
     if bridge.config.get("exec_auto_confirm") is not True:
         _wait_for_approval(bridge, plan, "exec_auto_confirm is not enabled; plan awaits approval")
         result.reason = "awaiting approval"
@@ -201,7 +210,7 @@ def _handle_plan(
         result.reason = "awaiting approval (auto-confirm env gate closed)"
         return
     if bridge.effective_mode() == "dry":
-        result.order_id = bridge.execute_order(plan, confirm=True, portfolio=portfolio)
+        result.order_id = execute_once()
         result.executed = True
         return
     if bridge.config.get("exec_live") is not True:
@@ -212,7 +221,7 @@ def _handle_plan(
         )
         result.reason = "awaiting approval (live auto-confirm gate closed)"
         return
-    result.order_id = bridge.execute_order(plan, confirm=True, portfolio=portfolio)
+    result.order_id = execute_once()
     result.executed = True
 
 

@@ -126,6 +126,8 @@ def enqueue(plan: dict) -> dict:
             "leverage": plan.get("leverage", 1.0),
             "mode_at_plan": plan.get("mode_at_plan", "dry"),
             "plan_reason": plan.get("plan_reason"),
+            "stop_loss": plan.get("stop_loss"),
+            "take_profit": plan.get("take_profit"),
             "mock": bool(plan.get("mock", False)),
             "status": "pending",
             "resolved_at": None,
@@ -179,6 +181,8 @@ def _rebuild_plan(item: dict) -> PlannedOrder:
         reason=None,
         market=item.get("market") or "spot",
         leverage=float(item.get("leverage") or 1.0),
+        stop_loss=item.get("stop_loss"),
+        take_profit=item.get("take_profit"),
     )
 
 
@@ -215,6 +219,12 @@ def _fail_execute(approval_id: str, reason: str) -> None:
     """Execute refused/failed: item → execute_failed + server trail."""
     _resolve(approval_id, status="execute_failed", resolution=reason)
     audit_log.record("approval_execute_failed", approval_id=approval_id, reason=reason)
+
+
+def _release_claim(approval_id: str, reason: str) -> None:
+    """Release an approved claim when execution cannot safely be attempted."""
+    _resolve(approval_id, status="pending", resolution=reason)
+    audit_log.record("approval_execute_deferred", approval_id=approval_id, reason=reason)
 
 
 def _placed_order_id(message: str) -> str | None:
@@ -277,23 +287,23 @@ async def approve_approval(approval_id: str, request: Request):
         item["status"] = "approved"  # claim: the idempotency fence (contract §4 step 3)
         _save_items(items)
 
-    audit_log.record("approval_granted", approval_id=item["id"], ticker=item["ticker"],
-                     side=item["side"], quantity=item["quantity"],
-                     daily_job_id=item.get("daily_job_id"))
-
+    warning: str | None = None
     try:
         bridge = _build_bridge(config)
     except Exception as exc:  # no usable venue: nothing can be rebuilt into an order
         _fail_execute(approval_id, f"venue not available: {exc}")
         raise ApiError(502, "execute_failed", f"venue not available: {exc}") from exc
 
-    warning: str | None = None
-    portfolio = None
     try:
         portfolio = bridge.sync_portfolio()
-    except Exception as exc:  # venue unreadable: guard's percent checks fail-open (risk.py:512-520)
-        warning = f"portfolio sync failed ({type(exc).__name__}: {exc}); percentage limits skipped fail-open"
-        audit_log.record("approval_portfolio_sync_failed", approval_id=item["id"], reason=warning)
+    except Exception as exc:  # venue unreadable: fail closed before risk checks
+        reason = f"portfolio sync failed ({type(exc).__name__}: {exc})"
+        _release_claim(approval_id, reason)
+        raise ApiError(503, "exchange_unreachable", reason) from exc
+
+    audit_log.record("approval_granted", approval_id=item["id"], ticker=item["ticker"],
+                     side=item["side"], quantity=item["quantity"],
+                     daily_job_id=item.get("daily_job_id"))
 
     order = _rebuild_plan(item)  # (a) rebuild the plan from the item
     mode = bridge.effective_mode()

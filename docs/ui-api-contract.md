@@ -1,6 +1,6 @@
 # Web UI API Contract (`docs/ui-api-contract.md`)
 
-updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id`) · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5, §6)
+updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id` · rev 4: §5 POST /api/daily nhận `auto: true` + `top_n` — quét tự động 1-click, server tự sàng universe crypto (ccxt public, top theo khối lượng) + cổ phiếu Mỹ (yfinance.screen, fallback danh sách tĩnh) qua `tradingagents/dataflows/screening.py`, payload job thêm `asset_types` + `screening`; ứng viên stock chỉ advisory — có tín hiệu, không sinh lệnh; ĐÃ IMPLEMENT cả hai phía · rev 4.1: sàng lọc nâng cấp theo tiêu chí thực chiến đã research — universe 40/asset (crypto top khối lượng, cổ phiếu mạnh 52 tuần sort theo `fiftytwowkpercentchange`, cap floor $2B), metrics thêm RSI(14) + ATR(14)% (stockstats) + khoảng cách đỉnh 52 tuần + breakout 20 phiên kèm RVOL≥2 + dollar-volume floor 20 phiên (crypto $5M / stock $10M — gate loại bỏ, không chỉ trừ điểm) + RS vs benchmark (BTC-USD / ^GSPC); phạt đu đỉnh (RSI≥75, RVOL≥4, ATR>20%) · ĐÃ IMPLEMENT) · rev 5: §12 mới GET /api/performance — metrics trade replay từ engine audit log (fill phase=execute FIFO long/short per ticker; summary win/loss/expectancy, open_positions per lot mark qua price seam, brackets, recent_orders 50 dòng mới nhất; log thiếu/rỗng là empty state, không đọc được → 503 `audit_log_unreadable` như /api/audit); §13 mới autoloop + halt — GET/POST /api/autoloop (vòng lặp tự chạy theo interval 15–1440 phút, enable fail-closed 409 `gate_closed` qua cổng auto-confirm của engine: config literal + env flag), POST /api/autoloop/run-now (202), POST /api/halt + POST /api/halt/reset — kill switch không gate, line `halt`/`halt_reset` trong engine audit log mà RiskGuard của mọi process replay · ĐÃ IMPLEMENT cả hai phía · rev 6: đường futures trong autoloop — DerivativesExecutor qua 3 cổng (exec_derivatives config + env + confirm per-order của _handle_plan), leverage cap 3.0, bracket futures reduceOnly; gates() thêm 2 nửa exec_derivatives (observability) · ĐÃ IMPLEMENT cả hai phía · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5 rev 4.1 đã implement auto mode; §6) · rev 7 (2026-10-05): **job/run/agent-log chuyển từ in-memory + file sang SQLite** (`server/db.py`, `job_store.py`, `run_store.py`; `server/data/control.db`, stdlib `sqlite3`, WAL) — §5 mới `GET /api/daily` (lịch sử + `active_job_id`) và `POST /api/daily/{id}/cancel`, `GET /api/daily/{id}` fallback DB; §3 mới `GET /api/runs` + `run_events` persist để replay run cũ + stream đọc từ DB; cả hai registry reconcile job/run mồ côi (`running` → `interrupted`) lúc khởi động nên không còn 409 vĩnh viễn; `status` thêm `cancelled`/`interrupted`; `error` cấp job. ĐÃ IMPLEMENT cả hai phía (UI: lịch sử + băng đang chạy + nút Dừng) — endpoint 24→26
 audience: frontend + backend implementer của control-panel UI cho TradingAgents
 
 Hợp đồng này bọc engine hiện có **mà không sửa mã lõi `tradingagents/`**. Mọi mapping
@@ -63,13 +63,13 @@ Mỗi endpoint dưới đây ghi rõ 4 trạng thái. Định nghĩa chung:
 
 ## 1. Settings — `GET /api/settings`, `PUT /api/settings`
 
-Nguồn: `_ENV_OVERRIDES` (`default_config.py:10-53`), defaults (`default_config.py:96-242`), `.env.example`.
+Nguồn: `_ENV_OVERRIDES` đọc được từ `default_config.py`; `exec_base_url` được thêm vào GET payload nhưng read-only qua PUT.
 
 Quy tắc bất di bất dịch:
 
 1. **Không bao giờ trả nguyên văn API key/secret.** Mọi key có tên khớp `*_API_KEY` / `*_SECRET` chỉ trả `masked` (4 ký tự cuối) + `configured`. Audit của bridge cũng redact credential (`bridge.py:619-624`).
 2. **Các env-gate FR5/FR-S2/FR-D là read-only**: `TRADINGAGENTS_EXEC_LIVE`, `TRADINGAGENTS_EXEC_AUTO_CONFIRM`, `TRADINGAGENTS_EXEC_DERIVATIVES` và config `exec_live`/`exec_auto_confirm`/`exec_derivatives` KHÔNG ghi được qua API. Chúng cố tình vắng khỏi `_ENV_OVERRIDES` (`default_config.py:33-36, 235-241`) và chỉ được đọc fail-closed lúc thực thi (`bridge.py:527-538`, `daily.py:67-76`). PUT nhận key này → `403 forbidden_key`.
-3. `exec_watchlist` và `exec_symbol_overrides` không thuộc settings (không coerce được list/dict — `default_config.py:38-41`); watchlist có endpoint riêng (mục 2).
+3. `exec_base_url` là cấu hình venue read-only qua API (đổi trong `.env` + restart backend), vì nó quyết định host mạng và cặp credentials; `exec_watchlist` và `exec_symbol_overrides` vẫn có endpoint riêng/không thuộc settings.
 
 ### GET /api/settings
 
@@ -98,6 +98,15 @@ Response 200:
       "source": "default"
     },
     {
+      "key": "exec_base_url",
+      "env_var": "TRADINGAGENTS_EXEC_BASE_URL",
+      "value": "https://demo-api.binance.com",
+      "default": "https://demo-api.binance.com",
+      "type": "str",
+      "editable": false,
+      "source": "default"
+    },
+    {
       "key": "exec_sandbox",
       "env_var": "TRADINGAGENTS_EXEC_SANDBOX",
       "value": false,
@@ -107,9 +116,9 @@ Response 200:
     }
   ],
   "credentials": [
-    { "env_var": "OPENAI_API_KEY",   "configured": true,  "masked": "••••abcd" },
-    { "env_var": "BINANCE_API_KEY",  "configured": false, "masked": null },
-    { "env_var": "BINANCE_SECRET",   "configured": false, "masked": null }
+    { "env_var": "OPENAI_API_KEY", "configured": true, "masked": "••••abcd" },
+    { "env_var": "BINANCE_DEMO_API_KEY", "configured": true, "masked": "••••wxyz" },
+    { "env_var": "BINANCE_DEMO_SECRET", "configured": true, "masked": "••••1234" }
   ],
   "gates_readonly": {
     "exec_live_config":          false,
@@ -123,11 +132,11 @@ Response 200:
 }
 ```
 
-- `settings[]` phủ đúng 29 dòng `_ENV_OVERRIDES` (`default_config.py:10-65`): llm_provider, deep_think_llm, quick_think_llm, backend_url, quick_provider, deep_provider, quick_backend_url, deep_backend_url, llm_wire_protocol, output_language, max_debate_rounds, max_risk_discuss_rounds, checkpoint_enabled, benchmark_ticker, temperature, llm_max_retries, max_tokens, google_thinking_level, openai_reasoning_effort, anthropic_effort, exec_quote_currency, risk_max_daily_loss_pct, risk_max_position_pct_per_asset, risk_max_total_exposure_pct, risk_max_consecutive_loss_count, risk_max_derivatives_leverage, risk_max_derivatives_exposure_pct, exec_exchange_id, exec_sandbox.
-- `type` suy từ kiểu của default trong `DEFAULT_CONFIG` (bool/int/float/str/null — `default_config.py:60-80`).
-- `source`: `default` | `env` (env var có giá trị non-empty) | `.env`.
-- `effective_exec_mode` = `bridge.effective_mode()` (`bridge.py:480-486`): `live` chỉ khi `exec_live is True` **và** env flag true — nếu UI thấy `live`, cả hai nửa gate đang mở.
-- Paths read-only (`results_dir`, `data_cache_dir`, `memory_log_path`, `exec_log_path`) trả trong `settings[]` với `editable: false`.
+- `settings[]` phản ánh `_ENV_OVERRIDES`; `exec_base_url` xuất hiện read-only dù được đọc từ `TRADINGAGENTS_EXEC_BASE_URL`. PUT key này → `403 forbidden_key`. `exec_sandbox` chỉ dùng cho sandbox của sàn khác, không chọn Binance venue.
+- `settings[]` có các row editable từ `_ENV_OVERRIDES` và các row read-only bổ sung (`exec_base_url` cùng các path); `type` suy từ kiểu default trong `DEFAULT_CONFIG`.
+- Với Binance, `exec_base_url` chỉ chấp nhận HTTPS API host Demo hoặc production được allowlist. URL được chọn quyết định credential pair: Demo dùng `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET`; production dùng `BINANCE_API_KEY`/`BINANCE_SECRET`. Demo là default. Đổi profile cần sửa URL + đúng pair trong `.env` rồi restart; API GET chỉ expose URL và status/mask, PUT không đổi được URL.
+- `effective_exec_mode` độc lập với venue URL: `live` chỉ khi `exec_live is True` **và** `TRADINGAGENTS_EXEC_LIVE=true`; chọn Demo không tự mở gate.
+- Paths read-only (`results_dir`, `data_cache_dir`, `memory_log_path`, `exec_log_path`) và `exec_base_url` trả trong `settings[]` với `editable: false`.
 
 Trạng thái: loading · empty (không xảy ra — luôn có defaults) · error 500 · stale sau 30s.
 
@@ -147,7 +156,7 @@ Request:
 
 Xử lý:
 
-1. Validate từng key: phải thuộc 29 keys `_ENV_OVERRIDES`; coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
+1. Validate từng key: phải thuộc 30 keys `_ENV_OVERRIDES`; coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
 2. Áp in-memory: `set_config({key: value})` (`dataflows/config.py`) — có hiệu lực với run mới tạo sau đó; run đang chạy không thấy (bridge chụp config lúc dựng — `bridge.py:110-121`).
 3. Persist vào `.env` (upsert dòng `TRADINGAGENTS_…`, giữ nguyên các dòng khác và comment). Ghi `encoding="utf-8"`.
 4. Nếu key là `exec_sandbox` → cảnh báo không cần (an toàn); nếu key là `risk_*` → nhớ rằng giá trị mới chỉ dùng cho guard dựng sau (`bridge.py:147-156`).
@@ -199,6 +208,8 @@ Trạng thái DELETE: loading · error 404/500 · stale (n/a).
 ## 3. Runs — phân tích
 
 Nguồn luồng thật: `cli/run.py:96-354` (stream graph thành event); graph API: `trading_graph.py:157-180` (`propagate`), `182-227` (checkpoint), `346-386` (`_log_state`); signal 5-tier + `REVIEW` (`trading_graph.py:167-171`); báo cáo trên đĩa: `reporting.py:13-101`.
+
+> rev 7 (đã implement): run và **toàn bộ log agent** được ghi vào `control.db` (`server/run_store.py`). Mỗi event `_emit` phát ra được persist ngay (`run_events`), và mỗi lần đổi trạng thái ghi lại `runs`; nên UI **replay được bất kỳ run đã xong nào**, không chỉ run đang stream. `_runs` in-memory giữ nguyên vì condition variable không sống được trong database — nó là buffer sống mà SSE chờ đợi. Stream của một run không còn trong live set được phục vụ từ `run_events` rồi tự đóng. Run bị process chết bỏ lại ở `running` được set `interrupted` lúc khởi động (`runs.reconcile()`), cùng lý do như job (§5 rev 7). Trạng thái cuối được ghi **trước** khi phát event terminal, để reader không bao giờ thấy run đã xong trong khi bản ghi còn nói `running`.
 
 Ràng buộc triển khai (quan trọng):
 
@@ -256,9 +267,37 @@ Response 201:
 2. **Synthetic fallback**: không có file nào → fixture nội tuyến (bản rút gọn: mỗi analyst 1 đoạn ngắn, 1 vòng debate, rating `"Hold"`) — đảm bảo UI luôn demo được.
 3. Mọi event mock mang `"replay": true` (xem SSE schema). Kết thúc `run_completed` như run thật, nhưng `report_paths` chỉ có khi chọn replay từ file thật.
 
+### GET /api/runs
+
+Lịch sử run, mới nhất trước (rev 7). Query: `status` (một trong 6 trạng thái; giá trị lạ → 400), `page` (≥1), `page_size` (1–100).
+
+```json
+{
+  "generated_at": "2026-10-05T09:11:30Z",
+  "items": [
+    {
+      "run_id": "r_20261005_081512_btcusd",
+      "status": "completed", "mode": "live", "ticker": "BTC-USD",
+      "trade_date": "2026-10-05", "asset_type": "crypto",
+      "created_at": "2026-10-05T08:15:12Z", "finished_at": "2026-10-05T08:27:40Z",
+      "signal": "Buy", "is_review": false, "error": null,
+      "report_paths": { "complete_report": "...", "state_log": "..." },
+      "analysts": ["market", "social", "news"],
+      "events_url": "/api/runs/r_20261005_081512_btcusd/events",
+      "events_count": 42
+    }
+  ],
+  "page": 1, "page_size": 20, "total": 7,
+  "active_run_id": null
+}
+```
+
+- `active_run_id` đọc từ live registry của process này (như `active_job_id` ở §5).
+- `events_count` là số event agent đã ghi cho run đó — cột "agent đã làm gì" của lịch sử.
+
 ### GET /api/runs/{id}
 
-Response 200:
+Live state nếu run thuộc process này, **ngược lại đọc từ database** (rev 7). Response 200:
 
 ```json
 {
@@ -324,12 +363,13 @@ Danh sách `type` (phát sinh từ chính các nhánh xử lý chunk trong `cli/
 
 Quy tắc:
 
-- Mỗi event có `seq` tăng dần; client reconnect gửi header `Last-Event-ID: <seq>` → server replay từ seq+1 (buffer trong bộ nhớ của run).
+- Mỗi event có `seq` tăng dần; client reconnect gửi header `Last-Event-ID: <seq>` → server replay từ seq+1 (buffer trong bộ nhớ của run, hoặc từ `run_events` khi run không còn trong live set — rev 7).
 - Terminal event (`run_completed`/`run_failed`) rồi server đóng stream.
 - Run ở trạng thái completed khi client mở stream → server phát lại toàn bộ buffer rồi đóng (UI refresh trang vẫn xem lại được).
+- rev 7: run **đã xong từ lâu** (không còn trong `_runs`) vẫn mở được stream — server đọc `run_events` từ database, phát lại rồi đóng. Đây là đường để UI xem lại "agent đã làm gì" của một lần chạy cũ.
 - `replay: true` trên mọi event của run mock.
 
-Trạng thái: loading (trước event đầu) · empty (không xảy ra — luôn có `run_started`) · error (network đứt → tự reconnect bằng `Last-Event-ID`; run failed → event `run_failed`) · stale (không nhận event > 60s trong khi status vẫn `running` → badge "đang treo", gợi ý cancel).
+Trạng thái: loading (trước event đầu) · empty (không xảy ra — luôn có `run_started`) · error (network đứt → tự reconnect bằng `Last-Event-ID`; run failed → event `run_failed`) · stale (không nhận event > 60s trong khi status vẫn `running` → badge "đang treo").
 
 ---
 
@@ -472,11 +512,14 @@ Trạng thái POSTs: loading (execute live có thể mất vài giây — disabl
 
 ---
 
-## 5. Daily pipeline — `POST /api/daily`, `GET /api/daily/{job_id}`
+## 5. Daily pipeline — `POST /api/daily`, `GET /api/daily`, `GET /api/daily/{job_id}`, `POST /api/daily/{job_id}/cancel`
 
 Nguồn: `run_daily(watchlist, config)` (`daily.py:114-174`) — bề mặt lập lịch của engine cho chuỗi *phân tích → sync portfolio → plan qua RiskGuard → confirm policy*. Đây là **nút bấm "Chạy pipeline hằng ngày ngay"** trên UI và là nguồn duy nhất của hàng đợi duyệt (§4, invariant 6).
 
 > rev 3: worker server **không gọi `run_daily` trực tiếp nữa** — nó tự chạy vòng lặp per-coin trên đúng các seam của engine, vì ba lý do: (1) enqueue phải xảy ra **ngay khi coin xong** (rev 2 đợi cả job `completed` — risk 13 cũ), (2) `mode:"mock"` cần tái dùng cơ chế replay của `runs.py` thay vì dựng graph, (3) **job bấm từ UI không bao giờ tự thực thi** — confirm policy của engine (`_handle_plan`, `daily.py:177-216`) chỉ thuộc surface unattended (cron → `run_daily`); job từ UI luôn resolve qua approval gate vì human đang ở màn đó. `run_daily` không đổi, vẫn là đường cron.
+
+> rev 7 (đã implement): **job là một dòng trong database, không còn là dict chết cùng process.** Mọi thay đổi trạng thái ghi vào `server/data/control.db` (`server/db.py` + `server/job_store.py`), nên (a) UI **list được lịch sử job** và đọc lại từng mã agent đã làm gì sau khi restart, (b) job bị process chết bỏ lại ở `running` được **reconcile thành `interrupted` lúc khởi động** (`server/main.py:_open_state_db`) thay vì chặn worker vĩnh viễn bằng 409, (c) có endpoint `cancel` để operator thoát khỏi job treo. `_jobs` in-memory giờ chỉ là live working set (handle của worker + fast path cho poll).
+
 
 ### POST /api/daily
 
@@ -486,7 +529,28 @@ Request bắt buộc `Content-Type: application/json` (quy tắc CSRF §0); body
 { "tickers": ["BTC-USD", "SOL-USD"], "mode": "live" }
 ```
 
+hoặc quét tự động (rev 4) — **một nút bấm, server tự tìm mã**:
+
+```json
+{ "auto": true, "top_n": 5, "mode": "live" }
+```
+
 - `tickers` bỏ qua/null → dùng `exec_watchlist` hiện hành (`daily.py:127-128`); normalize tại biên giới (strip, drop rỗng, dedupe giữ thứ tự — như `_normalize_watchlist`, `daily.py:95-111`); ticker rỗng sau strip → 400.
+- `auto` (rev 4, đã implement): `true` → **bỏ qua watchlist**. Worker chạy bước sàng lọc rẻ trước (`server/daily.py:_screen_candidates` → `tradingagents/dataflows/screening.py`):
+  - **Universe crypto** (rev 4.1): ccxt public (`fetch_tickers` trên `exec_exchange_id`, mặc định binance — không cần API key), **top 40 theo `quoteVolume` 24h** (mẫu VolumePairlist của freqtrade — lọc stablecoin USDC/USD1/FDUSD/…, floor 5M USDT), map về dạng pipeline `BASE-USD`. Chọn theo khối lượng, không theo vốn hóa — universe chứa cả mover ít người biết.
+  - **Universe cổ phiếu** (rev 4.1): `yfinance.screen` với `region=us + intradaymarketcap>2B + fiftytwowkpercentchange>0`, **sort theo `fiftytwowkpercentchange` giảm dần** (tilt George-Hwang 52-week-high: chỉ lấy mã đang mạnh theo năm, không phải danh sách vốn hóa lớn nhất); screener lỗi → fallback danh sách tĩnh lớn-cap (~38 mã liquid) nên outage không chặn auto-scan.
+  - **Chấm điểm** (rev 4.1, `screen_universe` — mỗi tiêu chí đều có nguồn research):
+    - Momentum 20 phiên (≥+5% cộng dồn có trần 2.0; ≤−5% cộng quá bán có trần 1.5) — factor backbone có bằng chứng học thuật cả crypto (15–35d) lẫn cổ phiếu (Jegadeesh-Titman).
+    - Trend stack: trên SMA20 +1.0, trên cả SMA50 +0.5 (Minervini Stage-2 rút gọn).
+    - RS vs benchmark: momentum 20P cao hơn BTC-USD (crypto) / ^GSPC (stock) ≥3 điểm % → +0.75.
+    - RVOL (volume phiên cuối / trung bình 20 phiên): ≥2 → cộng tối đa 1.5; ≥4 → **trừ 0.75** (cực hạn, nguy cơ hồi — altFINS); 1.5–2 → +0.5.
+    - RSI(14) (stockstats): 45–70 +0.5 (vùng sức mạnh còn dư địa); ≥75 **−0.75** (đu đỉnh); <30 +0.5 (quá bán).
+    - Đỉnh 52 tuần: sát đỉnh ≤5% +1.0; ≤15% +0.5 (George-Hwang 2004: tín hiệu 52w-high mạnh hơn raw momentum, ít crash hơn).
+    - Breakout: close > đỉnh High 20 phiên trước **và** RVOL≥2 → +1.0 ("bắt sớm, không chạy đuổi").
+    - ATR(14)%: trong dải tradability (crypto 3–10%, stock 2–8%) +0.5; >20% **−0.75** (casino tier).
+  - **Gate loại bỏ** (không phải trừ điểm): dollar-volume trung bình 20 phiên < $5M (crypto) / < $10M (stock) → loại khỏi universe; history < 60 phiên → bỏ (không đủ tính SMA50/RSI/52w).
+  - Top `top_n` (mặc định 5, cap 20) đi tiếp vào pipeline LLM; kết quả sàng gắn lên job dưới `screening`.
+  - `mode:"mock"` → sàng cố định fixture (BTC-USD/ETH-USD/NVDA) **không đụng network** (hằng số `MOCK_AUTO_CANDIDATES`).
 - `mode` (rev 3): `"live"` (mặc định — phân tích LLM thật) | `"mock"` (tái dùng cơ chế mock của `runs.py` — **không cần LLM key, không network**).
 - Chạy trong cùng worker thread duy nhất với `POST /api/runs` (lock `set_config` — §3); worker bận → `409 conflict`. Mock vẫn chiếm lock (đơn giản hoá; job không quá vài giây).
 
@@ -494,10 +558,11 @@ Vòng lặp worker — mỗi coin, coin fail không dừng watchlist (`daily.py:
 
 1. **Phân tích**:
    - `mode:"mock"` — tái dùng đúng machinery mock của `server/runs.py`: `_find_state_log` → `full_states_log_<date>.json` của ticker (mới nhất nếu thiếu đúng ngày — `runs.py:232-247`), không có → `_synthetic_state` (`runs.py:203-229`); signal = `parse_rating(state["final_trade_decision"])` (`runs.py:270`). Không dựng graph, không gọi LLM, không vendor call.
-   - `mode:"live"` — như `daily.py:147-164`: `TradingAgentsGraph(config, selected_analysts=("market","social","news"))` + `graph.propagate(coin, today, asset_type="crypto")`, tối đa 3 lần thử với backoff 20s/40s, mỗi lần dựng graph mới (checkpoint state hỏng giữa pipeline không dính vào lần sau).
+   - `mode:"live"` — như `daily.py:147-164`: `TradingAgentsGraph(config, selected_analysts=("market","social","news"))` + `graph.propagate(coin, today, asset_type=…)`, tối đa 3 lần thử với backoff 20s/40s, mỗi lần dựng graph mới (checkpoint state hỏng giữa pipeline không dính vào lần sau). rev 4: `asset_type` theo ứng viên (`crypto` giữ nguyên; `stock` thêm analyst `fundamentals` như `runs.py:_analysts_for`).
 2. **Plan**: `bridge.plan_order(coin, signal, portfolio)` (`bridge.py:192-263`) — tự audit plan line phase=`plan` (`bridge.py:255-262`) và tự chạy RiskGuard plan-time. `portfolio` = `bridge.sync_portfolio()`. Venue: mock → **stub venue inject** qua `exchange_factory` (`bridge.py:126-129, 137-145` — cùng seam test inject của engine): `fetch_ticker`/`fetch_balance`/`load_markets` trả giá/balance fixture cố định ⇒ không network; live → venue thật (lệch `exec_sandbox`/`exec_exchange_id` theo config).
+   - rev 4: **ứng viên stock chỉ advisory** — `plan_order` của bridge chỉ nhận crypto (`symbol_for` raise với mã khác, `bridge.py:174-186`), nên kết quả stock ghi `asset_type: "stock"`, `plan: null`, `reason: "advisory only — …"`; tín hiệu vẫn là output của pipeline.
 3. **Plan actionable → ENQUEUE, không execute** (dù `exec_auto_confirm` có arm hay không — invariant dưới): plan có `side != null` → `approvals.enqueue(plan_dict)` (§4) + `bridge.audit_plan(plan, action="awaiting_approval", reason="UI daily job: plan awaits approval")` (đúng seam `daily.py:219-222`) → `results[]` ghi `approval_id`. Plan không tradeable (`side is None` — Hold/REVIEW/sizing refusal `sizing.py:104-143`, hoặc risk rejection `bridge.py:240-254`) → chỉ ghi `reason = plan.reason`, `approval_id: null`.
-4. Audit vòng lặp: server trail ghi `daily_job_created` / `daily_job_completed` (kèm `job_id, mode, tickers`).
+4. Audit vòng lặp: server trail ghi `daily_job_created` / `daily_job_completed` (kèm `job_id, mode, tickers`; rev 4 thêm `auto, top_n`).
 
 Invariants của daily job:
 
@@ -518,11 +583,51 @@ Response 202:
 }
 ```
 
-Errors: 400 `validation_error` (ticker rỗng sau strip, `mode` lạ), 409 `conflict` (worker bận, kèm `details.run_id` hoặc `details.job_id` đang chạy), 415/403 CSRF (§0).
+Errors: 400 `validation_error` (ticker rỗng sau strip, `mode` lạ; rev 4: `auto` không phải bool, `top_n` ngoài 1–20, `tickers` đi cùng `auto`, `top_n` không nguyên), 409 `conflict` (worker bận, kèm `details.run_id` hoặc `details.job_id` đang chạy), 415/403 CSRF (§0).
+
+### GET /api/daily
+
+Lịch sử job, mới nhất trước (rev 7) — màn hình mở ra để trả lời "có gì đang chạy, và lần trước ra sao?". Query: `status` (tuỳ chọn, một trong 6 trạng thái; giá trị lạ → 400), `page` (≥1), `page_size` (1–100, mặc định 20).
+
+```json
+{
+  "generated_at": "2026-10-05T09:11:30Z",
+  "items": [
+    {
+      "job_id": "d_20261005_090001",
+      "status": "running",
+      "mode": "live",
+      "auto": true,
+      "top_n": 5,
+      "created_at": "2026-10-05T09:00:01Z",
+      "finished_at": null,
+      "tickers": ["BTC-USD", "SOL-USD"],
+      "results_count": 1,
+      "approval_count": 1,
+      "error": null
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 12,
+  "active_job_id": "d_20261005_090001"
+}
+```
+
+- `active_job_id` đọc từ **live registry của chính process này**, nên job của process khác không bao giờ bị báo nhầm là đang chạy. Đây là nguồn duy nhất cho băng "đang chạy" của UI — trước rev 7 người dùng chỉ biết có job khi bị từ chối 409.
+- `items[]` là **summary**: không kèm `results` (payload nằm ở `GET /api/daily/{job_id}`), kèm `results_count`/`approval_count` để hiển thị dòng lịch sử.
+
+### POST /api/daily/{job_id}/cancel
+
+Dừng job đang chạy (rev 7). **Không gate** — tắt một thứ là hướng an toàn. Trả 202 với payload job đã `cancelled`.
+
+- Job được đánh dấu terminal **ngay**, nên worker lock được giải phóng tức thì; worker nhận ra giữa hai coin và dừng vòng lặp. Coin đang trong một lệnh LLM **chạy nốt** (Python không kill thread an toàn được) — cancel giải phóng worker, không giải phóng network.
+- Coin đã chạy xong trước đó vẫn nằm trong `results[]`; coin đang chạy dở không được ghi.
+- 404 khi job không tồn tại; 409 khi job đã terminal (`details.status`).
 
 ### GET /api/daily/{job_id}
 
-Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results[]` điền dần theo từng coin (không đợi cả job xong). Response 200:
+Live state nếu job thuộc process này, **ngược lại đọc từ database** (rev 7). `results[]` điền dần theo từng coin (không đợi cả job xong). Response 200:
 
 ```json
 {
@@ -533,9 +638,12 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
   "created_at": "2026-09-30T09:00:01Z",
   "finished_at": null,
   "tickers": ["BTC-USD", "SOL-USD"],
+  "asset_types": {},
+  "screening": null,
   "results": [
     {
       "ticker": "BTC-USD",
+      "asset_type": "crypto",
       "signal": "Buy",
       "reason": "awaiting approval",
       "plan": {
@@ -548,6 +656,7 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
     },
     {
       "ticker": "SOL-USD",
+      "asset_type": "crypto",
       "signal": null,
       "reason": "PermissionError: risk guard halted trading: 3 consecutive losing trades reached the limit 3; trading halted for today",
       "plan": null,
@@ -558,12 +667,14 @@ Job state in-memory của server (như `RunState` — `runs.py:39-61`), `results
 }
 ```
 
-- Mỗi coin: `signal` (5-tier hoặc `REVIEW` — `trading_graph.py:167-171`), `reason` (lý do không trade / `"awaiting approval"` / `"<ExceptionType>: <message>"` khi coin fail), `plan` = **chi tiết đủ cho M4** (`side, quantity, price_est, cost, ccxt_symbol, market, leverage, mode_at_plan, plan_reason` — đúng field `enqueue` nhận, §4), `approval_id` tham chiếu `GET /api/approvals` (null khi plan không tradeable), `error` (lỗi hệ thống khác reason nghiệp vụ).
+- Mỗi coin: `signal` (5-tier hoặc `REVIEW` — `trading_graph.py:167-171`), `reason` (lý do không trade / `"awaiting approval"` / `"<ExceptionType>: <message>"` khi coin fail), `plan` = **chi tiết đủ cho M4** (`side, quantity, price_est, cost, ccxt_symbol, market, leverage, mode_at_plan, plan_reason` — đúng field `enqueue` nhận, §4), `approval_id` tham chiếu `GET /api/approvals` (null khi plan không tradeable), `error` (lỗi hệ thống khác reason nghiệp vụ). rev 4 thêm `asset_type` per coin (`"crypto"` mặc định; job cũ trước rev 4 không có field này — frontend đọc `asset_types`/`screening` null an toàn).
 - Job `mode:"mock"`: thêm `mock_source` per coin — `"replay:<path>"` (đã replay state log thật) hoặc `"synthetic"` (fixture nội tuyến); `signal` đến từ file replay, ví dụ `"Hold"` → không sinh plan; `plan.price_est` là giá fixture của stub venue.
-- `status`: `queued | running | completed | failed` (`failed` chỉ khi worker văng ngoài vòng lặp coin; coin fail riêng chỉ là `reason` trong `results[]`). Poll mỗi 2–5s khi `queued/running`; ngừng poll khi terminal. Đã có `generated_at` để đánh dấu stale.
+- Job `auto` (rev 4): `tickers` là danh sách ứng viên post-sàng; `screening` non-null với shape `{universe_count, universe_crypto, universe_stock, candidates[], mock?}`; `candidates[]` mỗi phần tử `{ticker, asset_type, score, last_close, momentum_pct, trend_pct, volume_ratio, rsi14, atr_pct, dist_52w_pct, breakout, avg_dollar_volume, reasons[]}` (rev 4.1: thêm `rsi14`/`atr_pct` nullable, `dist_52w_pct` ≤0, `breakout` bool, `avg_dollar_volume`). Bước sàng xong trước vòng lặp coin nên UI thấy bảng ứng viên ngay khi poll lần đầu sau khi worker start.
+- `status`: `queued | running | completed | failed | cancelled | interrupted` (rev 7 thêm hai trạng thái cuối; `failed` chỉ khi worker văng ngoài vòng lặp coin; coin fail riêng chỉ là `reason` trong `results[]`; `interrupted` = process chết khi job đang chạy, được set lúc khởi động lại). Poll mỗi 2–5s khi `queued/running`; ngừng poll khi terminal. Đã có `generated_at` để đánh dấu stale.
+- `error`: lý do **job** thất bại (screen/bridge), khác `reason`/`error` của từng coin trong `results[]`. rev 7.
 - Coin fail giữa pipeline KHÔNG dừng vòng lặp (`daily.py:170-173`); coin skip propagate sau 3 lần thử cũng ghi `reason` như vậy (`daily.py:155-164`).
 
-Errors: 404 (job không tồn tại — state in-memory, **restart server làm mất job**; các audit line đã ghi vẫn còn — risk §11.2). Trạng thái: loading · empty (n/a — job luôn có ≥1 coin) · error 404/500 · stale (poll là cơ chế chính; job không chuyển trạng thái > 15 phút → badge "đang treo").
+Errors: 404 (job không tồn tại ở cả live set lẫn database). Trạng thái: loading · empty (n/a — job luôn có ≥1 coin) · error 404/500 · stale (poll là cơ chế chính; job không chuyển trạng thái > 15 phút → gợi ý bấm "Dừng").
 
 ---
 
@@ -811,7 +922,9 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 7 | GET   | `/api/runs/{id}`                 | state nội bộ + artifacts trên đĩa |
 | 8 | GET   | `/api/runs/{id}/events` (SSE)    | stream chunks như `cli/run.py:226-323` |
 | 9 | POST  | `/api/daily`                     | worker per-coin (§5) — phân tích + `plan_order` + enqueue; nguồn duy nhất của plan/queue, không execute |
-| 10| GET   | `/api/daily/{job_id}`            | poll state job + `DailyResult`-shaped results |
+| 10| GET   | `/api/daily`                     | lịch sử job (database) + `active_job_id` — băng "đang chạy" của UI (§5 rev 7) |
+| 10a| GET  | `/api/daily/{job_id}`            | poll state job + `DailyResult`-shaped results; live hoặc từ database |
+| 10b| POST | `/api/daily/{job_id}/cancel`     | dừng job đang chạy, giải phóng worker lock ngay (§5 rev 7) |
 | 11| GET   | `/api/portfolio`                 | `sync_portfolio` + replay FIFO audit log (§6) |
 | 12| GET   | `/api/approvals`                 | queue mới của API layer |
 | 13| POST  | `/api/approvals/{id}/approve`    | rebuild plan → `execute_order(confirm=True)` — duyệt đường chính thống, duy nhất đặt lệnh (§4) |
@@ -820,15 +933,22 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 16| GET   | `/api/history`                   | decision log + run tree |
 | 17| GET   | `/api/backtest`                  | `results_dir/backtest/*` + summarize |
 | 18| GET   | `/api/health`                    | mode/halt/key status |
+| 19| GET   | `/api/performance`               | đọc `exec_log_path` FIFO long-only (§12) |
+| 20| GET   | `/api/autoloop`                  | gates (thêm 2 nửa futures — chỉ quan sát) + state file `autoloop.json` (§13, §14) |
+| 21| POST  | `/api/autoloop`                  | fail-closed 409 gate_closed (§13) |
+| 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan`; crypto qua `DerivativesExecutor` khi `exec_derivatives` bật — futures long/short, đòn bẩy ≤3× (§14) |
+| 23| POST  | `/api/halt`                      | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay |
+| 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
+| 25| GET   | `/api/runs`                      | lịch sử run (database) + `active_run_id` (§3 rev 7) |
 
-**endpointCount = 18.**
+**endpointCount = 26.**
 
 ---
 
 ## 11. Rủi ro thiết kế còn mở
 
 1. **Approval queue chưa tồn tại trong engine** — `daily.py:186-201` chỉ audit `awaiting_approval` rồi thoát; queue là state mới, persist thật tại `server/data/approvals.jsonl` (tmp+replace — `approvals.py:65-73`). Khi server restart giữa chừng, item `pending` khôi phục từ file; item đang ở `approved` (claimed, §4) khi sập **có thể đã gửi lệnh thật** — đối soát qua engine audit + venue, không tự hồi. Pipeline approve→execute đã implement từ rev 3.1 (`approvals.py:241-333`) — trước đó approve chỉ claim rồi dừng, để item ở dead-end `approved` vĩnh viễn (review finding, đã xoá).
-2. **Daily job là state in-memory** — restart server làm mất job, `GET /api/daily/{job_id}` → 404 dù watchlist có thể đã nửa đường; các audit line (`awaiting_approval`, plan lines) và queue item đã enqueue vẫn còn để đối soát. Persist job như queue là mở rộng sau v1.
+2. **Job/run là state trong database, không phải in-memory** (rev 7 — đã sửa). `server/data/control.db` (SQLite, stdlib `sqlite3`, WAL) lưu `jobs`/`job_results`/`runs`/`run_events`. Restart server không mất lịch sử: `GET /api/daily/{id}` và `GET /api/runs/{id}` đọc lại từ DB, và stream của một run đã xong replay được từ `run_events`. Job/run bị process chết bỏ lại ở `running` được set `interrupted` lúc khởi động (`main.py:_open_state_db` → `daily.reconcile()` / `runs.reconcile()`, mỗi cái ghi một audit line) — vì worker lock suy ra từ status, không reconcile thì job mồ côi sẽ trả 409 cho mọi job sau, vĩnh viễn và vô hình. Engine audit (`exec_log_path`) **vẫn là JSONL**: đó là contract replay của RiskGuard xuyên process, không phải state của API layer.
 3. **`exec_watchlist` không env-overridable** (`default_config.py:38-41`) — persistence phải là file riêng của API layer, không phải `.env`; mọi nơi đọc watchlist phải đi qua layer này hoặc sync vào `DEFAULT_CONFIG` lúc khởi động, nếu không CLI và UI sẽ trôi về default `["BTC-USD","ETH-USD"]` (đã làm ở `watchlist.py:39-44`).
 4. **Env-gates phải read-only trong API** — nếu PUT settings cho phép ghi `TRADINGAGENTS_EXEC_LIVE`/`_AUTO_CONFIRM`/`_DERIVATIVES` thì double-gate FR5 (`bridge.py:33-36, 527-538`) sụp thành một công tắc. Contract cấm; cần test chặn.
 5. **`.env` ghi từ API** có xung đột với format/comment hiện có và với việc user sửa tay cùng lúc; coercion phải chạy trước khi ghi để không sinh `.env` làm process chết lúc startup (`_apply_env_overrides` raise — `default_config.py:83-93`). Cân nhắc lock/ghi-đổi-tên.
@@ -838,10 +958,10 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 9. **Không có endpoint reset halt trong v1** — `RiskGuard.reset_halt` (`risk.py:591-596`) là hành động operator nhạy cảm; để ngoài UI tránh nút one-click mở lại trading trong ngày bị halt.
 10. **Web framework là dependency mới**: pyproject hiện không có fastapi/uvicorn (đã thêm qua `web` extra theo task control-panel — ghi rõ trong PR).
 11. **Approve → execute đồng bộ + idempotency**: live order có thể chậm (network) — UI disable nút + timeout riêng. Claim `approved` dưới store lock là hàng rào idempotency (409 cho tab khác); nhưng **không được retry sau 502** khi order_id có thể đã tồn tại — live order trùng là mất tiền thật (`bridge.py:18-21, 464-469`); đối soát `GET /api/audit?phase=execute` (§7) trước mọi thao tác kế tiếp.
-12. **`POST /api/daily` chiếm worker lock lâu (live mode)** — mỗi coin là một full LLM pipeline + tối đa 3 lần propagate với backoff 20s/40s (`daily.py:147-164`): watchlist 5 coin có thể khoá worker 10–30+ phút, chặn luôn `POST /api/runs`; mock mode chỉ vài giây/coin. V1 không có cancel endpoint — job chỉ kết thúc tự nhiên khi vòng lặp coin xong.
+12. **`POST /api/daily` chiếm worker lock lâu (live mode)** — mỗi coin là một full LLM pipeline + tối đa 3 lần propagate với backoff 20s/40s (`daily.py:147-164`): watchlist 5 coin có thể khoá worker 10–30+ phút, chặn luôn `POST /api/runs`; mock mode chỉ vài giây/coin. rev 7 thêm `POST /api/daily/{id}/cancel`: đánh dấu job terminal ngay (giải phóng lock) và worker dừng giữa hai coin; coin đang trong lệnh LLM chạy nốt vì Python không kill thread an toàn được — cancel giải phóng worker, không giải phóng network.
 13. **CSRF guard ≠ auth**: Content-Type + Origin/`Sec-Fetch-Site` chặn trang web lạ trong browser, nhưng không chống được process local hoặc malware trên cùng máy — mọi endpoint vẫn tin tưởng localhost; token auth chỉ bắt buộc khi mở bind ngoài `127.0.0.1` (§0).
 14. **Portfolio endpoint phụ thuộc seam private của `risk.py`** (`_replay`, `_consecutive_losses`, `_halted_today` — `_halted_today` đã import ở `server/audit.py:74`): engine đổi replay semantics (ví dụ thêm field mới vào audit line) → P&L của UI lệch im lặng. Cân nhắc public hoá helper replay trong engine (M5) thay vì giữ import private.
-15. **Approve với venue không đọc được fail-open**: `portfolio: null` → percent-limits bị bỏ qua (`risk.py:512-520`) **trên đường gửi lệnh thật** — đúng hành vi engine (guard luôn chạy, chỉ thiếu phân trăm) nhưng là khe hở tiềm tàng khi venue chậm đúng lúc duyệt; response phải mang `warning`, server audit ghi warning; M5 cân nhắc chặn cứng (503) khi `mode` thực sẽ là live.
+15. **Approve với venue không đọc được fail-closed**: `portfolio` không lấy được → server trả `503 exchange_unreachable`, giữ item ở `pending` và không chạy `RiskGuard`/gửi lệnh. Điều này tránh bỏ qua các giới hạn phần trăm khi venue không cung cấp equity; UI/operator có thể thử lại sau khi venue hồi phục.
 16. **Enqueue per-coin giữa job chạy**: mỗi enqueue rewrite cả `approvals.jsonl` (atomic — an toàn), nhưng v1 không có cancel job: job 20 coin có thể sinh tới 20 item; `daily_job_id` trên item (§4) là chìa khoá đối soát queue↔job khi user huỷ muốn dừng chuỗi.
 
 ### Changelog rev 3 (so với rev 2)
@@ -850,3 +970,157 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 - §5: worker server tự chạy vòng lặp per-coin trên seam engine (không gọi `run_daily`); `mode: "mock"` tái dùng machinery `runs.py`; enqueue per-coin (risk 13 cũ về enqueue-at-completion được giải quyết — xoá); job không bao giờ tự execute.
 - §6 mới: `GET /api/portfolio` (positions + realized P&L FIFO replay) — endpoint 18.
 - §7–§11: renumber từ §6–§10; thêm mã lỗi 403 `forbidden_key`, 410 `expired`, 502 `execute_failed`, 503 `exchange_unreachable` vào §0.1; Base URL/origin §0 khớp code thật (`server/main.py:5,26-33`, `web/next.config.ts:7-9`).
+
+---
+
+## 12. Performance — `GET /api/performance` (rev 5, màn Tổng quan)
+
+Nguồn: replay fill từ engine audit log (`exec_log_path`) qua `audit.read_events()` (`server/performance.py:202-205`) — KHÔNG đụng venue, trừ mark giá cho position mở.
+
+Định nghĩa **fill**: dòng audit có `action ∈ {buy, sell}`, `phase == "execute"`, ticker khác rỗng và `qty > 0`, `price_est > 0` (`performance.py:71-81`) — dòng plan, risk rejection, awaiting-approval không bao giờ dịch chuyển position.
+
+- **FIFO theo ticker, hỗ trợ long và futures short** (`performance.py:84-127`): buy khớp short futures trước rồi phần dư mở long; sell khớp long trước, và phần dư chỉ mở short nếu `market="derivatives"`. Spot sell không có long basis tiếp tục bị bỏ khỏi P&L. Short hiển thị `qty` âm; realized/unrealized return tính theo hướng short.
+
+### GET /api/performance
+
+Response 200:
+
+```json
+{
+  "generated_at": "2026-10-02T08:00:00Z",
+  "summary": {
+    "closed_trades": 2,
+    "wins": 1,
+    "losses": 1,
+    "win_rate_pct": 50.0,
+    "avg_win_pct": 10.0,
+    "avg_loss_pct": -5.0,
+    "expectancy_pct": 2.5
+  },
+  "open_positions": [
+    {
+      "ticker": "BTC-USD",
+      "qty": 0.002,
+      "entry_price": 50000.0,
+      "current_price": 52500.0,
+      "unrealized_pct": 5.0,
+      "mode": "dry",
+      "entry_at": "2026-10-01T03:00:00Z"
+    }
+  ],
+  "brackets": { "placed": 1, "failed": 1 },
+  "recent_orders": [
+    {
+      "timestamp": "2026-10-01T07:00:00Z",
+      "ticker": "BTC-USD",
+      "action": "rejected_by_risk",
+      "qty": null,
+      "price_est": 50000.0,
+      "mode": "dry",
+      "order_id": "order-2026-10-01T07:00:00Z"
+    }
+  ]
+}
+```
+
+- `summary` — win/loss trên round-trip đóng: `wins` = pnl > 0, `losses` = pnl ≤ 0 (loss giữ dấu âm), `expectancy_pct` = trung bình toàn bộ round-trip ⇒ `win_rate × avg_win + loss_rate × avg_loss == expectancy` (`performance.py:116-130`).
+- `open_positions[]` — một row per lot signed chưa khớp: lot long có `qty` dương, futures short có `qty` âm; `current_price` mark qua seam `price_fetcher` (default lazy `ExchangeBridge`, dựng lại khi exchange/url/sandbox config đổi — `performance.py:49-68`); không mark được → null. `mode`/`entry_at` lấy từ fill gốc.
+- `brackets` — đếm dòng `bracket_placed` / `bracket_failed` trên toàn log (`performance.py:156-161`) — sức khoẻ SL/TP giao venue.
+- `recent_orders[]` — tối đa 50 dòng (`RECENT_ORDERS_LIMIT`, `performance.py:27`) `phase == "execute"` mới nhất, mới nhất trước; shape tường minh 7 field, không lộ `_line_no` provenance (`performance.py:164-180`).
+
+Errors: `503 audit_log_unreadable` (log tồn tại nhưng không đọc được — nhất quán `/api/audit`); **log thiếu hoặc rỗng là empty state 200 toàn số 0, không phải lỗi** (`performance.py:202-205`).
+
+Trạng thái: loading · **empty** (chưa có fill nào — `summary` toàn 0, danh sách rỗng) · error 503 (retry) · stale 60s (badge "cũ" — `web/components/overview/performance-card.tsx:45`).
+
+---
+
+## 13. Autoloop + halt — vòng lặp tự chạy & kill switch (rev 5)
+
+Nguồn: `server/autoloop.py`. Scheduler là daemon thread re-read state file (`server/data/autoloop.json` — `paths.AUTOLOOP_PATH`, `server/paths.py:17`) mỗi wake, nên đổi interval/enabled có hiệu lực ở wake kế tiếp, không cần restart (`autoloop.py:152-172`). Một cycle = sàng universe (30 mã/asset → top 8, như daily auto scan) → pipeline LLM per candidate → **mọi plan resolve qua confirm policy của engine `_handle_plan`** (`tradingagents/execution/daily.py`) — plan không execute chỉ được audit; candidate stock chỉ advisory (không sinh plan). Cycle khi run/job active → skip + audit `autoloop_cycle_skipped` (`autoloop.py:198-218`).
+
+- **Enable fail-closed** (`autoloop.py:88-105, 373-381`): `all_open` = config `exec_auto_confirm is True` **và** env `TRADINGAGENTS_EXEC_AUTO_CONFIRM` true — đúng hai nửa đầu của confirm policy; hai nửa `exec_live` chỉ hiển thị để quan sát, không mở API này (live là quyết định của engine policy theo FR5). Rev 6: `gates` thêm 2 nửa `exec_derivatives_config`/`exec_derivatives_env` — cũng chỉ quan sát (futures là quyết định của executor policy, §14).
+- **Kill switch không gate** (`autoloop.py:405-432`): `POST /api/halt` ghi `{"event": "halt", "timestamp", "reason"}` vào engine audit log — RiskGuard của MỌI process replay line này và từ chối phần còn lại của hôm nay cho tới reset hoặc UTC day roll (sticky, day-scoped — `risk.py:163-173`; timestamp là thứ làm halt day-scoped — `risk.py:111-119`). `halt_reset` hôm nay gỡ sticky cho tới breach/halt mới. Đổi so với §11.9 (risk cũ "không có endpoint reset halt trong v1"): rev 5 đưa reset thành endpoint tường minh `/api/halt/reset`.
+
+### GET /api/autoloop
+
+Response 200:
+
+```json
+{
+  "generated_at": "2026-10-02T08:00:00Z",
+  "enabled": false,
+  "interval_minutes": 1440,
+  "running_cycle": false,
+  "gates": {
+    "auto_confirm_config": false,
+    "auto_confirm_env": false,
+    "exec_live_config": false,
+    "exec_live_env": false,
+    "exec_derivatives_config": false,
+    "exec_derivatives_env": false,
+    "all_open": false
+  },
+  "last_cycle": null
+}
+```
+
+- `interval_minutes` hợp lệ trong `[15, 1440]`, mặc định 1440; file hỏng/giá trị lạ → rơi về default, loop coi như tắt (`autoloop.py:111-141`).
+- `running_cycle` — một cycle đang giữ lock (in-memory, `autoloop.py:346`).
+- `last_cycle` — tóm tắt cycle hiện tại hoặc gần nhất, chỉ in-memory (mất khi restart): `{started_at, finished_at, status: "running"|"completed"|"timeout"|"failed"|"skipped_busy", candidates[], results[], error, telemetry?, universe?: {crypto, stock}, reason?}`. Summary được publish ngay khi cycle bắt đầu và cập nhật theo stage; `finished_at` là null khi chạy. `results[]` mỗi phần tử `{ticker, signal, executed, order_id, reason, stop_loss, take_profit}`.
+- `last_cycle.telemetry` — `{active_stage, active_ticker, active_elapsed_ms, active_node, active_path[], active_spans[], last_stage, current_ticker, events[], dropped_events}`. Các giá trị active có thể null; `active_path` giữ chuỗi stage cha để phân biệt LLM/tool/vendor trong node nào. `active_elapsed_ms` được tính lại mỗi GET khi chạy; sau timeout snapshot giữ nguyên, worker muộn không được ghi đè. `active_spans[]` gồm `{stage, ticker, node, started_at, elapsed_ms}`; timestamps UTC ISO-8601, thời gian dùng monotonic clock và đơn vị milliseconds.
+- `telemetry.events[]` giữ tối đa 100 sự kiện gần nhất: `{event: "started"|"finished"|"failed", stage, ticker, node, started_at, duration_ms?, error_type?}`. Event hoàn thành/thất bại có duration; lỗi chỉ giữ tên loại exception. `dropped_events` đếm số event cũ bị loại. Không lưu prompt, tool arguments/output, API key, URL hoặc nội dung exception trong telemetry.
+- Stage bao gồm screening/universe, venue setup, futures market context, graph build/state preparation, từng LangGraph node, LLM, tool, từng vendor attempt, planning/portfolio sync/bracket/execution policy và finalization. Timeout nêu ticker cùng stage/node đang hoạt động; engine deadline/cancellation guard vẫn chặn lệnh mới từ worker đã hết hạn. Chu kỳ timeout cũng ghi snapshot timing vào server audit. UI dùng nhãn `Đang chạy` và `Hết thời gian`, không hiển thị hai trạng thái này là `Hoàn tất`.
+
+Trạng thái: loading · empty (n/a) · error 500 · stale 30s, poll 5s khi `running_cycle` (`web/components/settings/autoloop-card.tsx:34-36`).
+
+### POST /api/autoloop
+
+Request bắt buộc `Content-Type: application/json` (§0):
+
+```json
+{ "enabled": true, "interval_minutes": 60 }
+```
+
+- `enabled` bắt buộc boolean; `interval_minutes` tuỳ chọn int `[15, 1440]` (bool không tính là int) — sai → `400 validation_error` (`autoloop.py:357-372`).
+- Bật khi `all_open` đóng → `409 gate_closed` kèm `details.gates`; không persist gì, scheduler không arm (`autoloop.py:373-381`). **Tắt không bao giờ gate** (điều kiện gate chỉ chặn `enabled: true` — `autoloop.py:374`).
+- Thành công: persist `{enabled, interval_minutes, updated_at}` atomically (tmp+replace), audit `autoloop_updated`, arm scheduler (idempotent), wake loop. Response 200: payload GET sau khi ghi.
+
+Trạng thái: loading · error 400/409/415 · stale (n/a — action).
+
+### POST /api/autoloop/run-now
+
+Body `{}` (vẫn phải `application/json` — §0). Chạy 1 cycle trên worker thread; nếu run/daily job đang active, hint trả `skipped_busy` và cycle tự re-check + audit `autoloop_cycle_skipped` (`autoloop.py:390-402`).
+
+Response 202:
+
+```json
+{ "generated_at": "2026-10-02T08:00:00Z", "status": "started" }
+```
+
+- `status`: `started` | `already_running` (cycle đang giữ lock) | `skipped_busy` (run hoặc daily job active).
+
+### POST /api/halt · POST /api/halt/reset
+
+Body `{}`. `halt` → 200 `{ "generated_at": "…", "halted": true }`; `halt/reset` → 200 `{ "generated_at": "…", "halted": false }`. Cả hai ghi line điều khiển vào engine audit log (§7) và audit server trail `autoloop_halt` / `autoloop_halt_reset`; sau action, `GET /api/health` → `halted_today` (§9) phản ánh ngay.
+
+Trạng thái POSTs: loading · error 415/403 CSRF (§0) · stale (n/a — action).
+
+---
+
+## 14. Đường futures trong autoloop (rev 6)
+
+Ứng viên crypto của 1 chu kỳ autoloop đi qua `DerivativesExecutor` thay vì spot bridge khi config `exec_derivatives` là literal True — executor được dựng 1 lần/cycle (`autoloop.py:253-254`, seam test `_build_derivatives_executor` — `autoloop.py:338-344`); ứng viên stock vẫn chỉ advisory như §13.
+
+**3 cổng — UI không giữ cổng nào:**
+
+1. **Config** — `exec_derivatives is True`: chặn lúc cycle quyết định dùng executor (`autoloop.py:254`) và chặn lần nữa trong `plan_order`/`execute_order` của executor (`derivatives.py:125-131, 191`).
+2. **Env** — `TRADINGAGENTS_EXEC_DERIVATIVES` đọc tại call time, fail-closed (`derivatives.py:45`, gate ở `derivatives.py:132, 198`): thiếu → plan bị refuse (audit `derivatives_denied`), candidate ghi refusal vào `reason`, cycle vẫn hoàn thành (`tests/test_server_autoloop.py::test_run_cycle_derivatives_gates_closed_refuse_planning`).
+3. **Confirm per-order** — mọi plan vẫn resolve qua `_handle_plan` của engine (`daily.py:177-216`, gọi ở `autoloop.py:310`): hai gate auto-confirm (config literal + env flag) quyết định dry-fill, live bị chặn bởi FR5 của bridge mà executor compose (`effective_mode` delegate — `derivatives.py:415`). Autoloop không thêm cổng mới, chỉ đi qua cổng cũ của engine.
+
+Hai nửa (1)+(2) hiển thị trong `gates()` là `exec_derivatives_config`/`exec_derivatives_env` — **chỉ quan sát**, không tham gia `all_open` (`autoloop.py:116-118`); enable autoloop vẫn chỉ cần 2 nửa auto-confirm.
+
+**Đòn bẩy:** cycle xin `min(risk_max_derivatives_leverage, MAX_AUTO_LEVERAGE = 3.0)`; thiếu config entry → 1× (`_auto_leverage` — `autoloop.py:62, 347-353`). RiskGuard với `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền (từ chối được dưới trần hệ thống); executor pin leverage trên venue cho mỗi lệnh (`derivatives.py:321-324`).
+
+**Position state (rev 8):** after a live derivatives entry is acknowledged and bracketed, the executor persists an initial `position_states` row keyed by unified symbol, side, and entry order id. It records planned entry, sent quantity, stop, target, and order provenance. `PositionManager` uses the DB CAS revision independently of the venue revision and deletes its snapshot when its adapter reconciles the venue flat. This is durable policy state, not a background polling service: the current autoloop does not instantiate a venue `PositionAdapter` for automatic trailing/partial management; exchange-side bracket and bracket recovery remain the active automatic protection path.
+
+**Venue Binance:** mặc định chọn Demo qua `TRADINGAGENTS_EXEC_BASE_URL=https://demo-api.binance.com`; ccxt tự route futures tới `demo-fapi.binance.com`. Chuyển production bằng cách thay URL thành `https://api.binance.com`, dùng `BINANCE_API_KEY`/`BINANCE_SECRET`, rồi restart backend. Bridge chỉ nhận đúng hai profile HTTPS allowlist này và chọn key pair tương ứng. Các gate `exec_live` + `TRADINGAGENTS_EXEC_LIVE` vẫn độc lập; Demo order vẫn là live execution trên tài khoản Demo, không phải dry-run.

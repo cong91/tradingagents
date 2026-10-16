@@ -5,7 +5,7 @@ import unittest
 import pytest
 
 from tradingagents.dataflows.errors import NoMarketDataError
-from tradingagents.dataflows.symbols import crypto_base, normalize_symbol
+from tradingagents.dataflows.symbols import crypto_base, futures_base, normalize_symbol
 
 
 @pytest.mark.unit
@@ -39,6 +39,28 @@ class TestNormalizeSymbol(unittest.TestCase):
     def test_crypto_pairs_get_dash_usd(self):
         self.assertEqual(normalize_symbol("BTCUSD"), "BTC-USD")
         self.assertEqual(normalize_symbol("ETHUSD"), "ETH-USD")
+
+    def test_crypto_bases_yahoo_disambiguates(self):
+        # Yahoo does not publish these bases as BASE-USD: a colliding equity
+        # ticker forces a numeric id, and TAO only lists wrapped. Every row is
+        # the ticker whose Yahoo name matches the coin (see symbols.py).
+        self.assertEqual(normalize_symbol("PEPE-USD"), "PEPE24478-USD")
+        self.assertEqual(normalize_symbol("pepeusdt"), "PEPE24478-USD")
+        self.assertEqual(normalize_symbol("UNI-USD"), "UNI7083-USD")
+        self.assertEqual(normalize_symbol("SUI-USD"), "SUI20947-USD")
+        self.assertEqual(normalize_symbol("HYPE-USD"), "HYPE32196-USD")
+        self.assertEqual(normalize_symbol("PUMP-USD"), "PUMP33991-USD")
+        self.assertEqual(normalize_symbol("GTC-USD"), "GTC10052-USD")
+        self.assertEqual(normalize_symbol("ZRO-USD"), "ZRO26997-USD")
+        self.assertEqual(normalize_symbol("TAO-USD"), "WTAO-USD")
+
+    def test_crypto_disambiguation_is_idempotent(self):
+        # A resolved ticker must survive a second pass, and a liquid base
+        # Yahoo already lists plainly must not be redirected.
+        self.assertEqual(normalize_symbol("PEPE24478-USD"), "PEPE24478-USD")
+        self.assertEqual(normalize_symbol("WTAO-USD"), "WTAO-USD")
+        self.assertEqual(normalize_symbol("MOVR-USD"), "MOVR-USD")
+        self.assertEqual(normalize_symbol("NEAR-USD"), "NEAR-USD")
 
     def test_six_letter_non_currency_left_alone(self):
         # GOOGLE-style 6-letter tickers that aren't two currency codes
@@ -98,10 +120,13 @@ class TestCryptoBase(unittest.TestCase):
         for raw in ("AAPL", "BRK-B", "GOLD", "XYZ-USD", "EURUSD", "", None):
             self.assertIsNone(crypto_base(raw))
 
-    def test_agrees_with_normalize_symbol(self):
-        # crypto_base is the shared primitive behind the -USD normalization.
-        self.assertEqual(normalize_symbol("BTCUSD"), "BTC-USD")
-        self.assertEqual(crypto_base("BTCUSD"), "BTC")
+    def test_futures_base_accepts_generic_contract_tickers(self):
+        for raw in ("NEAR-USD", "SUI-USD", "QNT-USD", "abc-usdt", "BTC-USDC"):
+            self.assertEqual(futures_base(raw), raw.strip().upper().split("-")[0])
+
+    def test_futures_base_rejects_malformed_tickers(self):
+        for raw in ("NEAR", "NEAR/USD", "NEAR-", "-USD", "NEAR-EUR", "NEAR-USD+"):
+            self.assertIsNone(futures_base(raw))
 
 
 if __name__ == "__main__":

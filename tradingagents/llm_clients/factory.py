@@ -1,4 +1,5 @@
 
+import math
 from typing import Any
 
 from .base_client import BaseLLMClient
@@ -74,6 +75,19 @@ def _coerce_max_retries(value):
     return n
 
 
+def _coerce_timeout(value):
+    """Validate an LLM request timeout as a finite positive number."""
+    if isinstance(value, bool):
+        raise ValueError(f"llm_timeout must be a number, not a boolean: {value!r}")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"llm_timeout must be a number, got {value!r}") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"llm_timeout must be a finite number > 0, got {value!r}")
+    return timeout
+
+
 def _coerce_max_tokens(value):
     """Validate a ``max_tokens`` value to a positive int (env vars are strings)."""
     if isinstance(value, bool):
@@ -136,6 +150,12 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
     temperature = config.get("temperature")
     if temperature is not None and temperature != "":
         kwargs["temperature"] = float(temperature)
+
+    # Request timeout is bounded by default so a stalled provider cannot hold a
+    # worker thread indefinitely. It remains configurable for slower local models.
+    timeout = config.get("llm_timeout")
+    if timeout is not None and timeout != "":
+        kwargs["timeout"] = _coerce_timeout(timeout)
 
     # SDK retry budget is cross-provider. Forward it only when explicitly set
     # so each provider keeps its own default (usually 2) otherwise (#1091).

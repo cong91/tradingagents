@@ -4,9 +4,18 @@ Analysis only — never execution: the endpoint streams the graph exactly like
 ``cli/run.py`` does and cannot produce an order plan. One run at a time (a
 process-wide ``set_config`` at graph build makes parallel graphs fight over
 config — trading_graph.py:65), enforced with a registry lock shared with the
-future daily-job endpoint. ``mode: "mock"`` replays a saved
+daily-job endpoint. ``mode: "mock"`` replays a saved
 ``full_states_log_<date>.json`` when one exists, else emits an inline
 synthetic fixture, so the UI runs with no LLM key and no network.
+
+Rev 7 — the agent's work is durable. Every event the graph emits (analyst
+reports, debate turns, tool calls, the final decision) is written to
+``control.db`` as it happens, and so is the run's own status, so the UI can
+replay any past run instead of only the one currently streaming. The
+in-memory ``_runs`` dict stays because a condition variable cannot live in a
+database: it is the live buffer the SSE stream waits on. A run left
+``running`` by a crash is reconciled to ``interrupted`` at the next startup
+(``reconcile``) rather than blocking the worker forever.
 """
 
 import json
@@ -16,10 +25,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
-from server import audit as audit_log
+from server import audit as audit_log, run_store
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.agents.rating import is_review, parse_rating
 from tradingagents.dataflows.config import get_config
@@ -27,7 +36,7 @@ from tradingagents.dataflows.symbols import safe_ticker_component
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 QUEUED_STATUSES = {"queued", "running"}
 
 # Pause between mock events so the UI shows progress; tests set this to 0.
@@ -61,6 +70,57 @@ class RunState:
 
 _runs: dict[str, RunState] = {}
 _registry_lock = threading.Lock()
+
+
+def _persist(run: RunState) -> None:
+    """Mirror the run to the database. Raises on failure — a run whose record
+    cannot be written is a run the operator cannot see."""
+    run_store.persist_run({
+        "run_id": run.run_id,
+        "ticker": run.ticker,
+        "trade_date": run.trade_date,
+        "asset_type": run.asset_type,
+        "mode": run.mode,
+        "status": run.status,
+        "signal": run.signal,
+        "is_review": run.is_review,
+        "error": run.error,
+        "report_paths": run.report_paths,
+        "analysts": list(run.analysts),
+        "created_at": run.created_at,
+        "finished_at": run.finished_at,
+    })
+
+
+def reconcile() -> list[str]:
+    """Close runs a dead process left active; returns the ids closed."""
+    closed = run_store.reconcile_orphans()
+    for run_id in closed:
+        audit_log.record("run_interrupted", run_id=run_id,
+                         reason="server restarted while the run was streaming")
+    return closed
+
+
+def _state_from_row(data: dict) -> RunState:
+    """Rebuild a readable RunState from a stored row. Its event buffer starts
+    empty: the stream for a finished run is served from the database instead
+    (see ``stream_run_events``)."""
+    return RunState(
+        run_id=data["run_id"],
+        ticker=data["ticker"],
+        trade_date=data["trade_date"],
+        asset_type=data["asset_type"],
+        mode=data["mode"],
+        checkpoint=None,
+        created_at=data["created_at"],
+        analysts=list(data["analysts"]),
+        status=data["status"],
+        finished_at=data["finished_at"],
+        signal=data["signal"],
+        is_review=data["is_review"],
+        error=data["error"],
+        report_paths=data["report_paths"],
+    )
 
 
 def _active_run() -> RunState | None:
@@ -125,10 +185,10 @@ def _valid_trade_date(value: str) -> bool:
 
 def _emit(run: RunState, event_type: str, *, stage: str, role: str | None = None,
           agent: str | None = None, payload: dict) -> None:
-    """Append one SSE event; safe to call while already holding ``run.cond``."""
+    """Append one SSE event and persist it; safe to call while holding ``run.cond``."""
     with run.cond:
         run.seq += 1
-        run.events.append({
+        event = {
             "seq": run.seq,
             "ts": utc_now_iso(),
             "type": event_type,
@@ -137,8 +197,11 @@ def _emit(run: RunState, event_type: str, *, stage: str, role: str | None = None
             "agent": agent,
             "replay": run.mode == "mock",
             "payload": payload,
-        })
+        }
+        run.events.append(event)
         run.cond.notify_all()
+    # Outside the lock: a database write must not stall the stream it feeds.
+    run_store.append_event(run.run_id, event)
 
 
 # --- mock replay -----------------------------------------------------------
@@ -271,15 +334,19 @@ def _run_mock(run: RunState, config: dict, source_run: str | None) -> None:
 
 
 def _complete(run: RunState, signal: str, report_paths: dict | None) -> None:
+    # Persist the terminal state BEFORE announcing it. The closing event is what
+    # releases a stream reader, so writing the database afterwards would let a
+    # reader observe a finished run while the record still said "running".
     with run.cond:
         run.signal = signal
         run.is_review = is_review(signal)
         run.report_paths = report_paths
-        _emit(run, "run_completed", stage="system", payload={
-            "signal": signal, "is_review": run.is_review, "report_paths": report_paths,
-        })
         run.status = "completed"
         run.finished_at = utc_now_iso()
+    _persist(run)
+    _emit(run, "run_completed", stage="system", payload={
+        "signal": signal, "is_review": run.is_review, "report_paths": report_paths,
+    })
 
 
 # --- live streaming (mirror of cli/run.py:226-323) --------------------------
@@ -376,7 +443,8 @@ def _run_live(run: RunState, config: dict) -> None:
 def _execute(run: RunState, config: dict, source_run: str | None) -> None:
     with run.cond:
         run.status = "running"
-        _emit(run, "run_started", stage="system", payload={"analysts": run.analysts})
+    _persist(run)
+    _emit(run, "run_started", stage="system", payload={"analysts": run.analysts})
     try:
         if run.mode == "mock":
             _run_mock(run, config, source_run)
@@ -387,8 +455,9 @@ def _execute(run: RunState, config: dict, source_run: str | None) -> None:
         with run.cond:
             run.error = error
             run.finished_at = utc_now_iso()
-            _emit(run, "run_failed", stage="system", payload={"error": error})
             run.status = "failed"
+        _persist(run)  # durable before the terminal event, as in _complete
+        _emit(run, "run_failed", stage="system", payload={"error": error})
         audit_log.record("run_failed", run_id=run.run_id, error=error["message"])
 
 
@@ -438,6 +507,7 @@ async def create_run(request: Request):
             created_at=utc_now_iso(), analysts=list(_analysts_for(asset_type)),
         )
         _runs[run.run_id] = run
+        _persist(run)  # durable before the 201 returns: a restart must not lose it
         payload = _run_payload(run)  # snapshot: the worker may flip to "running" at once
 
     audit_log.record("run_created", run_id=run.run_id, ticker=ticker, mode=mode)
@@ -446,20 +516,47 @@ async def create_run(request: Request):
     return payload
 
 
+@router.get("/runs")
+def list_runs(
+    status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Run history, newest first — what the agents analysed, and what came out.
+
+    ``active_run_id`` is read from the live registry, so a run this process is
+    not streaming can never be reported as active.
+    """
+    if status is not None and status not in TERMINAL_STATUSES | QUEUED_STATUSES:
+        raise ApiError(400, "validation_error",
+                       f'"status" must be one of {sorted(TERMINAL_STATUSES | QUEUED_STATUSES)}')
+    items, total = run_store.list_runs(status, page_size, (page - 1) * page_size)
+    return {
+        "generated_at": utc_now_iso(),
+        "items": [_run_payload(_state_from_row(item)) | {"events_count": item["events_count"]}
+                  for item in items],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "active_run_id": active_run_id(),
+    }
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: str):
-    run = _runs.get(run_id)
-    if run is None:
+    run = _runs.get(run_id)  # live first: the worker owns the freshest state
+    if run is not None:
+        with run.cond:
+            return _run_payload(run)
+    stored = run_store.load_run(run_id)
+    if stored is None:
         raise ApiError(404, "not_found", f"run {run_id} not found")
-    with run.cond:
-        return _run_payload(run)
+    return _run_payload(_state_from_row(stored))
 
 
 @router.get("/runs/{run_id}/events")
 def stream_run_events(run_id: str, request: Request):
     run = _runs.get(run_id)
-    if run is None:
-        raise ApiError(404, "not_found", f"run {run_id} not found")
     cursor = -1
     last_event_id = request.headers.get("last-event-id")
     if last_event_id is not None:
@@ -467,11 +564,28 @@ def stream_run_events(run_id: str, request: Request):
             cursor = int(last_event_id)
         except ValueError as exc:
             raise ApiError(400, "validation_error", "Last-Event-ID must be an integer") from exc
+    if run is None:
+        # A finished run's stream is replayed from the database, then ends —
+        # this is how the UI shows what the agents did on a past run.
+        if run_store.load_run(run_id) is None:
+            raise ApiError(404, "not_found", f"run {run_id} not found")
+        return StreamingResponse(
+            _stored_event_stream(run_id, cursor),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     return StreamingResponse(
         _event_stream(run, cursor),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _stored_event_stream(run_id: str, cursor: int):
+    """Replay a finished run's persisted agent log, then close the stream."""
+    for event in run_store.load_events(run_id, cursor):
+        data = json.dumps(event, ensure_ascii=False)
+        yield f"id: {event['seq']}\nevent: {event['type']}\ndata: {data}\n\n"
 
 
 def _event_stream(run: RunState, cursor: int):

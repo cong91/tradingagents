@@ -44,7 +44,10 @@ class PlannedOrder(BaseModel):
     CAN execute live if both gates are open and ``confirm=True`` is passed
     at that moment. ``market``/``leverage`` default to a spot order at 1x;
     derivatives plans set them explicitly (``cost`` is the margin committed,
-    notional = cost * leverage).
+    notional = cost * leverage). ``stop_loss``/``take_profit`` are optional
+    protective exit prices (ATR-derived at plan time): when present, a live
+    entry fill is followed by exchange-side protective orders so the exits
+    survive a server crash -- the exchange enforces them, not us.
     """
 
     ticker: str
@@ -59,6 +62,8 @@ class PlannedOrder(BaseModel):
     reason: str | None = None
     market: Literal["spot", "derivatives"] = "spot"
     leverage: float = 1.0
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
 
 def compute(

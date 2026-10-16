@@ -9,6 +9,8 @@ differ from the broker / TradingView / MT5 style symbols users often type:
                                         it is quoted as a COMEX future
     EURUSD            EURUSD=X          spot forex pairs take a ``=X`` suffix
     BTCUSD            BTC-USD           crypto pairs use a ``-`` separator
+    PEPE-USD          PEPE24478-USD     Yahoo appends a numeric id to a crypto
+                                        base that collides with an equity ticker
     SPX500, US500     ^GSPC             index CFDs map to Yahoo index symbols
     09992.HK, 700.HK  9992.HK, 0700.HK  HK codes are zero-padded to 4 digits
     600519.SH         600519.SS         Yahoo spells Shanghai ``.SS``
@@ -44,6 +46,24 @@ _CRYPTO_BASES = frozenset(
     {"BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "BCH", "DOT", "AVAX", "LINK"}
 )
 
+# Crypto bases Yahoo does not publish as ``BASE-USD``. When a base collides
+# with an equity ticker Yahoo appends a numeric id to the crypto listing
+# (``PEPE`` -> ``PEPE24478-USD``), and a wrapped token carries a prefix
+# (``TAO`` -> ``WTAO-USD``). Each row was verified against the symbol's own
+# Yahoo name metadata; the table is explicit because a fuzzy lookup silently
+# returns a DIFFERENT asset (searching GTC ranks ``GTC38989-USD`` "Global Tour
+# Club" above Gitcoin's ``GTC10052-USD``).
+_CRYPTO_TICKER_ALIASES = {
+    "PEPE": "PEPE24478-USD",
+    "UNI": "UNI7083-USD",
+    "SUI": "SUI20947-USD",
+    "HYPE": "HYPE32196-USD",
+    "PUMP": "PUMP33991-USD",
+    "GTC": "GTC10052-USD",
+    "ZRO": "ZRO26997-USD",
+    "TAO": "WTAO-USD",
+}
+
 # Explicit aliases for instruments whose broker symbol does not map to a
 # Yahoo symbol by rule. Metals/energy resolve to their front-month future;
 # index CFD names resolve to the underlying Yahoo index symbol. Extend by
@@ -77,6 +97,7 @@ _SHANGHAI_SH = re.compile(r"^(\d{6})\.SH$")
 # in any of these resolves to ``-USD`` (#982). Longest first so ``USDT``/``USDC``
 # match before the ``USD`` substring.
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+_FUTURES_TICKER = re.compile(r"^([A-Z0-9]{2,})-(USD|USDT|USDC)$")
 
 
 def crypto_base(raw: str) -> str | None:
@@ -94,10 +115,34 @@ def crypto_base(raw: str) -> str | None:
     return None
 
 
+def futures_base(raw: str) -> str | None:
+    """Return the base from a syntactically valid pipeline futures ticker.
+
+    This parser deliberately does not decide whether the venue lists the
+    instrument. Futures execution resolves that separately from live market
+    metadata, so newly listed contracts are not blocked by the Yahoo/spot
+    crypto allow-list above.
+    """
+    if not isinstance(raw, str):
+        return None
+    match = _FUTURES_TICKER.fullmatch(raw.strip().upper())
+    return match.group(1) if match else None
+
+
 def _normalize_crypto(s: str) -> str | None:
     """Return ``<BASE>-USD`` for a known USD/USDT/USDC-quoted crypto, else None."""
     base = crypto_base(s)
     return f"{base}-USD" if base else None
+
+
+def _normalize_crypto_alias(s: str) -> str | None:
+    """Return Yahoo's disambiguated ticker for a crypto base it does not
+    publish as ``BASE-USD``, else None. Purely syntactic: a table lookup."""
+    compact = s.replace("-", "")
+    for quote in _CRYPTO_QUOTES:
+        if compact.endswith(quote):
+            return _CRYPTO_TICKER_ALIASES.get(compact[: -len(quote)])
+    return None
 
 
 def normalize_symbol(raw: str) -> str:
@@ -107,11 +152,13 @@ def normalize_symbol(raw: str) -> str:
       1. Explicit alias table (metals, energy, index CFDs).
       2. Crypto rule: a known crypto base quoted in USD/USDT/USDC (dashed or
          not) -> ``BASE-USD``.
-      3. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
-      4. HK rule: a numeric ``.HK`` code -> Yahoo's 4-digit padding
+      3. Crypto disambiguation: a base Yahoo publishes under a numeric-id or
+         prefixed ticker -> that ticker (``PEPE-USD`` -> ``PEPE24478-USD``).
+      4. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
+      5. HK rule: a numeric ``.HK`` code -> Yahoo's 4-digit padding
          (``09992.HK`` -> ``9992.HK``, ``700.HK`` -> ``0700.HK``).
-      5. Shanghai rule: ``600519.SH`` -> ``600519.SS``.
-      6. Otherwise the upper-cased symbol is returned unchanged (plain
+      6. Shanghai rule: ``600519.SH`` -> ``600519.SS``.
+      7. Otherwise the upper-cased symbol is returned unchanged (plain
          equities, ETFs, Yahoo-native symbols like ``GC=F`` or ``^GSPC``).
 
     A trailing ``+`` (broker CFD marker, e.g. ``XAUUSD+``) is stripped before
@@ -130,6 +177,8 @@ def normalize_symbol(raw: str) -> str:
         canonical = _ALIASES[s]
     elif crypto is not None:
         canonical = crypto
+    elif (crypto_alias := _normalize_crypto_alias(s)) is not None:
+        canonical = crypto_alias
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
         canonical = f"{s}=X"
     elif hk := _HK_CODE.match(s):

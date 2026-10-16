@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -19,30 +19,79 @@ logger = logging.getLogger(__name__)
 # Connection-level retry for community relays that drop connections
 # intermittently. The openai SDK only retries HTTP status codes; a server
 # that disconnects before sending headers produces an APIConnectionError
-# with no status, so the SDK gives up on the first attempt.
-_CONNECTION_RETRIES = 10
-_CONNECTION_RETRY_WAIT = 5.0  # seconds; linear: 5, 10, 15, ... 50 (total ~5min)
+# with no status, so the SDK gives up on the first attempt. The wait grows
+# linearly because relay overload windows last seconds-to-minutes: a fixed
+# half-second gap retries into the same overload and burns both attempts.
+_CONNECTION_RETRIES = 2  # one initial request plus one bounded reconnect
+_CONNECTION_RETRY_WAIT = 4.0
+_DEFAULT_REQUEST_TIMEOUT = 60.0
+
+
+class _IncompleteStreamError(RuntimeError):
+    """The Responses relay ended without a successful terminal event."""
+
+    def __init__(self, status: str | None, reason: str | None = None):
+        self.retryable = reason is None
+        detail = f" with reason {reason!r}" if reason is not None else ""
+        super().__init__(f"Responses stream ended with status {status!r}{detail}")
 
 
 def _is_connection_error(exc: Exception) -> bool:
     """Whether an exception is a network/connection failure worth retrying."""
-    # Walk the cause chain: langchain wraps the openai SDK's exceptions.
     current = exc
     for _ in range(5):
         name = type(current).__name__
-        if name in (
-            "APIConnectionError", "APIConnectionErrorWrapper",
-            "OpenAIConnectionError", "RemoteProtocolError",
-            "ConnectError", "ConnectionError",
+        message = str(current).lower()
+        if any(
+            marker in message
+            for marker in (
+                "timed out",
+                "upstream_http2_stream_error",
+                "upstream_stream_read_error",
+                "upstream response stream was interrupted",
+                # Relay-side overload answers (HTTP 5xx equivalents): bounded
+                # retry applies the same as a dropped connection.
+                "server_error",
+                "overloaded",
+            )
         ):
             return True
-        cause = getattr(current, "__cause__", None) or getattr(current, "__cause__", None)
-        if cause is None:
-            cause = getattr(current, "__cause__", None)
+        if name in (
+            "APIConnectionError", "APIConnectionErrorWrapper",
+            "OpenAIConnectionError", "OpenAITimeoutError", "RemoteProtocolError",
+            "ConnectError", "ConnectionError", "TimeoutError",
+            # Relays intermittently answer with an empty or truncated body
+            # that dies at JSON parse instead of raising a connection error;
+            # same mid-pipeline abort, same bounded-retry treatment.
+            "JSONDecodeError",
+        ):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
         if cause is None or cause is current:
             break
         current = cause
     return False
+
+
+def _is_retryable_stream_error(exc: Exception) -> bool:
+    if isinstance(exc, _IncompleteStreamError):
+        return exc.retryable
+    return _is_connection_error(exc)
+
+
+def _incomplete_reason(metadata: dict) -> str | None:
+    details = metadata.get("incomplete_details")
+    if isinstance(details, dict):
+        reason = details.get("reason")
+    else:
+        reason = getattr(details, "reason", None)
+    return str(reason) if reason is not None else None
+
+
+def _stream_terminal_metadata(chunk: Any) -> tuple[str | None, str | None]:
+    message = getattr(chunk, "message", None)
+    metadata = getattr(message, "response_metadata", {}) or {}
+    return metadata.get("status"), _incomplete_reason(metadata)
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -101,6 +150,10 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
         # request is what survives them; local servers don't mind.
         headers = dict(kwargs.pop("default_headers", None) or {})
         headers.setdefault("Connection", "close")
+        kwargs.setdefault("timeout", _DEFAULT_REQUEST_TIMEOUT)
+        kwargs.setdefault("streaming", True)
+        if "stream_chunk_timeout" in getattr(type(self), "model_fields", {}):
+            kwargs.setdefault("stream_chunk_timeout", kwargs["timeout"])
         super().__init__(default_headers=headers, **kwargs)
 
     def _use_responses_api(self, payload: dict) -> bool:
@@ -118,36 +171,80 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
             return self.use_responses_api
         return False
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        """Retry on connection errors that the openai SDK does not retry.
-
-        Community relays drop connections intermittently (~50% per request
-        during bad windows). The openai SDK's ``_should_retry`` only checks
-        HTTP status codes (408/409/429/5xx); ``APIConnectionError`` from a
-        server that disconnects before sending headers has no status code,
-        so the SDK gives up immediately. Retry here with short backoff.
-        """
-        import time as _time
-
-        last_exc = None
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        """Buffer each relay attempt and publish only a complete attempt."""
+        responses_mode = self._use_responses_api({**kwargs, **self.model_kwargs})
         for attempt in range(_CONNECTION_RETRIES):
+            chunks: list[Any] = []
+            terminal_status = None
+            incomplete_reason = None
             try:
-                return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+                for chunk in super()._stream(*args, **kwargs):
+                    chunks.append(chunk)
+                    status, reason = _stream_terminal_metadata(chunk)
+                    terminal_status = status or terminal_status
+                    incomplete_reason = reason or incomplete_reason
+                if responses_mode and terminal_status != "completed":
+                    raise _IncompleteStreamError(terminal_status, incomplete_reason)
+                yield from chunks
+                return
             except Exception as exc:
-                # Only retry connection-level errors, not bad requests
-                if not _is_connection_error(exc):
+                if (
+                    not _is_retryable_stream_error(exc)
+                    or attempt == _CONNECTION_RETRIES - 1
+                ):
                     raise
-                last_exc = exc
-                if attempt < _CONNECTION_RETRIES - 1:
-                    wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
-                    logger.warning(
-                        "relay connection dropped (attempt %d/%d, %s); "
-                        "retrying in %.1fs",
-                        attempt + 1, _CONNECTION_RETRIES,
-                        type(exc).__name__, wait,
-                    )
+                wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
+                logger.warning(
+                    "relay stream attempt failed before completion "
+                    "(attempt %d/%d, %s); retrying in %.1fs",
+                    attempt + 1,
+                    _CONNECTION_RETRIES,
+                    type(exc).__name__,
+                    wait,
+                )
+                if wait:
+                    import time as _time
+
                     _time.sleep(wait)
-        raise last_exc
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        """Buffer each async relay attempt and publish only a complete attempt."""
+        import asyncio
+
+        responses_mode = self._use_responses_api({**kwargs, **self.model_kwargs})
+        for attempt in range(_CONNECTION_RETRIES):
+            chunks: list[Any] = []
+            terminal_status = None
+            incomplete_reason = None
+            try:
+                async for chunk in super()._astream(*args, **kwargs):
+                    chunks.append(chunk)
+                    status, reason = _stream_terminal_metadata(chunk)
+                    terminal_status = status or terminal_status
+                    incomplete_reason = reason or incomplete_reason
+                if responses_mode and terminal_status != "completed":
+                    raise _IncompleteStreamError(terminal_status, incomplete_reason)
+                for chunk in chunks:
+                    yield chunk
+                return
+            except Exception as exc:
+                if (
+                    not _is_retryable_stream_error(exc)
+                    or attempt == _CONNECTION_RETRIES - 1
+                ):
+                    raise
+                wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
+                logger.warning(
+                    "async relay stream attempt failed before completion "
+                    "(attempt %d/%d, %s); retrying in %.1fs",
+                    attempt + 1,
+                    _CONNECTION_RETRIES,
+                    type(exc).__name__,
+                    wait,
+                )
+                if wait:
+                    await asyncio.sleep(wait)
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         resolved = method or get_capabilities(self.model_name).preferred_structured_method
@@ -487,6 +584,13 @@ class OpenAIClient(BaseLLMClient):
             if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
                 continue
             llm_kwargs[key] = self.kwargs[key]
+
+        llm_kwargs["streaming"] = True
+        if "stream_chunk_timeout" in getattr(chat_cls, "model_fields", {}):
+            llm_kwargs.setdefault(
+                "stream_chunk_timeout",
+                llm_kwargs.get("timeout", _DEFAULT_REQUEST_TIMEOUT),
+            )
 
         # The subclass (provider quirks) comes from the registry spec.
         return chat_cls(**llm_kwargs)

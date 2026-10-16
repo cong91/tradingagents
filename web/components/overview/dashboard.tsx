@@ -19,6 +19,7 @@ import {
   fetchAudit,
   fetchHealth,
   fetchHistory,
+  fetchPerformance,
   fetchPortfolio,
   type AuditPayload,
   type HistoryPayload,
@@ -30,13 +31,17 @@ import { AlphaChart } from "./alpha-chart";
 import { OrderTable } from "./order-table";
 import { EmptyState } from "./empty-state";
 import { PortfolioCard } from "./portfolio-card";
+import { PerformanceCard } from "./performance-card";
 
 // Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8/§9):
-// audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6).
+// audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6);
+// performance 30s — endpoint chưa trả stale_after, chọn bằng chu kỳ portfolio
+// (cùng đọc audit log + mark giá từ sàn).
 const HEALTH_INTERVAL_MS = 15_000;
 const AUDIT_INTERVAL_MS = 10_000;
 const HISTORY_INTERVAL_MS = 60_000;
 const PORTFOLIO_INTERVAL_MS = 30_000;
+const PERFORMANCE_INTERVAL_MS = 30_000;
 const AUDIT_PAGE_SIZE = 200;
 const HISTORY_LIMIT = 200;
 
@@ -44,6 +49,7 @@ const loadHealth = () => fetchHealth();
 const loadHistory = () => fetchHistory(HISTORY_LIMIT);
 const loadAudit = () => fetchAudit(AUDIT_PAGE_SIZE);
 const loadPortfolio = () => fetchPortfolio();
+const loadPerformance = () => fetchPerformance();
 
 function PanelSkeleton() {
   return (
@@ -170,31 +176,41 @@ export function OverviewDashboard() {
   const history = usePoll(loadHistory, HISTORY_INTERVAL_MS, HISTORY_INTERVAL_MS, clock);
   const audit = usePoll(loadAudit, AUDIT_INTERVAL_MS, AUDIT_INTERVAL_MS, clock);
   const portfolio = usePoll(loadPortfolio, PORTFOLIO_INTERVAL_MS, PORTFOLIO_INTERVAL_MS, clock);
+  const performance = usePoll(
+    loadPerformance,
+    PERFORMANCE_INTERVAL_MS,
+    PERFORMANCE_INTERVAL_MS,
+    clock
+  );
   // refresh của từng hook là callback ổn định — destructure để deps của refreshAll ổn định.
   const { refresh: refreshHealth } = health;
   const { refresh: refreshHistory } = history;
   const { refresh: refreshAudit } = audit;
   const { refresh: refreshPortfolio } = portfolio;
+  const { refresh: refreshPerformance } = performance;
 
   const refreshAll = useCallback(() => {
     refreshHealth();
     refreshHistory();
     refreshAudit();
     refreshPortfolio();
-  }, [refreshHealth, refreshHistory, refreshAudit, refreshPortfolio]);
+    refreshPerformance();
+  }, [refreshHealth, refreshHistory, refreshAudit, refreshPortfolio, refreshPerformance]);
 
   const allLoading =
     health.state.status === "loading" &&
     history.state.status === "loading" &&
     audit.state.status === "loading" &&
-    portfolio.state.status === "loading";
+    portfolio.state.status === "loading" &&
+    performance.state.status === "loading";
 
-  const latestFetchedAt = [health.state, history.state, audit.state, portfolio.state]
+  const latestFetchedAt = [health.state, history.state, audit.state, portfolio.state, performance.state]
     .map((s) => (s.status === "ready" || s.status === "stale" ? s.fetchedAt : null))
     .filter((t): t is number => t !== null)
     .reduce<number | null>((max, t) => (max === null || t > max ? t : max), null);
 
-  const anyStale = health.stale || history.stale || audit.stale || portfolio.stale;
+  const anyStale =
+    health.stale || history.stale || audit.stale || portfolio.stale || performance.stale;
 
   const halted = health.state.status !== "loading" && health.state.status !== "error"
     ? health.state.data.halted_today === true
@@ -288,6 +304,13 @@ export function OverviewDashboard() {
               )}
             </CardContent>
           </Card>
+
+          <div className="mt-4">
+            <PerformanceCard
+              state={performance.state}
+              onRetry={performance.refresh}
+            />
+          </div>
 
           <Card className="mt-4">
             <CardHeader>

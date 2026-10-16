@@ -1,9 +1,12 @@
 // M1 "Tổng quan lợi nhuận" — tầng dữ liệu của màn: types + fetch theo đúng
-// docs/ui-api-contract.md. Màn này chỉ ĐỌC bốn endpoint có trong hợp đồng:
-//   GET /api/health    (§9)   — exec_mode, halted_today, pending_approvals
-//   GET /api/history   (§8)   — decision log: rating / pending / alpha (chuỗi "+1.2%")
-//   GET /api/audit     (§7)   — nhật ký thực thi: lệnh buy/sell, qty, price_est
-//   GET /api/portfolio (§6)   — positions + realized P&L (replay FIFO)
+// docs/ui-api-contract.md. Màn này chỉ ĐỌC năm endpoint:
+//   GET /api/health      (§9)  — exec_mode, halted_today, pending_approvals
+//   GET /api/history     (§8)  — decision log: rating / pending / alpha (chuỗi "+1.2%")
+//   GET /api/audit       (§7)  — nhật ký thực thi: lệnh buy/sell, qty, price_est
+//   GET /api/portfolio   (§6)  — positions + realized P&L (replay FIFO)
+//   GET /api/performance — hiệu suất giao dịch, replay FIFO trên audit log
+//     (server/performance.py:202-205, đang hiện thực song song; khi server
+//     chưa đăng ký router thì 404 → trạng thái trung tính như /api/portfolio).
 // Không tự chế endpoint ngoài hợp đồng; mọi response mang `generated_at`.
 import { parseErrorResponse } from "@/lib/api";
 
@@ -145,6 +148,58 @@ export type PortfolioPayload = {
 };
 
 // ---------------------------------------------------------------------------
+// GET /api/performance — server/performance.py:183-205 (replay FIFO trên audit
+// log). Shape lấy từ compute_performance; chưa có section riêng trong hợp đồng.
+
+export type PerformanceSummary = {
+  closed_trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  /** Trung bình lãi mỗi ván thắng, điểm % (> 0). */
+  avg_win_pct: number;
+  /** Trung bình lỗ mỗi ván thua, điểm % (luôn ≤ 0 — losses giữ dấu, performance.py:117-118). */
+  avg_loss_pct: number;
+  expectancy_pct: number;
+};
+
+export type PerformanceOpenPosition = {
+  ticker: string;
+  qty: number;
+  entry_price: number;
+  /** null khi sàn không trả giá mark — chỉ để hiển thị, không làm lỗi response. */
+  current_price: number | null;
+  unrealized_pct: number | null;
+  mode: string | null;
+  entry_at: string | null;
+};
+
+export type PerformanceBrackets = {
+  placed: number;
+  failed: number;
+};
+
+export type PerformanceOrder = {
+  timestamp: string | null;
+  ticker: string | null;
+  /** buy/sell và cả bracket_placed/bracket_failed — bridge.py:507,517,529 log
+   *  bracket với phase="execute" nên các dòng này lọt vào recent_orders. */
+  action: string | null;
+  qty: number | null;
+  price_est: number | null;
+  mode: string | null;
+  order_id: string | null;
+};
+
+export type PerformancePayload = {
+  generated_at: string;
+  summary: PerformanceSummary;
+  open_positions: PerformanceOpenPosition[];
+  brackets: PerformanceBrackets;
+  recent_orders: PerformanceOrder[];
+};
+
+// ---------------------------------------------------------------------------
 
 export function fetchHealth(): Promise<HealthPayload> {
   return fetchJson<HealthPayload>("/api/health");
@@ -160,6 +215,10 @@ export function fetchAudit(pageSize: number): Promise<AuditPayload> {
 
 export function fetchPortfolio(): Promise<PortfolioPayload> {
   return fetchJson<PortfolioPayload>("/api/portfolio");
+}
+
+export function fetchPerformance(): Promise<PerformancePayload> {
+  return fetchJson<PerformancePayload>("/api/performance");
 }
 
 /**

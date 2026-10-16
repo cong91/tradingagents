@@ -42,6 +42,7 @@ _NULL_DEFAULT_TYPES = {
     "openai_reasoning_effort": "str|null",
     "anthropic_effort": "str|null",
     "temperature": "float|null",
+    "llm_timeout": "float",
     "llm_max_retries": "int|null",
     "max_tokens": "int|null",
 }
@@ -50,6 +51,7 @@ _NULL_DEFAULT_TYPES = {
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 _ENV_BY_KEY = {key: env for env, key in _ENV_OVERRIDES.items()}
+_READONLY_ENV_KEYS = {"exec_base_url"}
 
 
 def _env_flag(name: str) -> bool:
@@ -130,13 +132,17 @@ def _settings_row(key: str, env_var: str, editable: bool) -> dict:
 def _settings_payload() -> dict:
     from tradingagents.execution.bridge import credential_env_names
 
-    rows = [_settings_row(key, env_var, editable=True) for key, env_var in _ENV_BY_KEY.items()]
+    rows = [
+        _settings_row(key, env_var, editable=key not in _READONLY_ENV_KEYS)
+        for key, env_var in _ENV_BY_KEY.items()
+    ]
     rows.extend(_settings_row(key, env_var, editable=False) for key, env_var in _PATH_KEYS.items())
     rows.sort(key=lambda row: row["key"])
 
-    exchange_id = str(get_config().get("exec_exchange_id", "binance"))
+    config = get_config()
+    exchange_id = str(config.get("exec_exchange_id", "binance"))
     credential_vars = ["OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"]
-    credential_vars.extend(credential_env_names(exchange_id))
+    credential_vars.extend(credential_env_names(exchange_id, config.get("exec_base_url")))
     credentials = []
     for env_var in credential_vars:
         raw = os.environ.get(env_var)
@@ -207,7 +213,7 @@ async def put_settings(request: Request):
     validated: dict[str, object] = {}
     for key, value in settings_in.items():
         env_var = _ENV_BY_KEY.get(key)
-        if env_var is None:
+        if env_var is None or key in _READONLY_ENV_KEYS:
             raise ApiError(403, "forbidden_key", f"setting {key!r} is read-only or unknown", {"key": key})
         try:
             validated[key] = _coerce_json(value, _type_name(key, DEFAULT_CONFIG.get(key)))

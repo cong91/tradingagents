@@ -12,6 +12,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { AutoloopCard } from "./autoloop-card";
 import { CredentialsCard } from "./credentials-card";
 import { formatDateTimeVi } from "./format-time";
 import { GatesCard } from "./gates-card";
@@ -176,6 +177,8 @@ export function SettingsScreen() {
               effectiveMode={payload.effective_exec_mode}
             />
           </div>
+          {/* Vòng tự động tự fetch GET /api/autoloop — độc lập với payload /api/settings. */}
+          <AutoloopCard />
           <PathsCard rows={grouped.pathRows} />
           <SaveBar controller={controller} />
         </div>

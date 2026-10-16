@@ -319,7 +319,11 @@ export function ApprovalsScreen() {
                 hiện coin có tín hiệu giao dịch. Hãy chạy pipeline từ màn M3 —
                 Tìm cặp giao dịch, rồi quay lại đây để duyệt.
               </p>
-              <Button className="min-touch" render={<Link href="/scanner" />}>
+              <Button
+                className="min-touch"
+                nativeButton={false}
+                render={<Link href="/scanner" />}
+              >
                 Mở màn Tìm cặp giao dịch
               </Button>
             </div>

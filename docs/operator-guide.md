@@ -133,12 +133,16 @@ Cách cài key:
 2. Thêm/sửa dòng, ví dụ:
    - `OPENAI_API_KEY=...` (hoặc `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY` tuỳ provider)
    - `BINANCE_API_KEY=...` và `BINANCE_SECRET=...` (khi chạy lệnh thật qua sàn)
-3. **Khởi động lại backend** (Ctrl+C cửa sổ 1 rồi chạy lại lệnh uvicorn) — env được
-   đọc lúc process khởi động.
-4. Vào màn **Cấu hình**, thẻ "Khóa API" phải hiện badge "Đã cấu hình ••••abcd".
+3. Chọn đúng bộ credentials theo venue URL:
+   - Binance Demo mặc định: `BINANCE_DEMO_API_KEY=...` và `BINANCE_DEMO_SECRET=...`.
+   - Binance production: `BINANCE_API_KEY=...`, `BINANCE_SECRET=...` và `TRADINGAGENTS_EXEC_BASE_URL=https://api.binance.com`.
+   Không trộn cặp key giữa hai endpoint. Backend kiểm tra URL host và chỉ đọc đúng cặp credentials tương ứng.
+4. **Khởi động lại backend** — env được đọc lúc process khởi động.
+5. Vào màn **Cấu hình**, thẻ "Khóa API" chỉ hiện trạng thái/mask của cặp credentials đang chọn; URL sàn hiện read-only ở nhóm "Thực thi & Sàn".
 
-Key nào cần khi nào? Xem §5.3 (tóm tắt: Mock không cần key nào; phân tích Live cần
-LLM key; duyệt lệnh thật cần thêm key sàn).
+Chuyển Demo sang production chỉ cần đổi `TRADINGAGENTS_EXEC_BASE_URL` cùng cặp API key/secret phù hợp rồi restart backend. Điều này **không mở** `exec_live`, auto-confirm hay derivatives gates; các gate vẫn fail-closed độc lập.
+
+Key nào cần khi nào? Xem §5.3 (Mock không cần key nào; phân tích Live cần LLM key; thực thi cần thêm đúng cặp key sàn).
 
 ---
 
@@ -149,19 +153,18 @@ Sidebar trái có 6 mục (`web/components/sidebar.tsx:15-22`). Thanh **Mode bar
 
 ### 3.0 Mode bar SANDBOX / LIVE
 
+`LIVE`/`SANDBOX` là trạng thái **quyền gửi lệnh**, không phải lựa chọn venue. Binance venue được chọn bằng `TRADINGAGENTS_EXEC_BASE_URL`: Demo là mặc định, production cần URL production cùng credentials production. Demo vẫn là lệnh live trên tài khoản Demo khi các gate LIVE mở; nó không phải paper/dry-run.
+
 Đọc `GET /api/settings` mỗi 30 giây (`web/components/mode-bar.tsx:22`). Bốn trạng thái:
 
 | Hiển thị | Ý nghĩa |
 |---|---|
-| **SANDBOX** (viền xanh dương, khiên) | Chế độ mô phỏng — **không có lệnh thật nào được gửi lên sàn**. Chữ SANDBOX che **hai trạng thái khác nhau** mà mode bar không phân biệt được (đều hiện SANDBOX): **(a) Cài mới** — `exec_live` đang `False` (mặc định, `default_config.py:206`): **mọi lần bấm Duyệt bị server từ chối 412 `gate_closed`**, kế hoạch giữ nguyên "Chờ duyệt", không có gì chạy cả mô phỏng (`server/approvals.py:246-251`). **(b) Trung gian** — `exec_live=True` trong config nhưng env `TRADINGAGENTS_EXEC_LIVE` tắt: duyệt được chấp nhận và chỉ *dry-fill* (ghi sổ mô phỏng, không chạm ccxt). |
-| **LIVE — LỆNH THẬT** (viền đỏ, tam giác cảnh báo) | "Cả hai cổng thực thi đang mở: lệnh được duyệt sẽ gửi thẳng lên sàn." Lệnh duyệt ở trạng thái này là tiền thật, không hoàn tác. |
+| **SANDBOX** (viền xanh dương, khiên) | Không có quyền gửi lệnh live hiện tại. Có thể do `exec_live=False` (duyệt trả 412 `gate_closed`) hoặc do config đã bật nhưng env `TRADINGAGENTS_EXEC_LIVE` đang tắt (duyệt chỉ ghi dry-fill, không chạm venue). |
+| **LIVE — LỆNH THẬT** (viền đỏ, tam giác cảnh báo) | Hai gate FR5 cùng mở: lệnh được duyệt có thể gửi bằng API tới venue đã cấu hình. Venue Demo vẫn là live execution trên số dư Demo; production dùng tài khoản tiền thật. |
 | ĐANG TẢI CHẾ ĐỘ… | Request đầu tiên chưa trả về. |
-| KHÔNG KẾT NỐI (viền vàng) + nút "Thử lại" | Không đọc được `/api/settings` — gần như chắc chắn backend chưa chạy (xem §4.1). |
+| KHÔNG KẾT NỐI (viền vàng) + nút "Thử lại" | Không đọc được `/api/settings` — backend có thể chưa chạy (xem §4.1). |
 
-> Hiểu nhanh: **SANDBOX ≠ duyệt được.** Trên cài mới, SANDBOX nghĩa là "không duyệt
-> được gì" (412); trạng thái dry-fill nằm giữa hai cổng và chỉ xuất hiện sau khi
-> operator đã mở nửa config (§4.8). Bấm Duyệt và nhận 412 là hành vi bình thường của
-> cài mới — không phải lỗi.
+> `SANDBOX` trên mode bar không chọn Binance Demo. Binance venue được xác định bởi URL read-only trong Settings; `exec_sandbox` chỉ điều khiển sandbox của các sàn khác. Với cài mới, `exec_live=False` nên bấm Duyệt trả 412.
 
 Vì sao LIVE phải hiển thị rõ ràng như vậy: duyệt lệnh LIVE là hành động không thể
 hoàn tác và mất tiền thật. LIVE chỉ bật khi **cả hai nửa cổng FR5** cùng mở —
@@ -397,9 +400,7 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     tiếp (đếm xuyên mã) → halt trong ngày.
   - *Đòn bẩy phái sinh tối đa / Phơi nhiễm phái sinh tối đa* (0 = chặn hẳn phái sinh).
   - Lưu ý: giá trị mới chỉ áp cho guard được dựng **sau** khi lưu (`types.ts:120`).
-- **Thực thi & Sàn** — `exec_exchange_id` (ví dụ `binance`), đồng tiền báo giá
-  (`exec_quote_currency`, ví dụ `USDT`), công tắc *Chế độ sandbox (testnet)* — chuyển
-  kết nối sang testnet của sàn, hướng an toàn.
+- **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
 
 **Các thẻ chỉ-đọc:**
 - *Khóa API* — trạng thái key (mục §2.2); không sửa được từ UI.
@@ -641,7 +642,7 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
 | Quét **"Quét ngay"** (hiện là live) | LLM key | Job per-coin như Pipeline Live; plan qua RiskGuard thật. Chế độ mock của daily job (API `POST /api/daily` `mode:"mock"`) dùng stub venue với **số demo cố định** — giá 83 078, tiền mặt 9 500 (`server/daily.py:45-46`); plan mock mang `mock:true`, **không bao giờ duyệt được** (409). |
 | **Duyệt lệnh** trên cài mới | Chưa được — cổng FR5 đóng → mọi lần duyệt trả 412 `gate_closed` (§4.8). | — |
 | **Duyệt lệnh** dry-fill | Nửa config đã arm + env tắt (trạng thái trung gian, §4.8) | Dry-fill ghi sổ mô phỏng, không chạm sàn. |
-| **Duyệt lệnh** LIVE | LLM key (đã dùng khi lập kế hoạch) + `BINANCE_API_KEY`/`BINANCE_SECRET` | `sync_portfolio` đọc số dư sàn; lệnh gửi qua ccxt (testnet nếu `exec_sandbox=true`). |
+| **Duyệt lệnh** LIVE | LLM key + cặp Binance phù hợp với URL đang chọn: `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET` cho Demo, hoặc `BINANCE_API_KEY`/`BINANCE_SECRET` cho production | URL Binance chỉ nhận host Demo hoặc production đã cho phép; lệnh qua ccxt tới đúng endpoint. Demo là live trên tài khoản Demo. |
 
 ### 5.4 Chưa kiểm chứng / giới hạn đã biết
 
@@ -652,10 +653,8 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
   tốn LLM phải gọi API trực tiếp.
 - **Không có cách huỷ run/job** và **không có nút reset halt** trên UI — đều là chủ đích
   thiết kế v1.
-- **Duyệt LIVE trên sàn thật chưa được kiểm chứng qua control panel.** Kiểm chứng gần
-  nhất về đường thực thi nằm ở tầng engine (lệnh testnet đã PASS trong quá khứ, thuộc
-  engine/CLI chứ không phải UI này). Với tiền thật: bật `exec_sandbox=true` (testnet)
-  trước khi cân nhắc LIVE.
+- **Live execution trên Binance Demo đã được kiểm tra end-to-end** bằng `python demo_flow_check.py`: spot fill + OCO bracket và futures fill + reduceOnly conditional legs; script dừng nếu API host không phải Binance Demo và dọn vị thế/orders sau test. Không chạy flow này với URL production.
+
 - **Bảo mật:** CSRF guard ≠ xác thực — mọi endpoint tin tưởng localhost; server bind
   `127.0.0.1` và **không được phép mở `--host` ra LAN** trước khi thêm token auth
   (chưa hiện thực — `server/main.py:7-13`).

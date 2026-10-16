@@ -39,13 +39,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.config import get_config
-from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.dataflows.symbols import crypto_base, futures_base
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.risk import RiskGuard, RiskLimits
@@ -54,26 +56,66 @@ from tradingagents.portfolio import PortfolioContext, Position
 
 logger = logging.getLogger(__name__)
 
+_UNIFIED_FUTURES_SYMBOL = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+:[A-Z0-9]+$")
 
-def credential_env_names(exchange_id: str) -> tuple[str, str]:
-    """Env var names for an exchange's credentials: ``{ID}_API_KEY``/``{ID}_SECRET``.
+_BINANCE_DEMO_HOSTS = frozenset({"demo-api.binance.com", "demo-fapi.binance.com"})
+_BINANCE_PRODUCTION_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 
-    "binance" maps to the L1 names BINANCE_API_KEY / BINANCE_SECRET unchanged;
-    every other id follows the same pattern (okx -> OKX_API_KEY, ...).
-    """
+
+def _binance_profile(base_url: str | None) -> str:
+    """Validate the configured Binance base URL and return its profile."""
+    raw = str(base_url or "").strip()
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.path not in ("", "/"):
+        raise ValueError("exec_base_url must be an HTTPS Binance API host without a path")
+    if host in _BINANCE_DEMO_HOSTS:
+        return "demo"
+    if host in _BINANCE_PRODUCTION_HOSTS:
+        return "production"
+    raise ValueError(
+        "exec_base_url must be https://demo-api.binance.com or https://api.binance.com"
+    )
+
+
+def credential_env_names(exchange_id: str, base_url: str | None = None) -> tuple[str, str]:
+    """Return credential env vars coupled to the selected venue profile."""
     upper = exchange_id.strip().upper()
+    if upper == "BINANCE" and _binance_profile(base_url or "https://api.binance.com") == "demo":
+        return "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_SECRET"
     return f"{upper}_API_KEY", f"{upper}_SECRET"
 
 
-def _default_exchange_factory(exchange_id: str, sandbox: bool = False) -> Any:
+def _assert_binance_urls(client: Any, profile: str) -> None:
+    expected = _BINANCE_DEMO_HOSTS if profile == "demo" else _BINANCE_PRODUCTION_HOSTS
+    api = client.urls.get("api", {}) if isinstance(getattr(client, "urls", None), dict) else {}
+    if isinstance(api, str):
+        watched = [api]
+    elif isinstance(api, dict):
+        watched = [
+            value for key, value in api.items()
+            if key in {"public", "private", "fapiPublic", "fapiPrivate"}
+        ]
+    else:
+        watched = []
+    hosts = {urlparse(str(url)).hostname for url in watched}
+    if not watched or not hosts.issubset(expected):
+        raise RuntimeError(
+            f"Binance {profile} profile resolved unexpected API hosts: {sorted(hosts)}"
+        )
+
+
+def _default_exchange_factory(
+    exchange_id: str, sandbox: bool = False, *, base_url: str | None = None
+) -> Any:
     """Build the configured ccxt client lazily; credentials from env only.
 
     ``exchange_id`` must name a ``ccxt.Exchange`` subclass (e.g. "binance",
     "okx"); anything else raises before any network call. ccxt is imported
     here, not at module level, so importing tradingagents.execution stays
-    cheap and tests can inject fakes. ``sandbox`` routes the client to the
-    exchange's testnet via ccxt's set_sandbox_mode -- testnet credentials
-    only authenticate there, never on production.
+    cheap and tests can inject fakes. For Binance, the safe mode is its Demo
+    Trading API (``demo-api.binance.com``), not Spot Testnet. Other exchanges
+    use ccxt's sandbox mode when available.
     """
     import ccxt
 
@@ -82,13 +124,33 @@ def _default_exchange_factory(exchange_id: str, sandbox: bool = False) -> Any:
         raise ValueError(
             f"exec_exchange_id {exchange_id!r} does not name a ccxt exchange class"
         )
-    key_env, secret_env = credential_env_names(exchange_id)
+    profile = None
+    if exchange_id == "binance":
+        profile = _binance_profile(base_url or "https://demo-api.binance.com")
+    credential_url = base_url or (
+        "https://demo-api.binance.com" if profile == "demo" else "https://api.binance.com"
+    ) if exchange_id == "binance" else None
+    key_env, secret_env = credential_env_names(exchange_id, credential_url)
+    api_key = os.environ.get(key_env, "")
+    secret = os.environ.get(secret_env, "")
+    if exchange_id == "binance" and (not api_key or not secret):
+        raise RuntimeError(f"missing exchange credentials: {key_env} and {secret_env}")
     client = klass({
-        "apiKey": os.environ.get(key_env, ""),
-        "secret": os.environ.get(secret_env, ""),
+        "apiKey": api_key,
+        "secret": secret,
         "enableRateLimit": True,
     })
-    if sandbox:
+    if exchange_id == "binance":
+        if profile == "demo":
+            enable_demo_trading = getattr(client, "enable_demo_trading", None)
+            if not callable(enable_demo_trading):
+                raise RuntimeError(
+                    "ccxt Binance client does not support Demo Trading mode; "
+                    "refusing to fall back to Spot Testnet"
+                )
+            enable_demo_trading(True)
+        _assert_binance_urls(client, profile)
+    elif sandbox:
         client.set_sandbox_mode(True)
     return client
 
@@ -137,9 +199,13 @@ class ExchangeBridge:
         if exchange_factory is not None:
             self._exchange_factory = exchange_factory
         else:
-            self._exchange_factory = lambda: _default_exchange_factory(
-                self.exchange_id, sandbox=self.config.get("exec_sandbox") is True
-            )
+            def build_exchange() -> Any:
+                kwargs = {"sandbox": self.config.get("exec_sandbox") is True}
+                if self.exchange_id == "binance":
+                    kwargs["base_url"] = self.config.get("exec_base_url")
+                return _default_exchange_factory(self.exchange_id, **kwargs)
+
+            self._exchange_factory = build_exchange
         self.rules = rules if rules is not None else SizingRules()
         self._exchange: Any | None = None
         self.risk_guard = risk_guard if risk_guard is not None else self._build_risk_guard()
@@ -162,6 +228,54 @@ class ExchangeBridge:
         except ValueError:
             return None
         return self._fetch_price(symbol)
+
+    def futures_symbol_for(self, ticker: str, *, markets: dict[str, Any] | None = None) -> str:
+        """Resolve a pipeline futures ticker against active contract metadata."""
+        overrides = self.config.get("exec_symbol_overrides")
+        requested = overrides.get(ticker) if isinstance(overrides, dict) else None
+        base = futures_base(ticker)
+        if not base and not requested:
+            raise ValueError(f"{ticker!r} is not a valid futures ticker")
+        if requested is not None:
+            requested = str(requested).strip().upper()
+            if not _UNIFIED_FUTURES_SYMBOL.fullmatch(requested):
+                raise ValueError(
+                    f"exec_symbol_overrides[{ticker!r}] = {requested!r} is not a valid unified futures symbol"
+                )
+        if markets is None:
+            markets = self._exchange_or_raise().load_markets()
+        if not isinstance(markets, dict):
+            raise ValueError("exchange returned invalid futures market metadata")
+        candidates = [str(requested)] if requested else [symbol for symbol in markets if isinstance(symbol, str)]
+        quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
+        for symbol in candidates:
+            if not isinstance(symbol, str) or not _UNIFIED_FUTURES_SYMBOL.fullmatch(symbol):
+                continue
+            market = markets.get(symbol)
+            if not isinstance(market, dict):
+                continue
+            if requested and symbol != requested:
+                continue
+            if not requested and (
+                str(market.get("base") or "").upper() != base
+                or str(market.get("quote") or "").upper() != quote
+            ):
+                continue
+            if requested and (
+                str(market.get("quote") or "").upper() != quote
+                or str(market.get("settle") or "").upper() != quote
+            ):
+                continue
+            market_type = str(market.get("type") or "").lower()
+            if market.get("active") is False or market.get("contract") is not True:
+                continue
+            if market_type not in {"swap", "future"}:
+                continue
+            settle = str(market.get("settle") or "").upper()
+            if settle != quote:
+                continue
+            return symbol
+        raise ValueError(f"no active {quote}-settled futures contract for {ticker!r}")
 
     def symbol_for(self, ticker: str) -> str:
         """Map a pipeline (Yahoo-form) ticker to the ccxt symbol.
@@ -357,7 +471,9 @@ class ExchangeBridge:
 
     def _execute_dry(self, order: PlannedOrder, confirm: bool) -> None:
         # Simulated fill: no exchange call of any kind, so no write endpoint
-        # can be reached and no confirm is needed (FR4).
+        # can be reached and no confirm is needed (FR4). Planned brackets
+        # ride the audit line via stop_loss/take_profit — the dry fill is the
+        # rehearsal for the live bracket placement.
         self._audit(
             action=order.side or "no_order",
             order=order,
@@ -391,7 +507,9 @@ class ExchangeBridge:
                 reason="missing exchange API credentials",
                 phase="execute",
             )
-            key_env, secret_env = credential_env_names(self.exchange_id)
+            key_env, secret_env = credential_env_names(
+                self.exchange_id, self.config.get("exec_base_url")
+            )
             raise RuntimeError(
                 f"live execution requires {key_env} and {secret_env}; nothing was sent"
             )
@@ -467,7 +585,107 @@ class ExchangeBridge:
                 f"order {order_id!r} WAS placed on {order.ccxt_symbol} but writing "
                 f"the audit log failed: {exc}"
             ) from exc
+        if order.side == "buy" and (order.stop_loss is not None or order.take_profit is not None):
+            self._place_bracket(order, confirm)
         return order_id
+
+    def _place_bracket(self, order: PlannedOrder, confirm: bool) -> None:
+        """Attach exchange-side protective exits after an entry fill.
+
+        Binance spot: one OCO order list (``POST /api/v3/orderList/oco``) —
+        the above leg takes profit at the target, the below leg stops out,
+        and they share the same locked balance (two separate orders would
+        double-lock it and refuse). The bracket lives on the venue, so the
+        stop survives this process dying — the exchange enforces it, not us.
+        Verified live on testnet: both legs appear as open orders with the
+        entry amount. A bracket that fails to place AFTER the entry filled
+        must never discard the fill or look like a failed order (safety #4):
+        it is audited loudly as ``bracket_failed`` and the position stays,
+        protected only by the next daily loop's exit signals.
+        """
+        exchange = self._exchange_or_raise()
+        market_id = exchange.market_id(order.ccxt_symbol)
+        # A market buy's taker fee is charged in the received asset, so the
+        # filled base amount is slightly BELOW the planned quantity — the OCO
+        # must sell what is actually held (verified live: selling the planned
+        # quantity after a fill refuses with InsufficientFunds).
+        base = order.ccxt_symbol.split("/", 1)[0]
+        balance = exchange.fetch_balance()
+        held = float((balance.get("free") or {}).get(base, 0) or 0)
+        bracket_qty = exchange.amount_to_precision(
+            order.ccxt_symbol, min(float(order.quantity), held)
+        )
+        if not float(bracket_qty) > 0:
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"no sellable {base} after the entry fill (free={held}); "
+                       "bracket not placed",
+                phase="execute",
+            )
+            return
+        request: dict[str, Any] = {
+            "symbol": market_id,
+            "side": "SELL",
+            "quantity": bracket_qty,
+        }
+        if order.take_profit is not None:
+            request["aboveType"] = "LIMIT_MAKER"
+            request["abovePrice"] = exchange.price_to_precision(
+                order.ccxt_symbol, order.take_profit
+            )
+        if order.stop_loss is not None:
+            request["belowType"] = "STOP_LOSS"
+            request["belowStopPrice"] = exchange.price_to_precision(
+                order.ccxt_symbol, order.stop_loss
+            )
+        import ccxt
+
+        try:
+            # The camelCase implicit method (ccxt generates no snake_case
+            # alias for this endpoint in 4.5.x) — verified on testnet.
+            place = getattr(exchange, "privatePostOrderListOco", None)
+            if place is None:
+                raise RuntimeError("exchange client does not expose orderList/oco")
+            response = place(request)
+        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"exchange error placing protective exits: {exc}",
+                phase="execute",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — the entry already filled
+            self._audit(
+                action="bracket_failed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                reason=f"unexpected error placing protective exits: {exc!r}",
+                phase="execute",
+            )
+            return
+        bracket_id = response.get("orderListId") if isinstance(response, dict) else None
+        try:
+            self._audit(
+                action="bracket_placed",
+                order=order,
+                mode="live",
+                confirmed=confirm,
+                order_id=str(bracket_id) if bracket_id is not None else None,
+                reason="exchange-side OCO stopLoss/takeProfit attached after entry fill",
+                phase="execute",
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"bracket {bracket_id!r} WAS placed on {order.ccxt_symbol} but writing "
+                f"the audit log failed: {exc}"
+            ) from exc
 
     def _effective_mode(self) -> str:
         # ``is True`` on purpose: the config gate only opens on a real boolean
@@ -597,6 +815,10 @@ class ExchangeBridge:
             "market": getattr(order, "market", "spot"),
             "leverage": getattr(order, "leverage", 1.0),
         }
+        if getattr(order, "stop_loss", None) is not None:
+            event["stop_loss"] = order.stop_loss
+        if getattr(order, "take_profit", None) is not None:
+            event["take_profit"] = order.take_profit
         if qty_precision is not None:
             event["qty_precision"] = qty_precision
         if reason is not None:

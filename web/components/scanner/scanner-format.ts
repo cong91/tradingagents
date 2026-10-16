@@ -50,3 +50,28 @@ export function elapsedLabel(fromIso: string, nowMs: number): string {
   if (minutes >= 1) return `${minutes} phút ${seconds % 60} giây`;
   return `${seconds} giây`;
 }
+
+/** Nhãn tiếng Việt cho trạng thái job (contract §5 rev 7). */
+export function jobStatusLabel(status: string): string {
+  switch (status) {
+    case "queued":
+      return "Đang chờ";
+    case "running":
+      return "Đang chạy";
+    case "completed":
+      return "Hoàn tất";
+    case "failed":
+      return "Thất bại";
+    case "cancelled":
+      return "Đã dừng";
+    case "interrupted":
+      return "Bị gián đoạn";
+    default:
+      return status;
+  }
+}
+
+/** Job đã kết thúc (mọi trạng thái không còn chiếm worker). */
+export function isTerminalStatus(status: string): boolean {
+  return !["queued", "running"].includes(status);
+}

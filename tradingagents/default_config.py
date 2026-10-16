@@ -27,6 +27,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
+    "TRADINGAGENTS_LLM_TIMEOUT":          "llm_timeout",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
@@ -51,9 +52,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE":     "risk_max_derivatives_leverage",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT": "risk_max_derivatives_exposure_pct",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
-    # Sandbox routes the client to the exchange's testnet (ccxt
-    # set_sandbox_mode); safe direction, so env-overridable is fine -- unlike
-    # exec_live it can never send orders to real-money venues by itself.
+    "TRADINGAGENTS_EXEC_BASE_URL":                     "exec_base_url",
+    # Safe mode routes Binance to its Demo Trading API; other exchanges use
+    # their ccxt sandbox when available. This is safe-direction and env-overridable.
     "TRADINGAGENTS_EXEC_SANDBOX":                      "exec_sandbox",
 }
 
@@ -143,6 +144,9 @@ def build_default_config() -> dict:
         # variation on models that honor it; reasoning models largely ignore it
         # and no setting makes LLM output bit-identical across runs (see README).
         "temperature": None,
+        # Bound one provider request so a stalled relay cannot hold an autoloop
+        # worker forever. The default stays below common reverse-proxy read limits.
+        "llm_timeout": 60.0,
         # SDK retry budget forwarded to every provider chat client. None leaves each
         # provider/SDK at its own default (usually 2). Raise it to ride out bursty
         # 429 throttling on rate-limited deployments instead of aborting a run (#1091).
@@ -258,9 +262,10 @@ def build_default_config() -> dict:
         # (e.g. {"BTC-USD": "BTC/USDC"}), bypassing the closed crypto set.
         "exec_exchange_id": "binance",
         "exec_symbol_overrides": {},
-        # Route the ccxt client to the exchange's testnet (ccxt set_sandbox_mode).
-        # Testnet credentials only authenticate there, never on production; the
-        # FR5 live gates still apply on top.
+        # Explicit Binance venue URL. Demo is the safe default; switching to
+        # production is a credentials-and-URL change, independent of live gates.
+        "exec_base_url": "https://demo-api.binance.com",
+        # Route non-Binance exchanges through ccxt sandbox when requested.
         "exec_sandbox": False,
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],

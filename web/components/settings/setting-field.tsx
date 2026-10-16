@@ -29,9 +29,13 @@ export function SettingField({
   return (
     <div className="grid gap-2 border-t py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_minmax(0,340px)] sm:items-center sm:gap-4">
       <div className="min-w-0">
-        <label htmlFor={id} className="text-sm font-medium">
-          {label}
-        </label>
+        {!row.editable ? (
+          <span className="text-sm font-medium">{label}</span>
+        ) : (
+          <label htmlFor={id} className="text-sm font-medium">
+            {label}
+          </label>
+        )}
         {meta?.hint ? (
           <p className="mt-0.5 text-xs text-muted-foreground">{meta.hint}</p>
         ) : null}
@@ -40,7 +44,11 @@ export function SettingField({
         </p>
       </div>
       <div className="flex items-center gap-2">
-        {fieldType === "bool" ? (
+        {!row.editable ? (
+          <span className="min-w-0 flex-1 break-all rounded-md border border-border bg-muted/40 px-3 py-2 font-mono text-xs text-muted-foreground">
+            {value === null || value === undefined ? "—" : String(value)}
+          </span>
+        ) : fieldType === "bool" ? (
           // Mục tiêu chạm = cả nhãn (min-touch ≥44px), không chỉ ô checkbox.
           <label
             htmlFor={id}

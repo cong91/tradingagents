@@ -107,6 +107,24 @@ export function ApprovalCard({
             {item.market === "spot" ? "Spot" : (item.market ?? "—")}
             {hasLeverage ? ` · đòn bẩy ${item.leverage}×` : ""}
           </Field>
+          <Field label="Cắt lỗ (SL)">
+            {item.stop_loss != null ? (
+              <span className="tabular-nums text-destructive">
+                {formatPrice(item.stop_loss)}
+              </span>
+            ) : (
+              "—"
+            )}
+          </Field>
+          <Field label="Chốt lời (TP)">
+            {item.take_profit != null ? (
+              <span className="tabular-nums text-emerald-700 dark:text-emerald-400">
+                {formatPrice(item.take_profit)}
+              </span>
+            ) : (
+              "—"
+            )}
+          </Field>
         </dl>
         {(item.plan_reason || item.mode_at_plan) && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">

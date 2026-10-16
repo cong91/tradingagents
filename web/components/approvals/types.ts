@@ -29,6 +29,10 @@ export type ApprovalItem = {
   leverage: number | null;
   mode_at_plan: string | null;
   plan_reason: string | null;
+  /** Giá cắt lỗ/chốt lời đính kèm kế hoạch (ATR-derived, rev 5) — null khi
+   *  ATR không đọc được; approve → execute sẽ đặt bracket trên sàn. */
+  stop_loss?: number | null;
+  take_profit?: number | null;
   /** Kế hoạch demo từ job mock — approve bị server từ chối (409). */
   mock?: boolean;
   status: ApprovalStatus;

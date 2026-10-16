@@ -13,12 +13,28 @@ exempt. This is not authentication: bind beyond 127.0.0.1 only after adding a
 token (contract §0, §11.12).
 """
 
+import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 
-from server import approvals, audit, daily, health, history, portfolio, runs, settings, watchlist
+from server import (
+    approvals,
+    audit,
+    autoloop,
+    daily,
+    db,
+    health,
+    history,
+    job_store,
+    paths,
+    performance,
+    portfolio,
+    runs,
+    settings,
+    watchlist,
+)
 from server.contract import error_response, install_error_handlers
 
 # Origins allowed to drive state-changing requests: the server itself, the
@@ -35,9 +51,53 @@ ALLOWED_ORIGINS = {
 _STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE"}
 
 
+def _apply_operator_config() -> None:
+    """Load the operator's arming overrides (server/data/operator_config.json)
+    into the process config at startup.
+
+    The shipped engine defaults stay fail-closed (tests pin them); an operator
+    arms gates like ``exec_auto_confirm`` through this local file instead of
+    editing engine code. Malformed or unreadable content is ignored — the
+    loop simply stays off.
+    """
+    import json
+
+    from tradingagents.dataflows.config import set_config
+
+    try:
+        data = json.loads(paths.OPERATOR_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict):
+        set_config({k: v for k, v in data.items() if not k.startswith("_")})
+
+
+def _open_state_db() -> None:
+    """Open the API-layer database and close out what the last process left running.
+
+    A job or run recorded as active belongs to a thread that no longer exists
+    after a restart, and the worker lock is derived from that status — so
+    without this reconciliation a crashed job would answer 409 to every new one
+    forever, with nothing in the UI able to show or clear it. Reconciliation
+    writes an audit line per orphan, so the operator can see it happened.
+    """
+    db.connect().close()  # creates the file and the schema
+    daily.reconcile()  # each reconciled orphan writes its own audit line
+    runs.reconcile()
+    job_store.reconcile_futures_cycles()
+    with suppress(Exception):
+        autoloop.recover_pending_brackets()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    with suppress(OSError):  # an unreadable data dir must not keep the server down
+        _apply_operator_config()
+    with suppress(OSError, sqlite3.Error):  # a broken database must not keep the server down
+        _open_state_db()
     watchlist.ensure_seeded()
+    with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
+        autoloop.ensure_started()
     yield
 
 
@@ -75,5 +135,7 @@ for _router in (
     audit.router,
     history.router,
     health.router,
+    performance.router,
+    autoloop.router,
 ):
     app.include_router(_router)

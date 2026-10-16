@@ -89,13 +89,26 @@ def _today() -> str:
 
 @pytest.fixture(autouse=True)
 def _server_state(tmp_path, monkeypatch):
-    """Point all server state at tmp and start every test with an empty registry."""
+    """Point all server state at tmp and start every test with an empty registry.
+
+    ``watchlist._save_state`` deliberately syncs ``DEFAULT_CONFIG
+    ["exec_watchlist"]`` (process-global, so the in-process daily runner sees
+    the same list), which would leak into later test files
+    (test_execution_daily reads the default) — snapshot and restore it.
+    """
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
     monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
     monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
     monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
+    monkeypatch.setattr(server_paths, "OPERATOR_CONFIG_PATH", tmp_path / "operator_config.json")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
+    set_config({"exec_live": False})
+    yield
+    DEFAULT_CONFIG["exec_watchlist"] = saved_watchlist
 
 
 @pytest.fixture()
@@ -139,6 +152,8 @@ def test_settings_get_masks_credentials_and_lists_paths(client, monkeypatch):
     # reports configured/masked, so blank them here to make the assert exact.
     monkeypatch.delenv("BINANCE_API_KEY", raising=False)
     monkeypatch.delenv("BINANCE_SECRET", raising=False)
+    monkeypatch.delenv("BINANCE_DEMO_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_DEMO_SECRET", raising=False)
     response = client.get("/api/settings")
     assert response.status_code == 200
     body = response.json()
@@ -147,16 +162,18 @@ def test_settings_get_masks_credentials_and_lists_paths(client, monkeypatch):
     readonly = {row["key"] for row in body["settings"] if not row["editable"]}
     # Contract §1 prose says "24 rows" but its own list — and the file — have 25
     # (_ENV_OVERRIDES, default_config.py:10-53). The mapping is authoritative.
-    assert len(editable) == len(_ENV_OVERRIDES)
+    assert len(editable) == len(_ENV_OVERRIDES) - 1
     assert "llm_provider" in {row["key"] for row in editable}
-    assert readonly == {"results_dir", "data_cache_dir", "memory_log_path", "exec_log_path"}
+    assert readonly == {
+        "results_dir", "data_cache_dir", "memory_log_path", "exec_log_path", "exec_base_url",
+    }
 
     credentials = {item["env_var"]: item for item in body["credentials"]}
     assert credentials["OPENAI_API_KEY"]["configured"] is True
     assert credentials["OPENAI_API_KEY"]["masked"].endswith("1234")
     assert "sk-test-abcd" not in response.text  # never the raw key
-    assert credentials["BINANCE_API_KEY"]["configured"] is False
-    assert credentials["BINANCE_API_KEY"]["masked"] is None
+    assert credentials["BINANCE_DEMO_API_KEY"]["configured"] is False
+    assert credentials["BINANCE_DEMO_API_KEY"]["masked"] is None
 
     assert body["gates_readonly"]["exec_live_config"] is False
     assert body["effective_exec_mode"] == "dry"
@@ -183,6 +200,32 @@ def test_settings_put_forbids_gate_and_unknown_keys(client):
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "forbidden_key"
     assert get_config()["exec_live"] is False  # the FR5 config gate never moves via API
+
+
+def test_settings_credentials_follow_binance_venue_url(client, monkeypatch):
+    set_config({"exec_base_url": "https://api.binance.com"})
+    monkeypatch.setenv("BINANCE_API_KEY", "prod-key-1234")
+    monkeypatch.setenv("BINANCE_SECRET", "prod-secret-5678")
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key-9999")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret-0000")
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    body = response.json()
+    credential_vars = {item["env_var"] for item in body["credentials"]}
+    assert "BINANCE_API_KEY" in credential_vars
+    assert "BINANCE_SECRET" in credential_vars
+    assert "BINANCE_DEMO_API_KEY" not in credential_vars
+    assert "prod-key-1234" not in response.text
+    assert "demo-key-9999" not in response.text
+
+
+def test_settings_put_forbids_venue_url_switch(client):
+    response = client.put(
+        "/api/settings", json={"settings": {"exec_base_url": "https://api.binance.com"}}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden_key"
 
 
 def test_settings_put_coercion_error_names_env_var(client):
@@ -247,6 +290,10 @@ def test_watchlist_add_delete_roundtrip(client):
 
     empty = client.post("/api/watchlist", json={"symbol": "   "})
     assert empty.status_code == 400
+
+    malformed = client.post("/api/watchlist", json={"symbol": "MOVR-USD, LITE"})
+    assert malformed.status_code == 400
+    assert malformed.json()["error"]["code"] == "validation_error"
 
     removed = client.delete("/api/watchlist/sol-usd", headers=_JSON)
     assert removed.status_code == 200
@@ -631,6 +678,24 @@ def test_approve_execute_failed_when_guard_refuses(client, tmp_path, monkeypatch
     assert '"action": "rejected_by_risk"' in engine_log
 
 
+def test_approve_venue_portfolio_failure_stays_pending(client, monkeypatch):
+    set_config({"exec_live": True})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+
+    class _DeadVenue(_FakeExchange):
+        def fetch_balance(self):
+            raise RuntimeError("exchangeInfo 502 Bad Gateway")
+
+    _inject_bridge(monkeypatch, _DeadVenue())
+    item = _enqueue()
+
+    response = client.post(f"/api/approvals/{item['id']}/approve", json={})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "exchange_unreachable"
+    assert approvals_mod._load_items()[0]["status"] == "pending"
+
+
 def test_approve_exchange_failure_marks_execute_failed(client, tmp_path, monkeypatch):
     set_config({"exec_live": True, "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
@@ -999,6 +1064,99 @@ def test_daily_and_runs_share_one_worker_lock(client):
     job_while_busy = client.post("/api/daily", json={"tickers": ["ETH-USD"], "mode": "mock"})
     assert job_while_busy.status_code == 409
     assert job_while_busy.json()["error"]["details"]["job_id"] == "d_active"
+
+
+def test_daily_auto_mock_screens_then_replays_pipeline(client, tmp_path):
+    """Auto mode (§5 rev 4): mock screens deterministically, then the pipeline
+    runs on the screened candidates — one click, no watchlist, no network."""
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+
+    created = client.post("/api/daily", json={"auto": True, "mode": "mock", "top_n": 3})
+    assert created.status_code == 202
+    assert created.json()["tickers"] == []  # decided by the screen inside the worker
+
+    job = _await_job(client, created.json()["job_id"])
+    assert job["status"] == "completed"
+    screening = job["screening"]
+    assert screening["mock"] is True
+    assert screening["universe_count"] == 3
+    tickers = [candidate["ticker"] for candidate in screening["candidates"]]
+    assert tickers == job["tickers"] == ["BTC-USD", "ETH-USD", "NVDA"]
+
+    # the pipeline ran on the screened candidates in rank order, stock advisory
+    assert [result["asset_type"] for result in job["results"]] == ["crypto", "crypto", "stock"]
+    btc, _eth, nvda = job["results"]
+    assert btc["signal"] == "Hold"  # synthetic fixture, no state log → Hold
+    assert nvda["asset_type"] == "stock"
+    assert nvda["plan"] is None
+    assert nvda["approval_id"] is None
+    assert "advisory only" in nvda["reason"]
+    assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
+def test_daily_auto_validates_body_and_never_takes_tickers(client):
+    set_config({"results_dir": "results", "exec_log_path": "engine-audit.jsonl"})
+    for bad_body in (
+        {"auto": "yes"},          # not a boolean
+        {"auto": True, "top_n": 0},
+        {"auto": True, "top_n": 21},
+        {"auto": True, "top_n": "3"},
+        {"auto": True, "mode": "mock", "tickers": ["BTC-USD"]},  # screen picks, not you
+    ):
+        response = client.post("/api/daily", json=bad_body)
+        assert response.status_code == 400, bad_body
+        assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_daily_auto_off_set_crypto_is_advisory(client, tmp_path, monkeypatch):
+    """A crypto-universe ticker outside the closed executable set (QNT-USD)
+    keeps the crypto analysts but cannot plan: its result is advisory, never a
+    bridge ValueError."""
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+    monkeypatch.setattr(daily_mod, "MOCK_AUTO_CANDIDATES", (
+        {"ticker": "QNT-USD", "asset_type": "crypto", "score": 3.0,
+         "last_close": 294.5, "momentum_pct": 12.0, "trend_pct": 4.0,
+         "volume_ratio": 1.1, "reasons": ["+12.0% trong 20 phiên"]},
+    ))
+
+    created = client.post("/api/daily", json={"auto": True, "mode": "mock"})
+    assert created.status_code == 202
+    job = _await_job(client, created.json()["job_id"])
+    (result,) = job["results"]
+    assert result["asset_type"] == "crypto"
+    assert result["plan"] is None
+    assert result["approval_id"] is None
+    assert "outside the executable crypto set" in result["reason"]
+    assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
+def test_daily_mock_buy_plan_carries_bracket_and_approval_keeps_it(client, tmp_path):
+    """A Buy plan gets protective exits attached (mock: fixed demo distances),
+    and the approval item + rebuilt plan both carry them so approve → execute
+    can place the exchange-side bracket."""
+    _state_log(tmp_path, rating="Buy")
+    set_config({"results_dir": str(tmp_path / "results"),
+                "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
+
+    created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})
+    job = _await_job(client, created.json()["job_id"])
+    (result,) = job["results"]
+    plan = result["plan"]
+    assert plan["side"] == "buy"
+    price = plan["price_est"]
+    assert plan["stop_loss"] == pytest.approx(price * 0.96)
+    assert plan["take_profit"] == pytest.approx(price * 1.08)
+
+    items = client.get("/api/approvals").json()["items"]
+    (item,) = items
+    assert item["stop_loss"] == pytest.approx(price * 0.96)
+    assert item["take_profit"] == pytest.approx(price * 1.08)
+
+    rebuilt = approvals_mod._rebuild_plan(item)
+    assert rebuilt.stop_loss == pytest.approx(price * 0.96)
+    assert rebuilt.take_profit == pytest.approx(price * 1.08)
 
 
 def test_daily_mock_plan_cannot_be_approved(client, tmp_path):
