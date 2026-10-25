@@ -33,6 +33,8 @@ import { EmptyState } from "./empty-state";
 import { PortfolioCard } from "./portfolio-card";
 import { PerformanceCard } from "./performance-card";
 import { OverviewActivityCard } from "./activity-card";
+import { useT } from "@/lib/i18n";
+import { formatDateWith } from "@/lib/format";
 
 // Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8/§9):
 // audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6);
@@ -53,13 +55,14 @@ const loadPortfolio = () => fetchPortfolio();
 const loadPerformance = () => fetchPerformance();
 
 function PanelSkeleton() {
+  const t = useT();
   return (
     <div
       className="flex h-40 items-center justify-center gap-2 rounded-lg border border-dashed text-sm text-muted-foreground"
       role="status"
     >
       <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
-      Đang tải dữ liệu…
+      {t.common.loadingData}
     </div>
   );
 }
@@ -73,37 +76,41 @@ function PanelError({
   code: string;
   onRetry: () => void;
 }) {
+  const t = useT();
   return (
     <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed px-6 py-8">
       <p className="text-sm font-medium text-destructive">
-        Không đọc được dữ liệu ({code})
+        {t.overview.cannotReadData(code)}
       </p>
       <p className="text-sm text-muted-foreground">{message}</p>
       <Button variant="outline" size="sm" className="min-touch" onClick={onRetry}>
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
 }
 
 function StaleErrorNote({ message, code }: { message: string; code: string }) {
+  const t = useT();
   return (
     <p role="alert" className="text-sm text-destructive">
-      Lần poll gần nhất lỗi ({code}) — đang hiển thị dữ liệu cũ: {message}
+      {t.overview.staleNote(code, message)}
     </p>
   );
 }
 
 function StaleBadge() {
+  const t = useT();
   return (
     <Badge variant="outline" className="gap-1">
       <TriangleAlertIcon className="size-3" aria-hidden="true" />
-      Dữ liệu cũ
+      {t.common.staleData}
     </Badge>
   );
 }
 
 function HistorySection({ state }: { state: ReadyPanel<HistoryPayload> }) {
+  const t = useT();
   // useMemo giữ identity của series ổn định giữa các render — biểu đồ không bị dựng lại chỉ vì đồng hồ stale chạy.
   const summary = useMemo(
     () => summarizeHistory(state.data.items),
@@ -113,9 +120,9 @@ function HistorySection({ state }: { state: ReadyPanel<HistoryPayload> }) {
   if (state.data.items.length === 0) {
     return (
       <EmptyState
-        title="Chưa có quyết định nào trong nhật ký"
-        hint="Lịch sử quyết định được ghi lại khi một phiên phân tích chạy xong. Hãy chạy pipeline để bắt đầu."
-        action={{ label: "Chạy phân tích ở Agent Pipeline", href: "/pipeline" }}
+        title={t.overview.noDecisionsTitle}
+        hint={t.overview.noDecisionsHint}
+        action={{ label: t.overview.noDecisionsAction, href: "/pipeline" }}
       />
     );
   }
@@ -126,30 +133,27 @@ function HistorySection({ state }: { state: ReadyPanel<HistoryPayload> }) {
         <StaleErrorNote message={state.message} code={state.code} />
       ) : null}
       {state.data.warning ? (
-        <p className="text-xs text-muted-foreground">Cảnh báo: {state.data.warning}</p>
+        <p className="text-xs text-muted-foreground">{t.common.warning(state.data.warning)}</p>
       ) : null}
       <KpiCards summary={summary} />
       {summary.series.length > 0 ? (
         <AlphaChart points={summary.series} />
       ) : (
         <EmptyState
-          title="Chưa có quyết định nào đã chốt để vẽ biểu đồ"
-          hint="Một quyết định chỉ có alpha sau thời gian nắm giữ. Các quyết định đang chờ sẽ về đây khi được chốt."
-          action={{ label: "Xem quyết định đang chờ ở Lịch sử & Audit", href: "/audit" }}
+          title={t.overview.noResolvedTitle}
+          hint={t.overview.noResolvedHint}
+          action={{ label: t.overview.noResolvedAction, href: "/audit" }}
         />
       )}
       <p className="text-xs text-muted-foreground">
-        Số liệu tính trên {state.data.items.length}
-        {state.data.total > state.data.items.length
-          ? ` quyết định gần nhất (tổng ${state.data.total})`
-          : " quyết định"}
-        .
+        {t.overview.computedOn(state.data.items.length, state.data.total)}
       </p>
     </div>
   );
 }
 
 function AuditSection({ state }: { state: ReadyPanel<AuditPayload> }) {
+  const t = useT();
   return (
     <div className="space-y-3">
       {state.status === "stale" ? (
@@ -158,7 +162,7 @@ function AuditSection({ state }: { state: ReadyPanel<AuditPayload> }) {
       <OrderTable items={state.data.items} />
       {state.data.skipped_lines > 0 ? (
         <p className="text-xs text-muted-foreground">
-          Cảnh báo: {state.data.skipped_lines} dòng log hỏng đã bị bỏ qua.
+          {t.overview.skippedLines(state.data.skipped_lines)}
         </p>
       ) : null}
     </div>
@@ -166,6 +170,7 @@ function AuditSection({ state }: { state: ReadyPanel<AuditPayload> }) {
 }
 
 export function OverviewDashboard() {
+  const t = useT();
   // Đồng hồ 5s chỉ để tính lại badge "cũ" giữa hai lần poll.
   const [clock, setClock] = useState<number>(() => Date.now());
   useEffect(() => {
@@ -231,14 +236,16 @@ export function OverviewDashboard() {
       <div className="mb-4 flex items-center justify-between gap-3">
         <p className="text-xs text-muted-foreground" aria-live="polite">
           {latestFetchedAt === null
-            ? "Chưa có dữ liệu"
-            : `Cập nhật lúc ${new Date(latestFetchedAt).toLocaleTimeString("vi-VN")}`}
+            ? t.overview.noDataYet
+            : t.overview.updatedAt(
+                formatDateWith(latestFetchedAt, { hour: "numeric", minute: "2-digit", second: "2-digit" })
+              )}
         </p>
         <div className="flex items-center gap-2">
           {anyStale ? <StaleBadge /> : null}
           <Button className="min-touch" onClick={refreshAll}>
             <RefreshCwIcon aria-hidden="true" />
-            Làm mới
+            {t.common.refresh}
           </Button>
         </div>
       </div>
@@ -248,10 +255,10 @@ export function OverviewDashboard() {
       {halted ? (
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border-l-4 border-red-600 bg-red-50 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-100">
           <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
-          <span className="font-semibold">RiskGuard đã dừng giao dịch hôm nay.</span>
+          <span className="font-semibold">{t.overview.haltedToday}</span>
           {haltReason ? <span className="truncate">{haltReason}</span> : null}
           <a href="/audit" className="ml-auto inline-flex min-touch items-center underline">
-            Xem audit
+            {t.overview.viewAudit}
           </a>
         </div>
       ) : null}
@@ -259,9 +266,9 @@ export function OverviewDashboard() {
       {pendingApprovals > 0 ? (
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border-l-4 border-amber-500 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
           <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
-          <span className="font-semibold">{pendingApprovals} lệnh đang chờ duyệt.</span>
+          <span className="font-semibold">{t.overview.pendingApprovals(pendingApprovals)}</span>
           <a href="/approvals" className="ml-auto inline-flex min-touch items-center underline">
-            Mở màn Duyệt lệnh
+            {t.overview.openApprovals}
           </a>
         </div>
       ) : null}
@@ -286,11 +293,8 @@ export function OverviewDashboard() {
 
           <Card>
             <CardHeader>
-              <CardTitle>Hiệu suất quyết định</CardTitle>
-              <CardDescription>
-                Alpha của các quyết định trong decision log, đơn vị điểm % — lãi luôn kèm
-                dấu +, lỗ luôn kèm dấu −.
-              </CardDescription>
+              <CardTitle>{t.overview.decisionPerformanceTitle}</CardTitle>
+              <CardDescription>{t.overview.decisionPerformanceDescription}</CardDescription>
               {history.stale ? <StaleBadge /> : null}
             </CardHeader>
             <CardContent>
@@ -317,10 +321,9 @@ export function OverviewDashboard() {
 
           <Card className="mt-4">
             <CardHeader>
-              <CardTitle>Lệnh thực thi gần đây</CardTitle>
-              <CardDescription>
-                Spot mua/bán hiển thị ước tính dòng tiền; Futures hiển thị notional và margin, không phải tiền vào hoặc lãi/lỗ đã chốt.
-              </CardDescription>
+              <CardTitle>{t.overview.recentOrdersTitle}</CardTitle>
+              <CardDescription>{t.overview.recentOrdersDescription}</CardDescription>
+
               {audit.stale ? <StaleBadge /> : null}
             </CardHeader>
             <CardContent>

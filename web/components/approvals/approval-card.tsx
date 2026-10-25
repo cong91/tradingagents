@@ -23,6 +23,7 @@ import {
   SignalBadge,
 } from "./labels";
 import type { ApprovalItem } from "./types";
+import { useT } from "@/lib/i18n";
 
 /** Badge "quá hạn" là suy đoán phía client (contract §4): item còn pending
  * nhưng expires_at đã qua. Server không lưu trạng thái này. */
@@ -52,6 +53,8 @@ export function ApprovalCard({
   onApprove: (item: ApprovalItem) => void;
   onReject: (item: ApprovalItem) => void;
 }) {
+  const t = useT();
+  const c = t.approvals.card;
   const ticker = item.ticker ?? item.id;
   const hasLeverage = item.leverage != null && item.leverage > 1;
 
@@ -68,12 +71,12 @@ export function ApprovalCard({
         <CardDescription className="flex flex-wrap items-center gap-x-2">
           <span className="inline-flex items-center gap-1">
             <ClockIcon className="size-3.5" aria-hidden="true" />
-            Đề xuất lúc {item.created_at ? formatDateTime(item.created_at) : "—"}
+            {c.proposedAt(item.created_at ? formatDateTime(item.created_at) : "—")}
           </span>
           {item.expires_at ? (
             <>
               <span aria-hidden="true">·</span>
-              <span>Hạn duyệt {formatDateTime(item.expires_at)}</span>
+              <span>{c.deadline(formatDateTime(item.expires_at))}</span>
             </>
           ) : null}
           <span aria-hidden="true">·</span>
@@ -86,15 +89,15 @@ export function ApprovalCard({
       </CardHeader>
       <CardContent>
         <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <Field label="Khối lượng">
+          <Field label={c.quantity}>
             {item.quantity != null
               ? formatQuantity(item.quantity, item.ccxt_symbol, item.ticker)
               : "—"}
           </Field>
-          <Field label="Giá ước tính">
+          <Field label={c.estPrice}>
             {item.price_est != null ? formatPrice(item.price_est) : "—"}
           </Field>
-          <Field label="Giá trị lệnh">
+          <Field label={c.orderValue}>
             {item.cost != null ? (
               <span className="tabular-nums">
                 {formatOrderAmount(item.cost, item.side)}
@@ -103,11 +106,11 @@ export function ApprovalCard({
               "—"
             )}
           </Field>
-          <Field label="Thị trường">
+          <Field label={c.market}>
             {item.market === "spot" ? "Spot" : (item.market ?? "—")}
-            {hasLeverage ? ` · đòn bẩy ${item.leverage}×` : ""}
+            {hasLeverage && item.leverage != null ? c.leverage(item.leverage) : ""}
           </Field>
-          <Field label="Cắt lỗ (SL)">
+          <Field label={c.stopLoss}>
             {item.stop_loss != null ? (
               <span className="tabular-nums text-destructive">
                 {formatPrice(item.stop_loss)}
@@ -116,7 +119,7 @@ export function ApprovalCard({
               "—"
             )}
           </Field>
-          <Field label="Chốt lời (TP)">
+          <Field label={c.takeProfit}>
             {item.take_profit != null ? (
               <span className="tabular-nums text-emerald-700 dark:text-emerald-400">
                 {formatPrice(item.take_profit)}
@@ -130,15 +133,13 @@ export function ApprovalCard({
           <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
             <PlanModeBadge mode={item.mode_at_plan} />
             {item.plan_reason && (
-              <span className="text-muted-foreground">Lý do: {item.plan_reason}</span>
+              <span className="text-muted-foreground">{c.reason(item.plan_reason)}</span>
             )}
           </div>
         )}
         {item.mock ? (
           <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
-            Kế hoạch này sinh từ job quét chế độ mô phỏng — dữ liệu tổng hợp
-            không thể thành lệnh thật: server sẽ từ chối duyệt (409), chỉ có
-            thể từ chối kế hoạch.
+            {c.mockNote}
           </p>
         ) : null}
       </CardContent>
@@ -148,7 +149,7 @@ export function ApprovalCard({
           disabled={actionsDisabled}
           onClick={() => onApprove(item)}
         >
-          Duyệt lệnh
+          {c.approve}
         </Button>
         <Button
           variant="destructive"
@@ -156,8 +157,9 @@ export function ApprovalCard({
           disabled={actionsDisabled}
           onClick={() => onReject(item)}
         >
-          Từ chối
+          {c.reject}
         </Button>
+
       </CardFooter>
     </Card>
   );

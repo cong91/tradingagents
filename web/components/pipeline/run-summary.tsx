@@ -15,15 +15,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "cn";
 import { formatClock } from "./format";
 import type { RunPayload } from "./types";
-
-const SIGNAL_LABELS: Record<string, string> = {
-  Buy: "Buy (Mua)",
-  Overweight: "Overweight (Thiên tăng)",
-  Hold: "Hold (Giữ)",
-  Underweight: "Underweight (Thiên giảm)",
-  Sell: "Sell (Bán)",
-  REVIEW: "REVIEW (Cần rà soát)",
-};
+import { useT } from "@/lib/i18n";
 
 type SignalTone = "bull" | "bear" | "hold" | "review";
 
@@ -43,24 +35,26 @@ const TONE_BADGE_CLASS: Record<SignalTone, string> = {
 };
 
 function ReportPaths({ run }: { run: RunPayload }) {
+  const t = useT();
+  const c = t.pipeline.summary;
   const complete = run.report_paths?.complete_report;
   const stateLog = run.report_paths?.state_log;
   if (!complete && !stateLog) {
     return (
       <p className="text-sm text-muted-foreground">
-        Không có tệp báo cáo trên đĩa (chế độ Mock tổng hợp không ghi tệp).
+        {c.noReports}
       </p>
     );
   }
   return (
     <div>
-      <p className="text-sm font-medium">Tệp kết quả</p>
+      <p className="text-sm font-medium">{c.outputFiles}</p>
       <ul className="mt-1 space-y-1 text-sm">
         {complete && (
           <li className="flex items-start gap-2">
             <FileTextIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
             <span>
-              Báo cáo đầy đủ: <code className="break-all">{complete}</code>
+              {c.fullReport} <code className="break-all">{complete}</code>
             </span>
           </li>
         )}
@@ -68,7 +62,7 @@ function ReportPaths({ run }: { run: RunPayload }) {
           <li className="flex items-start gap-2">
             <FileTextIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
             <span>
-              State log: <code className="break-all">{stateLog}</code>
+              {c.stateLog} <code className="break-all">{stateLog}</code>
             </span>
           </li>
         )}
@@ -84,6 +78,8 @@ export function RunSummary({
   run: RunPayload;
   onNewRun: () => void;
 }) {
+  const t = useT();
+  const c = t.pipeline.summary;
   const startedAt = formatClock(run.created_at);
   const finishedAt = run.finished_at ? formatClock(run.finished_at) : "—";
 
@@ -93,18 +89,18 @@ export function RunSummary({
         <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm">
           <CircleXIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-loss" />
           <div className="min-w-0">
-            <p className="font-medium text-loss">Phiên thất bại</p>
+            <p className="font-medium text-loss">{c.failedTitle}</p>
             <p className="mt-0.5 break-words">
-              {run.error?.message ?? "Lỗi không rõ nguyên nhân."}
+              {run.error?.message ?? c.failedUnknown}
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Mã lỗi: {run.error?.code ?? "internal_error"} — kiểm tra log server rồi chạy phiên mới.
+              {c.failedCode(run.error?.code ?? "internal_error")}
             </p>
           </div>
         </div>
         <Button variant="outline" className="min-touch" onClick={onNewRun}>
           <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
-          Chạy phiên mới
+          {c.newRun}
         </Button>
       </div>
     );
@@ -116,18 +112,18 @@ export function RunSummary({
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
           <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0">
-            <p className="font-medium">Phiên bị gián đoạn</p>
+            <p className="font-medium">{c.interruptedTitle}</p>
             <p className="mt-0.5 break-words">
-              {run.error?.message ?? "Server dừng trước khi phiên phân tích hoàn tất."}
+              {run.error?.message ?? c.interruptedUnknown}
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Mã lỗi: {run.error?.code ?? "interrupted"} — dữ liệu đã nhận vẫn được giữ trong luồng sự kiện.
+              {c.interruptedCode(run.error?.code ?? "interrupted")}
             </p>
           </div>
         </div>
         <Button variant="outline" className="min-touch" onClick={onNewRun}>
           <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
-          Chạy phiên mới
+          {c.newRun}
         </Button>
       </div>
     );
@@ -136,10 +132,10 @@ export function RunSummary({
   if (run.status === "cancelled") {
     return (
       <div className="space-y-3">
-        <p className="text-sm text-muted-foreground">Phiên đã bị huỷ.</p>
+        <p className="text-sm text-muted-foreground">{c.cancelled}</p>
         <Button variant="outline" className="min-touch" onClick={onNewRun}>
           <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
-          Chạy phiên mới
+          {c.newRun}
         </Button>
       </div>
     );
@@ -147,12 +143,12 @@ export function RunSummary({
 
   const tone = signalTone(run.signal, run.is_review);
   const signalLabel =
-    run.signal !== null ? (SIGNAL_LABELS[run.signal] ?? run.signal) : "Không xác định";
+    run.signal !== null ? (c.signals[run.signal] ?? run.signal) : c.unknownSignal;
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm text-muted-foreground">Tín hiệu cuối:</span>
+        <span className="text-sm text-muted-foreground">{c.finalSignal}</span>
         <Badge variant="outline" className={cn("h-6 px-2 text-sm", TONE_BADGE_CLASS[tone])}>
           {tone === "review" ? (
             <TriangleAlertIcon aria-hidden="true" />
@@ -165,17 +161,17 @@ export function RunSummary({
       {run.is_review && (
         <p className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
           <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-          REVIEW là tín hiệu không giao dịch được: quyết định không đọc được rating —
-          hãy rà soát thủ công hoặc chạy lại phiên.
+          {c.reviewNote}
         </p>
       )}
       <p className="text-sm text-muted-foreground">
-        Bắt đầu {startedAt} · Kết thúc {finishedAt}
+        {c.times(startedAt, finishedAt)}
+
       </p>
       <ReportPaths run={run} />
       <Button variant="outline" className="min-touch" onClick={onNewRun}>
         <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
-        Chạy phiên mới
+        {c.newRun}
       </Button>
     </div>
   );

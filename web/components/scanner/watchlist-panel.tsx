@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/card";
 import { formatTimestamp } from "./scanner-format";
 import type { WatchlistController } from "./use-watchlist";
+import { useT } from "@/lib/i18n";
 
 const STALE_AFTER_MS = 60_000;
 
@@ -26,6 +27,8 @@ export function WatchlistPanel({
 }) {
   const [input, setInput] = useState("");
   const [inputError, setInputError] = useState<string | null>(null);
+  const t = useT();
+  const c = t.scanner.watchlist;
   // Đồng hồ cho badge stale — Date.now() không được gọi trong render (purity).
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -41,7 +44,7 @@ export function WatchlistPanel({
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!input.trim()) {
-      setInputError("Nhập một mã giao dịch, ví dụ BTC-USD.");
+      setInputError(c.inputRequired);
       return;
     }
     setInputError(null);
@@ -52,14 +55,11 @@ export function WatchlistPanel({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Danh sách theo dõi</CardTitle>
-        <CardDescription>
-          Các mã sẽ được quét trong pipeline. Thêm hoặc xóa tại đây — server
-          lưu và đồng bộ với engine.
-        </CardDescription>
+        <CardTitle>{c.title}</CardTitle>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction className="flex items-center gap-2">
           {isStale ? (
-            <Badge variant="outline">Dữ liệu cũ — bấm Làm mới</Badge>
+            <Badge variant="outline">{c.stale}</Badge>
           ) : null}
           <Button
             variant="ghost"
@@ -68,7 +68,7 @@ export function WatchlistPanel({
             disabled={watchlist.status === "loading" || watchlist.mutating}
           >
             <RefreshCw data-icon="inline-start" aria-hidden />
-            Làm mới
+            {t.common.refresh}
           </Button>
         </CardAction>
       </CardHeader>
@@ -86,7 +86,7 @@ export function WatchlistPanel({
         <form onSubmit={handleSubmit} className="space-y-1.5" noValidate>
           <div className="flex flex-wrap items-center gap-2">
             <label htmlFor="scanner-symbol-input" className="sr-only">
-              Mã giao dịch cần thêm
+              {c.inputLabel}
             </label>
             <input
               id="scanner-symbol-input"
@@ -107,11 +107,11 @@ export function WatchlistPanel({
               disabled={watchlist.mutating || watchlist.status !== "ready"}
             >
               <Plus data-icon="inline-start" aria-hidden />
-              Thêm mã
+              {c.add}
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Định dạng Yahoo: BTC-USD, SOL-USD, NVDA. Trùng mã sẽ bị từ chối.
+            {c.formatHint}
           </p>
           {inputError ? (
             <p role="alert" className="text-sm text-destructive">
@@ -127,7 +127,7 @@ export function WatchlistPanel({
 
         {watchlist.status === "loading" ? (
           <div role="status" className="space-y-2">
-            <span className="sr-only">Đang tải danh sách theo dõi…</span>
+            <span className="sr-only">{c.loading}</span>
             <div className="h-12 animate-pulse rounded-lg bg-muted" aria-hidden />
             <div className="h-12 animate-pulse rounded-lg bg-muted" aria-hidden />
           </div>
@@ -136,21 +136,21 @@ export function WatchlistPanel({
         {watchlist.status === "error" ? (
           <div className="flex h-40 flex-col items-center justify-center gap-3 rounded-lg border border-dashed p-4 text-center">
             <p className="text-sm text-destructive">
-              {watchlist.loadError?.message ?? "Không tải được danh sách theo dõi."}
+              {watchlist.loadError?.message ?? c.loadFailed}
             </p>
             <Button
               variant="outline"
               className="min-touch"
               onClick={() => void watchlist.refresh()}
             >
-              Thử lại
+              {t.common.retry}
             </Button>
           </div>
         ) : null}
 
         {watchlist.status === "ready" && watchlist.symbols.length === 0 ? (
           <div className="flex h-40 items-center justify-center rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-            Chưa có mã nào — nhập mã ở trên rồi bấm “Thêm mã” để bắt đầu quét.
+            {c.empty}
           </div>
         ) : null}
 
@@ -166,14 +166,15 @@ export function WatchlistPanel({
                     {item.symbol}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Thêm lúc {formatTimestamp(item.added_at)}
+                    {c.addedAt(formatTimestamp(item.added_at))}
                   </p>
                 </div>
                 <Button
                   variant="ghost"
                   size="icon"
                   className="min-touch"
-                  aria-label={`Xóa ${item.symbol} khỏi danh sách theo dõi`}
+                  aria-label={c.removeAria(item.symbol)}
+
                   disabled={watchlist.mutating}
                   onClick={() => void watchlist.remove(item.symbol)}
                 >

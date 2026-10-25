@@ -9,6 +9,7 @@
 //     chưa đăng ký router thì 404 → trạng thái trung tính như /api/portfolio).
 // Không tự chế endpoint ngoài hợp đồng; mọi response mang `generated_at`.
 import { parseErrorResponse } from "@/lib/api";
+import { getMessages } from "@/lib/i18n/messages";
 
 /** Lỗi fetch: mạng đứt (backend chưa chạy) hoặc HTTP với error shape §0.1. */
 export class FetchError extends Error {
@@ -31,7 +32,7 @@ async function fetchJson<T>(url: string): Promise<T> {
   } catch {
     throw new FetchError(
       "network",
-      "Không kết nối được backend FastAPI.",
+      getMessages().overview.activity.backendUnreachable,
       null,
       "network_error"
     );

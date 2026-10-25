@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "cn";
+import { useT } from "@/lib/i18n";
 
 type ModeState =
   | { status: "loading" }
@@ -25,6 +26,8 @@ export function ModeBar() {
   // Trạng thái ban đầu là "loading"; setState chỉ chạy trong callback của
   // promise (sau khi fetch trả về), không chạy đồng bộ trong effect.
   const [state, setState] = useState<ModeState>({ status: "loading" });
+  const t = useT();
+  const copy = t.common.modeBar;
 
   // Hàm thuần: chỉ fetch và trả về trạng thái mới, không đụng setState.
   const fetchMode = useCallback(async (): Promise<ModeState> => {
@@ -62,9 +65,8 @@ export function ModeBar() {
                   aria-hidden="true"
                 />
               ),
-              title: "LIVE — LỆNH THẬT",
-              subtitle:
-                "Cả hai cổng thực thi đang mở: lệnh được duyệt sẽ gửi thẳng lên sàn.",
+              title: copy.liveTitle,
+              subtitle: copy.liveSubtitle,
             }
           : {
               bar: "border-b-blue-600 bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-100",
@@ -74,8 +76,8 @@ export function ModeBar() {
                   aria-hidden="true"
                 />
               ),
-              title: "SANDBOX",
-              subtitle: "Chế độ mô phỏng — không có lệnh thật nào được gửi.",
+              title: copy.sandboxTitle,
+              subtitle: copy.sandboxSubtitle,
             };
       case "loading":
         return {
@@ -86,8 +88,8 @@ export function ModeBar() {
               aria-hidden="true"
             />
           ),
-          title: "ĐANG TẢI CHẾ ĐỘ…",
-          subtitle: "Đang đọc GET /api/settings.",
+          title: copy.loadingTitle,
+          subtitle: copy.loadingSubtitle,
         };
       case "error":
         return {
@@ -95,8 +97,8 @@ export function ModeBar() {
           icon: (
             <TriangleAlertIcon className="size-5 shrink-0" aria-hidden="true" />
           ),
-          title: "KHÔNG KẾT NỐI",
-          subtitle: "Không đọc được GET /api/settings — kiểm tra backend.",
+          title: copy.errorTitle,
+          subtitle: copy.errorSubtitle,
         };
     }
   })();
@@ -120,7 +122,7 @@ export function ModeBar() {
           className="min-touch ml-auto"
           onClick={refresh}
         >
-          Thử lại
+          {t.common.retry}
         </Button>
       )}
     </div>

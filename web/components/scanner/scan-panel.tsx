@@ -24,11 +24,14 @@ import { JobHistoryPanel } from "./job-history-panel";
 import { ApiHttpError, scannerApi, toApiHttpError } from "./scanner-api";
 import { useJobHistory } from "./use-job-history";
 import type { DailyJobStatus } from "./scanner-types";
+import { useT } from "@/lib/i18n";
 
 type ScanKind = "watchlist" | "auto";
 
 export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
   const [starting, setStarting] = useState<ScanKind | null>(null);
+  const t = useT();
+  const c = t.scanner.scan;
   const [error, setError] = useState<ApiHttpError | null>(null);
   // Job đã chọn tường minh: do phiên này tạo, hoặc do bấm từ lịch sử.
   const [pickedJobId, setPickedJobId] = useState<string | null>(null);
@@ -94,15 +97,8 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
     <>
       <Card>
         <CardHeader>
-          <CardTitle>Quét pipeline</CardTitle>
-          <CardDescription>
-            Quét tự động: server tự sàng universe (crypto top khối lượng sàn +
-            cổ phiếu Mỹ đang mạnh 52 tuần) bằng bộ tiêu chí thực chiến — động
-            lượng, RSI, đỉnh 52 tuần, breakout kèm khối lượng, thanh khoản —
-            rồi chạy pipeline LLM trên các ứng viên điểm cao nhất. Không cần
-            danh sách theo dõi. “Quét ngay” chạy trên watchlist hiện hành; mỗi
-            mã là một pipeline LLM đầy đủ nên job có thể mất nhiều phút.
-          </CardDescription>
+          <CardTitle>{c.title}</CardTitle>
+          <CardDescription>{c.description}</CardDescription>
           <CardAction className="flex items-center gap-2">
             <Button
               variant="outline"
@@ -115,7 +111,7 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
               ) : (
                 <ScanSearch data-icon="inline-start" aria-hidden />
               )}
-              {starting === "auto" ? "Đang gửi…" : "Quét tự động"}
+              {starting === "auto" ? c.sending : c.auto}
             </Button>
             <Button
               className="min-touch"
@@ -127,15 +123,14 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
               ) : (
                 <Play data-icon="inline-start" aria-hidden />
               )}
-              {starting === "watchlist" ? "Đang gửi…" : "Quét ngay"}
+              {starting === "watchlist" ? c.sending : c.now}
             </Button>
           </CardAction>
         </CardHeader>
         <CardContent className="space-y-3">
           {symbolsCount === 0 ? (
             <p className="text-sm text-muted-foreground">
-              Cần ít nhất một mã trong danh sách theo dõi trước khi “Quét ngay” —
-              hoặc bấm “Quét tự động” để server tự tìm mã.
+              {c.needSymbol}
             </p>
           ) : null}
 
@@ -144,8 +139,8 @@ export function ScanPanel({ symbolsCount }: { symbolsCount: number }) {
               <p className="text-sm text-destructive">{error.message}</p>
               {error.status === 409 ? (
                 <p className="text-sm text-muted-foreground">
-                  Đang có job khác chiếm worker — xem “Lịch sử quét” bên dưới để
-                  biết job nào đang chạy và dừng nó nếu cần.
+                  {c.busy}
+
                 </p>
               ) : null}
             </div>

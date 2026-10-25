@@ -22,14 +22,15 @@ import { SaveBar } from "./save-bar";
 import { SettingsSection } from "./settings-section";
 import { groupRows } from "./types";
 import { useSettings } from "./use-settings";
+import { InterfacePreferencesCard } from "./interface-preferences-card";
+import { useT } from "@/lib/i18n";
 
 function SettingsSkeleton() {
+  const t = useT();
   return (
     <div aria-busy="true" aria-live="polite">
-      <PageHeader
-        title="Cáº¥u hÃ¬nh"
-        description="Äang táº£i cÃ i Ä‘áº·t tá»« GET /api/settingsâ€¦"
-      />
+      <PageHeader page="settings" description={t.settings.screen.loadingDescription} />
+      <InterfacePreferencesCard />
       <div className="space-y-4">
         {[0, 1, 2].map((card) => (
           <div key={card} className="rounded-xl bg-card p-4 ring-1 ring-foreground/10">
@@ -47,6 +48,8 @@ function SettingsSkeleton() {
 }
 
 export function SettingsScreen() {
+  const t = useT();
+  const c = t.settings.screen;
   const controller = useSettings();
   const grouped = useMemo(
     () => (controller.payload ? groupRows(controller.payload) : null),
@@ -60,10 +63,8 @@ export function SettingsScreen() {
   if (controller.phase === "error") {
     return (
       <div>
-        <PageHeader
-          title="Cáº¥u hÃ¬nh"
-          description="Äá»c vÃ  ghi cÃ i Ä‘áº·t engine qua GET / PUT /api/settings."
-        />
+        <PageHeader page="settings" description={c.errorDescription} />
+        <InterfacePreferencesCard />
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -71,13 +72,13 @@ export function SettingsScreen() {
                 className="size-5 shrink-0 text-destructive"
                 aria-hidden="true"
               />
-              KhÃ´ng táº£i Ä‘Æ°á»£c cÃ i Ä‘áº·t
+              {c.loadFailed}
             </CardTitle>
             <CardDescription>{controller.errorMessage}</CardDescription>
           </CardHeader>
           <CardContent>
             <Button className="min-touch" onClick={() => void controller.reload()}>
-              Thá»­ láº¡i
+              {t.common.retry}
             </Button>
           </CardContent>
         </Card>
@@ -90,18 +91,16 @@ export function SettingsScreen() {
 
   return (
     <div>
-      <PageHeader
-        title="Cáº¥u hÃ¬nh"
-        description="Äá»c vÃ  ghi cÃ i Ä‘áº·t engine qua GET / PUT /api/settings. Thay Ä‘á»•i Ã¡p dá»¥ng cho phiÃªn phÃ¢n tÃ­ch má»›i; khÃ³a API vÃ  cá»•ng LIVE chá»‰-Ä‘á»c theo thiáº¿t káº¿."
-      />
+      <PageHeader page="settings" />
+      <InterfacePreferencesCard />
       <div className="mb-4 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-        <span>Cáº­p nháº­t lÃºc {formatDateTimeVi(payload.generated_at)}</span>
+        <span>{c.updatedAt(formatDateTimeVi(payload.generated_at))}</span>
         {controller.isStale ? (
           <Badge
             variant="outline"
             className="border-amber-500 text-amber-700 dark:text-amber-400"
           >
-            Dá»¯ liá»‡u cÅ©
+            {t.common.staleData}
           </Badge>
         ) : null}
         <Button
@@ -111,7 +110,7 @@ export function SettingsScreen() {
           onClick={() => void controller.reload()}
         >
           <RefreshCwIcon aria-hidden="true" />
-          LÃ m má»›i
+          {t.common.refresh}
         </Button>
       </div>
       {controller.serverAhead ? (
@@ -120,8 +119,7 @@ export function SettingsScreen() {
           className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
         >
           <span className="min-w-0 flex-1">
-            MÃ¡y chá»§ cÃ³ dá»¯ liá»‡u má»›i hÆ¡n báº£n Ä‘ang xem. Thay Ä‘á»•i chÆ°a lÆ°u cá»§a báº¡n khÃ´ng bá»‹
-            ghi Ä‘Ã¨.
+            {c.serverAhead}
           </span>
           <Button
             variant="outline"
@@ -132,18 +130,15 @@ export function SettingsScreen() {
               void controller.reload();
             }}
           >
-            Náº¡p dá»¯ liá»‡u mÃ¡y chá»§
+            {c.loadServerData}
           </Button>
         </div>
       ) : null}
       {payload.settings.length === 0 ? (
         <Card>
           <CardHeader>
-            <CardTitle>ChÆ°a cÃ³ cÃ i Ä‘áº·t nÃ o</CardTitle>
-            <CardDescription>
-              MÃ¡y chá»§ tráº£ vá» danh sÃ¡ch cÃ i Ä‘áº·t trá»‘ng. Kiá»ƒm tra backend Ä‘Ã£ cháº¡y Ä‘Ãºng
-              phiÃªn báº£n há»£p Ä‘á»“ng rá»“i báº¥m LÃ m má»›i.
-            </CardDescription>
+            <CardTitle>{c.emptyTitle}</CardTitle>
+            <CardDescription>{c.emptyDescription}</CardDescription>
           </CardHeader>
         </Card>
       ) : (
@@ -152,8 +147,8 @@ export function SettingsScreen() {
             rows.length === 0 ? null : (
               <SettingsSection
                 key={group.id}
-                title={group.title}
-                description={group.description}
+                title={t.settings.groups[group.id].title}
+                description={t.settings.groups[group.id].description}
                 rows={rows}
                 values={controller.formValues}
                 errors={controller.fieldErrors}
@@ -163,8 +158,9 @@ export function SettingsScreen() {
           )}
           {grouped.otherRows.length > 0 ? (
             <SettingsSection
-              title="CÃ i Ä‘áº·t khÃ¡c"
-              description="CÃ¡c key mÃ¡y chá»§ tráº£ vá» ngoÃ i cÃ¡c nhÃ³m chuáº©n."
+              title={c.otherTitle}
+              description={c.otherDescription}
+
               rows={grouped.otherRows}
               values={controller.formValues}
               errors={controller.fieldErrors}

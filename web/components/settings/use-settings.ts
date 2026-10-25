@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { NETWORK_HINT, parseErrorResponse } from "@/lib/api";
+import { networkHint, parseErrorResponse } from "@/lib/api";
+import { getMessages } from "@/lib/i18n/messages";
 
 import type { SettingsPayload, SettingValue } from "./types";
 
@@ -11,7 +12,8 @@ import type { SettingsPayload, SettingValue } from "./types";
 const REFRESH_INTERVAL_MS = 30_000;
 const STALE_TICK_MS = 10_000;
 
-const NETWORK_ERROR_MESSAGE = NETWORK_HINT;
+// Thông điệp lỗi dựng lúc xảy ra lỗi, theo locale đang chọn.
+const saveCopy = () => getMessages().settings.save;
 
 export type FieldType = "bool" | "int" | "float" | "text";
 
@@ -100,21 +102,21 @@ function buildChangeSet(
     const raw = String(current).trim();
     if (raw === "") {
       if (isNullableType(row.type)) values[key] = null;
-      else errors[key] = "Không được để trống. Dùng “Huỷ thay đổi” để quay về giá trị đã lưu.";
+      else errors[key] = saveCopy().required;
       continue;
     }
     const base = fieldTypeOf(row.type);
     if (base === "int") {
       const parsed = Number(raw);
       if (!Number.isInteger(parsed)) {
-        errors[key] = `Phải là số nguyên, nhận được “${raw}”.`;
+        errors[key] = saveCopy().mustBeInteger(raw);
         continue;
       }
       values[key] = parsed;
     } else if (base === "float") {
       const parsed = Number(raw.replace(",", "."));
       if (!Number.isFinite(parsed)) {
-        errors[key] = `Phải là số, nhận được “${raw}”.`;
+        errors[key] = saveCopy().mustBeNumber(raw);
         continue;
       }
       values[key] = parsed;
@@ -170,7 +172,7 @@ export function useSettings() {
       applyFetch((await res.json()) as SettingsPayload);
     } catch (err) {
       setErrorMessage(
-        err instanceof SettingsHttpError ? err.message : NETWORK_ERROR_MESSAGE
+        err instanceof SettingsHttpError ? err.message : networkHint()
       );
       // Đã có dữ liệu: giữ nguyên UI (badge "cũ" tự hiện vì fetchedAt ngừng cập nhật).
       if (!hasDataRef.current) setPhase("error");
@@ -233,7 +235,7 @@ export function useSettings() {
       setFieldErrors(errors);
       setSaveState({
         kind: "failed",
-        message: "Có trường chưa hợp lệ — sửa các ô được đánh dấu rồi lưu lại.",
+        message: saveCopy().invalidFields,
       });
       return;
     }
@@ -258,20 +260,20 @@ export function useSettings() {
           if (row) {
             setFieldErrors((prev) => ({
               ...prev,
-              [row.key]: `Máy chủ từ chối: ${details.message ?? err.message}`,
+              [row.key]: saveCopy().serverRejected(details.message ?? err.message),
             }));
             setSaveState({
               kind: "failed",
-              message: "Có giá trị máy chủ không nhận — sửa lại ô được đánh dấu.",
+              message: saveCopy().serverRejectedSummary,
             });
             return;
           }
         }
         const memoryNote =
           err.code === "internal_error"
-            ? " Thay đổi có thể đã có hiệu lực tạm thời trong bộ nhớ nhưng chưa ghi vào .env."
+            ? saveCopy().memoryNote
             : "";
-        setSaveState({ kind: "failed", message: `Lưu thất bại: ${err.message}${memoryNote}` });
+        setSaveState({ kind: "failed", message: saveCopy().failed(`${err.message}${memoryNote}`) });
         return;
       }
       const data = (await res.json()) as SettingsPayload;
@@ -296,7 +298,8 @@ export function useSettings() {
       dirtyRef.current = true;
       setSaveState({
         kind: "failed",
-        message: `Không gửi được yêu cầu lưu tới backend. ${NETWORK_ERROR_MESSAGE}`,
+        message: saveCopy().networkFailed(networkHint()),
+
       });
     }
   }, [formValues, payload, saveState.kind, savedValues]);

@@ -8,6 +8,7 @@ import { useState, type FormEvent } from "react";
 import { PlayIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AssetType, RunMode, StartRunInput } from "./types";
+import { useT } from "@/lib/i18n";
 
 // Server so ngày với "hôm nay UTC" (server/runs.py:116-123) — mặc định theo UTC.
 function utcToday(): string {
@@ -30,16 +31,18 @@ export function RunForm({
   const [mode, setMode] = useState<RunMode>("mock");
   const [checkpoint, setCheckpoint] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const t = useT();
+  const f = t.pipeline.form;
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const cleaned = ticker.trim().toUpperCase();
     if (cleaned === "") {
-      setLocalError("Nhập mã tài sản, ví dụ BTC-USD hoặc NVDA.");
+      setLocalError(f.tickerRequired);
       return;
     }
     if (tradeDate === "") {
-      setLocalError("Chọn ngày phân tích.");
+      setLocalError(f.dateRequired);
       return;
     }
     setLocalError(null);
@@ -56,7 +59,7 @@ export function RunForm({
   return (
     <form onSubmit={handleSubmit} noValidate className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <label className="flex flex-col gap-1 text-sm">
-        <span className="font-medium">Mã tài sản</span>
+        <span className="font-medium">{f.ticker}</span>
         <input
           className={FIELD_CLASS}
           value={ticker}
@@ -64,13 +67,13 @@ export function RunForm({
             setTicker(e.target.value);
             setLocalError(null);
           }}
-          placeholder="BTC-USD hoặc NVDA"
+          placeholder={f.tickerPlaceholder}
           autoComplete="off"
           spellCheck={false}
         />
       </label>
       <label className="flex flex-col gap-1 text-sm">
-        <span className="font-medium">Ngày phân tích</span>
+        <span className="font-medium">{f.date}</span>
         <input
           type="date"
           className={FIELD_CLASS}
@@ -80,25 +83,25 @@ export function RunForm({
         />
       </label>
       <label className="flex flex-col gap-1 text-sm">
-        <span className="font-medium">Loại tài sản</span>
+        <span className="font-medium">{f.assetType}</span>
         <select
           className={FIELD_CLASS}
           value={assetType}
           onChange={(e) => setAssetType(e.target.value as AssetType)}
         >
-          <option value="crypto">Crypto (tiền mã hoá)</option>
-          <option value="stock">Cổ phiếu (stock)</option>
+          <option value="crypto">{f.crypto}</option>
+          <option value="stock">{f.stock}</option>
         </select>
       </label>
       <label className="flex flex-col gap-1 text-sm">
-        <span className="font-medium">Chế độ</span>
+        <span className="font-medium">{f.mode}</span>
         <select
           className={FIELD_CLASS}
           value={mode}
           onChange={(e) => setMode(e.target.value as RunMode)}
         >
-          <option value="mock">Mock — không gọi LLM</option>
-          <option value="live">Live — gọi LLM thật</option>
+          <option value="mock">{f.mock}</option>
+          <option value="live">{f.live}</option>
         </select>
       </label>
       <label className="flex items-center gap-2 text-sm sm:col-span-2">
@@ -108,12 +111,13 @@ export function RunForm({
           checked={checkpoint}
           onChange={(e) => setCheckpoint(e.target.checked)}
         />
-        Bật checkpoint (tiếp tục phiên bị gián đoạn)
+        {f.checkpoint}
       </label>
       <div className="flex items-end sm:col-span-2 lg:justify-end">
         <Button type="submit" className="min-touch" disabled={disabled}>
           <PlayIcon data-icon="inline-start" aria-hidden="true" />
-          Chạy phân tích
+          {f.submit}
+
         </Button>
       </div>
       {localError && (

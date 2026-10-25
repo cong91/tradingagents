@@ -36,6 +36,8 @@ import type {
   DailyResultItem,
   ScreeningInfo,
 } from "./scanner-types";
+import { formatNumber } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 
 const POLL_INTERVAL_MS = 3_000;
 const STUCK_AFTER_MS = 15 * 60_000;
@@ -62,6 +64,8 @@ export function ActiveJobCard({
   onSettled: (jobId: string) => void;
 }) {
   const [job, setJob] = useState<DailyJobStatusResponse | null>(null);
+  const t = useT();
+  const c = t.scanner.job;
   const [error, setError] = useState<ApiHttpError | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [cancelling, setCancelling] = useState(false);
@@ -137,15 +141,15 @@ export function ActiveJobCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Kết quả quét</CardTitle>
+        <CardTitle>{c.title}</CardTitle>
         <CardDescription>
           {jobId === null ? (
-            <>Chưa có lần quét nào — bấm “Quét tự động” hoặc “Quét ngay” ở trên.</>
+            <>{c.none}</>
           ) : (
             <>
               Job <span className="font-mono">{jobId}</span>
-              {status ? ` — ${jobStatusLabel(status)}` : " — đang chờ trạng thái…"}
-              {job && running ? ` · đã chạy ${elapsedLabel(job.created_at, now)}` : null}
+              {status ? ` — ${jobStatusLabel(status)}` : c.waitingStatus}
+              {job && running ? c.elapsed(elapsedLabel(job.created_at, now)) : null}
             </>
           )}
         </CardDescription>
@@ -162,7 +166,7 @@ export function ActiveJobCard({
               ) : (
                 <Square data-icon="inline-start" aria-hidden />
               )}
-              Dừng
+              {c.stop}
             </Button>
           </CardAction>
         ) : null}
@@ -173,8 +177,7 @@ export function ActiveJobCard({
             <p className="text-sm text-destructive">{error.message}</p>
             {error.status === 404 ? (
               <p className="text-sm text-muted-foreground">
-                Không tìm thấy job này trên server. Chọn lại một lần chạy trong
-                “Lịch sử quét” bên dưới.
+                {c.notFound}
               </p>
             ) : null}
           </div>
@@ -182,26 +185,20 @@ export function ActiveJobCard({
 
         {running && job == null && !error ? (
           <p aria-live="polite" className="text-sm text-muted-foreground">
-            Đang chờ trạng thái đầu tiên từ server…
+            {c.waitingFirst}
           </p>
         ) : null}
 
         {isStuck ? (
           <div className="flex items-start gap-2 rounded-lg bg-muted p-3 text-sm">
             <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
-              <span>
-                Không ghi nhận tiến triển trong hơn 15 phút
-                {job?.current_ticker ? ` khi đang xử lý ${job.current_ticker}` : ""}.
-                Kiểm tra log hoặc bấm “Dừng” nếu nhà cung cấp dữ liệu/LLM không phản hồi.
-              </span>
+              <span>{c.stuck(job?.current_ticker ?? null)}</span>
           </div>
         ) : null}
 
         {running && job?.screening == null ? (
           <p aria-live="polite" className="text-sm text-muted-foreground">
-            Đang sàng thị trường (crypto + cổ phiếu Mỹ)… Bước này chỉ tính chỉ
-            báo, không tốn LLM — sau đó pipeline LLM mới chạy trên các ứng viên
-            điểm cao nhất.
+            {c.screening}
           </p>
         ) : null}
 
@@ -210,8 +207,7 @@ export function ActiveJobCard({
         ) : null}
         {screeningEmpty ? (
           <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
-            Bước sàng lọc không cho ứng viên nào đủ điểm — không có mã nào đáng
-            chạy pipeline lúc này. Thử lại sau phiên giao dịch kế tiếp.
+            {c.screeningEmpty}
           </p>
         ) : null}
 
@@ -219,16 +215,16 @@ export function ActiveJobCard({
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <caption className="sr-only">
-                Kết quả quét pipeline theo từng mã
+                {c.caption}
               </caption>
               <thead>
                 <tr className="border-b text-left text-xs text-muted-foreground">
-                  <th scope="col" className="py-2 pr-3 font-medium">Cặp</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Tín hiệu</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Lệnh đề xuất</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Dòng tiền</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Kết quả</th>
-                  <th scope="col" className="py-2 font-medium">Duyệt</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colPair}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colSignal}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colPlan}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colCashFlow}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colResult}</th>
+                  <th scope="col" className="py-2 font-medium">{c.colApproval}</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -239,9 +235,7 @@ export function ActiveJobCard({
             </table>
             {job.status === "failed" ? (
               <p role="alert" className="mt-3 text-sm text-destructive">
-                Job kết thúc với trạng thái “Thất bại”
-                {job.error ? ` — ${job.error}` : ""}. Kết quả bên dưới là phần
-                đã chạy được.
+                {c.failedPartial(job.error ?? null)}
               </p>
             ) : null}
           </div>
@@ -250,27 +244,24 @@ export function ActiveJobCard({
         {job && job.results.length === 0 && !running ? (
           <div className="flex h-40 items-center justify-center rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
             {job.status === "failed"
-              ? `Job quét thất bại — không có kết quả nào.${job.error ? ` Lý do: ${job.error}` : ""}`
+              ? c.failedEmpty(job.error ?? null)
               : job.status === "cancelled"
-                ? "Job đã được dừng trước khi mã nào chạy xong."
+                ? c.cancelledEmpty
                 : job.status === "interrupted"
-                  ? "Job bị gián đoạn khi server khởi động lại — chạy lại để có kết quả."
-                  : "Job kết thúc mà không có kết quả nào cho mã nào."}
+                  ? c.interruptedEmpty
+                  : c.noResults}
           </div>
         ) : null}
 
         {job && !running ? (
           // Job xong → dẫn thẳng sang màn Duyệt lệnh nơi kế hoạch đang chờ.
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-dashed p-3 text-sm">
-            <span>
-              Job {jobStatusLabel(job.status).toLowerCase()} — {approvalCount} kế
-              hoạch trong hàng đợi duyệt.
-            </span>
+            <span>{c.summary(jobStatusLabel(job.status).toLowerCase(), approvalCount)}</span>
             <Link
               href="/approvals"
               className="min-touch inline-flex items-center rounded-lg border px-3 text-sm font-medium hover:bg-muted"
             >
-              Xem trong Duyệt lệnh
+              {c.viewApprovals}
             </Link>
           </div>
         ) : null}
@@ -281,6 +272,7 @@ export function ActiveJobCard({
 
 function ResultRow({ item }: { item: DailyResultItem }) {
   const plan = item.plan;
+  const t = useT();
   return (
     <tr className="align-top">
       <td className="py-2 pr-3 font-mono font-medium">
@@ -292,7 +284,7 @@ function ResultRow({ item }: { item: DailyResultItem }) {
         ) : null}
         {item.asset_type === "stock" ? (
           <Badge variant="secondary" className="ml-2 align-middle text-xs">
-            Cổ phiếu
+            {t.scanner.job.stock}
           </Badge>
         ) : null}
       </td>
@@ -350,7 +342,7 @@ function ResultRow({ item }: { item: DailyResultItem }) {
             href="/approvals"
             className="min-touch inline-flex items-center text-sm underline underline-offset-4"
           >
-            Xem hàng duyệt
+            {t.scanner.job.viewQueue}
           </Link>
         ) : (
           "—"
@@ -362,33 +354,39 @@ function ResultRow({ item }: { item: DailyResultItem }) {
 
 /** Bảng ứng viên sau bước sàng lọc kỹ thuật (job auto, contract §5 rev 4). */
 function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
+  const t = useT();
+  const c = t.scanner.job;
+  const fixed = (value: number, digits: number) =>
+    formatNumber(value, { minimumFractionDigits: digits, maximumFractionDigits: digits });
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-sm">
-        <Badge variant="outline">Kết quả sàng lọc</Badge>
+        <Badge variant="outline">{c.screeningResult}</Badge>
         <span className="text-muted-foreground">
-          universe: {screening.universe_crypto} crypto (top khối lượng) +{" "}
-          {screening.universe_stock} cổ phiếu (mạnh 52 tuần) ={" "}
-          {screening.universe_count} mã · top {screening.candidates.length}{" "}
-          ứng viên đi tiếp vào pipeline
-          {screening.mock ? " (mock)" : ""}
+          {c.universe(
+            screening.universe_crypto,
+            screening.universe_stock,
+            screening.universe_count,
+            screening.candidates.length,
+            Boolean(screening.mock)
+          )}
         </span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <caption className="sr-only">
-            Ứng viên sau sàng lọc kỹ thuật, xếp theo điểm
+            {c.screeningCaption}
           </caption>
           <thead>
             <tr className="border-b text-left text-xs text-muted-foreground">
-              <th scope="col" className="py-2 pr-3 font-medium">Mã</th>
-              <th scope="col" className="py-2 pr-3 font-medium">Loại</th>
-              <th scope="col" className="py-2 pr-3 font-medium">Điểm</th>
-              <th scope="col" className="py-2 pr-3 font-medium">Động lượng 20P</th>
+              <th scope="col" className="py-2 pr-3 font-medium">{c.colTicker}</th>
+              <th scope="col" className="py-2 pr-3 font-medium">{c.colType}</th>
+              <th scope="col" className="py-2 pr-3 font-medium">{c.colScore}</th>
+              <th scope="col" className="py-2 pr-3 font-medium">{c.colMomentum}</th>
               <th scope="col" className="py-2 pr-3 font-medium">RSI 14</th>
               <th scope="col" className="py-2 pr-3 font-medium">RVOL</th>
-              <th scope="col" className="py-2 pr-3 font-medium">vs đỉnh 52T</th>
-              <th scope="col" className="py-2 font-medium">Lý do</th>
+              <th scope="col" className="py-2 pr-3 font-medium">{c.colVs52w}</th>
+              <th scope="col" className="py-2 font-medium">{c.colReason}</th>
             </tr>
           </thead>
           <tbody className="divide-y">
@@ -397,29 +395,30 @@ function ScreeningTable({ screening }: { screening: ScreeningInfo }) {
                 <td className="py-2 pr-3 font-mono font-medium">
                   {candidate.ticker}
                   {candidate.breakout ? (
-                    <Badge className="ml-2 align-middle text-xs">Phá đỉnh</Badge>
+                    <Badge className="ml-2 align-middle text-xs">{c.breakout}</Badge>
                   ) : null}
                 </td>
                 <td className="py-2 pr-3">
                   <Badge variant={candidate.asset_type === "crypto" ? "default" : "secondary"}>
-                    {candidate.asset_type === "crypto" ? "Crypto" : "Cổ phiếu"}
+                    {candidate.asset_type === "crypto" ? "Crypto" : c.stock}
                   </Badge>
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
-                  {candidate.score.toFixed(1)}
+                  {fixed(candidate.score, 1)}
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
                   {candidate.momentum_pct >= 0 ? "+" : ""}
-                  {candidate.momentum_pct.toFixed(1)}%
+                  {fixed(candidate.momentum_pct, 1)}%
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
-                  {candidate.rsi14 != null ? candidate.rsi14.toFixed(0) : "—"}
+                  {candidate.rsi14 != null ? fixed(candidate.rsi14, 0) : "—"}
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
-                  ×{candidate.volume_ratio.toFixed(1)}
+                  ×{fixed(candidate.volume_ratio, 1)}
                 </td>
                 <td className="py-2 pr-3 tabular-nums">
-                  {candidate.dist_52w_pct.toFixed(1)}%
+                  {fixed(candidate.dist_52w_pct, 1)}%
+
                 </td>
                 <td className="py-2 text-muted-foreground">
                   {candidate.reasons.length > 0

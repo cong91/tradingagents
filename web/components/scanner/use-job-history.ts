@@ -6,6 +6,7 @@
 // chạy và bị từ chối 409.
 
 import { useCallback, useEffect, useState } from "react";
+import { getMessages } from "@/lib/i18n/messages";
 
 import { scannerApi } from "./scanner-api";
 import type { DailyJobSummary } from "./scanner-types";
@@ -40,7 +41,7 @@ export function useJobHistory(): JobHistoryState {
           setError(null);
         },
         (err: unknown) => {
-          setError(err instanceof Error ? err.message : "Không tải được lịch sử job");
+          setError(err instanceof Error ? err.message : getMessages().scanner.history.loadFailed);
         }
       )
       .finally(() => setLoading(false));

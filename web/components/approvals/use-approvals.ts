@@ -11,6 +11,7 @@
 // (react-hooks/set-state-in-effect), cùng pattern với components/mode-bar.tsx.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getMessages } from "@/lib/i18n/messages";
 
 import { parseErrorResponse } from "@/lib/api";
 
@@ -70,7 +71,7 @@ async function fetchQueue(): Promise<QueueSnapshot> {
   }
   const data = (await res.json()) as ApprovalsResponse;
   if (!data || !Array.isArray(data.items)) {
-    throw new Error("Phản hồi không đúng định dạng hợp đồng (thiếu items).");
+    throw new Error(getMessages().approvals.errors.badShape);
   }
   const items = data.items.filter(
     (item): item is ApprovalItem => Boolean(item) && typeof item.id === "string"
@@ -105,7 +106,7 @@ export function useApprovals({ paused }: { paused: boolean }) {
         setStale(false);
       })
       .catch((exc: unknown) => {
-        const message = exc instanceof Error ? exc.message : "Lỗi không xác định";
+        const message = exc instanceof Error ? exc.message : getMessages().common.unknownError;
         // Đã có dữ liệu → giữ nguyên UI và đánh dấu "cũ" (quy tắc stale §0.2);
         // chưa có dữ liệu → hiển thị error-state với nút thử lại.
         if (hasData.current) setStale(true);
@@ -162,7 +163,7 @@ export function useApprovals({ paused }: { paused: boolean }) {
             resolve({
               ok: false,
               code: "network",
-              message: "Không kết nối được backend — kiểm tra server FastAPI đang chạy.",
+              message: getMessages().approvals.errors.network,
               details: {},
             });
           });

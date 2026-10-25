@@ -17,6 +17,7 @@ import {
 import { formatTimestamp } from "./scanner-format";
 import { jobStatusLabel } from "./scanner-format";
 import type { DailyJobSummary } from "./scanner-types";
+import { useT } from "@/lib/i18n";
 
 const STATUS_VARIANT: Record<
   string,
@@ -45,17 +46,16 @@ export function JobHistoryPanel({
   onOpen: (jobId: string) => void;
   onRefresh: () => void;
 }) {
+  const t = useT();
+  const c = t.scanner.history;
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <History className="size-4" aria-hidden />
-          Lịch sử quét
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          Mọi lần quét được lưu lại — mở lại xem tín hiệu và kế hoạch của từng
-          mã bất cứ lúc nào, kể cả sau khi khởi động lại server.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {error ? (
@@ -67,27 +67,27 @@ export function JobHistoryPanel({
         {loading && jobs.length === 0 ? (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" aria-hidden />
-            Đang tải lịch sử…
+            {c.loading}
           </p>
         ) : null}
 
         {!loading && jobs.length === 0 ? (
           <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
-            Chưa có lần quét nào được ghi lại.
+            {c.empty}
           </p>
         ) : null}
 
         {jobs.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <caption className="sr-only">Lịch sử các lần quét pipeline</caption>
+              <caption className="sr-only">{c.caption}</caption>
               <thead>
                 <tr className="border-b text-left text-xs text-muted-foreground">
-                  <th scope="col" className="py-2 pr-3 font-medium">Thời gian</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Kiểu</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Trạng thái</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Mã</th>
-                  <th scope="col" className="py-2 pr-3 font-medium">Chờ duyệt</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colTime}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colKind}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colStatus}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colTickers}</th>
+                  <th scope="col" className="py-2 pr-3 font-medium">{c.colPending}</th>
                   <th scope="col" className="py-2 font-medium"></th>
                 </tr>
               </thead>
@@ -99,7 +99,7 @@ export function JobHistoryPanel({
                     </td>
                     <td className="py-2 pr-3">
                       <Badge variant="outline">
-                        {job.auto ? `Tự động · top ${job.top_n ?? "?"}` : "Watchlist"}
+                        {job.auto ? c.auto(String(job.top_n ?? "?")) : "Watchlist"}
                       </Badge>
                       {job.mode === "mock" ? (
                         <Badge variant="secondary" className="ml-1">
@@ -119,7 +119,7 @@ export function JobHistoryPanel({
                       ) : null}
                     </td>
                     <td className="py-2 pr-3 max-w-xs truncate" title={job.tickers.join(", ")}>
-                      {job.results_count} mã
+                      {c.tickers(job.results_count)}
                       {job.tickers.length > 0 ? ` · ${job.tickers.join(", ")}` : ""}
                     </td>
                     <td className="py-2 pr-3 tabular-nums">
@@ -132,7 +132,7 @@ export function JobHistoryPanel({
                         className="min-touch"
                         onClick={() => onOpen(job.job_id)}
                       >
-                        Xem
+                        {c.open}
                       </Button>
                     </td>
                   </tr>
@@ -143,7 +143,8 @@ export function JobHistoryPanel({
         ) : null}
 
         <Button variant="outline" size="sm" className="min-touch" onClick={onRefresh}>
-          Làm mới
+          {t.common.refresh}
+
         </Button>
       </CardContent>
     </Card>

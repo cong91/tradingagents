@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "cn";
 import type { HistoryItem } from "./types";
 import { formatLoggedPercent, signedTextTone } from "./display";
+import { useT } from "@/lib/i18n";
 
 function RatingBadge({ rating }: { rating: string }) {
   switch (rating) {
@@ -32,6 +33,8 @@ function RatingBadge({ rating }: { rating: string }) {
 }
 
 export function HistoryEntryRow({ item }: { item: HistoryItem }) {
+  const t = useT();
+  const c = t.audit.history;
   const rawPct = formatLoggedPercent(item.raw);
   const alphaPct = formatLoggedPercent(item.alpha);
   const artifact =
@@ -49,16 +52,16 @@ export function HistoryEntryRow({ item }: { item: HistoryItem }) {
             variant="outline"
             className="border-amber-500/60 text-amber-900 dark:text-amber-100"
           >
-            Chưa settle
+            {c.pending}
           </Badge>
         )}
-        {item.resolved && <Badge variant="secondary">Settle {item.resolved}</Badge>}
+        {item.resolved && <Badge variant="secondary">{c.settled(item.resolved)}</Badge>}
       </div>
       {(rawPct || alphaPct || item.holding) && (
         <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           {rawPct && (
             <span>
-              Kết quả giá:{" "}
+              {c.priceResult}{" "}
               <span className={cn("tabular-nums", signedTextTone(rawPct))}>
                 {rawPct}
               </span>
@@ -72,7 +75,7 @@ export function HistoryEntryRow({ item }: { item: HistoryItem }) {
               </span>
             </span>
           )}
-          {item.holding && <span>Giữ vị thế: {item.holding}</span>}
+          {item.holding && <span>{c.holding(item.holding)}</span>}
         </div>
       )}
       {item.decision_excerpt && (
@@ -80,7 +83,7 @@ export function HistoryEntryRow({ item }: { item: HistoryItem }) {
       )}
       {item.reflection && (
         <p className="mt-1 line-clamp-2 text-xs italic text-muted-foreground">
-          Suy ngẫm: {item.reflection}
+          {c.reflection(item.reflection)}
         </p>
       )}
       {artifact && (
@@ -88,7 +91,8 @@ export function HistoryEntryRow({ item }: { item: HistoryItem }) {
           className="mt-2 truncate font-mono text-[11px] text-muted-foreground"
           title={artifact}
         >
-          Tệp run: {artifact}
+          {c.runFile(artifact)}
+
         </p>
       )}
     </li>

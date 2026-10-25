@@ -1,16 +1,14 @@
 import type { Metadata } from "next";
+import { messages } from "@/lib/i18n/messages";
 import { PageHeader } from "@/components/page-header";
 import { ScannerScreen } from "@/components/scanner/scanner-screen";
 
-export const metadata: Metadata = { title: "Tìm cặp giao dịch" };
+export const metadata: Metadata = { title: messages.en.pages.scanner.title };
 
 export default function ScannerPage() {
   return (
     <div>
-      <PageHeader
-        title="Tìm cặp giao dịch"
-        description="Quản lý danh sách theo dõi (watchlist) và chạy quét pipeline cho từng mã trước khi đưa vào hàng duyệt lệnh."
-      />
+      <PageHeader page="scanner" />
       <ScannerScreen />
     </div>
   );

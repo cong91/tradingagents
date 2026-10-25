@@ -8,6 +8,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { ShieldAlertIcon, TriangleAlertIcon } from "lucide-react";
 
+import { useT } from "@/lib/i18n";
+import { getMessages } from "@/lib/i18n/messages";
+
 import type { HealthResponse } from "./types";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -26,7 +29,7 @@ export function useGateHealth() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as HealthResponse;
       if (typeof data.halted_today !== "boolean") {
-        throw new Error("Phản hồi /api/health thiếu halted_today");
+        throw new Error(getMessages().approvals.errors.healthMissingHalted);
       }
       return {
         status: "ready",
@@ -62,6 +65,7 @@ export function useGateHealth() {
 }
 
 export function GateBanner({ gate }: { gate: GateState }) {
+  const t = useT();
   if (gate.status === "ready" && !gate.haltedToday) return null;
 
   if (gate.status === "ready" && gate.haltedToday) {
@@ -72,12 +76,8 @@ export function GateBanner({ gate }: { gate: GateState }) {
       >
         <ShieldAlertIcon className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
         <div>
-          <p className="font-semibold">RiskGuard đã dừng giao dịch hôm nay</p>
-          <p>
-            Mọi phê duyệt sẽ bị server từ chối (403 risk_halted). Việc mở lại
-            halt chỉ do operator thực hiện phía server — màn này cố ý không có
-            nút reset.
-          </p>
+          <p className="font-semibold">{t.approvals.gate.haltedTitle}</p>
+          <p>{t.approvals.gate.haltedBody}</p>
         </div>
       </div>
     );
@@ -87,10 +87,8 @@ export function GateBanner({ gate }: { gate: GateState }) {
     return (
       <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
         <TriangleAlertIcon className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
-        <p>
-          Không đọc được GET /api/health — chưa kiểm tra được trạng thái halt
-          của RiskGuard.
-        </p>
+        <p>{t.approvals.gate.healthError}</p>
+
       </div>
     );
   }

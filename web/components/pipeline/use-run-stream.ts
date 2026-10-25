@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { parseErrorResponse } from "@/lib/api";
+import { getMessages } from "@/lib/i18n/messages";
 
 import type { RunEvent, RunPayload, StartRunInput } from "./types";
 
@@ -128,7 +129,7 @@ function applyEventToRun(run: RunPayload | null, event: RunEvent): RunPayload | 
           message:
             typeof err.message === "string"
               ? err.message
-              : "Phiên thất bại không rõ nguyên nhân.",
+              : getMessages().pipeline.errors.failedUnknown,
         },
         finished_at: event.ts,
       };
@@ -145,7 +146,7 @@ function applyEventToRun(run: RunPayload | null, event: RunEvent): RunPayload | 
           message:
             typeof err.message === "string"
               ? err.message
-              : "Phiên bị gián đoạn trước khi hoàn tất.",
+              : getMessages().pipeline.errors.interruptedUnknown,
         },
         finished_at: event.ts,
       };
@@ -263,7 +264,7 @@ export function useRunStream() {
                 ...s,
                 phase: {
                   phase: "error",
-                  message: `Không tìm thấy phiên ${runId} trên backend (server có thể đã khởi động lại).`,
+                  message: getMessages().pipeline.errors.runNotFound(runId),
                 },
                 sseConnected: false,
                 stale: false,
@@ -407,8 +408,7 @@ export function useRunStream() {
           ...s,
           phase: {
             phase: "error",
-            message:
-              "Không kết nối được backend. Hãy khởi động server FastAPI (uvicorn server.main:app --port 8000) rồi thử lại.",
+            message: getMessages().pipeline.errors.backendDown,
           },
         } : s);
         return;
@@ -437,7 +437,7 @@ export function useRunStream() {
       } catch {
         setState((s) => isCurrent() ? {
           ...s,
-          phase: { phase: "error", message: "Phản hồi POST /api/runs không đọc được." },
+          phase: { phase: "error", message: getMessages().pipeline.errors.postUnreadable },
         } : s);
         return;
       }
@@ -476,7 +476,7 @@ export function useRunStream() {
       } catch {
         setState((s) => isCurrent() ? {
           ...s,
-          phase: { phase: "error", message: "Không kết nối được backend khi tải phiên." },
+          phase: { phase: "error", message: getMessages().pipeline.errors.loadNetwork },
         } : s);
         return;
       }
@@ -490,7 +490,7 @@ export function useRunStream() {
             phase: "error",
             message:
               err.status === 404
-                ? `Phiên ${runId} không còn trên backend (server có thể đã khởi động lại — run chỉ lưu trong bộ nhớ).`
+                ? getMessages().pipeline.errors.runGone(runId)
                 : err.message,
           },
         } : s);
@@ -504,7 +504,7 @@ export function useRunStream() {
           ...s,
           phase: {
             phase: "error",
-            message: "Phản hồi GET /api/runs/{id} không đọc được.",
+            message: getMessages().pipeline.errors.getUnreadable,
           },
         } : s);
         return;

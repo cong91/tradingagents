@@ -1,11 +1,13 @@
 "use client";
 
-import { SETTING_META, type SettingRow, type SettingValue } from "./types";
+import { useT, type Messages } from "@/lib/i18n";
+import type { SettingRow, SettingValue } from "./types";
 import { fieldTypeOf } from "./use-settings";
 
-function formatDefault(row: SettingRow): string {
-  if (fieldTypeOf(row.type) === "bool") return row.default === true ? "bật" : "tắt";
-  if (row.default === null || row.default === undefined) return "trống";
+function formatDefault(t: Messages, row: SettingRow): string {
+  if (fieldTypeOf(row.type) === "bool")
+    return row.default === true ? t.settings.field.defaultOn : t.settings.field.defaultOff;
+  if (row.default === null || row.default === undefined) return t.settings.field.defaultEmpty;
   return String(row.default);
 }
 
@@ -20,7 +22,8 @@ export function SettingField({
   error?: string;
   onChange: (value: SettingValue) => void;
 }) {
-  const meta = SETTING_META[row.key];
+  const t = useT();
+  const meta = t.settings.settingMeta[row.key];
   const label = meta?.label ?? row.key;
   const id = `setting-${row.key}`;
   const fieldType = fieldTypeOf(row.type);
@@ -40,7 +43,7 @@ export function SettingField({
           <p className="mt-0.5 text-xs text-muted-foreground">{meta.hint}</p>
         ) : null}
         <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-          {row.env_var} · mặc định: {formatDefault(row)}
+          {row.env_var} · {t.settings.field.defaultLabel(formatDefault(t, row))}
         </p>
       </div>
       <div className="flex items-center gap-2">
@@ -63,7 +66,7 @@ export function SettingField({
               className="size-6 cursor-pointer accent-primary"
             />
             <span className="text-sm text-muted-foreground">
-              {value === true ? "Bật" : "Tắt"}
+              {value === true ? t.common.on : t.common.off}
             </span>
           </label>
         ) : (
@@ -76,7 +79,8 @@ export function SettingField({
               onChange={(event) => onChange(event.target.value)}
               aria-invalid={error ? true : undefined}
               aria-describedby={describedBy}
-              placeholder={formatDefault(row)}
+              placeholder={formatDefault(t, row)}
+
               className="h-11 w-full min-w-0 rounded-lg border border-input bg-background px-3 text-sm tabular-nums outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 aria-[invalid=true]:border-destructive"
             />
             {meta?.unit ? (

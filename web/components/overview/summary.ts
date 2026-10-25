@@ -69,6 +69,7 @@ export function summarizeHistory(items: HistoryItem[]): DecisionSummary {
   };
 }
 
+// Nhãn hiển thị của từng kết quả nằm ở lib/i18n/messages/overview.ts (`outcome`).
 export type DecisionOutcome = "profit" | "loss" | "flat";
 
 export function outcomeOf(alphaPct: number): DecisionOutcome {
@@ -76,9 +77,3 @@ export function outcomeOf(alphaPct: number): DecisionOutcome {
   if (alphaPct < 0) return "loss";
   return "flat";
 }
-
-export const OUTCOME_LABEL: Record<DecisionOutcome, string> = {
-  profit: "Lãi",
-  loss: "Lỗ",
-  flat: "Hoà",
-};

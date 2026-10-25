@@ -11,24 +11,26 @@ import {
   WorkflowIcon,
 } from "lucide-react";
 import { cn } from "cn";
+import { useT } from "@/lib/i18n";
 
 const NAV_ITEMS = [
-  { label: "Tổng quan lợi nhuận", href: "/", icon: LayoutDashboardIcon },
-  { label: "Agent Pipeline", href: "/pipeline", icon: WorkflowIcon },
-  { label: "Tìm cặp giao dịch", href: "/scanner", icon: ScanSearchIcon },
-  { label: "Duyệt lệnh", href: "/approvals", icon: ClipboardCheckIcon },
-  { label: "Cấu hình", href: "/settings", icon: SettingsIcon },
-  { label: "Lịch sử & Audit", href: "/audit", icon: HistoryIcon },
+  { key: "overview", href: "/", icon: LayoutDashboardIcon },
+  { key: "pipeline", href: "/pipeline", icon: WorkflowIcon },
+  { key: "scanner", href: "/scanner", icon: ScanSearchIcon },
+  { key: "approvals", href: "/approvals", icon: ClipboardCheckIcon },
+  { key: "settings", href: "/settings", icon: SettingsIcon },
+  { key: "audit", href: "/audit", icon: HistoryIcon },
 ] as const;
 
 export function Sidebar() {
   const pathname = usePathname();
+  const t = useT();
 
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar">
-      <nav aria-label="Điều hướng chính" className="flex-1 p-3">
+      <nav aria-label={t.common.nav.label} className="flex-1 p-3">
         <ul className="space-y-1">
-          {NAV_ITEMS.map(({ label, href, icon: Icon }) => {
+          {NAV_ITEMS.map(({ key, href, icon: Icon }) => {
             const active =
               href === "/" ? pathname === "/" : pathname.startsWith(href);
             return (
@@ -44,7 +46,7 @@ export function Sidebar() {
                   )}
                 >
                   <Icon className="size-4 shrink-0" aria-hidden="true" />
-                  <span>{label}</span>
+                  <span>{t.common.nav[key]}</span>
                 </Link>
               </li>
             );
@@ -52,7 +54,7 @@ export function Sidebar() {
         </ul>
       </nav>
       <p className="border-t p-3 text-[11px] leading-snug text-muted-foreground">
-        Công cụ nghiên cứu — không phải lời khuyên tài chính.
+        {t.common.disclaimer}
       </p>
     </aside>
   );

@@ -8,6 +8,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { getMessages } from "@/lib/i18n/messages";
+
 import { FetchError } from "./contract";
 
 export type PanelState<T> =
@@ -31,7 +33,7 @@ export function usePoll<T>(
     fetcher().then(
       (data) => setState({ status: "ready", data, fetchedAt: Date.now() }),
       (err: unknown) => {
-        const message = err instanceof Error ? err.message : "Lỗi không xác định";
+        const message = err instanceof Error ? err.message : getMessages().common.unknownError;
         const code = err instanceof FetchError ? err.code : "unknown_error";
         setState((prev) => {
           if (prev.status === "ready" || prev.status === "stale") {

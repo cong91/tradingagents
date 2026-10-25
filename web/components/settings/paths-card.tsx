@@ -10,33 +10,35 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { PATH_LABELS, type SettingRow } from "./types";
+import { useT } from "@/lib/i18n";
+import type { SettingRow } from "./types";
 
 export function PathsCard({ rows }: { rows: SettingRow[] }) {
+  const t = useT();
+  const c = t.settings.paths;
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <FolderIcon className="size-4" aria-hidden="true" />
-          Đường dẫn hệ thống
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          Chỉ đọc — đặt qua biến môi trường tương ứng, không ghi được qua API.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          <Badge variant="outline">Chỉ đọc</Badge>
+          <Badge variant="outline">{t.common.readOnly}</Badge>
         </CardAction>
       </CardHeader>
       <CardContent>
         {rows.length === 0 ? (
           <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-            Máy chủ không trả về đường dẫn nào.
+            {c.empty}
           </p>
         ) : (
           <ul className="space-y-2">
             {rows.map((row) => (
               <li key={row.key} className="border-t py-2 first:border-t-0 first:pt-0">
-                <p className="text-sm">{PATH_LABELS[row.key] ?? row.key}</p>
+                <p className="text-sm">{t.settings.pathLabels[row.key] ?? row.key}
+</p>
                 <p className="break-all font-mono text-xs text-muted-foreground">
                   {row.value === null || row.value === undefined ? "—" : String(row.value)}
                 </p>

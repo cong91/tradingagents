@@ -42,6 +42,7 @@ import type {
 import { EmptyState } from "./empty-state";
 import { formatHistoricalMoney, historicalCurrencies } from "./historical-currency";
 import type { PanelState } from "./use-panel";
+import { useT, type Messages } from "@/lib/i18n";
 
 const STALE_AFTER_MS = 60_000; // badge "cũ" khi generated_at già hơn 60 giây
 
@@ -51,9 +52,10 @@ function isMissingEndpoint(code: string): boolean {
 }
 
 function PerformanceSkeleton() {
+  const t = useT();
   return (
     <div role="status" className="space-y-4">
-      <span className="sr-only">Đang tải hiệu suất giao dịch…</span>
+      <span className="sr-only">{t.overview.performance.loading}</span>
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4" aria-hidden="true">
         {Array.from({ length: 4 }, (_, index) => (
           <div key={index} className="h-20 animate-pulse rounded-lg bg-muted" />
@@ -66,15 +68,13 @@ function PerformanceSkeleton() {
 }
 
 function MissingEndpointState({ onRetry }: { onRetry: () => void }) {
+  const t = useT();
   return (
     <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed px-6 py-8">
-      <p className="text-sm font-medium">Chưa có dữ liệu hiệu suất</p>
-      <p className="text-sm text-muted-foreground">
-        Backend chưa hiện thực GET /api/performance. Card này sẽ có dữ liệu sau
-        khi server cập nhật.
-      </p>
+      <p className="text-sm font-medium">{t.overview.performance.missingTitle}</p>
+      <p className="text-sm text-muted-foreground">{t.overview.performance.missingBody}</p>
       <Button variant="outline" size="sm" className="min-touch" onClick={onRetry}>
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
@@ -89,14 +89,15 @@ function PerformanceError({
   code: string;
   onRetry: () => void;
 }) {
+  const t = useT();
   return (
     <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed px-6 py-8">
       <p className="text-sm font-medium text-destructive">
-        Không đọc được hiệu suất giao dịch ({code})
+        {t.overview.performance.cannotRead(code)}
       </p>
       <p className="text-sm text-muted-foreground">{message}</p>
       <Button variant="outline" size="sm" className="min-touch" onClick={onRetry}>
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
@@ -105,14 +106,14 @@ function PerformanceError({
 /** Nhãn action của dòng execute — buy/sell và cả bracket (bridge.py:507,517,529
  *  log bracket_placed/bracket_failed với phase="execute"). Không thể map mù
  *  "buy → Mua, còn lại → Bán" vì bracket line sẽ thành "Bán" sai sự thật. */
-function actionBadge(action: string | null): {
+function actionBadge(t: Messages, action: string | null): {
   label: string;
   variant: "outline" | "secondary" | "destructive";
 } {
-  if (action === "buy") return { label: "Mua", variant: "outline" };
-  if (action === "sell") return { label: "Bán", variant: "outline" };
-  if (action === "bracket_placed") return { label: "Bảo vệ lỗ", variant: "secondary" };
-  if (action === "bracket_failed") return { label: "Lỗi bảo vệ lỗ", variant: "destructive" };
+  if (action === "buy") return { label: t.common.buy, variant: "outline" };
+  if (action === "sell") return { label: t.common.sell, variant: "outline" };
+  if (action === "bracket_placed") return { label: t.overview.performance.bracketPlaced, variant: "secondary" };
+  if (action === "bracket_failed") return { label: t.overview.performance.bracketFailed, variant: "destructive" };
   return { label: action ?? "—", variant: "outline" };
 }
 
@@ -150,24 +151,26 @@ function Tile({
 }
 
 function SummaryTiles({ data }: { data: PerformancePayload }) {
+  const t = useT();
+  const c = t.overview.performance;
   const { summary } = data;
   // Kỳ vọng/ván: màu xanh khi >0, đỏ khi <0 — dấu +/− trong số là tín hiệu
   // không dựa vào màu (WCAG 1.4.1, quy ước lib/format.ts).
-  const expectancyLabel = `Kỳ vọng trên mỗi ván ${formatSignedNumber(summary.expectancy_pct, 2)} phần trăm`;
+  const expectancyLabel = c.expectancyAria(formatSignedNumber(summary.expectancy_pct, 2));
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      <Tile label="Ván đã đóng" note={`${summary.wins} thắng · ${summary.losses} thua`}>
+      <Tile label={c.closedTrades} note={c.winsLosses(summary.wins, summary.losses)}>
         {summary.closed_trades}
       </Tile>
-      <Tile label="Tỉ lệ thắng" note={`trên ${summary.closed_trades} ván đã đóng`}>
+      <Tile label={c.winRate} note={c.onClosed(summary.closed_trades)}>
         {formatPercent(summary.win_rate_pct)}
       </Tile>
-      <Tile label="Kỳ vọng/ván" ariaLabel={expectancyLabel}>
+      <Tile label={c.expectancy} ariaLabel={expectancyLabel}>
         <span className={pnlTextClass(summary.expectancy_pct)}>
           {formatSignedNumber(summary.expectancy_pct, 2)}&nbsp;%
         </span>
       </Tile>
-      <Tile label="Trung bình thắng/lỗ" note="điểm % mỗi vòng giao dịch đã đóng">
+      <Tile label={c.avgWinLoss} note={c.avgWinLossNote}>
         <span className="text-profit">{formatSignedNumber(summary.avg_win_pct, 2)}&nbsp;%</span>
         <span className="text-muted-foreground"> / </span>
         <span className="text-loss">{formatSignedNumber(summary.avg_loss_pct, 2)}&nbsp;%</span>
@@ -177,25 +180,27 @@ function SummaryTiles({ data }: { data: PerformancePayload }) {
 }
 
 function OpenPositionsTable({ positions }: { positions: PerformanceOpenPosition[] }) {
+  const t = useT();
+  const c = t.overview.performance;
   if (positions.length === 0) {
     return (
       <p className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
-        Chưa có vị thế nào đang mở
+        {c.noOpenPositions}
       </p>
     );
   }
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
-        <caption className="sr-only">Vị thế đang mở với lãi/lỗ tạm tính</caption>
+        <caption className="sr-only">{c.openCaption}</caption>
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
-            <th scope="col" className="py-2 pr-4 font-medium">Mã</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Thị trường</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Giá vào</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Giá hiện tại</th>
-            <th scope="col" className="py-2 text-right font-medium">Lãi/lỗ %</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.ticker}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.market}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantity}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.entryPrice}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.currentPrice}</th>
+            <th scope="col" className="py-2 text-right font-medium">{c.pnlPct}</th>
           </tr>
         </thead>
         <tbody className="divide-y">
@@ -240,32 +245,34 @@ function OpenPositionsTable({ positions }: { positions: PerformanceOpenPosition[
 }
 
 function RecentOrdersTable({ orders }: { orders: PerformanceOrder[] }) {
+  const t = useT();
+  const c = t.overview.performance;
   if (orders.length === 0) {
     return (
       <p className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
-        Chưa có lệnh gần đây
+        {c.noRecentOrders}
       </p>
     );
   }
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
-        <caption className="sr-only">Lệnh execute gần đây, mới nhất trước</caption>
+        <caption className="sr-only">{c.recentCaption}</caption>
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
-            <th scope="col" className="py-2 pr-4 font-medium">Thời gian</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Mã</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Lệnh</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Thị trường</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Giá</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Notional / margin</th>
-            <th scope="col" className="py-2 font-medium">Chế độ</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.time}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.ticker}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.order}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.market}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantity}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.price}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.notionalMargin}</th>
+            <th scope="col" className="py-2 font-medium">{c.mode}</th>
           </tr>
         </thead>
         <tbody className="divide-y">
           {orders.map((order, index) => {
-            const action = actionBadge(order.action);
+            const action = actionBadge(t, order.action);
             const mode = modeBadge(order.mode);
             const isDerivatives = order.market === "derivatives";
             const { quote, settle } = historicalCurrencies(order.ccxt_symbol);
@@ -306,6 +313,8 @@ function RecentOrdersTable({ orders }: { orders: PerformanceOrder[] }) {
 }
 
 function PerformanceBody({ data }: { data: PerformancePayload }) {
+  const t = useT();
+  const c = t.overview.performance;
   const { summary, open_positions, brackets, recent_orders } = data;
 
   // Empty theo yêu cầu: closed_trades = 0 → "chưa có giao dịch nào được thực
@@ -319,8 +328,8 @@ function PerformanceBody({ data }: { data: PerformancePayload }) {
   if (!hasExecutions) {
     return (
       <EmptyState
-        title="Chưa có giao dịch nào được thực thi"
-        hint="Dữ liệu sẽ xuất hiện sau lần chạy đầu tiên."
+        title={c.emptyTitle}
+        hint={c.emptyHint}
       />
     );
   }
@@ -330,17 +339,17 @@ function PerformanceBody({ data }: { data: PerformancePayload }) {
       <SummaryTiles data={data} />
 
       <section className="space-y-2">
-        <h3 className="text-sm font-medium">Vị thế đang mở</h3>
+        <h3 className="text-sm font-medium">{c.openPositions}</h3>
         <OpenPositionsTable positions={open_positions} />
       </section>
 
       <section className="space-y-2">
-        <h3 className="text-sm font-medium">Lệnh gần đây</h3>
+        <h3 className="text-sm font-medium">{c.recentOrders}</h3>
         <RecentOrdersTable orders={recent_orders} />
       </section>
 
       <p className="text-xs text-muted-foreground">
-        Bảo vệ lỗ: {brackets.placed} bracket đã đặt trên sàn, {brackets.failed} lỗi.
+        {c.bracketsNote(brackets.placed, brackets.failed)}
       </p>
     </div>
   );
@@ -353,6 +362,7 @@ export function PerformanceCard({
   state: PanelState<PerformancePayload>;
   onRetry: () => void;
 }) {
+  const t = useT();
   // Đồng hồ cho badge stale — Date.now() không được gọi trong render (purity),
   // mẫu WatchlistPanel.
   const [now, setNow] = useState(() => Date.now());
@@ -368,17 +378,14 @@ export function PerformanceCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Hiệu suất giao dịch</CardTitle>
-        <CardDescription>
-          Thắng/thua, kỳ vọng mỗi ván và lệnh gần đây — replay FIFO trên nhật
-          ký thực thi của engine.
-        </CardDescription>
+        <CardTitle>{t.overview.performance.title}</CardTitle>
+        <CardDescription>{t.overview.performance.description}</CardDescription>
         <CardAction>
           <div className="flex items-center gap-2">
             {isStale ? (
               <Badge variant="outline" className="gap-1">
                 <TriangleAlertIcon className="size-3" aria-hidden="true" />
-                Dữ liệu cũ
+                {t.common.staleData}
               </Badge>
             ) : null}
             <Button
@@ -392,7 +399,7 @@ export function PerformanceCard({
               ) : (
                 <RefreshCwIcon aria-hidden="true" />
               )}
-              Làm mới
+              {t.common.refresh}
             </Button>
           </div>
         </CardAction>
@@ -414,8 +421,7 @@ export function PerformanceCard({
           <>
             {state.status === "stale" ? (
               <p role="alert" className="mb-4 text-sm text-destructive">
-                Lần poll gần nhất lỗi ({state.code}) — đang hiển thị dữ liệu cũ:{" "}
-                {state.message}
+                {t.overview.staleNote(state.code, state.message)}
               </p>
             ) : null}
             <PerformanceBody data={state.data} />
@@ -425,8 +431,8 @@ export function PerformanceCard({
       {state.status === "ready" || state.status === "stale" ? (
         <CardContent className="pt-0">
           <p className="text-xs text-muted-foreground">
-            Cập nhật {formatDateTime(state.data.generated_at)} · tự làm mới mỗi
-            30 giây.
+            {t.overview.performance.footer(formatDateTime(state.data.generated_at))}
+
           </p>
         </CardContent>
       ) : null}

@@ -1,4 +1,6 @@
 import { Badge } from "@/components/ui/badge";
+import { formatDateWith, formatQuantityValue } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { EmptyState } from "./empty-state";
 import type { AuditItem } from "./contract";
 import {
@@ -7,14 +9,9 @@ import {
   historicalCurrencies,
 } from "./historical-currency";
 
-const qtyFormat = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 8 });
-
 function formatTime(timestamp: string | null): string {
   if (!timestamp) return "—";
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime())
-    ? timestamp
-    : date.toLocaleString("vi-VN", { dateStyle: "short", timeStyle: "medium" });
+  return formatDateWith(timestamp, { dateStyle: "short", timeStyle: "medium" });
 }
 
 /** Lệnh thực thi = dòng audit action buy/sell ở phase "execute" (hợp đồng §6). */
@@ -23,14 +20,16 @@ function isExecutedOrder(item: AuditItem): boolean {
 }
 
 export function OrderTable({ items }: { items: AuditItem[] }) {
+  const t = useT();
+  const c = t.overview.orders;
   const orders = items.filter(isExecutedOrder);
 
   if (orders.length === 0) {
     return (
       <EmptyState
-        title="Chưa có lệnh nào được thực thi"
-        hint="Lệnh xuất hiện sau khi pipeline tạo kế hoạch và kế hoạch đó được duyệt ở màn Duyệt lệnh."
-        action={{ label: "Mở màn Duyệt lệnh", href: "/approvals" }}
+        title={c.emptyTitle}
+        hint={c.emptyHint}
+        action={{ label: t.overview.openApprovals, href: "/approvals" }}
       />
     );
   }
@@ -40,14 +39,14 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
-            <th scope="col" className="py-2 pr-4 font-medium">Thời gian</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Cặp</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Lệnh</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Giá ước tính</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Spot dòng tiền / Futures notional</th>
-            <th scope="col" className="py-2 pr-4 font-medium">Chế độ</th>
-            <th scope="col" className="py-2 font-medium">Order ID</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.time}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.pair}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.order}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantity}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.estPrice}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.flowNotional}</th>
+            <th scope="col" className="py-2 pr-4 font-medium">{c.mode}</th>
+            <th scope="col" className="py-2 font-medium">{c.orderId}</th>
           </tr>
         </thead>
         <tbody>
@@ -65,20 +64,21 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
                 <td className="py-2 pr-4 font-medium">{order.ticker ?? "—"}</td>
                 <td className="py-2 pr-4">
                   <div className="flex flex-wrap items-center gap-1">
-                    <Badge variant="outline">{isBuy ? "Mua" : "Bán"}</Badge>
+                    <Badge variant="outline">{isBuy ? t.common.buy : t.common.sell}</Badge>
                     <Badge variant="secondary">{isDerivatives ? "Futures" : "Spot"}</Badge>
                   </div>
                 </td>
-                <td className="py-2 pr-4 text-right tabular-nums">{qty != null ? qtyFormat.format(qty) : "—"}</td>
+                <td className="py-2 pr-4 text-right tabular-nums">{qty != null ? formatQuantityValue(qty) : "—"}</td>
                 <td className="py-2 pr-4 text-right tabular-nums">{formatHistoricalMoney(price, quote)}</td>
                 <td className={`py-2 pr-4 text-right tabular-nums ${!isDerivatives && flow != null && flow !== 0 ? flow > 0 ? "text-profit" : "text-loss" : ""}`}>
                   {isDerivatives
-                    ? `${formatHistoricalMoney(notional, quote)} notional${order.leverage != null ? ` · ${qtyFormat.format(order.leverage)}x · margin ${formatHistoricalMoney(order.cost, settle)}` : order.cost != null ? ` · margin ${formatHistoricalMoney(order.cost, settle)}` : ""}`
+                    ? `${formatHistoricalMoney(notional, quote)} notional${order.leverage != null ? ` · ${formatQuantityValue(order.leverage)}x · margin ${formatHistoricalMoney(order.cost, settle)}` : order.cost != null ? ` · margin ${formatHistoricalMoney(order.cost, settle)}` : ""}`
                     : flow != null ? formatHistoricalSignedMoney(flow, quote) : "—"}
                 </td>
                 <td className="py-2 pr-4">
                   <Badge variant={order.mode === "live" ? "destructive" : "secondary"}>
-                    {order.mode === "live" ? "LIVE" : "Mô phỏng"}
+                    {order.mode === "live" ? "LIVE" : t.common.simulated}
+
                   </Badge>
                 </td>
                 <td className="py-2 font-mono text-xs">{order.order_id ?? "—"}</td>

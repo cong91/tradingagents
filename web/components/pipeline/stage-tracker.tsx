@@ -13,16 +13,9 @@ import {
 } from "lucide-react";
 import { cn } from "cn";
 import type { RunEvent, RunEventType, RunStatus } from "./types";
+import { useT } from "@/lib/i18n";
 
-const STAGES = [
-  "Analyst (phân tích thị trường)",
-  "Tranh luận Bull/Bear",
-  "Research Manager",
-  "Trader",
-  "Tranh luận rủi ro",
-  "Quản lý danh mục (PM)",
-  "Quyết định cuối",
-] as const;
+// Nhãn 7 giai đoạn (theo thứ tự engine) ở lib/i18n/messages/pipeline.ts (stages).
 
 const ADVANCING: Partial<Record<RunEventType, number>> = {
   debate_update: 1,
@@ -75,6 +68,7 @@ export function StageTracker({
   status: RunStatus;
 }) {
   const current = currentStageIndex(events);
+  const t = useT();
 
   const statusFor = (index: number): StageStatus => {
     if (status === "failed") {
@@ -92,11 +86,11 @@ export function StageTracker({
 
   return (
     <ol className="space-y-1.5">
-      {STAGES.map((label, index) => {
+      {t.pipeline.stages.map((label, index) => {
         const stageStatus = statusFor(index);
         const Icon = STAGE_ICON[stageStatus];
         return (
-          <li key={label} className="flex items-center gap-2 text-sm">
+          <li key={index} className="flex items-center gap-2 text-sm">
             <Icon
               aria-hidden="true"
               className={cn(
@@ -116,9 +110,10 @@ export function StageTracker({
               {label}
             </span>
             {stageStatus === "active" && (
-              <span className="sr-only">(đang chạy)</span>
+              <span className="sr-only">{t.pipeline.stageRunning}</span>
             )}
-            {stageStatus === "failed" && <span className="sr-only">(thất bại)</span>}
+            {stageStatus === "failed" && <span className="sr-only">{t.pipeline.stageFailed}</span>}
+
           </li>
         );
       })}

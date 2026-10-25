@@ -21,31 +21,17 @@ import { DataMeta, EmptyState, ErrorState, SectionSkeleton } from "./section-sta
 import { formatDateTime, formatPriceEst, formatQty } from "./display";
 import { useSectionData } from "./use-section-data";
 import type { AuditEvent, AuditPayload } from "./types";
+import { useT, type Messages } from "@/lib/i18n";
 
 const PAGE_SIZE = 25;
 const STALE_SECONDS = 10;
 const FIELD_CLASS =
   "h-9 w-full rounded-lg border border-input bg-background px-3 text-sm";
 
-const ACTION_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "buy", label: "Mua (buy)" },
-  { value: "sell", label: "Bán (sell)" },
-  { value: "no_order", label: "Không đặt lệnh (no_order)" },
-  { value: "rejected_by_risk", label: "RiskGuard từ chối (rejected_by_risk)" },
-  { value: "rejected_at_execute", label: "Từ chối lúc thực thi (rejected_at_execute)" },
-  { value: "execute_denied", label: "Thực thi bị chặn (execute_denied)" },
-  { value: "awaiting_approval", label: "Chờ duyệt (awaiting_approval)" },
-  { value: "approval_granted", label: "Đã duyệt (approval_granted)" },
-  { value: "approval_denied", label: "Từ chối duyệt (approval_denied)" },
-];
-
-const PHASE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "plan", label: "Lập kế hoạch (plan)" },
-  { value: "execute", label: "Thực thi (execute)" },
-];
-
-function actionLabel(action: string): string {
-  return ACTION_OPTIONS.find((option) => option.value === action)?.label ?? action;
+// Danh sách hành động/giai đoạn (giá trị enum backend + nhãn theo locale):
+// lib/i18n/messages/audit.ts (log.actions / log.phases).
+function actionLabel(t: Messages, action: string): string {
+  return t.audit.log.actions.find((option) => option.value === action)?.label ?? action;
 }
 
 function actionVariant(
@@ -69,14 +55,15 @@ function actionVariant(
 }
 
 function ActionCell({ event }: { event: AuditEvent }) {
+  const t = useT();
   return (
     <div className="flex flex-col gap-1">
       <Badge variant={actionVariant(event.action ?? "")}>
-        {event.action ? actionLabel(event.action) : "Không có hành động"}
+        {event.action ? actionLabel(t, event.action) : t.audit.log.noAction}
       </Badge>
       {event.phase && (
         <span className="text-[11px] text-muted-foreground">
-          {PHASE_OPTIONS.find((option) => option.value === event.phase)?.label ??
+          {t.audit.log.phases.find((option) => option.value === event.phase)?.label ??
             event.phase}
         </span>
       )}
@@ -90,15 +77,16 @@ function ActionCell({ event }: { event: AuditEvent }) {
 }
 
 function ModeCell({ event }: { event: AuditEvent }) {
+  const t = useT();
   if (!event.mode) return <span className="text-muted-foreground">—</span>;
   return (
     <div className="flex flex-col gap-0.5">
       <Badge variant={event.mode === "live" ? "destructive" : "secondary"}>
-        {event.mode === "live" ? "LIVE — lệnh thật" : "Mô phỏng (dry)"}
+        {event.mode === "live" ? t.audit.log.live : t.audit.log.dry}
       </Badge>
       {event.confirmed != null && (
         <span className="text-[11px] text-muted-foreground">
-          {event.confirmed ? "Đã xác nhận" : "Chưa xác nhận"}
+          {event.confirmed ? t.audit.log.confirmed : t.audit.log.unconfirmed}
         </span>
       )}
     </div>
@@ -107,12 +95,13 @@ function ModeCell({ event }: { event: AuditEvent }) {
 
 function ControlLineRow({ event }: { event: AuditEvent }) {
   const isHalt = event.event === "halt";
+  const t = useT();
   return (
     <tr className="border-b bg-amber-50/70 dark:bg-amber-950/40">
       <td colSpan={7} className="px-3 py-2">
         <div className="flex flex-wrap items-baseline gap-x-2 text-xs">
           <span className="font-semibold">
-            {isHalt ? "HALT — dừng giao dịch trong ngày" : "Mở lại giao dịch (halt_reset)"}
+            {isHalt ? t.audit.log.haltRow : t.audit.log.haltResetRow}
           </span>
           {event.reason && (
             <span className="text-muted-foreground">{event.reason}</span>
@@ -156,6 +145,8 @@ function AuditRow({ event }: { event: AuditEvent }) {
 }
 
 export function AuditLogCard() {
+  const t = useT();
+  const c = t.audit.log;
   const [tickerInput, setTickerInput] = useState("");
   const [ticker, setTicker] = useState("");
   const [action, setAction] = useState("");
@@ -195,12 +186,8 @@ export function AuditLogCard() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Nhật ký audit</CardTitle>
-        <CardDescription>
-          {
-            "GET /api/audit — nhật ký kiểm soát thực thi (JSONL, mới nhất trước): mọi quyết định RiskGuard, lệnh và hành động duyệt đều nằm ở đây."
-          }
-        </CardDescription>
+        <CardTitle>{c.title}</CardTitle>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
           <DataMeta
             generatedAt={data?.generated_at ?? null}
@@ -217,18 +204,17 @@ export function AuditLogCard() {
             className="flex flex-col gap-1 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-3"
           >
             <p className="text-sm font-semibold text-destructive">
-              RiskGuard đã dừng giao dịch hôm nay
+              {c.haltedTitle}
             </p>
             {data.halt_reason && (
               <p className="text-sm text-muted-foreground">{data.halt_reason}</p>
             )}
             <p className="text-xs text-muted-foreground">
-              Halt gần nhất: {formatDateTime(data.last_halt)}
+              {c.lastHalt(formatDateTime(data.last_halt))}
               {data.last_halt_reset
-                ? ` · Mở lại gần nhất: ${formatDateTime(data.last_halt_reset)}`
-                : " · Chưa được mở lại"}
-              . Việc mở lại halt chỉ thực hiện được trên máy chủ — cố ý không có
-              nút reset trên UI.
+                ? c.lastReset(formatDateTime(data.last_halt_reset))
+                : c.notReset}
+              {c.haltNote}
             </p>
           </div>
         )}
@@ -236,19 +222,19 @@ export function AuditLogCard() {
         <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
           <div className="col-span-2 md:col-span-1">
             <label htmlFor="audit-ticker" className="text-xs text-muted-foreground">
-              Ticker
+              {c.ticker}
             </label>
             <input
               id="audit-ticker"
               value={tickerInput}
               onChange={(e) => setTickerInput(e.target.value)}
-              placeholder="VD: BTC-USD"
+              placeholder={c.tickerPlaceholder}
               className={cn(FIELD_CLASS, "mt-1")}
             />
           </div>
           <div className="col-span-2 md:col-span-1">
             <label htmlFor="audit-action" className="text-xs text-muted-foreground">
-              Hành động
+              {c.action}
             </label>
             <select
               id="audit-action"
@@ -259,8 +245,8 @@ export function AuditLogCard() {
               }}
               className={cn(FIELD_CLASS, "mt-1")}
             >
-              <option value="">Tất cả</option>
-              {ACTION_OPTIONS.map((option) => (
+              <option value="">{c.all}</option>
+              {c.actions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -269,7 +255,7 @@ export function AuditLogCard() {
           </div>
           <div className="col-span-2 md:col-span-1">
             <label htmlFor="audit-phase" className="text-xs text-muted-foreground">
-              Giai đoạn
+              {c.phase}
             </label>
             <select
               id="audit-phase"
@@ -280,8 +266,8 @@ export function AuditLogCard() {
               }}
               className={cn(FIELD_CLASS, "mt-1")}
             >
-              <option value="">Tất cả</option>
-              {PHASE_OPTIONS.map((option) => (
+              <option value="">{c.all}</option>
+              {c.phases.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -290,7 +276,7 @@ export function AuditLogCard() {
           </div>
           <div className="col-span-2 md:col-span-1">
             <label htmlFor="audit-from" className="text-xs text-muted-foreground">
-              Từ ngày
+              {c.from}
             </label>
             <input
               id="audit-from"
@@ -305,7 +291,7 @@ export function AuditLogCard() {
           </div>
           <div className="col-span-2 md:col-span-1">
             <label htmlFor="audit-to" className="text-xs text-muted-foreground">
-              Đến ngày
+              {c.to}
             </label>
             <input
               id="audit-to"
@@ -326,18 +312,18 @@ export function AuditLogCard() {
         )}
         {state.status === "ready" && state.data.total_lines === 0 && (
           <EmptyState
-            title="Nhật ký audit chưa có dòng nào"
-            hint="File audit JSONL chưa được tạo — đây là dấu hiệu cài mới, không phải lỗi. Chạy pipeline hằng ngày hoặc phê duyệt một lệnh để tạo dòng audit đầu tiên."
+            title={c.emptyTitle}
+            hint={c.emptyHint}
             actionHref="/approvals"
-            actionLabel="Đến hàng đợi duyệt lệnh (M4)"
+            actionLabel={c.emptyAction}
           />
         )}
         {state.status === "ready" &&
           state.data.total_lines > 0 &&
           state.data.items.length === 0 && (
             <EmptyState
-              title="Không có dòng nào khớp bộ lọc"
-              hint={`Tổng cộng ${state.data.total_lines} dòng audit nhưng không dòng nào khớp điều kiện hiện tại. Thử nới lỏng bộ lọc hoặc xóa khoảng ngày.`}
+              title={c.noMatchTitle}
+              hint={c.noMatchHint(state.data.total_lines)}
             />
           )}
         {state.status === "ready" && state.data.items.length > 0 && (
@@ -345,17 +331,17 @@ export function AuditLogCard() {
             <div className="overflow-x-auto rounded-lg border">
               <table className="w-full text-sm">
                 <caption className="sr-only">
-                  Nhật ký audit thực thi — mới nhất trước
+                  {c.caption}
                 </caption>
                 <thead>
                   <tr className="border-b bg-muted/50 text-left text-xs text-muted-foreground">
-                    <th scope="col" className="px-3 py-2 font-medium">Thời điểm</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Ticker</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Hành động</th>
-                    <th scope="col" className="px-3 py-2 text-right font-medium">Khối lượng</th>
-                    <th scope="col" className="px-3 py-2 text-right font-medium">Giá ước tính</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Chế độ</th>
-                    <th scope="col" className="px-3 py-2 font-medium">Lý do</th>
+                    <th scope="col" className="px-3 py-2 font-medium">{c.colTime}</th>
+                    <th scope="col" className="px-3 py-2 font-medium">{c.colTicker}</th>
+                    <th scope="col" className="px-3 py-2 font-medium">{c.colAction}</th>
+                    <th scope="col" className="px-3 py-2 text-right font-medium">{c.colQty}</th>
+                    <th scope="col" className="px-3 py-2 text-right font-medium">{c.colPrice}</th>
+                    <th scope="col" className="px-3 py-2 font-medium">{c.colMode}</th>
+                    <th scope="col" className="px-3 py-2 font-medium">{c.colReason}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -372,11 +358,8 @@ export function AuditLogCard() {
 
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="text-xs text-muted-foreground">
-                {state.data.total_matching} dòng khớp / {state.data.total_lines} dòng
-                tổng cộng
-                {state.data.skipped_lines
-                  ? ` · ${state.data.skipped_lines} dòng JSON hỏng đã bỏ qua`
-                  : ""}
+                {c.matching(state.data.total_matching, state.data.total_lines)}
+                {state.data.skipped_lines ? c.skipped(state.data.skipped_lines) : ""}
               </p>
               <div className="flex items-center gap-2">
                 <Button
@@ -387,10 +370,10 @@ export function AuditLogCard() {
                   onClick={() => setPage((current) => current - 1)}
                 >
                   <ChevronLeftIcon aria-hidden="true" />
-                  Trang trước
+                  {c.prev}
                 </Button>
                 <span className="text-xs tabular-nums text-muted-foreground">
-                  Trang {state.data.page}/{totalPages}
+                  {c.page(state.data.page, totalPages)}
                 </span>
                 <Button
                   variant="outline"
@@ -399,7 +382,8 @@ export function AuditLogCard() {
                   disabled={page >= totalPages}
                   onClick={() => setPage((current) => current + 1)}
                 >
-                  Trang sau
+                  {c.next}
+
                   <ChevronRightIcon aria-hidden="true" />
                 </Button>
               </div>

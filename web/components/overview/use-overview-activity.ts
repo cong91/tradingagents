@@ -7,6 +7,7 @@ import type { AutoloopPayload } from "@/components/settings/autoloop-types";
 import { scannerApi } from "@/components/scanner/scanner-api";
 import type { DailyJobListResponse, DailyJobStatusResponse } from "@/components/scanner/scanner-types";
 import type { RunPayload } from "@/components/pipeline/types";
+import { getMessages } from "@/lib/i18n/messages";
 import { fetchHealth } from "./contract";
 
 const POLL_IDLE_MS = 15_000;
@@ -29,7 +30,7 @@ export type OverviewActivityState =
 async function fetchActiveRun(runId: string | null): Promise<RunPayload | null> {
   if (!runId) return null;
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Không đọc được run đang hoạt động (HTTP ${response.status}).`);
+  if (!response.ok) throw new Error(getMessages().overview.activity.runReadError(response.status));
   return (await response.json()) as RunPayload;
 }
 
@@ -71,7 +72,7 @@ export function useOverviewActivity() {
     if (autoloopResult.status === "rejected") {
       errors.autoloop = autoloopResult.reason instanceof Error
         ? autoloopResult.reason.message
-        : "Không đọc được trạng thái autoloop.";
+        : getMessages().overview.activity.autoloopReadError;
     }
     if (dailyResult.status === "rejected" || dailyJobResult.status === "rejected") {
       const reason = dailyResult.status === "rejected"
@@ -81,7 +82,7 @@ export function useOverviewActivity() {
           : null;
       errors.daily = reason instanceof Error
         ? reason.message
-        : "Không đọc được trạng thái job hằng ngày.";
+        : getMessages().overview.activity.dailyReadError;
     }
     if (healthResult.status === "rejected" || activeRunResult.status === "rejected") {
       const reason = healthResult.status === "rejected"
@@ -91,7 +92,7 @@ export function useOverviewActivity() {
           : null;
       errors.run = reason instanceof Error
         ? reason.message
-        : "Không đọc được phiên phân tích đang hoạt động.";
+        : getMessages().overview.activity.runFallbackError;
     }
 
     const data: OverviewActivityData = {

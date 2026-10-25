@@ -30,15 +30,18 @@ import {
 import { HistoryEntryRow } from "./history-entry";
 import { useSectionData } from "./use-section-data";
 import type { BacktestDetailPayload, BacktestListPayload, BacktestRun } from "./types";
+import { useT } from "@/lib/i18n";
 
 const STALE_SECONDS = 60;
 
 function ByRatingTable({ run }: { run: BacktestRun }) {
+  const t = useT();
+  const c = t.audit.backtest;
   const ratings = Object.entries(run.by_rating);
   if (ratings.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        Không có quyết định nào được chấm điểm theo rating.
+        {c.noRatings}
       </p>
     );
   }
@@ -46,14 +49,14 @@ function ByRatingTable({ run }: { run: BacktestRun }) {
     <div className="overflow-x-auto rounded-lg border">
       <table className="w-full text-sm">
         <caption className="sr-only">
-          Tổng kết backtest theo rating — run {run.run_id}
+          {c.caption(run.run_id)}
         </caption>
         <thead>
           <tr className="border-b bg-muted/50 text-left text-xs text-muted-foreground">
-            <th scope="col" className="px-3 py-2 font-medium">Rating</th>
-            <th scope="col" className="px-3 py-2 text-right font-medium">Số quyết định</th>
-            <th scope="col" className="px-3 py-2 text-right font-medium">Tỉ lệ trúng</th>
-            <th scope="col" className="px-3 py-2 text-right font-medium">Alpha trung bình</th>
+            <th scope="col" className="px-3 py-2 font-medium">{c.colRating}</th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">{c.colCount}</th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">{c.colHitRate}</th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">{c.colAlpha}</th>
           </tr>
         </thead>
         <tbody>
@@ -81,6 +84,7 @@ function ByRatingTable({ run }: { run: BacktestRun }) {
 }
 
 function RunDetail({ runId }: { runId: string }) {
+  const t = useT();
   const { state, refresh } = useSectionData<BacktestDetailPayload>(
     `/api/backtest?run_id=${encodeURIComponent(runId)}`
   );
@@ -93,12 +97,12 @@ function RunDetail({ runId }: { runId: string }) {
     <div className="space-y-2 rounded-lg bg-muted/40 p-3">
       {data.warning && (
         <p className="text-xs text-amber-900 dark:text-amber-100">
-          Cảnh báo: {data.warning}
+          {t.common.warning(data.warning)}
         </p>
       )}
       {data.entries.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          Run này không ghi nhật ký quyết định nào.
+          {t.audit.backtest.noEntries}
         </p>
       ) : (
         <ul className="space-y-2">
@@ -120,14 +124,16 @@ function RunRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const t = useT();
+  const c = t.audit.backtest;
   return (
     <li className="rounded-xl border p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-sm font-semibold">{run.run_id}</span>
-        <Badge variant="secondary">{run.entries} quyết định</Badge>
-        <Badge variant="outline">{run.resolved} đã chấm điểm</Badge>
-        {run.pending > 0 && <Badge variant="outline">{run.pending} chưa settle</Badge>}
-        {run.unscored > 0 && <Badge variant="outline">{run.unscored} không chấm được</Badge>}
+        <Badge variant="secondary">{c.entries(run.entries)}</Badge>
+        <Badge variant="outline">{c.resolved(run.resolved)}</Badge>
+        {run.pending > 0 && <Badge variant="outline">{c.pending(run.pending)}</Badge>}
+        {run.unscored > 0 && <Badge variant="outline">{c.unscored(run.unscored)}</Badge>}
         <Button
           variant="outline"
           size="sm"
@@ -137,24 +143,24 @@ function RunRow({
         >
           {expanded ? (
             <>
-              Đóng chi tiết
+              {c.hideDetails}
               <ChevronUpIcon aria-hidden="true" />
             </>
           ) : (
             <>
-              Xem chi tiết
+              {c.showDetails}
               <ChevronDownIcon aria-hidden="true" />
             </>
           )}
         </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        {run.holding ? `Thời gian giữ trung bình: ${run.holding}. ` : ""}
+        {run.holding ? c.avgHolding(run.holding) : ""}
         Log: <span className="font-mono">{run.log_path}</span>
       </p>
       {run.warning && (
         <p className="mt-1 text-xs text-amber-900 dark:text-amber-100">
-          Cảnh báo: {run.warning}
+          {t.common.warning(run.warning)}
         </p>
       )}
       <div className="mt-3">
@@ -170,17 +176,15 @@ export function BacktestRunsCard() {
     "/api/backtest"
   );
   const [openRunId, setOpenRunId] = useState<string | null>(null);
+  const t = useT();
+  const c = t.audit.backtest;
   const data = state.status === "ready" ? state.data : null;
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Backtest</CardTitle>
-        <CardDescription>
-          {
-            "GET /api/backtest — tổng kết các lần sweep backtest: quyết định quá khứ được chấm điểm theo kết quả giá sau đó (hit rate và alpha trung bình)."
-          }
-        </CardDescription>
+        <CardTitle>{c.title}</CardTitle>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
           <DataMeta
             generatedAt={data?.generated_at ?? null}
@@ -197,8 +201,9 @@ export function BacktestRunsCard() {
         )}
         {state.status === "ready" && state.data.runs.length === 0 && (
           <EmptyState
-            title="Chưa có lần chạy backtest nào"
-            hint="Chưa có sweep nào ghi kết quả vào results_dir/backtest. Chạy sweep từ CLI, ví dụ: tradingagents backtest NVDA,AAPL --start 2026-07-01 --end 2026-09-30."
+            title={c.emptyTitle}
+            hint={c.emptyHint}
+
           />
         )}
         {state.status === "ready" && state.data.runs.length > 0 && (

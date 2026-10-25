@@ -2,7 +2,11 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ModeBar } from "@/components/mode-bar";
+import { PreferencesSync } from "@/components/preferences-sync";
 import { Sidebar } from "@/components/sidebar";
+import { DEFAULT_LOCALE, LOCALE_INIT_SCRIPT } from "@/lib/i18n/locale";
+import { messages } from "@/lib/i18n/messages";
+import { THEME_INIT_SCRIPT } from "@/lib/theme";
 
 const geistSans = Geist({
   variable: "--font-sans",
@@ -14,22 +18,34 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+// Metadata is static (the server cannot read the stored locale): default
+// locale here, client components update document.title per locale.
+const copy = messages[DEFAULT_LOCALE].common;
+
 export const metadata: Metadata = {
   title: {
-    default: "TradingAgents — Bảng điều khiển",
+    default: copy.appTitle,
     template: "%s — TradingAgents",
   },
-  description:
-    "Bảng điều khiển nghiên cứu và phê duyệt giao dịch TradingAgents. Công cụ nghiên cứu — không phải lời khuyên tài chính.",
+  description: copy.appDescription,
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
+    // suppressHydrationWarning: the inline script may set lang/.dark on <html>
+    // before React hydrates (stored preferences live in localStorage).
     <html
-      lang="vi"
+      lang={DEFAULT_LOCALE}
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
+      <head>
+        <script
+          dangerouslySetInnerHTML={{ __html: `${LOCALE_INIT_SCRIPT};${THEME_INIT_SCRIPT}` }}
+        />
+      </head>
       <body className="flex min-h-full flex-col">
+        <PreferencesSync />
         <ModeBar />
         <div className="flex flex-1">
           <Sidebar />

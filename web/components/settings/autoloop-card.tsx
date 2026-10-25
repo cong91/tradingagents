@@ -29,6 +29,7 @@ import {
   type AutoloopPayload,
 } from "./autoloop-types";
 import { formatDateTimeVi } from "./format-time";
+import { useT, type Messages } from "@/lib/i18n";
 
 // Poll chậm khi rảnh, nhanh khi một chu kỳ đang chạy để spinner "Chạy thử"
 // tự tắt đúng lúc; cùng nhịp stale 30s mà màn Cấu hình dùng cho /api/settings.
@@ -37,11 +38,6 @@ const POLL_RUNNING_MS = 5_000;
 
 type Feedback = { role: "status" | "alert"; text: string };
 
-const RUN_STATUS_TEXT: Record<string, string> = {
-  started: "Đã gửi yêu cầu — chu kỳ đang bắt đầu.",
-  already_running: "Một chu kỳ đang chạy — bỏ qua yêu cầu mới.",
-  skipped_busy: "Bỏ qua — run/daily job khác đang bận.",
-};
 
 /** Khoảng cách phút hợp lệ: số nguyên trong [15, 1440] — cùng ràng buộc server. */
 function parseInterval(raw: string): number | null {
@@ -52,45 +48,47 @@ function parseInterval(raw: string): number | null {
 }
 
 /** Tóm tắt một dòng của chu kỳ gần nhất (thời gian + trạng thái + ứng viên). */
-function lastCycleSummary(cycle: AutoloopLastCycle): string {
+function lastCycleSummary(t: Messages, cycle: AutoloopLastCycle): string {
+  const c = t.settings.autoloop;
   const when = formatDateTimeVi(cycle.finished_at ?? cycle.started_at);
   if (cycle.status === "skipped_busy") {
-    return `${when} · Bỏ qua — ${cycle.reason ?? "worker khác đang bận"}`;
+    return `${when} · ${c.skipped(cycle.reason)}`;
   }
   if (cycle.status === "failed") {
-    return `${when} · Thất bại — ${cycle.error ?? "lỗi không xác định"}`;
+    return `${when} · ${c.failed(cycle.error)}`;
   }
   if (cycle.status === "running" || cycle.status === "timeout") {
     const telemetry = cycle.telemetry;
     const ticker = telemetry?.active_ticker ?? telemetry?.current_ticker;
     const stage = telemetry?.active_stage ?? telemetry?.last_stage;
     const progress = [
-      ticker ? `Mã: ${ticker}` : null,
-      telemetry?.active_node ? `Agent: ${telemetry.active_node}` : null,
-      stage ? `${telemetry?.active_stage ? "Bước" : "Bước gần nhất"}: ${stage}` : null,
+      ticker ? c.ticker(ticker) : null,
+      telemetry?.active_node ? c.agent(telemetry.active_node) : null,
+      stage ? c.stage(Boolean(telemetry?.active_stage), stage) : null,
     ].filter(Boolean).join(" · ");
-    const status = cycle.status === "running"
-      ? "Đang chạy"
-      : `Hết thời gian — ${cycle.error ?? "vượt quá thời gian chờ"}`;
+    const status = cycle.status === "running" ? c.running : c.timeout(cycle.error);
     return `${when} · ${status}${progress ? ` · ${progress}` : ""}`;
   }
   const executed = cycle.results.filter((result) => result.executed).length;
   const candidates =
-    cycle.candidates.length > 0 ? `Ứng viên: ${cycle.candidates.join(", ")}` : "Không có ứng viên";
-  return `${when} · Hoàn tất · ${candidates} · ${executed}/${cycle.results.length} lệnh đã thực thi`;
+    cycle.candidates.length > 0 ? c.candidates(cycle.candidates.join(", ")) : c.noCandidates;
+  return `${when} · ${c.completed} · ${candidates} · ${c.executed(executed, cycle.results.length)}`;
 }
 
 function GateBadge({ open }: { open: boolean }) {
+  const t = useT();
   return open ? (
     <Badge className="border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
-      Mở
+      {t.settings.autoloop.gateOpen}
     </Badge>
   ) : (
-    <Badge variant="destructive">Đóng</Badge>
+    <Badge variant="destructive">{t.settings.autoloop.gateClosed}</Badge>
   );
 }
 
 export function AutoloopCard() {
+  const t = useT();
+  const c = t.settings.autoloop;
   const [phase, setPhase] = useState<"loading" | "error" | "ready">("loading");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [payload, setPayload] = useState<AutoloopPayload | null>(null);
@@ -154,9 +152,7 @@ export function AutoloopCard() {
       const interval = parseInterval(intervalDraft);
       if (interval === null) {
         draftDirtyRef.current = true;
-        setIntervalError(
-          `Khoảng cách phải là số nguyên từ ${AUTOLOOP_MIN_INTERVAL} đến ${AUTOLOOP_MAX_INTERVAL} phút.`,
-        );
+        setIntervalError(c.intervalError(AUTOLOOP_MIN_INTERVAL, AUTOLOOP_MAX_INTERVAL));
         return;
       }
       setIntervalError(null);
@@ -169,15 +165,13 @@ export function AutoloopCard() {
         setFeedback({
           role: "status",
           text: enabled
-            ? `Đã bật vòng tự động — chu kỳ chạy mỗi ${data.interval_minutes} phút.`
-            : "Đã tắt vòng tự động.",
+            ? c.enabledFeedback(data.interval_minutes)
+            : c.disabledFeedback,
         });
       } catch (err) {
         const error = toAutoloopError(err);
         if (error.code === "gate_closed") {
-          setGateWarning(
-            "Cổng an toàn chưa mở — vòng tự động từ chối bật (thiết kế fail-closed).",
-          );
+          setGateWarning(c.gateClosedWarning);
         } else {
           setFeedback({ role: "alert", text: error.message });
         }
@@ -185,7 +179,7 @@ export function AutoloopCard() {
         setSavePending(false);
       }
     },
-    [applyPayload, intervalDraft],
+    [applyPayload, intervalDraft, c],
   );
 
   const runNow = useCallback(async () => {
@@ -193,7 +187,7 @@ export function AutoloopCard() {
     setFeedback(null);
     try {
       const res = await autoloopApi.runNow();
-      setFeedback({ role: "status", text: RUN_STATUS_TEXT[res.status] ?? `Phản hồi máy chủ: ${res.status}.` });
+      setFeedback({ role: "status", text: c.runStatus[res.status] ?? c.serverResponse(res.status) });
       // GET lại sau 1s để running_cycle kịp phản ánh worker vừa được spawn.
       setTimeout(() => {
         if (aliveRef.current) void load();
@@ -203,7 +197,7 @@ export function AutoloopCard() {
     } finally {
       setRunPending(false);
     }
-  }, [load]);
+  }, [load, c]);
 
   const doHalt = useCallback(async () => {
     setHaltPending(true);
@@ -212,27 +206,27 @@ export function AutoloopCard() {
       setHalted(res.halted === true);
       setFeedback({
         role: "status",
-        text: "Đã ghi halt vào audit log — RiskGuard chặn mọi lệnh mới còn lại hôm nay, ở cả tiến trình khác.",
+        text: c.haltedFeedback,
       });
     } catch (err) {
       setFeedback({ role: "alert", text: toAutoloopError(err).message });
     } finally {
       setHaltPending(false);
     }
-  }, []);
+  }, [c]);
 
   const doResetHalt = useCallback(async () => {
     setHaltPending(true);
     try {
       const res = await autoloopApi.resetHalt();
       setHalted(res.halted);
-      setFeedback({ role: "status", text: "Đã gỡ halt hôm nay — RiskGuard nhận lệnh mới bình thường." });
+      setFeedback({ role: "status", text: c.resetFeedback });
     } catch (err) {
       setFeedback({ role: "alert", text: toAutoloopError(err).message });
     } finally {
       setHaltPending(false);
     }
-  }, []);
+  }, [c]);
 
   if (phase === "loading") {
     return (
@@ -240,9 +234,9 @@ export function AutoloopCard() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <TimerIcon className="size-4" aria-hidden="true" />
-            Chế độ tự động
+            {c.title}
           </CardTitle>
-          <CardDescription>Đang tải trạng thái vòng tự động từ GET /api/autoloop…</CardDescription>
+          <CardDescription>{c.loading}</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="h-20 animate-pulse rounded-lg bg-muted" />
@@ -257,13 +251,13 @@ export function AutoloopCard() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <TriangleAlertIcon className="size-4 shrink-0 text-destructive" aria-hidden="true" />
-            Chế độ tự động
+            {c.title}
           </CardTitle>
-          <CardDescription>{errorMessage ?? "Không tải được trạng thái vòng tự động."}</CardDescription>
+          <CardDescription>{errorMessage ?? c.loadFailed}</CardDescription>
         </CardHeader>
         <CardContent>
           <Button variant="outline" className="min-touch" onClick={() => void load()}>
-            Thử lại
+            {t.common.retry}
           </Button>
         </CardContent>
       </Card>
@@ -278,21 +272,18 @@ export function AutoloopCard() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <TimerIcon className="size-4" aria-hidden="true" />
-          Chế độ tự động
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          Vòng quét + giao dịch theo lịch chạy trên server: sàng universe, phân tích ứng viên rồi
-          tự duyệt theo đúng cổng an toàn của engine. Bật chỉ được khi các cổng auto-confirm cùng mở.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          {enabled ? <Badge variant="default">Đang bật</Badge> : <Badge variant="outline">Đang tắt</Badge>}
+          {enabled ? <Badge variant="default">{c.enabled}</Badge> : <Badge variant="outline">{c.disabled}</Badge>}
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
         {/* (1) Bảng 6 hàng cổng an toàn — chỉ đọc, cùng nguồn với chính sách của engine. */}
-        <section aria-label="Cổng an toàn">
+        <section aria-label={c.gatesAria}>
           <ul className="space-y-2">
-            {AUTOLOOP_GATE_ROWS.map(({ key, label, hint }) => (
+            {AUTOLOOP_GATE_ROWS.map((key) => ({ key, ...c.gateRows[key] })).map(({ key, label, hint }) => (
               <li
                 key={key}
                 className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
@@ -306,9 +297,7 @@ export function AutoloopCard() {
             ))}
           </ul>
           <p className="mt-2 text-xs text-muted-foreground">
-            Bật futures cần đặt exec_derivatives=True trong .env theo hướng dẫn — vòng tự động sẽ mở
-            long/short đòn bẩy cho ứng viên crypto khi cổng này mở (đòn bẩy tối đa 3×, trần exposure
-            do RiskGuard kiểm).
+            {c.futuresNote}
           </p>
           <p
             className={cn(
@@ -317,8 +306,8 @@ export function AutoloopCard() {
             )}
           >
             {gates.all_open
-              ? "Đủ điều kiện tự động"
-              : "Chưa đủ điều kiện — vòng tự động không thể bật"}
+              ? c.allOpen
+              : c.notAllOpen}
           </p>
         </section>
 
@@ -336,11 +325,11 @@ export function AutoloopCard() {
               onChange={(event) => void save(event.target.checked)}
               className="size-6 cursor-pointer accent-primary"
             />
-            <span className="text-sm font-medium">Bật vòng tự động</span>
+            <span className="text-sm font-medium">{c.enableLabel}</span>
           </label>
           <span className="ml-auto flex flex-wrap items-center gap-2">
             <label htmlFor="autoloop-interval" className="text-sm text-muted-foreground">
-              Khoảng cách (phút)
+              {c.intervalLabel}
             </label>
             <input
               id="autoloop-interval"
@@ -364,7 +353,7 @@ export function AutoloopCard() {
               onClick={() => void save(enabled)}
               disabled={savePending}
             >
-              Áp dụng
+              {c.apply}
             </Button>
           </span>
         </div>
@@ -391,10 +380,10 @@ export function AutoloopCard() {
             ) : (
               <PlayIcon aria-hidden="true" />
             )}
-            {cycleBusy ? "Chu kỳ đang chạy…" : "Chạy thử một chu kỳ"}
+            {cycleBusy ? c.cycleRunning : c.runOnce}
           </Button>
           <span className="min-w-0 flex-1 text-sm text-muted-foreground">
-            Chạy ngay một vòng không cần chờ lịch — sàng universe rồi phân tích top ứng viên.
+            {c.runOnceHint}
           </span>
         </div>
 
@@ -402,15 +391,15 @@ export function AutoloopCard() {
         <div className="rounded-lg border-2 border-destructive/60 bg-destructive/5 p-3">
           <p className="flex items-center gap-2 text-sm font-semibold text-destructive">
             <OctagonXIcon className="size-4" aria-hidden="true" />
-            STOP khẩn cấp
+            {c.stopTitle}
           </p>
           <p className="mt-1 text-sm text-muted-foreground">
-            Ghi halt vào audit log — RiskGuard chặn mọi lệnh mới còn lại hôm nay, ở cả tiến trình khác.
+            {c.stopBody}
           </p>
           <div className="mt-3">
             {halted === true ? (
               <div className="flex flex-wrap items-center gap-3">
-                <Badge variant="destructive">Halt đang hiệu lực (theo card này)</Badge>
+                <Badge variant="destructive">{c.haltActive}</Badge>
                 <Button
                   variant="outline"
                   className="min-touch"
@@ -420,7 +409,7 @@ export function AutoloopCard() {
                   {haltPending ? (
                     <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
                   ) : null}
-                  Gỡ halt hôm nay
+                  {c.resetHalt}
                 </Button>
               </div>
             ) : (
@@ -435,7 +424,7 @@ export function AutoloopCard() {
                 ) : (
                   <OctagonXIcon aria-hidden="true" />
                 )}
-                DỪNG TẤT CẢ GIAO DỊCH HÔM NAY
+                {c.haltAll}
               </Button>
             )}
           </div>
@@ -445,10 +434,11 @@ export function AutoloopCard() {
         {lastCycle ? (
           <p
             className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground"
-            title={lastCycleSummary(lastCycle)}
+            title={lastCycleSummary(t, lastCycle)}
           >
-            <span className="font-medium text-foreground">Chu kỳ gần nhất: </span>
-            {lastCycleSummary(lastCycle)}
+            <span className="font-medium text-foreground">{c.lastCycle}</span>
+            {lastCycleSummary(t, lastCycle)}
+
           </p>
         ) : null}
 

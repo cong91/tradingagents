@@ -5,24 +5,27 @@ import { cn } from "cn";
 import { Button } from "@/components/ui/button";
 import { formatTimeVi } from "./format-time";
 import type { SettingsController } from "./use-settings";
+import { useT } from "@/lib/i18n";
 
 // Lưu cài đặt là thao tác reversable (PUT lại giá trị cũ) → không confirm-dialog.
 export function SaveBar({ controller }: { controller: SettingsController }) {
   const { dirtyCount, fieldErrors, saveState, resetChanges, save } = controller;
   const saving = saveState.kind === "saving";
   const fieldErrorCount = Object.keys(fieldErrors).length;
+  const t = useT();
+  const c = t.settings.save;
 
   let statusText: string;
   if (saveState.kind === "saving") {
-    statusText = "Đang lưu thay đổi…";
+    statusText = c.saving;
   } else if (saveState.kind === "saved") {
-    statusText = `Đã lưu lúc ${formatTimeVi(saveState.appliedAt)} — áp dụng cho phiên phân tích mới.`;
+    statusText = c.saved(formatTimeVi(saveState.appliedAt));
   } else if (saveState.kind === "failed") {
     statusText = saveState.message;
   } else if (dirtyCount > 0) {
-    statusText = `${dirtyCount} thay đổi chưa lưu.`;
+    statusText = c.unsaved(dirtyCount);
   } else {
-    statusText = "Không có thay đổi nào chưa lưu.";
+    statusText = c.clean;
   }
 
   return (
@@ -45,7 +48,7 @@ export function SaveBar({ controller }: { controller: SettingsController }) {
             onClick={resetChanges}
             disabled={saving || dirtyCount === 0}
           >
-            Huỷ thay đổi
+            {c.discard}
           </Button>
           <Button
             className="min-touch"
@@ -57,7 +60,8 @@ export function SaveBar({ controller }: { controller: SettingsController }) {
             ) : (
               <CheckIcon aria-hidden="true" />
             )}
-            Lưu cài đặt
+            {c.submit}
+
           </Button>
         </div>
       </div>

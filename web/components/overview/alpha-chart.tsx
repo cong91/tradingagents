@@ -2,6 +2,8 @@
 
 import { useEffect, useRef } from "react";
 import type { IChartApi, ISeriesApi } from "lightweight-charts";
+import { intlLocale, useLocale, useT } from "@/lib/i18n";
+import { useResolvedTheme } from "@/lib/use-theme";
 import type { AlphaPoint } from "./summary";
 
 const FALLBACK_PROFIT = "#047857"; // emerald-700 — đồng bộ --profit bản sáng (globals.css:71)
@@ -44,6 +46,9 @@ function resolveToken(styles: CSSStyleDeclaration, name: string, fallback: strin
  * empty-state do section cha render. Import động trong effect để không đụng SSR.
  */
 export function AlphaChart({ points }: { points: AlphaPoint[] }) {
+  const t = useT();
+  const locale = useLocale();
+  const theme = useResolvedTheme();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Line"> | null>(null);
@@ -72,7 +77,7 @@ export function AlphaChart({ points }: { points: AlphaPoint[] }) {
 
       const chart = createChart(el, {
         autoSize: true,
-        localization: { locale: "vi-VN" },
+        localization: { locale: intlLocale() },
         layout: {
           background: { color: "transparent" },
           textColor: text,
@@ -119,11 +124,31 @@ export function AlphaChart({ points }: { points: AlphaPoint[] }) {
     chart.timeScale().fitContent();
   }, [points]);
 
+  // Đổi theme/locale: đọc lại token màu và locale cho chart đã tạo (canvas
+  // không tự theo CSS variables).
+  useEffect(() => {
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) return;
+    const styles = getComputedStyle(document.documentElement);
+    const last = pointsRef.current.length > 0 ? pointsRef.current[pointsRef.current.length - 1].value : 0;
+    chart.applyOptions({
+      localization: { locale: intlLocale(locale) },
+      layout: { textColor: resolveToken(styles, "--muted-foreground", FALLBACK_TEXT) },
+    });
+    series.applyOptions({
+      color: last < 0
+        ? resolveToken(styles, "--loss", FALLBACK_LOSS)
+        : resolveToken(styles, "--profit", FALLBACK_PROFIT),
+    });
+  }, [theme, locale]);
+
   return (
     <div
       ref={containerRef}
       role="img"
-      aria-label="Biểu đồ alpha tích luỹ theo ngày, đơn vị phần trăm"
+      aria-label={t.overview.chartAria}
+
       className="h-64 w-full"
     />
   );

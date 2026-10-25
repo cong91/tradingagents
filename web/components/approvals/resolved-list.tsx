@@ -16,23 +16,24 @@ import {
 import { formatDateTime, formatOrderAmount } from "./format";
 import { ApprovalStatusBadge, SideChip } from "./labels";
 import type { ApprovalItem } from "./types";
+import { useT } from "@/lib/i18n";
 
 export function ResolvedList({ items }: { items: ApprovalItem[] }) {
+  const t = useT();
+  const c = t.approvals.resolved;
   return (
     <Card className="mt-4">
       <CardHeader>
-        <CardTitle>Đã xử lý gần đây</CardTitle>
+        <CardTitle>{c.title}</CardTitle>
         <CardDescription>
-          {items.length > 0
-            ? `${items.length} mục — mới giải quyết nhất trước.`
-            : "Kế hoạch sau khi duyệt / từ chối sẽ xuất hiện ở đây."}
+          {items.length > 0 ? c.count(items.length) : c.emptyHint}
         </CardDescription>
       </CardHeader>
       {items.length === 0 ? (
         <CardContent>
           <div className="flex h-24 flex-col items-center justify-center gap-1 rounded-lg border border-dashed text-sm text-muted-foreground">
             <InboxIcon className="size-5" aria-hidden="true" />
-            Chưa có kế hoạch nào được xử lý.
+            {c.empty}
           </div>
         </CardContent>
       ) : (
@@ -60,11 +61,11 @@ export function ResolvedList({ items }: { items: ApprovalItem[] }) {
                     live; dry-fill hiển thị mode để phân biệt với lệnh thật. */}
                 {item.order_id ? (
                   <span className="text-xs text-muted-foreground">
-                    order {item.order_id}
+                    {c.order(item.order_id)}
                   </span>
                 ) : item.status === "executed" && item.mode === "dry" ? (
                   <span className="text-xs text-muted-foreground">
-                    dry-fill (chưa gửi sàn)
+                    {c.dryFill}
                   </span>
                 ) : null}
                 <span className="text-xs text-muted-foreground">
@@ -72,7 +73,8 @@ export function ResolvedList({ items }: { items: ApprovalItem[] }) {
                 </span>
                 {item.resolution && (
                   <span className="w-full truncate text-xs text-muted-foreground">
-                    Lý do: {item.resolution}
+                    {t.approvals.card.reason(item.resolution)}
+
                   </span>
                 )}
               </li>

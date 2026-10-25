@@ -2,7 +2,7 @@
 // Content-Type: application/json kể cả body rỗng — quy tắc CSRF bắt buộc của
 // backend (contract §0, server/main.py:48-65). Shape lỗi parse qua lib/api.ts
 // (envelope §0.1 / {detail} của FastAPI) — chung cho cả 6 màn.
-import { NETWORK_HINT, parseErrorResponse } from "@/lib/api";
+import { networkHint, parseErrorResponse } from "@/lib/api";
 
 import type {
   AutoloopHaltResponse,
@@ -29,7 +29,7 @@ export class AutoloopApiError extends Error {
 export function toAutoloopError(err: unknown): AutoloopApiError {
   if (err instanceof AutoloopApiError) return err;
   // fetch throw TypeError khi network đứt hoặc rewrite không tới được backend.
-  return new AutoloopApiError(0, "network", NETWORK_HINT);
+  return new AutoloopApiError(0, "network", networkHint());
 }
 
 async function parseHttpError(res: Response): Promise<AutoloopApiError> {
