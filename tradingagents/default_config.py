@@ -22,6 +22,11 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_PROVIDER":        "deep_provider",
     "TRADINGAGENTS_QUICK_BACKEND_URL":    "quick_backend_url",
     "TRADINGAGENTS_DEEP_BACKEND_URL":     "deep_backend_url",
+    # OpenRouter-only fallback chain per tier, comma-separated model IDs tried
+    # in order after the tier's primary model (sent as the request's "models"
+    # list, so OpenRouter fails over on 429/5xx/unavailable upstreams).
+    "TRADINGAGENTS_QUICK_FALLBACK_MODELS": "quick_fallback_models",
+    "TRADINGAGENTS_DEEP_FALLBACK_MODELS":  "deep_fallback_models",
     # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
     # Chat Completions; "responses" switches to /responses for endpoints that
     # implement it. Validated in build_llm_kwargs.
@@ -146,6 +151,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "deep_provider": None,
     "quick_backend_url": None,
     "deep_backend_url": None,
+    # OpenRouter fallback chains (comma-separated model IDs; "" = primary only).
+    # Ignored for every other provider.
+    "quick_fallback_models": "",
+    "deep_fallback_models": "",
     # Wire protocol for OpenAI-compatible endpoints: "chat" (Chat Completions,
     # the wide-compatibility default) or "responses" (/responses for endpoints
     # that implement it). Native OpenAI ignores this -- it already prefers

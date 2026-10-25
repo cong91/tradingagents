@@ -60,6 +60,13 @@ def _tier_llm_settings(config: dict, tier: str) -> tuple[str, str | None]:
     return str(provider).lower(), base_url
 
 
+def _fallback_models(config: dict, tier: str) -> list[str]:
+    """The tier's OpenRouter fallback chain from a comma-separated config value."""
+    raw = config.get(f"{tier}_fallback_models") or ""
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return [item.strip() for item in items if str(item).strip()]
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -95,6 +102,14 @@ class TradingAgentsGraph:
         if self.callbacks:
             deep_kwargs["callbacks"] = self.callbacks
             quick_kwargs["callbacks"] = self.callbacks
+
+        for tier, provider, kwargs in (
+            ("deep", deep_provider, deep_kwargs),
+            ("quick", quick_provider, quick_kwargs),
+        ):
+            fallbacks = _fallback_models(self.config, tier)
+            if provider == "openrouter" and fallbacks:
+                kwargs["fallback_models"] = fallbacks
 
         deep_client = create_llm_client(
             provider=deep_provider,

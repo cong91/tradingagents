@@ -82,6 +82,18 @@ _MINIMAX_THINKING = ModelCapabilities(
     requires_reasoning_split=True,
 )
 
+# Claude Sonnet/Opus/Fable 5.x behind OpenRouter reject a forced tool_choice
+# ("type tool and any are not supported for this model"), so langchain's
+# function_calling path 400s. response_format json_schema is accepted and
+# still constrains the output to the schema. Haiku accepts tool_choice and
+# keeps _DEFAULT.
+_ANTHROPIC_NO_FORCED_TOOL = ModelCapabilities(
+    supports_tool_choice=False,
+    supports_json_mode=True,
+    supports_json_schema=True,
+    preferred_structured_method="json_schema",
+)
+
 _DEFAULT = ModelCapabilities(
     supports_tool_choice=True,
     supports_json_mode=True,
@@ -113,6 +125,7 @@ _BY_PATTERN: list[tuple[re.Pattern[str], ModelCapabilities]] = [
     (re.compile(r"^deepseek-v\d"), _DEEPSEEK_THINKING),
     (re.compile(r"^deepseek-reasoner"), _DEEPSEEK_THINKING),
     (re.compile(r"^MiniMax-M\d"), _MINIMAX_THINKING),
+    (re.compile(r"^anthropic/claude-(sonnet|opus|fable)-5"), _ANTHROPIC_NO_FORCED_TOOL),
 ]
 
 

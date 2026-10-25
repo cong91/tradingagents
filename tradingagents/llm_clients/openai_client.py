@@ -346,6 +346,9 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
 
 
 # Kwargs forwarded from user config to ChatOpenAI
+# OpenRouter's documented ceiling for the request-level "models" list.
+_OPENROUTER_MAX_MODELS = 3
+
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature", "max_tokens",
     "api_key", "callbacks", "http_client", "http_async_client",
@@ -513,6 +516,20 @@ class OpenAIClient(BaseLLMClient):
             if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
                 continue
             llm_kwargs[key] = self.kwargs[key]
+
+        # OpenRouter model fallbacks: the request's "models" list is tried in
+        # order (primary first) when an upstream is rate-limited or down.
+        # OpenRouter 400s on more than 3 entries, so the chain is truncated.
+        fallbacks = self.kwargs.get("fallback_models")
+        if self.provider == "openrouter" and fallbacks:
+            chain = [self.model] + [m for m in fallbacks if m != self.model]
+            if len(chain) > _OPENROUTER_MAX_MODELS:
+                logger.warning(
+                    "OpenRouter accepts at most %d models per request; dropping %s",
+                    _OPENROUTER_MAX_MODELS, chain[_OPENROUTER_MAX_MODELS:],
+                )
+                chain = chain[:_OPENROUTER_MAX_MODELS]
+            llm_kwargs["extra_body"] = {"models": chain}
 
         llm_kwargs["streaming"] = True
         if "stream_chunk_timeout" in getattr(chat_cls, "model_fields", {}):
