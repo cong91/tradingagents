@@ -209,7 +209,11 @@ def _write_state(bridge: Any, plan: AdoptionPlan, task_id: str, order_ids: list[
 
 
 def _raw_symbol(symbol: str) -> str:
-    return symbol.split("/")[0] + "USDT"
+    # "ETH/USDC:USDC" -> "ETHUSDC"; the quote is part of the venue id, so it
+    # must come from the unified symbol rather than an assumed USDT.
+    base, _, rest = symbol.partition("/")
+    quote = rest.split(":", 1)[0] or "USDT"
+    return base + quote
 
 
 def _venue_key(bridge: Any) -> str:

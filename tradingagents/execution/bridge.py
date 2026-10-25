@@ -208,6 +208,10 @@ class ExchangeBridge:
             self._exchange_factory = build_exchange
         self.rules = rules if rules is not None else SizingRules()
         self._exchange: Any | None = None
+        # Futures contracts chosen by the screen for this bridge's lifetime
+        # (ticker -> unified symbol, e.g. "SOL-USD" -> "SOL/USDC:USDC"). A pin
+        # wins over exec_symbol_overrides and the exec_quote_currency default.
+        self._pinned_futures: dict[str, str] = {}
         self.risk_guard = risk_guard if risk_guard is not None else self._build_risk_guard()
 
     def _build_risk_guard(self) -> RiskGuard:
@@ -229,10 +233,35 @@ class ExchangeBridge:
             return None
         return self._fetch_price(symbol)
 
+    def futures_settle_currencies(self) -> frozenset[str]:
+        """Settle assets whose linear contracts this bridge may trade."""
+        raw = self.config.get("exec_futures_settle_currencies") or ()
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        allowed = {str(item).strip().upper() for item in raw if str(item).strip()}
+        quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
+        return frozenset(allowed | {quote})
+
+    def pin_futures_contract(self, ticker: str, symbol: str) -> None:
+        """Bind ``ticker`` to one unified futures contract for later resolution."""
+        symbol = str(symbol).strip().upper()
+        if not _UNIFIED_FUTURES_SYMBOL.fullmatch(symbol):
+            raise ValueError(f"{symbol!r} is not a unified futures symbol (BASE/QUOTE:SETTLE)")
+        settle = symbol.rsplit(":", 1)[1]
+        if settle not in self.futures_settle_currencies():
+            raise ValueError(
+                f"{symbol!r} settles in {settle}, outside exec_futures_settle_currencies"
+            )
+        self._pinned_futures[ticker] = symbol
+
+    def pinned_futures_symbol(self, ticker: str) -> str | None:
+        return self._pinned_futures.get(ticker)
+
     def futures_symbol_for(self, ticker: str, *, markets: dict[str, Any] | None = None) -> str:
         """Resolve a pipeline futures ticker against active contract metadata."""
+        pinned = self._pinned_futures.get(ticker)
         overrides = self.config.get("exec_symbol_overrides")
-        requested = overrides.get(ticker) if isinstance(overrides, dict) else None
+        requested = pinned or (overrides.get(ticker) if isinstance(overrides, dict) else None)
         base = futures_base(ticker)
         if not base and not requested:
             raise ValueError(f"{ticker!r} is not a valid futures ticker")
@@ -248,6 +277,10 @@ class ExchangeBridge:
             raise ValueError("exchange returned invalid futures market metadata")
         candidates = [str(requested)] if requested else [symbol for symbol in markets if isinstance(symbol, str)]
         quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
+        if pinned:
+            # A pinned contract carries its own settle asset (validated against
+            # exec_futures_settle_currencies when it was pinned).
+            quote = pinned.rsplit(":", 1)[1]
         for symbol in candidates:
             if not isinstance(symbol, str) or not _UNIFIED_FUTURES_SYMBOL.fullmatch(symbol):
                 continue

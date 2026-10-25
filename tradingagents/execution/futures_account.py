@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -290,11 +293,72 @@ def read_futures_positions(bridge) -> tuple[FuturesPosition, ...]:
     )
 
 
-def read_futures_account(bridge) -> FuturesAccountSnapshot:
+def _binance_multi_assets(client: Any) -> bool:
+    """True when the Binance USD-M account pools margin across assets.
+
+    An unreadable mode answers False: the per-asset reading is the smaller,
+    conservative equity, so a failed probe can only make sizing stricter.
+    """
+    try:
+        response = client.fapiPrivateGetMultiAssetsMargin()
+    except Exception as exc:  # noqa: BLE001 - mode probe must never block a read
+        logger.warning("futures account: multi-assets mode unavailable (%r)", exc)
+        return False
+    return isinstance(response, dict) and response.get("multiAssetsMargin") in (True, "true")
+
+
+def _binance_settle_values(balance: dict[str, Any], settle: str) -> dict[str, Any] | None:
+    """Binance single-asset mode: the settle asset's own row is its margin book.
+
+    The account totals only count USDT there, so a USDC contract must be sized
+    against the USDC row (marginBalance/walletBalance/availableBalance).
+    """
+    info = balance.get("info") if isinstance(balance.get("info"), dict) else {}
+    assets = info.get("assets") if isinstance(info.get("assets"), list) else []
+    row = next(
+        (item for item in assets
+         if isinstance(item, dict) and str(item.get("asset") or "").upper() == settle),
+        None,
+    )
+    if row is None:
+        return None
+    return {
+        "equity": _first_number(row, "marginBalance"),
+        "wallet_balance": _first_number(row, "walletBalance"),
+        "available_balance": _first_number(row, "availableBalance"),
+        "unrealized_pnl": _first_number(row, "unrealizedProfit"),
+        "equity_currency": settle,
+        "wallet_balance_currency": settle,
+        "available_balance_currency": settle,
+        "unrealized_pnl_currency": settle,
+        "account_scope": "derivatives",
+    }
+
+
+def read_futures_settle_balances(bridge) -> dict[str, float]:
+    """Non-zero futures wallet balances by asset (e.g. {"USDT": 5000, "USDC": 5000})."""
+    client = bridge.client()
+    exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
+    balance_params, _ = _futures_params(exchange_id, bridge.config)
+    balance = client.fetch_balance(params=balance_params)
+    if not isinstance(balance, dict):
+        raise ValueError("exchange returned an invalid futures account response")
+    totals = balance.get("total") if isinstance(balance.get("total"), dict) else {}
+    out: dict[str, float] = {}
+    for asset, amount in totals.items():
+        value = _number(amount)
+        if value is not None and value > 0:
+            out[str(asset).upper()] = value
+    return out
+
+
+def read_futures_account(bridge, settle: str | None = None) -> FuturesAccountSnapshot:
     """Read the configured futures account without changing client mode or state.
 
     Venue-specific params keep CCXT on derivatives endpoints while preserving
-    the venue's current client configuration.
+    the venue's current client configuration. ``settle`` (e.g. "USDC") scopes
+    a Binance single-asset-mode account to that asset's margin book; without
+    it, or in multi-assets mode, the account totals are used.
     """
     client = bridge.client()
     exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
@@ -305,7 +369,13 @@ def read_futures_account(bridge) -> FuturesAccountSnapshot:
     if not isinstance(balance, dict):
         raise ValueError("exchange returned an invalid futures account response")
     normalized = read_futures_positions(bridge)
-    values = _account_values(balance, exchange_id)
+    values = None
+    if settle and exchange_id == "binance" and not _binance_multi_assets(client):
+        values = _binance_settle_values(balance, settle.strip().upper())
+        if values is None:
+            raise ValueError(f"futures wallet has no {settle} balance row")
+    if values is None:
+        values = _account_values(balance, exchange_id)
     return FuturesAccountSnapshot(
         equity=values["equity"],
         wallet_balance=values["wallet_balance"],
