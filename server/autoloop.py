@@ -860,21 +860,43 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
     cancelled = threading.Event()
     try:
         from tradingagents.dataflows.screening import (
+            MAX_PRICE_MISMATCH,
             crypto_universe,
+            price_mismatch,
             screen_universe,
             stock_universe,
         )
 
+        # Futures mode builds the universe FROM the venue — the settle assets
+        # the futures wallet holds, then the contracts settled in them — so the
+        # derivatives executor exists before screening. The spot bridge is
+        # still built only after a successful screen.
+        derivatives = None
+        if config.get("exec_derivatives") is True:
+            _cycle_timeout(deadline, "venue setup")
+            with telemetry.span("venue_setup"):
+                derivatives = _build_derivatives_executor(config)
+
+        crypto_fn: Callable = crypto_universe
+        screen_fn: Callable = screen_universe
+        mismatched: dict[str, dict] = {}
+        if derivatives is not None:
+            contracts: dict[str, dict] = {}
+            crypto_fn = _futures_crypto_universe(derivatives, contracts, summary)
+            screen_fn = _pinning_screen(
+                screen_universe, derivatives, contracts, mismatched,
+                max_mismatch=MAX_PRICE_MISMATCH, price_mismatch=price_mismatch,
+            )
+
         with telemetry.span("screening"):
             crypto, stocks, candidates = _screen_with_timeout(
-                crypto_universe, stock_universe, screen_universe, config, _today_iso(),
+                crypto_fn, stock_universe, screen_fn, config, _today_iso(),
                 telemetry=telemetry,
             )
             _cycle_timeout(deadline, "screening")
         _cycle_timeout(deadline, "venue setup")
         with telemetry.span("venue_setup"):
             bridge = _build_bridge(config)
-            derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
 
         # Drop candidates that cannot end in an order before spending LLM time
         # on them (futures mode: stocks and symbols without a live contract).
@@ -896,9 +918,9 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             with telemetry.span("screening:refill"):
                 crypto, stocks, candidates, skipped, candidate_selection = (
                     _refill_futures_candidates(
-                        crypto_universe,
+                        crypto_fn,
                         stock_universe,
-                        screen_universe,
+                        screen_fn,
                         config,
                         _today_iso(),
                         derivatives,
@@ -918,6 +940,10 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             # snapshot (screening.py:138-167 refetches the venue per call), so
             # reporting the last round's count would under-state the discovery.
             summary["universe"]["crypto"] = int(candidate_selection["discovery_inspected"])
+        if mismatched:
+            # Price-mismatch drops happen inside screening (every round), so
+            # they never reach preflight; report them with the other skips.
+            skipped = list(mismatched.values()) + skipped
         if skipped:
             summary["skipped"] = skipped
             audit_log.record("autoloop_candidates_skipped", skipped=skipped)
@@ -1024,7 +1050,10 @@ def _process_candidate(
                 )
                 return result
             with telemetry.span("futures_account", ticker):
-                futures_account = read_futures_account(derivatives._bridge)
+                # Size against the margin book the contract settles in
+                # (a USDC perpetual draws on USDC, not the USDT totals).
+                settle = str(futures_context.get("unified_symbol") or "").rpartition(":")[2] or None
+                futures_account = read_futures_account(derivatives._bridge, settle=settle)
             if not futures_account.positions_scope_complete:
                 raise ValueError("futures position scope is unverified; analysis deferred")
             futures_cycle_id, four_hour_open, one_hour_open = futures_cycle_identity(futures_context)
@@ -1250,6 +1279,106 @@ def _process_candidate(
             )
     return result
 
+
+def _futures_crypto_universe(derivatives: Any, contracts: dict, summary: dict) -> Callable:
+    """Universe builder for futures mode, run inside the screening timeout.
+
+    Reads which settle assets the futures wallet holds (intersected with
+    exec_futures_settle_currencies), then the liquid perpetuals settled in
+    them. Fills ``contracts`` (ticker -> contract row) for pinning afterwards.
+    Called once per discovery round, so a refill round widens it too.
+    """
+    from tradingagents.dataflows.screening import (
+        _public_futures_ranking_client,
+        futures_universe,
+    )
+    from tradingagents.execution.futures_account import read_futures_settle_balances
+
+    def build(config: dict, top_n: int) -> list[str]:
+        bridge = derivatives._bridge
+        balances = read_futures_settle_balances(bridge)
+        settles = bridge.futures_settle_currencies() & set(balances)
+        summary["settle_assets"] = sorted(settles)
+        if not settles:
+            logger.warning("autoloop: futures wallet holds no allowed settle asset (%s)", balances)
+            return []
+        try:
+            ranking = _public_futures_ranking_client(config)
+        except Exception as exc:  # noqa: BLE001 - fail closed, see below
+            # Demo Trading reports synthetic volumes, so ranking on the venue
+            # would rank by fake liquidity. Without the production ranking
+            # there is no trustworthy universe; skip the cycle instead.
+            logger.warning(
+                "autoloop: production volume ranking unavailable (%s); "
+                "futures universe skipped", exc,
+            )
+            summary["universe_error"] = f"ranking_unavailable: {exc}"
+            return []
+        # ``top_n`` is the discovery size: the initial pool, then each refill
+        # round's widened pool (_futures_discovery_limit).
+        rows = futures_universe(bridge.client(), settles, top_n, ranking_client=ranking)
+        contracts.update({row["ticker"]: row for row in rows})
+        return [row["ticker"] for row in rows]
+
+    return build
+
+
+
+def _pinning_screen(
+    screen_universe: Callable,
+    derivatives: Any,
+    contracts: dict[str, dict],
+    mismatched: dict[str, dict],
+    *,
+    max_mismatch: float,
+    price_mismatch: Callable,
+) -> Callable:
+    """Wrap ``screen_universe`` so every discovery round pins its picks.
+
+    Each screened candidate with a known contract is checked against it: a
+    Yahoo close more than ``max_mismatch`` off the contract price means the
+    ``BASE-USD`` series is another asset sharing the ticker (analysts and
+    brackets would read the wrong market), so it is dropped into
+    ``mismatched``. The rest are pinned to their exact contract (for example
+    ``SOL/USDC:USDC``) before preflight resolves them.
+    """
+
+    try:
+        parameters = inspect.signature(screen_universe).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    forwards_cancel = "cancel_event" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+    def screen(crypto, stocks, trade_date, pool_limit, *, cancel_event=None) -> list[dict]:
+        if forwards_cancel:
+            candidates = screen_universe(
+                crypto, stocks, trade_date, pool_limit, cancel_event=cancel_event,
+            )
+        else:
+            candidates = screen_universe(crypto, stocks, trade_date, pool_limit)
+        kept: list[dict] = []
+        for candidate in candidates:
+            ticker = str(candidate.get("ticker"))
+            contract = contracts.get(ticker)
+            if contract is None:
+                kept.append(candidate)
+                continue
+            gap = price_mismatch(candidate.get("last_close"), contract.get("last_price"))
+            if gap is not None and gap > max_mismatch:
+                mismatched[ticker] = {
+                    "ticker": ticker,
+                    "reason": f"price data mismatch {gap:.0%} vs {contract['futures_symbol']}",
+                }
+                continue
+            candidate["futures_symbol"] = contract["futures_symbol"]
+            candidate["settle"] = contract["settle"]
+            derivatives._bridge.pin_futures_contract(ticker, contract["futures_symbol"])
+            kept.append(candidate)
+        return kept
+
+    return screen
 
 def _closed_futures_context(derivatives: Any, ticker: str) -> dict | None:
     now = datetime.now(UTC)
