@@ -510,13 +510,15 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             stock_universe,
         )
 
-        # Venue first: in futures mode the universe is built FROM the venue —
-        # the settle assets the futures wallet holds, then the contracts
-        # settled in them — so nothing untradable reaches the scoring pool.
-        _cycle_timeout(deadline, "venue setup")
-        with telemetry.span("venue_setup"):
-            bridge = _build_bridge(config)
-            derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
+        # Futures mode builds the universe FROM the venue — the settle assets
+        # the futures wallet holds, then the contracts settled in them — so the
+        # derivatives executor exists before screening. The spot bridge is
+        # still built only after a successful screen.
+        derivatives = None
+        if config.get("exec_derivatives") is True:
+            _cycle_timeout(deadline, "venue setup")
+            with telemetry.span("venue_setup"):
+                derivatives = _build_derivatives_executor(config)
 
         contracts: dict[str, dict] = {}
         universe_fns = (crypto_universe, stock_universe)
@@ -533,6 +535,9 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             )
             _cycle_timeout(deadline, "screening")
         summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
+        _cycle_timeout(deadline, "venue setup")
+        with telemetry.span("venue_setup"):
+            bridge = _build_bridge(config)
         mismatched: list[dict] = []
         for candidate in list(candidates):
             contract = contracts.get(str(candidate.get("ticker")))
@@ -786,9 +791,16 @@ def _futures_crypto_universe(derivatives: Any, contracts: dict, summary: dict) -
             return []
         try:
             ranking = _public_futures_ranking_client(config)
-        except Exception as exc:  # noqa: BLE001 - fall back to venue volumes
-            logger.warning("autoloop: production volume ranking unavailable (%s)", exc)
-            ranking = None
+        except Exception as exc:  # noqa: BLE001 - fail closed, see below
+            # Demo Trading reports synthetic volumes, so ranking on the venue
+            # would rank by fake liquidity. Without the production ranking
+            # there is no trustworthy universe; skip the cycle instead.
+            logger.warning(
+                "autoloop: production volume ranking unavailable (%s); "
+                "futures universe skipped", exc,
+            )
+            summary["universe_error"] = f"ranking_unavailable: {exc}"
+            return []
         rows = futures_universe(bridge.client(), settles, FUTURES_UNIVERSE_SIZE, ranking_client=ranking)
         contracts.update({row["ticker"]: row for row in rows})
         return [row["ticker"] for row in rows]
