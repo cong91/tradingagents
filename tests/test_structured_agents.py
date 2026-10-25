@@ -8,6 +8,7 @@ so they share the same deterministic output shape.
 """
 
 import inspect
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +18,7 @@ from tradingagents.agents.analysts.sentiment_analyst import create_sentiment_ana
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.schemas import (
+    FuturesExecutionProposal,
     PortfolioDecision,
     PortfolioRating,
     ResearchPlan,
@@ -69,6 +71,117 @@ class TestRenderTraderProposal:
         for field in ("Entry Price", "Stop Loss", "Position Sizing"):
             assert f"**{field}**: not provided" in md
         assert "FINAL TRANSACTION PROPOSAL: **SELL**" in md
+
+    def test_futures_proposal_fields_are_rendered_for_risk_debate(self):
+        p = TraderProposal(
+            action=TraderAction.BUY,
+            reasoning="The confirmed trend has room to run.",
+            entry_price=100,
+            stop_loss=96,
+            take_profit=108,
+            futures_execution=FuturesExecutionProposal(
+                margin_mode="isolated",
+                leverage=2,
+                risk_fraction=0.005,
+                margin_fraction=0.2,
+                rationale="A 4% invalidation distance supports 2x within the account cap.",
+            ),
+        )
+
+        rendered = render_trader_proposal(p)
+
+        assert "**Take Profit**: 108.0" in rendered
+        assert "**Futures Margin Mode**: isolated" in rendered
+        assert "**Futures Leverage**: 2x" in rendered
+        assert "**Futures Risk Budget**: 0.005" in rendered
+        assert "A 4% invalidation distance" in rendered
+
+
+@pytest.mark.unit
+def test_portfolio_manager_emits_explicit_abstain_intent_without_terms():
+    from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
+
+    risk = {
+        "history": "Risk debate rejects a new short entry.",
+        "aggressive_history": "aggressive",
+        "conservative_history": "conservative",
+        "neutral_history": "neutral",
+        "current_aggressive_response": "",
+        "current_conservative_response": "",
+        "current_neutral_response": "",
+        "latest_speaker": "Neutral",
+        "count": 3,
+    }
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=PortfolioRating.UNDERWEIGHT,
+        executive_summary="Reduce existing exposure only.",
+        investment_thesis="No defensible new futures entry.",
+        futures_execution_intent="manage_existing",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": risk,
+        "investment_plan": "Reduce exposure if already held.",
+        "trader_investment_plan": "Do not open a new short.",
+    })
+
+    assert result["futures_execution_intent"] == "manage_existing"
+    assert result["futures_execution_proposal"] == {}
+    assert "manage_existing" in result["final_trade_decision"]
+
+
+    from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
+
+    risk = {
+        "history": "Risk debate favors isolated 2x with a 0.5% risk budget.",
+        "aggressive_history": "aggressive",
+        "conservative_history": "conservative",
+        "neutral_history": "neutral",
+        "current_aggressive_response": "",
+        "current_conservative_response": "",
+        "current_neutral_response": "",
+        "latest_speaker": "Neutral",
+        "count": 3,
+    }
+    proposal = FuturesExecutionProposal(
+        margin_mode="isolated",
+        leverage=2,
+        risk_fraction=0.005,
+        margin_fraction=0.2,
+        stop_loss=96,
+        take_profit=108,
+        rationale="Closed 1h and 4h confirmation, isolated collateral, and 0.5% risk.",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=PortfolioRating.BUY,
+        executive_summary="Buy with isolated 2x and a defined bracket.",
+        investment_thesis="The risk debate supports the setup.",
+        futures_execution=proposal,
+        futures_execution_intent="enter",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": risk,
+        "investment_plan": "Buy after aligned confirmation.",
+        "trader_investment_plan": "Trader proposal.",
+    })
+
+    assert result["futures_execution_proposal"] == proposal.model_dump()
+    assert result["futures_execution_intent"] == "enter"
+    assert result["futures_execution_status"] == "structured"
+    assert "Futures equity: 1000 USDT" in str(structured.invoke.call_args.args[0])
 
 
 @pytest.mark.unit
@@ -194,21 +307,54 @@ def _structured_trader_llm(captured: dict, proposal: TraderProposal | None = Non
 
 
 @pytest.mark.unit
-def test_invoke_structured_falls_back_when_result_is_none():
-    # A thinking model can answer in plain text, leaving the parser with None.
-    # That must fall back to free text, not crash on render(None) (#1051).
+def test_invoke_structured_retries_json_decode_and_commits_after_render():
+    from tradingagents.agents.structured import invoke_structured_or_freetext
+
+    structured = MagicMock()
+    expected = MagicMock(rating="Buy")
+    structured.invoke.side_effect = [
+        json.JSONDecodeError("empty", "", 0),
+        expected,
+    ]
+    plain = MagicMock()
+    committed = []
+
+    out = invoke_structured_or_freetext(
+        structured,
+        plain,
+        "prompt",
+        render=lambda result: result.rating,
+        agent_name="Portfolio Manager",
+        on_result=committed.append,
+        structured_retry_instruction="return schema",
+    )
+
+    assert out == "Buy"
+    assert structured.invoke.call_count == 2
+    assert committed == [expected]
+    plain.invoke.assert_not_called()
+
+
+@pytest.mark.unit
+def test_invoke_structured_fallback_reports_non_executable_status():
     from tradingagents.agents.structured import invoke_structured_or_freetext
 
     structured = MagicMock()
     structured.invoke.return_value = None
     plain = MagicMock()
-    plain.invoke.return_value = MagicMock(content="FREETEXT")
+    plain.invoke.return_value = MagicMock(content="prose")
+    fallback = []
 
-    out = invoke_structured_or_freetext(
-        structured, plain, "prompt", render=lambda r: r.rating, agent_name="t"
-    )
-    assert out == "FREETEXT"
-    plain.invoke.assert_called_once()
+    assert invoke_structured_or_freetext(
+        structured,
+        plain,
+        "prompt",
+        render=lambda result: result,
+        agent_name="Portfolio Manager",
+        on_fallback=fallback.append,
+        structured_retry_instruction="return schema",
+    ) == "prose"
+    assert fallback == ["ValueError"]
 
 
 @pytest.mark.unit
@@ -253,6 +399,25 @@ class TestTraderAgent:
         assert "14-day ATR 4.2" in user            # the actual report content reached the Trader
         assert "support $178, resistance $196" in user
         assert "Ground concrete price levels" in system
+
+    def test_prompt_includes_futures_account_and_market_context(self):
+        captured = {}
+        state = {
+            **_make_trader_state(),
+            "asset_type": "crypto",
+            "execution_context": (
+                "Futures equity: 1000 USDT; available margin: 700 USDT; "
+                "1h and 4h candles confirmed bullish; ATR: 3.2%."
+            ),
+        }
+
+        create_trader(_structured_trader_llm(captured))(state)
+
+        user = " ".join(m["content"] for m in captured["prompt"] if m["role"] == "user")
+        system = " ".join(m["content"] for m in captured["prompt"] if m["role"] == "system")
+        assert "Futures equity: 1000 USDT" in user
+        assert "ATR: 3.2%" in user
+        assert "propose margin mode, leverage, risk budget, and" in system
 
     def test_empty_market_report_omits_the_section_and_grounding(self):
         # #1167: when the market analyst wasn't selected the report is empty, so
@@ -544,4 +709,6 @@ def test_the_trader_names_the_levels_it_did_not_give():
     rendered = render_trader_proposal(TraderProposal(action=TraderAction.HOLD, reasoning="r"))
     for field in ("Entry Price", "Stop Loss", "Position Sizing"):
         assert field in rendered
-    assert rendered.lower().count("not provided") == 3
+    # Entry/stop/take-profit/position-sizing plus the futures-execution line
+    # all name themselves even when the model omitted them.
+    assert rendered.lower().count("not provided") == 5

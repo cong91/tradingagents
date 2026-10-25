@@ -19,13 +19,14 @@ from fastapi.testclient import TestClient
 import tradingagents.dataflows.screening as screening_mod
 from server import (
     autoloop as autoloop_mod,
+    control_store,
     daily as daily_mod,
     health as health_mod,
-    paths as server_paths,
     runs as runs_mod,
 )
 from server.contract import install_error_handlers, utc_now_iso
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
 
@@ -78,21 +79,29 @@ def _today() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point all server state at tmp and reset the in-memory loop state."""
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
-    monkeypatch.setattr(server_paths, "AUTOLOOP_PATH", tmp_path / "autoloop.json")
+    if autoloop_mod._scheduler_thread is not None and autoloop_mod._scheduler_thread.is_alive():
+        autoloop_mod.stop()
+    scheduler_stop = threading.Event()
+    monkeypatch.setattr(autoloop_mod, "_scheduler_stop", scheduler_stop)
     monkeypatch.setattr(autoloop_mod, "_last_cycle", None)
     monkeypatch.setattr(autoloop_mod, "_last_telemetry", None)
     monkeypatch.setattr(autoloop_mod, "_cycle_thread", None)
+    monkeypatch.setattr(autoloop_mod, "_scheduler_thread", None)
     autoloop_mod._wakeup.clear()
     # A run/job planted anywhere must never leak into a cycle's busy check.
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
     yield
+    scheduler_stop.set()
+    wakeup_set = getattr(autoloop_mod._wakeup, "set", None)
+    if wakeup_set is not None:
+        wakeup_set()
+    for thread in threading.enumerate():
+        if thread.name == "server-autoloop-scheduler":
+            thread.join(timeout=1.0)
+            assert not thread.is_alive(), "autoloop scheduler leaked past test teardown"
 
 
 def _test_app() -> FastAPI:
@@ -148,7 +157,7 @@ def test_enable_gate_closed_is_409_and_armes_nothing(client, tmp_path, monkeypat
     assert error["details"]["gates"]["all_open"] is False
     assert error["details"]["gates"]["auto_confirm_config"] is False
 
-    assert not (tmp_path / "autoloop.json").exists()  # a refused enable persists nothing
+    assert control_store.load_autoloop_state() == {}  # a refused enable persists nothing
     assert client.get("/api/autoloop").json()["enabled"] is False
     assert started == []  # the scheduler was never armed by a refused enable
 
@@ -171,7 +180,7 @@ def test_enable_with_gates_open_persists_state_and_arms_scheduler(client, tmp_pa
     assert body["gates"]["exec_live_config"] is False  # reported, never required to enable
     assert body["gates"]["exec_derivatives_config"] is False  # futures: observability only, never required
 
-    state = json.loads((tmp_path / "autoloop.json").read_text(encoding="utf-8"))
+    state = control_store.load_autoloop_state()
     assert state == {"enabled": True, "interval_minutes": 30, "updated_at": state["updated_at"]}
     assert state["updated_at"]
     assert client.get("/api/autoloop").json()["enabled"] is True
@@ -182,7 +191,7 @@ def test_disable_is_never_gated_and_omitted_interval_defaults(client, tmp_path):
     # gates closed: turning the loop OFF must still work (the safe direction)
     response = client.post("/api/autoloop", json={"enabled": False})
     assert response.status_code == 200
-    state = json.loads((tmp_path / "autoloop.json").read_text(encoding="utf-8"))
+    state = control_store.load_autoloop_state()
     assert state["enabled"] is False
     assert state["interval_minutes"] == 1440  # default when omitted
 
@@ -199,7 +208,7 @@ def test_autoloop_validates_body(client, tmp_path):
         response = client.post("/api/autoloop", json=bad_body)
         assert response.status_code == 400, bad_body
         assert response.json()["error"]["code"] == "validation_error"
-    assert not (tmp_path / "autoloop.json").exists()
+    assert control_store.load_autoloop_state() == {}
 
 
 # --- scheduler -----------------------------------------------------------------
@@ -217,6 +226,53 @@ def test_ensure_started_reuses_a_live_scheduler(monkeypatch):
     assert autoloop_mod._scheduler_thread is sentinel  # idempotent: never a second thread
 
 
+def test_stop_joins_the_autoloop_scheduler(monkeypatch):
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_load_state",
+        lambda: {"enabled": False, "interval_minutes": 1440},
+    )
+    autoloop_mod._wakeup.clear()
+
+    autoloop_mod.ensure_started()
+    scheduler = autoloop_mod._scheduler_thread
+    assert scheduler is not None and scheduler.is_alive()
+
+    autoloop_mod.stop()
+
+    assert not scheduler.is_alive()
+    assert autoloop_mod._scheduler_thread is None
+
+
+def test_scheduler_stop_during_state_read_launches_no_new_cycle(monkeypatch):
+    """A stop arriving between the loop-top check and the spawn decision must
+    not launch one final cycle: shutdown never arms new work."""
+    reads: list[int] = []
+    spawns: list[int] = []
+
+    def load_state():
+        reads.append(1)
+        if len(reads) >= 2:
+            autoloop_mod._scheduler_stop.set()
+        return {"enabled": True, "interval_minutes": 1440, "updated_at": f"u{len(reads)}"}
+
+    class Wakeup:
+        def wait(self, timeout=None):
+            return True
+
+        def clear(self):
+            pass
+
+    monkeypatch.setattr(autoloop_mod, "_load_state", load_state)
+    monkeypatch.setattr(autoloop_mod, "_spawn_cycle",
+                        lambda *_args, **_kwargs: spawns.append(1) or "started")
+    monkeypatch.setattr(autoloop_mod, "_wakeup", Wakeup())
+
+    autoloop_mod._scheduler_loop()
+
+    assert spawns == [1]
+
+
 def test_scheduler_loop_runs_enabled_state_immediately(monkeypatch, tmp_path):
     autoloop_mod._save_state({"enabled": True, "interval_minutes": 1440, "updated_at": utc_now_iso()})
     calls: list[int] = []
@@ -229,10 +285,18 @@ def test_scheduler_loop_runs_enabled_state_immediately(monkeypatch, tmp_path):
 
     monkeypatch.setattr(autoloop_mod, "_spawn_cycle", spawn)
     monkeypatch.setattr(autoloop_mod, "_wakeup", stop)
-    thread = threading.Thread(target=autoloop_mod._scheduler_loop, daemon=True)
+    thread = threading.Thread(
+        target=autoloop_mod._scheduler_loop, name="server-autoloop-scheduler", daemon=True
+    )
     thread.start()
-    thread.join(timeout=1.0)
-    assert calls == [1]
+    try:
+        thread.join(timeout=1.0)
+        assert calls == [1]
+    finally:
+        autoloop_mod._scheduler_stop.set()
+        stop.set()
+        thread.join(timeout=1.0)
+    assert not thread.is_alive()
 
 
 def test_scheduler_runs_again_after_interval_timeout(monkeypatch, tmp_path):
@@ -374,7 +438,7 @@ def test_run_now_skipped_busy_records_the_skip_trail(client, tmp_path):
     worker.join(timeout=5.0)
     assert not worker.is_alive()
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "autoloop_cycle_skipped" in trail
     assert "run r_active" in trail
     assert autoloop_mod._last_cycle["status"] == "skipped_busy"
@@ -432,8 +496,16 @@ class _StubVenue:
     def load_markets(self) -> dict:
         return {}  # no market minimums: plan_order falls back to the rules floor
 
-    def fetch_balance(self) -> dict:
-        return {"total": {"USDT": _STUB_CASH}, "free": {"USDT": _STUB_CASH}}
+    def fetch_balance(self, params: dict | None = None) -> dict:
+        # ``equity``/``info.asset`` are the futures wallet the cycle sizes
+        # against; the spot ``total`` map is what sync_portfolio reads.
+        return {
+            "total": {"USDT": _STUB_CASH}, "free": {"USDT": _STUB_CASH},
+            "equity": _STUB_CASH, "info": {"asset": "USDT"},
+        }
+
+    def fetch_positions(self, symbols=None, params: dict | None = None) -> list:
+        return []
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, **kwargs):
         duration = 3_600_000 if timeframe == "1h" else 14_400_000
@@ -443,16 +515,35 @@ class _StubVenue:
                  _STUB_PRICE - 100, _STUB_PRICE + 1, 1.0]]
 
 
-class _FakeGraph:
-    """propagate() returns a fixed signal and records the calls it saw."""
+def _agent_proposal(**overrides) -> dict:
+    """A complete FuturesExecutionProposal-shaped decision for the fixtures."""
+    proposal = {
+        "margin_mode": "isolated",
+        "leverage": 3,
+        "risk_fraction": 0.01,
+        "margin_fraction": 0.25,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+    }
+    proposal.update(overrides)
+    return proposal
 
-    def __init__(self, signal: str):
+
+class _FakeGraph:
+    """propagate() returns a fixed signal/state and records the calls it saw."""
+
+    def __init__(self, signal: str, proposal: dict | None = None, intent: str = "enter"):
         self._signal = signal
+        self._proposal = _agent_proposal() if proposal is None else proposal
+        self._intent = intent
         self.calls: list[tuple[str, str, str]] = []
 
     def propagate(self, ticker: str, trade_date: str, asset_type: str | None = None):
         self.calls.append((ticker, trade_date, str(asset_type)))
-        return {}, self._signal
+        state = {
+            "futures_execution_proposal": self._proposal,
+            "futures_execution_intent": self._intent,
+        }
+        return state, self._signal
 
 
 def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
@@ -508,7 +599,7 @@ def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
     assert dry_buy["stop_loss"] == _STOP and dry_buy["take_profit"] == _TAKE
     assert all(event.get("mode") != "live" for event in events)  # never goes live on its own
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "autoloop_cycle_started" in trail
     assert "autoloop_cycle_completed" in trail
 
@@ -548,7 +639,7 @@ def test_run_cycle_skips_each_failing_candidate_but_completes(tmp_path, monkeypa
     assert btc.reason == "RuntimeError: LLM relay down"
     assert autoloop_mod._last_cycle["status"] == "completed"  # the cycle itself completed
     (completed,) = [json.loads(line) for line in
-                    (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8").splitlines()
+                    [json.dumps(e) for e in control_store.load_server_audit()]
                     if "autoloop_cycle_completed" in line]
     assert completed["results"][0]["reason"] == "RuntimeError: LLM relay down"
 
@@ -577,7 +668,7 @@ def test_cycle_screening_timeout_is_terminal_and_does_not_build_venue(tmp_path, 
     assert autoloop_mod._run_cycle(lambda *_args: pytest.fail("graph must not build")) == []
     assert autoloop_mod._last_cycle["status"] == "timeout"
     assert "screening" in autoloop_mod._last_cycle["error"]
-    audit = server_paths.SERVER_AUDIT_PATH.read_text(encoding="utf-8")
+    audit = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "autoloop_cycle_timeout" in audit
     assert not engine_audit.exists()
 
@@ -612,10 +703,58 @@ def test_cycle_runs_crypto_candidates_before_advisory_stocks(tmp_path, monkeypat
             return {}, "Hold"
 
     results = autoloop_mod._run_cycle(lambda *_args: RecordingGraph())
-    assert seen == ["BTC-USD", "ETH-USD", "AAPL", "MRNA"]
+    # The run is capped at AUTO_TOP_N after crypto-first ordering: the screen
+    # pool is wider than the run so filtering cannot starve the cycle.
+    assert seen == ["BTC-USD", "ETH-USD", "AAPL"]
     assert [result.ticker for result in results] == seen
     assert autoloop_mod._last_cycle["status"] == "completed"
     assert autoloop_mod._last_cycle["candidates"] == seen
+
+
+def test_preflight_drops_stocks_and_contractless_symbols_in_futures_mode(tmp_path, monkeypatch):
+    """In futures mode a stock or a symbol with no live contract can never end
+    in an order, yet each costs a full LLM pipeline. Preflight drops them
+    before the pipeline runs and records why, so a cycle spends its budget on
+    candidates that can actually trade."""
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    executor = DerivativesExecutor(config=get_config(), exchange_factory=_StubDerivVenue)
+
+    candidates = [
+        {"ticker": "BTC-USD", "asset_type": "crypto"},
+        {"ticker": "SPCXB-USD", "asset_type": "crypto"},  # no contract in the stub venue
+        {"ticker": "MRNA", "asset_type": "stock"},
+    ]
+    runnable, skipped = autoloop_mod._preflight_candidates(candidates, executor)
+
+    assert [c["ticker"] for c in runnable] == ["BTC-USD"]
+    assert [s["ticker"] for s in skipped] == ["SPCXB-USD", "MRNA"]
+    assert "no active futures contract" in skipped[0]["reason"]
+    assert "advisory only in futures mode" in skipped[1]["reason"]
+
+
+def test_preflight_keeps_everything_when_market_metadata_is_unavailable(tmp_path, monkeypatch):
+    """An unreachable venue must not empty the cycle: the per-candidate path
+    still re-checks and rejects on its own."""
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    executor = DerivativesExecutor(config=get_config(), exchange_factory=_StubDerivVenue)
+
+    class DeadVenue:
+        def load_markets(self):
+            raise OSError("venue down")
+
+    monkeypatch.setattr(executor._bridge, "client", lambda: DeadVenue())
+
+    candidates = [
+        {"ticker": "BTC-USD", "asset_type": "crypto"},
+        {"ticker": "MRNA", "asset_type": "stock"},
+    ]
+    runnable, skipped = autoloop_mod._preflight_candidates(candidates, executor)
+    assert [c["ticker"] for c in runnable] == ["BTC-USD", "MRNA"]
+    assert skipped == []
 
 
 def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monkeypatch):
@@ -623,12 +762,15 @@ def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monk
     set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
-    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
     monkeypatch.setattr(
-        screening_mod, "screen_universe",
-        lambda *_args: [{"ticker": "BTC-USD", "asset_type": "crypto"}],
+        autoloop_mod,
+        "_screen_with_timeout",
+        lambda *_args, **_kwargs: (
+            ["BTC-USD"], [], [{"ticker": "BTC-USD", "asset_type": "crypto"}],
+        ),
     )
     monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
     release_graph = threading.Event()
@@ -720,7 +862,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
     set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
-    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
     monkeypatch.setattr(
@@ -731,6 +873,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(autoloop_mod, "_bracket_prices", lambda *_args, **_kwargs: (90.0, 110.0))
 
     release_sync = threading.Event()
+    sync_entered = threading.Event()
     sync_finished = threading.Event()
     submitted: list[object] = []
 
@@ -738,7 +881,8 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
         config = {"exec_auto_confirm": True, "exec_live": True}
 
         def sync_portfolio(self):
-            release_sync.wait(timeout=1.0)
+            sync_entered.set()
+            release_sync.wait(timeout=30.0)
             sync_finished.set()
             return PortfolioContext(cash=1_000.0)
 
@@ -747,6 +891,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
                 ticker="BTC-USD",
                 ccxt_symbol="BTC/USDT",
                 signal="Buy",
+                futures_execution_intent="enter",
                 side="buy",
                 quantity=0.01,
                 cost=500.0,
@@ -765,11 +910,21 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
 
     monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: SlowBridge())
 
-    assert autoloop_mod._run_cycle(lambda *_args: _FakeGraph("Buy")) == []
+    cycle = threading.Thread(
+        target=lambda: autoloop_mod._run_cycle(lambda *_args: _FakeGraph("Buy")),
+        name="test-cycle-worker", daemon=True,
+    )
+    cycle.start()
+    # Deterministic ordering: the worker must be blocked inside sync_portfolio
+    # before the deadline can fire. Waiting for sync_entered replaces the old
+    # 0.02s race that made the suite-order run flaky under CPU contention.
+    assert sync_entered.wait(timeout=10.0)
+    cycle.join(timeout=10.0)
+    assert not cycle.is_alive()
     assert autoloop_mod._last_cycle["status"] == "timeout"
 
     release_sync.set()
-    assert sync_finished.wait(timeout=1.0)
+    assert sync_finished.wait(timeout=15.0)
     assert submitted == []
     assert not engine_audit.exists()
 
@@ -863,25 +1018,78 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
 
 def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
     """exec_derivatives armed: the crypto candidate plans through the
-    DerivativesExecutor (leverage clamped to the system cap) and the Buy's
-    dry fill carries the LONG bracket (stop below entry, target above)."""
+    DerivativesExecutor using the AGENT's leverage (not a code default) and the
+    Buy's dry fill carries the LONG bracket (stop below entry, target above)."""
     engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
 
-    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+    results = autoloop_mod._run_cycle(
+        lambda config, analysts: _FakeGraph("Buy", proposal=_agent_proposal(leverage=2)),
+    )
 
     (btc,) = results
     assert btc.executed is True
     assert btc.plan.market == "derivatives"
-    assert btc.plan.leverage == autoloop_mod.MAX_AUTO_LEVERAGE
+    assert btc.plan.leverage == 2  # the proposal's number, below the 3x ceiling
+    assert btc.plan.margin_mode == "isolated"
     assert btc.plan.side == "buy"
     assert btc.plan.stop_loss < btc.plan.estimated_price < btc.plan.take_profit
 
     events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     (plan_buy,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "buy"]
     (dry_buy,) = [event for event in events if event.get("phase") == "execute" and event.get("action") == "buy"]
-    assert plan_buy["market"] == "derivatives" and plan_buy["leverage"] == autoloop_mod.MAX_AUTO_LEVERAGE
+    assert plan_buy["market"] == "derivatives" and plan_buy["leverage"] == 2
+    assert plan_buy["margin_mode"] == "isolated"
     assert dry_buy["mode"] == "dry" and dry_buy["confirmed"] is True
     assert all(event.get("mode") != "live" for event in events)
+
+
+def test_run_cycle_passes_the_futures_decision_context_to_the_agents(tmp_path, monkeypatch):
+    """The agents decide margin mode, leverage and budgets, so the cycle must
+    hand them the futures wallet, the closed candles, and the hard limits."""
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    seen = {}
+
+    class RecordingGraph(_FakeGraph):
+        def propagate(self, ticker, trade_date, asset_type=None, execution_context=""):
+            seen["execution_context"] = execution_context
+            return super().propagate(ticker, trade_date, asset_type)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: RecordingGraph("Buy"))
+
+    (btc,) = results
+    assert btc.executed is True
+    context = seen["execution_context"]
+    assert f"Futures equity: {_STUB_CASH:,.4f} USDT" in context
+    assert "Closed 1h candle" in context and "Closed 4h candle" in context
+    assert f"Maximum leverage: {autoloop_mod.MAX_AUTO_LEVERAGE:g}x" in context
+    assert "A FuturesExecutionProposal is required for any entry" in context
+
+
+def test_futures_sizing_book_uses_the_futures_wallet_not_spot_cash():
+    """Spot cash is a different wallet: sizing futures against it would risk
+    money the derivatives account does not hold."""
+    from tradingagents.execution.futures_account import FuturesAccountSnapshot
+
+    book = autoloop_mod._futures_portfolio(FuturesAccountSnapshot(
+        equity=420.5, wallet_balance=400.0, available_balance=380.0,
+        equity_currency="USDT", available_balance_currency="USDT",
+    ))
+
+    assert book.cash == pytest.approx(420.5)
+    assert book.currency == "USDT"
+    # The equity already contains open PnL; adding notional again would
+    # overstate the denominator every percentage cap divides by.
+    assert book.positions == []
+
+
+def test_futures_sizing_book_falls_back_to_available_balance():
+    from tradingagents.execution.futures_account import FuturesAccountSnapshot
+
+    book = autoloop_mod._futures_portfolio(FuturesAccountSnapshot(
+        equity=None, available_balance=125.0, available_balance_currency="USDT",
+    ))
+
+    assert book.cash == pytest.approx(125.0)
 
 
 def test_run_cycle_derivatives_dry_sell_short_bracket(tmp_path, monkeypatch):
@@ -1102,16 +1310,188 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
             return PlannedOrder(ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", market="derivatives", side="buy", quantity=1, cost=100, estimated_price=100, stop_loss=90, take_profit=110)
 
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
-    autoloop_mod._process_futures_candidate(Derivatives(), "BTC-USD", "Buy", {}, result)
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", "Buy", {}, result, proposal=_agent_proposal(),
+        intent="enter",
+    )
     assert result.reason == "awaiting approval"
     duplicate = autoloop_mod.DailyResult(ticker="BTC-USD")
-    autoloop_mod._process_futures_candidate(Derivatives(), "BTC-USD", "Buy", {}, duplicate)
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", "Buy", {}, duplicate, proposal=_agent_proposal(),
+        intent="enter",
+    )
     assert duplicate.reason == "duplicate futures signal skipped"
 
 
-def test_auto_leverage_clamped_to_system_cap():
-    """The cycle's requested leverage = the configured risk cap clamped to
-    MAX_AUTO_LEVERAGE; a missing entry means 1x (RiskLimits' default)."""
-    assert autoloop_mod._auto_leverage({}) == 1.0
-    assert autoloop_mod._auto_leverage({"risk_max_derivatives_leverage": 2.0}) == 2.0
-    assert autoloop_mod._auto_leverage({"risk_max_derivatives_leverage": 10.0}) == autoloop_mod.MAX_AUTO_LEVERAGE
+def test_futures_intent_abstain_is_recorded_without_planning(monkeypatch):
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    context = _market_context()
+
+    class Derivatives(_NoopDerivatives):
+        def plan_order(self, *args, **kwargs):
+            pytest.fail("abstain intent must not plan an order")
+
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: None,
+    )
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", "Sell", {}, result,
+        context=context, proposal={}, intent="abstain",
+    )
+    assert result.plan is None
+    assert result.reason == "agent_abstained"
+
+
+@pytest.mark.parametrize(
+    ("signal", "intent", "reason"),
+    [
+        ("Sell", None, "structured_terms_unavailable"),
+        ("Underweight", None, "structured_terms_unavailable"),
+        ("Sell", "manage_existing", "position_management_only"),
+        ("Underweight", "manage_existing", "position_management_only"),
+        ("Sell", "unexpected", "invalid_futures_intent: unexpected"),
+    ],
+)
+def test_bearish_rating_never_bypasses_missing_or_non_entry_intent(
+    monkeypatch, signal, intent, reason,
+):
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    context = _market_context()
+
+    class Derivatives(_NoopDerivatives):
+        def plan_order(self, *args, **kwargs):
+            pytest.fail("non-entry intent must never reach futures planning")
+
+    monkeypatch.setattr(
+        autoloop_mod,
+        "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: None,
+    )
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", signal, {}, result,
+        context=context, proposal=_agent_proposal(), intent=intent,
+    )
+
+    assert result.plan is None
+    assert result.executed is False
+    assert result.reason == reason
+
+
+def test_futures_entry_without_agent_proposal_is_refused():
+    """The decision agents own the futures terms: without a proposal the cycle
+    records the refusal instead of falling back to code-chosen leverage."""
+    from server import job_store
+
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    autoloop_mod._process_futures_candidate(
+        _NoopDerivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
+        intent="enter",
+    )
+
+    assert result.plan is None and result.executed is False
+    assert result.reason.startswith("agent_proposal_missing")
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected" and cycle["phase"] == "proposal"
+
+
+def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
+    """A complete proposal is passed through verbatim: leverage, risk budget,
+    margin budget and margin mode all come from the agents, not the config."""
+    from tradingagents.execution.sizing import PlannedOrder
+
+    captured = {}
+
+    class Derivatives(_NoopDerivatives):
+        def plan_order(self, *args, **kwargs):
+            captured.update(kwargs)
+            return PlannedOrder(
+                ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy",
+                market="derivatives", futures_execution_intent="enter", side="buy", quantity=1, cost=100,
+                estimated_price=100, stop_loss=90, take_profit=110,
+            )
+
+        def audit_plan(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(autoloop_mod.job_store, "claim_futures_cycle", lambda *a, **k: True)
+    monkeypatch.setattr(autoloop_mod.job_store, "update_futures_cycle", lambda *a, **k: None)
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    autoloop_mod._process_futures_candidate(
+        Derivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
+        proposal=_agent_proposal(leverage=2, risk_fraction=0.004, margin_fraction=0.15,
+                                 margin_mode="cross", stop_loss=90.0, take_profit=110.0),
+        intent="enter",
+        portfolio=PortfolioContext(cash=1_000.0, currency="USDT"),
+    )
+
+    assert captured["leverage"] == 2
+    assert captured["risk_fraction"] == 0.004
+    assert captured["margin_fraction"] == 0.15
+    assert captured["margin_mode"] == "cross"
+
+
+def test_proposal_above_the_hard_caps_is_refused_not_clamped():
+    """An over-cap proposal is refused: silently resizing it would execute a
+    decision no agent made."""
+    for overrides, fragment in (
+        ({"leverage": autoloop_mod.MAX_AUTO_LEVERAGE + 1}, "leverage"),
+        ({"risk_fraction": 0.5}, "risk_fraction"),
+        ({"margin_fraction": 0.9}, "margin_fraction"),
+        ({"margin_mode": "portfolio"}, "margin_mode"),
+        ({"stop_loss": 120, "take_profit": 80}, "bracket"),
+    ):
+        terms, reason = autoloop_mod._proposal_terms(
+            _agent_proposal(**overrides), mark=100.0, direction="long", config={},
+        )
+        assert terms is None, overrides
+        assert fragment in (reason or ""), (overrides, reason)
+
+
+class _NoopDerivatives:
+    """Minimal executor surface for the proposal-validation paths."""
+
+    def __init__(self):
+        self._bridge = _NoopBridge()
+        self.config = {}
+
+    def symbol_for(self, ticker):
+        return "BTC/USDT:USDT"
+
+    def plan_order(self, *args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("plan_order must not run when the proposal is refused")
+
+
+class _NoopBridge:
+    def client(self):
+        return _NoopVenue()
+
+    def sync_portfolio(self):
+        return PortfolioContext(cash=1_000.0, currency="USDT")
+
+
+class _NoopVenue:
+    def fetch_ticker(self, symbol):
+        return {"last": 100.0, "close": 100.0}
+
+
+def _market_context(ticker: str = "BTC-USD"):
+    from tradingagents.dataflows.market_data import Candle
+
+    now = int(datetime(2026, 10, 7, 8, tzinfo=timezone.utc).timestamp() * 1000)
+    one_hour = Candle("BTC/USDT:USDT", "1h", now - 3_600_000, now - 1, 100, 110, 90, 105, 1.0, True)
+    four_hour = Candle("BTC/USDT:USDT", "4h", now - 14_400_000, now - 1, 100, 110, 90, 105, 1.0, True)
+    return {
+        "requested_ticker": ticker,
+        "symbol": "BTC/USDT:USDT",
+        "unified_symbol": "BTC/USDT:USDT",
+        "one_hour": one_hour,
+        "four_hour": four_hour,
+        "one_hour_open": one_hour.open_time,
+        "one_hour_close": one_hour.close,
+        "four_hour_open": four_hour.open_time,
+        "four_hour_close": four_hour.close,
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bullish",
+    }

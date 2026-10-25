@@ -56,8 +56,9 @@ export function formatSignedNumber(value: number, fractionDigits = 2): string {
   return abs;
 }
 
-export function formatSignedCurrency(value: number, currency = "USD"): string {
-  return `${formatSignedNumber(value)} ${currency}`;
+export function formatSignedCurrency(value: number, currency?: string | null): string {
+  const amount = formatSignedNumber(value);
+  return currency ? `${amount} ${currency}` : amount;
 }
 
 /** Phần trăm không dấu: "54,3%". */
@@ -77,10 +78,11 @@ export function formatUsdPrice(value: number | null | undefined): string {
 /** Tiền theo đơn vị danh mục server trả (vd "USDT"): "9.500,00 USDT"; null/NaN → "—". */
 export function formatMoney(
   value: number | null | undefined,
-  currency: string
+  currency?: string | null
 ): string {
   if (value == null || Number.isNaN(value)) return "—";
-  return `${usdFormat.format(value)} ${currency}`;
+  const amount = usdFormat.format(value);
+  return currency ? `${amount} ${currency}` : amount;
 }
 
 /** Tài sản gốc của cặp: "BTC/USDT" hoặc "BTC-USD" → "BTC"; không parse được → nguyên văn/null. */

@@ -399,7 +399,40 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
   - *Giới hạn lệnh lỗ liên tiếp* (`risk_max_consecutive_loss_count`): đủ N lỗ liên
     tiếp (đếm xuyên mã) → halt trong ngày.
   - *Đòn bẩy phái sinh tối đa / Phơi nhiễm phái sinh tối đa* (0 = chặn hẳn phái sinh).
-  - Lưu ý: giá trị mới chỉ áp cho guard được dựng **sau** khi lưu (`types.ts:120`).
+  - *Rủi ro tối đa mỗi lệnh* (`risk_derivatives_max_risk_fraction`, mặc định 0.02) và
+    *Ký quỹ tối đa mỗi lệnh* (`risk_derivatives_max_margin_fraction`, mặc định 0.5): trần
+    cứng cho đề xuất của agent. Đề xuất vượt trần bị **từ chối**, không bị tự hạ xuống.
+  - *Rủi ro/Ký quỹ mặc định mỗi lệnh* (`risk_derivatives_risk_fraction` 0.01,
+    `risk_derivatives_margin_fraction` 0.25): chỉ dùng cho lệnh CLI/script không có đề xuất
+    của agent. Autoloop luôn cần `FuturesExecutionProposal` từ Trader/Portfolio Manager.
+  - *Tự khóa lợi nhuận Futures* (`risk_derivatives_profit_protection_enabled`): quản lý các vị thế
+    do bot đã mở và đã lưu `position_states` cùng bracket task. Mặc định bật, nhưng không tự mở
+    `exec_derivatives` hay `exec_live`; mọi mutation trên venue vẫn cần đủ cả hai nửa config/env của
+    cả hai gate.
+  - Chính sách dùng `R = khoảng cách entry thực tế đến stop ban đầu`: `break_even_r` mặc định 1R
+    dời SL về entry; `lock_profit_r` 2R khóa tối thiểu 1R; từ `trail_start_r` 3R, SL bám mark cách
+    `trail_distance_r` 1R; TP vượt qua được gia hạn từng `target_extension_r` 1R. Stop chỉ đi theo
+    hướng giảm rủi ro, không bao giờ bị nới ngược. `min_stop_move_r` (mặc định 0.1R) bỏ qua các
+    bước dời SL quá nhỏ để không huỷ/tạo conditional order mỗi vòng poll.
+  - Monitor chỉ mutate khi đọc được position mode và account đang **One-way**; Hedge Mode trả
+    `hedge_mode_unsupported` vì Binance không nhận `reduceOnly` ở chế độ đó. Mark được đọc riêng
+    từ endpoint mark price; mark cũ hơn `mark_max_age_seconds` (mặc định 120s) trả `mark_stale`
+    và không thay lệnh. Trigger của conditional leg dùng `workingType=MARK_PRICE`, cùng nguồn giá
+    với policy.
+  - *Chốt lời nhiều tầng* (`risk_derivatives_scale_out_enabled`, mặc định tắt): khi bật, mỗi lệnh
+    mới đặt **hai mức chốt theo R** (`scale_out_first_r`/`scale_out_second_r`) với tỷ lệ khối
+    lượng **của vị thế ban đầu** (`scale_out_first_fraction`/`scale_out_second_fraction`, tổng
+    phải nhỏ hơn 1). Phần còn lại là runner do trailing stop quản lý. Khi một tầng khớp, stop
+    được thu khối lượng về đúng phần còn lại; các tầng khác **không** bị huỷ. Tắt (mặc định) thì
+    dùng một TP duy nhất như trước. Đây là scale-out có chủ đích, khác với ladder do nhiều entry
+    tích tụ.
+  - Entry/khối lượng dùng fill thật từ venue khi có; monitor đọc lại Futures position/mark mỗi 30s.
+    Replacement đặt leg mới, lưu ID, rồi mới hủy leg cũ; timeout/cancel lỗi giữ state để reconcile
+    sau restart. Nếu DB có nhiều entry-state cùng mã/hướng trong khi Binance báo một net position,
+    hệ thống fail-closed và không tự chia khối lượng.
+  - Đây là cơ chế khóa lợi nhuận có điều kiện, không phải bảo đảm lợi nhuận: gap, slippage,
+    liquidation, mất mạng/API hoặc venue outage vẫn có thể khiến fill khác mức stop.
+  - Lưu ý: giá trị mới chỉ áp cho guard/monitor được dựng sau khi lưu (`types.ts:120`).
 - **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
 
 **Các thẻ chỉ-đọc:**

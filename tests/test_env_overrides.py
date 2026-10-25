@@ -151,6 +151,23 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert isinstance(config["risk_max_consecutive_loss_count"], int)
     assert config["risk_max_derivatives_leverage"] == 1.0
     assert config["risk_max_derivatives_exposure_pct"] == 0.0
+    assert config["risk_derivatives_max_risk_fraction"] == 0.02
+    assert config["risk_derivatives_max_margin_fraction"] == 0.5
+    assert config["risk_derivatives_risk_fraction"] == 0.01
+    assert config["risk_derivatives_margin_fraction"] == 0.25
+    assert config["risk_derivatives_profit_protection_enabled"] is True
+    assert config["risk_derivatives_break_even_r"] == 1.0
+    assert config["risk_derivatives_lock_profit_r"] == 2.0
+    assert config["risk_derivatives_trail_start_r"] == 3.0
+    assert config["risk_derivatives_trail_distance_r"] == 1.0
+    assert config["risk_derivatives_target_extension_r"] == 1.0
+    assert config["risk_derivatives_min_stop_move_r"] == 0.1
+    assert config["risk_derivatives_mark_max_age_seconds"] == 120.0
+    assert config["risk_derivatives_scale_out_enabled"] is False
+    assert config["risk_derivatives_scale_out_first_r"] == 1.0
+    assert config["risk_derivatives_scale_out_first_fraction"] == 0.33
+    assert config["risk_derivatives_scale_out_second_r"] == 2.0
+    assert config["risk_derivatives_scale_out_second_fraction"] == 0.33
     assert config["exec_exchange_id"] == "binance"
     assert config["exec_symbol_overrides"] == {}
     assert config["exec_watchlist"] == ["BTC-USD", "ETH-USD"]

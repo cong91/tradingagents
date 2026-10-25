@@ -31,6 +31,8 @@ def create_trader(llm):
         # only offer it (and the grounding instruction) when it has content.
         market_report = (state["market_report"] or "").strip()
         portfolio_context = get_portfolio_context_from_state(state)
+        execution_context = (state.get("execution_context") or "").strip()
+        futures_context = state.get("asset_type") == "crypto" and bool(execution_context)
 
         if market_report:
             grounding = (
@@ -42,6 +44,13 @@ def create_trader(llm):
         else:
             grounding = ""
             report_section = ""
+
+        # A backslash inside an f-string expression is only valid on Python
+        # 3.12+; the repo targets 3.10, so the block is built as a variable.
+        futures_context_block = (
+            f"Futures Account and Market Context:\n{execution_context}\n\n"
+            if futures_context else ""
+        )
 
         messages = [
             {
@@ -57,6 +66,14 @@ def create_trader(llm):
                     "instrument's quote currency (for example 189.5), never a percentage "
                     "or a range; convert a percentage distance to the price level it "
                     "implies, or omit the field if you cannot state a number. "
+                    + (
+                        "For crypto futures, propose margin mode, leverage, risk budget, and "
+                        "margin budget in a FuturesExecutionProposal, plus entry/stop/take-profit. "
+                        "Justify the choice using the current account, volatility, stop distance, "
+                        "funding, and risk/reward. Do not maximize leverage; if account context "
+                        "or setup is insufficient, omit the proposal and explain why. "
+                        if futures_context else ""
+                    )
                     + NO_EXTERNAL_TOOLS
                     + get_language_instruction()
                 ),
@@ -68,6 +85,7 @@ def create_trader(llm):
                     f"{instrument_context}\n\n"
                     f"{report_section}"
                     f"{portfolio_context}\n\n"
+                    f"{futures_context_block}"
                     f"Proposed Investment Plan:\n{investment_plan}\n\n"
                     "Make an informed, strategic trading decision.\n\n"
                     "## Output\n\n"
@@ -78,6 +96,11 @@ def create_trader(llm):
                     "sized by how strong the case is; conflict alone is not a Hold.\n"
                     "- **Reasoning**: why, against the plan and the price structure\n"
                     "- **Entry Price**, **Stop Loss**, **Position Sizing**: when you can state them"
+                    + (
+                        "\n- **Futures Execution Proposal**: margin mode, leverage, risk_fraction, "
+                        "margin_fraction, entry, stop, target, and evidence-based rationale"
+                        if futures_context else ""
+                    )
                 ),
             },
         ]
@@ -88,6 +111,10 @@ def create_trader(llm):
             messages,
             render_trader_proposal,
             "Trader",
+            structured_retry_instruction=(
+                "Return the TraderProposal schema now. Do not answer with prose outside the "
+                "schema fields; if futures context exists, set futures_execution_intent explicitly."
+            ) if futures_context else None,
         )
 
         return {

@@ -104,7 +104,10 @@ def layer_futures() -> None:
 
     portfolio = executor._bridge.sync_portfolio()
     price = float(client.fetch_ticker(symbol)["last"])
-    plan = executor.plan_order("BTC-USD", "Buy", portfolio, price=price, leverage=2.0)
+    plan = executor.plan_order(
+        "BTC-USD", "Buy", portfolio, price=price, leverage=2.0,
+        futures_execution_intent="enter",
+    )
     step("futures: plan_order sizes a leveraged long",
          plan.side == "buy" and plan.market == "derivatives" and (plan.quantity or 0) > 0,
          f"side={plan.side} qty={plan.quantity} leverage={plan.leverage} "

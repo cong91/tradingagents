@@ -29,6 +29,7 @@ dependencies = [
     "stockstats>=0.6.5",
     "typing-extensions>=4.14.0",
     "yfinance>=1.7.0",
+    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
@@ -62,6 +63,7 @@ include = ["tradingagents*", "cli*", "server*"]
 [tool.setuptools.package-data]
 cli = ["static/*"]
 tradingagents = ["assets/*.svg"]
+server = ["migrations/*.sql", "migrations/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

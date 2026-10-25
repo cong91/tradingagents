@@ -19,7 +19,7 @@ const POLL_INTERVAL_MS = 2_000;
 const STALE_AFTER_MS = 60_000;
 const STALE_CHECK_MS = 5_000;
 
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 /** Lỗi có shape thống nhất của hợp đồng §0.1: { error: { code, message, details } }. */
 export class ApiError extends Error {
@@ -56,6 +56,7 @@ export type StreamPhase =
   | { phase: "streaming" }
   | { phase: "completed" }
   | { phase: "failed" }
+  | { phase: "interrupted" }
   | { phase: "error"; message: string; activeRunId?: string };
 
 export interface RunStreamState {
@@ -78,6 +79,12 @@ const IDLE_STATE: RunStreamState = {
 
 function isTerminalStatus(status: string): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+function terminalPhase(status: RunPayload["status"]): StreamPhase {
+  if (status === "failed") return { phase: "failed" };
+  if (status === "interrupted") return { phase: "interrupted" };
+  return { phase: "completed" };
 }
 
 /** Cập nhật run từ event terminal để UI không phải đợi GET cuối cùng. */
@@ -126,6 +133,23 @@ function applyEventToRun(run: RunPayload | null, event: RunEvent): RunPayload | 
         finished_at: event.ts,
       };
     }
+    case "run_interrupted": {
+      const raw = event.payload["error"];
+      const err =
+        raw && typeof raw === "object" ? (raw as { code?: unknown; message?: unknown }) : {};
+      return {
+        ...run,
+        status: "interrupted",
+        error: {
+          code: typeof err.code === "string" ? err.code : "interrupted",
+          message:
+            typeof err.message === "string"
+              ? err.message
+              : "Phiên bị gián đoạn trước khi hoàn tất.",
+        },
+        finished_at: event.ts,
+      };
+    }
     default:
       return run;
   }
@@ -136,6 +160,9 @@ export function useRunStream() {
 
   const sourceRef = useRef<EventSource | null>(null);
   const pollRef = useRef<number | null>(null);
+  const generationRef = useRef(0);
+  const pollGenerationRef = useRef(0);
+  const pollSequenceRef = useRef(0);
   const lastSeqRef = useRef(0);
   const lastEventAtRef = useRef<number | null>(null);
   // Gán trong openStream (không khởi tạo bằng Date.now() trong render — impure).
@@ -149,45 +176,59 @@ export function useRunStream() {
   }, []);
 
   const stopPolling = useCallback(() => {
+    pollGenerationRef.current += 1;
     if (pollRef.current !== null) {
       window.clearInterval(pollRef.current);
       pollRef.current = null;
     }
   }, []);
 
-  /** Chốt phiên khi đã nhận event terminal: lấy trạng thái chuẩn từ GET. */
+  const invalidate = useCallback(() => {
+    generationRef.current += 1;
+    closeStream();
+    stopPolling();
+    return generationRef.current;
+  }, [closeStream, stopPolling]);
+
+  /** Chốt ngay bằng event terminal; GET chỉ bổ sung nếu cùng trạng thái. */
   const finish = useCallback(
-    async (runId: string) => {
+    async (
+      runId: string,
+      terminalStatus: RunPayload["status"],
+      generation: number,
+      terminalEvent: RunEvent,
+    ) => {
+      if (generation !== generationRef.current) return;
+      const finishingGeneration = generationRef.current;
       closeStream();
       stopPolling();
-      let settled = false;
+      setState((s) => {
+        if (finishingGeneration !== generationRef.current || s.run?.run_id !== runId) return s;
+        return {
+          ...s,
+          run: applyEventToRun(s.run, terminalEvent),
+          phase: terminalPhase(terminalStatus),
+          sseConnected: false,
+          stale: false,
+        };
+      });
       try {
         const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`, {
           cache: "no-store",
         });
-        if (res.ok) {
-          const run = (await res.json()) as RunPayload;
-          setState((s) => ({
-            ...s,
-            run,
-            phase:
-              run.status === "failed" ? { phase: "failed" } : { phase: "completed" },
-            sseConnected: false,
-            stale: false,
-          }));
-          settled = true;
-        }
+        if (!res.ok || finishingGeneration !== generationRef.current) return;
+        const run = (await res.json()) as RunPayload;
+        if (finishingGeneration !== generationRef.current || run.run_id !== runId) return;
+        setState((s) =>
+          finishingGeneration === generationRef.current &&
+          s.run?.run_id === runId &&
+          isTerminalStatus(run.status) &&
+          run.status === terminalStatus
+            ? { ...s, run }
+            : s,
+        );
       } catch {
-        // Backend không trả lời — chốt bằng trạng thái suy ra từ event bên dưới.
-      }
-      if (!settled) {
-        setState((s) => ({
-          ...s,
-          phase:
-            s.run?.status === "failed" ? { phase: "failed" } : { phase: "completed" },
-          sseConnected: false,
-          stale: false,
-        }));
+        // Backend không trả lời — giữ trạng thái terminal từ event.
       }
     },
     [closeStream, stopPolling],
@@ -195,7 +236,16 @@ export function useRunStream() {
 
   /** Poll dự phòng khi SSE rớt (hợp đồng §3: mỗi 2s). */
   const pollRun = useCallback(
-    async (runId: string) => {
+    async (runId: string, generation: number, pollGeneration: number) => {
+      const sequence = ++pollSequenceRef.current;
+      const eventSequence = lastSeqRef.current;
+      const isCurrent = () =>
+        generation === generationRef.current &&
+        pollGeneration === pollGenerationRef.current &&
+        sequence === pollSequenceRef.current &&
+        eventSequence === lastSeqRef.current &&
+        pollRef.current !== null;
+      if (!isCurrent()) return;
       let res: Response;
       try {
         res = await fetch(`/api/runs/${encodeURIComponent(runId)}`, {
@@ -204,18 +254,22 @@ export function useRunStream() {
       } catch {
         return; // lỗi mạng tạm thời — poll lại chu kỳ sau.
       }
+      if (!isCurrent()) return;
       if (res.status === 404) {
-        stopPolling();
-        closeStream();
-        setState((s) => ({
-          ...s,
-          phase: {
-            phase: "error",
-            message: `Không tìm thấy phiên ${runId} trên backend (server có thể đã khởi động lại).`,
-          },
-          sseConnected: false,
-          stale: false,
-        }));
+        const endedGeneration = invalidate();
+        setState((s) =>
+          endedGeneration === generationRef.current && s.run?.run_id === runId
+            ? {
+                ...s,
+                phase: {
+                  phase: "error",
+                  message: `Không tìm thấy phiên ${runId} trên backend (server có thể đã khởi động lại).`,
+                },
+                sseConnected: false,
+                stale: false,
+              }
+            : s,
+        );
         return;
       }
       if (!res.ok) return;
@@ -225,35 +279,49 @@ export function useRunStream() {
       } catch {
         return;
       }
+      if (!isCurrent() || run.run_id !== runId) return;
       if (isTerminalStatus(run.status)) {
         // SSE chết trước khi terminal kịp tới: poll cứu trạng thái rồi đóng.
-        closeStream();
-        stopPolling();
-        setState((s) => ({
+        const endedGeneration = invalidate();
+        setState((s) => endedGeneration === generationRef.current && s.run?.run_id === runId ? {
           ...s,
           run,
-          phase:
-            run.status === "failed" ? { phase: "failed" } : { phase: "completed" },
+          phase: terminalPhase(run.status),
           sseConnected: false,
           stale: false,
-        }));
+        } : s);
       } else {
-        setState((s) => ({ ...s, run }));
+        setState((s) =>
+          isCurrent() && s.run?.run_id === runId && !isTerminalStatus(s.run.status)
+            ? { ...s, run }
+            : s,
+        );
       }
     },
-    [closeStream, stopPolling],
+    [invalidate],
   );
 
   const openStream = useCallback(
     (runId: string) => {
-      closeStream();
-      stopPolling();
+      const generation = invalidate();
       streamStartedAtRef.current = Date.now();
       const source = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
       sourceRef.current = source;
-      source.onopen = () =>
-        setState((s) => (s.sseConnected ? s : { ...s, sseConnected: true }));
-      source.onmessage = (message) => {
+      const isCurrent = () =>
+        generation === generationRef.current && sourceRef.current === source;
+      source.onopen = () => {
+        if (!isCurrent()) return;
+        stopPolling();
+        setState((s) =>
+          generation === generationRef.current && s.run?.run_id === runId
+            ? s.sseConnected
+              ? s
+              : { ...s, sseConnected: true }
+            : s,
+        );
+      };
+      const handleEvent = (message: MessageEvent<string>) => {
+        if (!isCurrent()) return;
         let event: RunEvent;
         try {
           event = JSON.parse(message.data) as RunEvent;
@@ -264,35 +332,64 @@ export function useRunStream() {
         if (typeof event.seq !== "number" || event.seq <= lastSeqRef.current) return;
         lastSeqRef.current = event.seq;
         lastEventAtRef.current = Date.now();
-        setState((s) => ({
-          ...s,
-          run: applyEventToRun(s.run, event),
-          events: [...s.events, event],
-          stale: false,
-        }));
-        if (event.type === "run_completed" || event.type === "run_failed") {
-          void finish(runId);
+        setState((s) => {
+          if (generation !== generationRef.current || s.run?.run_id !== runId) return s;
+          const nextRun = applyEventToRun(s.run, event);
+          return nextRun?.run_id === runId
+            ? { ...s, run: nextRun, events: [...s.events, event], stale: false }
+            : s;
+        });
+        if (event.type === "run_completed") {
+          void finish(runId, "completed", generation, event);
+        } else if (event.type === "run_failed") {
+          void finish(runId, "failed", generation, event);
+        } else if (event.type === "run_interrupted") {
+          void finish(runId, "interrupted", generation, event);
         }
       };
+      for (const eventType of [
+        "run_started",
+        "message",
+        "tool_call",
+        "analyst_status",
+        "debate_update",
+        "research_manager",
+        "trader_update",
+        "risk_update",
+        "pm_decision",
+        "run_completed",
+        "run_failed",
+        "run_interrupted",
+      ]) {
+        source.addEventListener(eventType, handleEvent);
+      }
       source.onerror = () => {
+        if (!isCurrent()) return;
         // EventSource tự reconnect (gửi lại Last-Event-ID) — bật poll dự phòng.
-        setState((s) => (s.sseConnected ? { ...s, sseConnected: false } : s));
+        setState((s) =>
+          generation === generationRef.current && s.run?.run_id === runId
+            ? s.sseConnected
+              ? { ...s, sseConnected: false }
+              : s
+            : s,
+        );
         if (pollRef.current === null) {
+          const pollGeneration = ++pollGenerationRef.current;
           pollRef.current = window.setInterval(
-            () => void pollRun(runId),
+            () => void pollRun(runId, generation, pollGeneration),
             POLL_INTERVAL_MS,
           );
         }
       };
     },
-    [closeStream, finish, pollRun, stopPolling],
+    [finish, invalidate, pollRun, stopPolling],
   );
 
   /** POST /api/runs và mở stream cho run mới. */
   const startRun = useCallback(
     async (input: StartRunInput) => {
-      closeStream();
-      stopPolling();
+      const generation = invalidate();
+      const isCurrent = () => generation === generationRef.current;
       lastSeqRef.current = 0;
       lastEventAtRef.current = null;
       setState({
@@ -306,20 +403,21 @@ export function useRunStream() {
       try {
         res = await postJson("/api/runs", input);
       } catch {
-        setState((s) => ({
+        setState((s) => isCurrent() ? {
           ...s,
           phase: {
             phase: "error",
             message:
               "Không kết nối được backend. Hãy khởi động server FastAPI (uvicorn server.main:app --port 8000) rồi thử lại.",
           },
-        }));
+        } : s);
         return;
       }
+      if (generation !== generationRef.current) return;
       if (!res.ok) {
         const err = await readErrorEnvelope(res);
         const detailsRunId = err.details["run_id"];
-        setState((s) => ({
+        setState((s) => isCurrent() ? {
           ...s,
           phase: {
             phase: "error",
@@ -330,19 +428,20 @@ export function useRunStream() {
                 ? detailsRunId
                 : undefined,
           },
-        }));
+        } : s);
         return;
       }
       let run: RunPayload;
       try {
         run = (await res.json()) as RunPayload;
       } catch {
-        setState((s) => ({
+        setState((s) => isCurrent() ? {
           ...s,
           phase: { phase: "error", message: "Phản hồi POST /api/runs không đọc được." },
-        }));
+        } : s);
         return;
       }
+      if (generation !== generationRef.current) return;
       setState({
         phase: { phase: "streaming" },
         run,
@@ -352,14 +451,14 @@ export function useRunStream() {
       });
       openStream(run.run_id);
     },
-    [closeStream, openStream, stopPolling],
+    [invalidate, openStream],
   );
 
   /** Bám theo một run đã tồn tại (409 từ tab khác, hoặc active_run_id từ /api/health). */
   const attachRun = useCallback(
     async (runId: string) => {
-      closeStream();
-      stopPolling();
+      const generation = invalidate();
+      const isCurrent = () => generation === generationRef.current;
       lastSeqRef.current = 0;
       lastEventAtRef.current = null;
       setState({
@@ -375,15 +474,17 @@ export function useRunStream() {
           cache: "no-store",
         });
       } catch {
-        setState((s) => ({
+        setState((s) => isCurrent() ? {
           ...s,
           phase: { phase: "error", message: "Không kết nối được backend khi tải phiên." },
-        }));
+        } : s);
         return;
       }
+      if (generation !== generationRef.current) return;
       if (!res.ok) {
         const err = await readErrorEnvelope(res);
-        setState((s) => ({
+        if (generation !== generationRef.current) return;
+        setState((s) => isCurrent() ? {
           ...s,
           phase: {
             phase: "error",
@@ -392,22 +493,23 @@ export function useRunStream() {
                 ? `Phiên ${runId} không còn trên backend (server có thể đã khởi động lại — run chỉ lưu trong bộ nhớ).`
                 : err.message,
           },
-        }));
+        } : s);
         return;
       }
       let run: RunPayload;
       try {
         run = (await res.json()) as RunPayload;
       } catch {
-        setState((s) => ({
+        setState((s) => isCurrent() ? {
           ...s,
           phase: {
             phase: "error",
             message: "Phản hồi GET /api/runs/{id} không đọc được.",
           },
-        }));
+        } : s);
         return;
       }
+      if (generation !== generationRef.current || run.run_id !== runId) return;
       // Luôn mở stream: với run đã kết thúc, server phát lại toàn bộ buffer rồi
       // đóng (hợp đồng §3) — event terminal phát lại sẽ chốt completed/failed.
       setState({
@@ -419,28 +521,33 @@ export function useRunStream() {
       });
       openStream(run.run_id);
     },
-    [closeStream, openStream, stopPolling],
+    [invalidate, openStream],
   );
 
   /** Về trạng thái trống (sau khi xem xong kết quả). */
   const reset = useCallback(() => {
-    closeStream();
-    stopPolling();
+    invalidate();
     lastSeqRef.current = 0;
     lastEventAtRef.current = null;
     setState(IDLE_STATE);
-  }, [closeStream, stopPolling]);
+  }, [invalidate]);
 
   // Mở màn: nếu backend đang có run active (từ tab khác) thì bám theo nó.
   useEffect(() => {
+    const generation = generationRef.current;
     let cancelled = false;
     void (async () => {
       try {
         const res = await fetch("/api/health", { cache: "no-store" });
-        if (!res.ok || cancelled) return;
+        if (!res.ok || cancelled || generation !== generationRef.current) return;
         const health = (await res.json()) as { active_run_id?: unknown };
         const activeId = health["active_run_id"];
-        if (!cancelled && typeof activeId === "string" && activeId !== "") {
+        if (
+          !cancelled &&
+          generation === generationRef.current &&
+          typeof activeId === "string" &&
+          activeId !== ""
+        ) {
           await attachRun(activeId);
         }
       } catch {
@@ -471,10 +578,9 @@ export function useRunStream() {
   // Dọn stream/poll khi unmount.
   useEffect(
     () => () => {
-      closeStream();
-      stopPolling();
+      invalidate();
     },
-    [closeStream, stopPolling],
+    [invalidate],
   );
 
   return { state, startRun, attachRun, reset };

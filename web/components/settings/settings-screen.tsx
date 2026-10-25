@@ -16,6 +16,7 @@ import { AutoloopCard } from "./autoloop-card";
 import { CredentialsCard } from "./credentials-card";
 import { formatDateTimeVi } from "./format-time";
 import { GatesCard } from "./gates-card";
+import { OperatorConfigCard } from "./operator-config-card";
 import { PathsCard } from "./paths-card";
 import { SaveBar } from "./save-bar";
 import { SettingsSection } from "./settings-section";
@@ -179,6 +180,8 @@ export function SettingsScreen() {
           </div>
           {/* Vòng tự động tự fetch GET /api/autoloop — độc lập với payload /api/settings. */}
           <AutoloopCard />
+          {/* Override vận hành: đọc/ghi PostgreSQL, thay cho operator_config.json. */}
+          <OperatorConfigCard />
           <PathsCard rows={grouped.pathRows} />
           <SaveBar controller={controller} />
         </div>

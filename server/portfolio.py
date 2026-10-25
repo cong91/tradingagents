@@ -20,6 +20,7 @@ from fastapi import APIRouter
 from server import audit as audit_log
 from server.contract import ApiError, utc_now_iso
 from tradingagents.dataflows.config import get_config
+from tradingagents.execution.futures_account import read_futures_account
 from tradingagents.execution.risk import _consecutive_losses, _halted_today, _replay
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -94,7 +95,10 @@ def get_portfolio():
     config = get_config()
     events, skipped = audit_log.read_events()  # 503 when the log exists but cannot be read
     today = datetime.now(timezone.utc).date()
-    closed, open_lots = _replay(events)
+    # This response's top-level portfolio is Spot-only. Futures positions and
+    # account P&L come from the venue snapshot below, not the Spot FIFO replay.
+    spot_events = [event for event in events if event.get("market", "spot") != "derivatives"]
+    closed, open_lots = _replay(spot_events)
 
     warnings: list[str] = []
     if skipped:
@@ -146,16 +150,39 @@ def get_portfolio():
                 equity += position["quantity"] * position["marked_price"]
 
     by_ticker: dict[str, float] = {}
-    trade_tickers = sorted({event["ticker"] for event in events
+    trade_tickers = sorted({event["ticker"] for event in spot_events
                             if event.get("action") in ("buy", "sell")
                             and isinstance(event.get("ticker"), str)})
     for ticker in trade_tickers:
-        ticker_closed, _ = _replay([e for e in events if e.get("ticker") == ticker])
+        ticker_closed, _ = _replay([e for e in spot_events if e.get("ticker") == ticker])
         if ticker_closed:  # only tickers with actual closes appear (contract §6)
             by_ticker[ticker] = float(sum(t.pnl for t in ticker_closed if t.pnl is not None))
 
     total = float(sum(t.pnl for t in closed if t.pnl is not None))
     today_total = float(sum(t.pnl for t in closed if t.pnl is not None and t.day == today))
+
+    futures = {
+        "equity": None,
+        "wallet_balance": None,
+        "available_balance": None,
+        "unrealized_pnl": None,
+        "venue_profile": None,
+        "equity_currency": None,
+        "wallet_balance_currency": None,
+        "available_balance_currency": None,
+        "unrealized_pnl_currency": None,
+        "account_scope": "derivatives",
+        "positions": [],
+        "status": "unavailable",
+        "error": None,
+    }
+    if live:
+        try:
+            futures = read_futures_account(bridge).as_dict()
+        except Exception as exc:
+            futures["status"] = "error"
+            futures["error"] = f"futures account read failed ({type(exc).__name__})"
+            warnings.append(futures["error"])
 
     return {
         "generated_at": utc_now_iso(),
@@ -176,4 +203,5 @@ def get_portfolio():
         "halted_today": _halted_today(events, today),
         "warnings": warnings,
         "stale_after": STALE_AFTER,
+        "futures": futures,
     }

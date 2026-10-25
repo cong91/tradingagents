@@ -28,24 +28,24 @@ plan sizing uses margin (``cost``) with notional = margin * leverage.
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime, timezone
+import contextlib
+import math
 from typing import Any
 
 from server import job_store
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
 from tradingagents.default_config import _BOOL_TRUE
+from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
     risk_limited_quantity,
     validate_bracket,
 )
+from tradingagents.execution.scale_out import plan_scale_out
 from tradingagents.execution.sizing import PlannedOrder, SizingRules
 from tradingagents.portfolio import PortfolioContext
-
-logger = logging.getLogger(__name__)
 
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 
@@ -146,6 +146,10 @@ class DerivativesExecutor:
         leverage: float = 1.0,
         stop_loss: float | None = None,
         take_profit: float | None = None,
+        risk_fraction: float | None = None,
+        margin_fraction: float | None = None,
+        margin_mode: str | None = None,
+        futures_execution_intent: str | None = None,
     ) -> PlannedOrder:
         """Size a derivatives plan; refuses (audited) unless gates (a)+(b) are open.
 
@@ -153,11 +157,26 @@ class DerivativesExecutor:
         Sell/Underweight size like Buy/Overweight instead of reading the
         book. ``cost`` is the margin; quantity covers notional*leverage.
         Without ``price`` the plan is a network read.
+
+        ``futures_execution_intent`` is the authorization for a NEW position:
+        a tradeable rating is only a market view, so planning refuses unless
+        the caller passes exactly ``"enter"`` (the Portfolio Manager's typed
+        decision). Underweight/Sell never authorize a short on their own.
+        ``Hold``/``REVIEW`` stay no-order plans and need no authorization.
+
+        ``risk_fraction``/``margin_fraction``/``margin_mode`` are the decision
+        agents' terms; ``None`` keeps the configured sizing defaults. The
+        plan refuses (never substitutes) when a term is unusable.
         """
         offline_symbol = self.symbol_for(ticker)
+        # The shell stays valid while the terms are still unvalidated: an
+        # unrecognized margin_mode must become a refused plan (audited) rather
+        # than a pydantic ValidationError escaping the planner.
+        authorized = "enter" if futures_execution_intent == "enter" else None
         shell = PlannedOrder(
             ticker=ticker, ccxt_symbol=offline_symbol, signal=signal,
             market="derivatives", leverage=leverage,
+            futures_execution_intent=authorized,
         )
         if self.config.get("exec_derivatives") is not True:
             raise self._refuse(
@@ -173,6 +192,14 @@ class DerivativesExecutor:
                 "nothing was planned",
                 phase="plan",
             )
+        if signal in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT) and authorized is None:
+            raise self._refuse(
+                shell,
+                "futures entry requires futures_execution_intent='enter' "
+                f"(got {futures_execution_intent!r}): an investment rating alone "
+                "never authorizes a new futures position; nothing was planned",
+                phase="plan",
+            )
         ccxt_symbol = self.resolve_market(ticker)
         if price is None:
             price = self._bridge.fetch_price(ticker)
@@ -183,6 +210,9 @@ class DerivativesExecutor:
                 signal=signal, ticker=ticker, ccxt_symbol=ccxt_symbol,
                 portfolio=portfolio, price=price, leverage=leverage,
                 stop_loss=None, take_profit=None,
+                risk_fraction=risk_fraction, margin_fraction=margin_fraction,
+                margin_mode=margin_mode,
+                futures_execution_intent=authorized,
             )
             order.mode = mode
             self._bridge.audit_plan(order, action="no_order", reason=order.reason, phase="plan")
@@ -191,6 +221,9 @@ class DerivativesExecutor:
             signal=signal, ticker=ticker, ccxt_symbol=ccxt_symbol,
             portfolio=portfolio, price=price, leverage=leverage,
             stop_loss=stop_loss, take_profit=take_profit,
+            risk_fraction=risk_fraction, margin_fraction=margin_fraction,
+            margin_mode=margin_mode,
+            futures_execution_intent=authorized,
         )
         order.mode = mode
         decision = self.risk_guard.check(order, portfolio, self.config["exec_log_path"])
@@ -236,6 +269,21 @@ class DerivativesExecutor:
         if order.side is None or order.quantity is None:
             raise ValueError(
                 f"not an executable order: side={order.side!r}, quantity={order.quantity!r}"
+            )
+        if order.futures_execution_intent != "enter":
+            self._bridge.audit_plan(
+                order,
+                action="derivatives_denied",
+                reason=(
+                    "futures execution requires explicit futures_execution_intent='enter'; "
+                    "nothing was sent"
+                ),
+                confirmed=confirm,
+                phase="execute",
+            )
+            raise PermissionError(
+                "futures execution requires explicit futures_execution_intent='enter'; "
+                "nothing was sent"
             )
         try:
             validate_bracket(
@@ -321,15 +369,24 @@ class DerivativesExecutor:
         leverage: float,
         stop_loss: float | None,
         take_profit: float | None,
+        risk_fraction: float | None = None,
+        margin_fraction: float | None = None,
+        margin_mode: str | None = None,
+        futures_execution_intent: str | None = None,
     ) -> PlannedOrder:
         """Derivatives mapping of the 5-tier signal; always returns a plan."""
         book = portfolio if portfolio is not None else PortfolioContext()
         floor = self.rules.min_order_cost
+        # PlannedOrder only carries a valid literal; an unrecognized mode is
+        # refused below with its own reason instead of failing validation here.
+        plan_margin_mode = margin_mode if margin_mode in ("isolated", "cross") else None
 
         def no_order(reason: str, *, needs_review: bool = False) -> PlannedOrder:
             return PlannedOrder(
                 ticker=ticker, ccxt_symbol=ccxt_symbol, signal=signal,
                 market="derivatives", leverage=leverage,
+                margin_mode=plan_margin_mode,
+                futures_execution_intent=futures_execution_intent,
                 needs_review=needs_review, reason=reason,
             )
 
@@ -346,18 +403,40 @@ class DerivativesExecutor:
             return no_order("price unavailable")
         if book.cash is None:
             return no_order("cash unavailable")
+        if margin_mode is not None and margin_mode not in ("isolated", "cross"):
+            return no_order(
+                f"unrecognized margin_mode {margin_mode!r}: expected 'isolated' or 'cross'"
+            )
         long = signal in (_BUY, _OVERWEIGHT)
         side = "buy" if long else "sell"
         if stop_loss is None or take_profit is None:
             return no_order("derivatives entry requires explicit stop_loss and take_profit")
+        risk_fraction = (
+            float(risk_fraction) if risk_fraction is not None
+            else float(self.config.get("risk_derivatives_risk_fraction", 0.01))
+        )
+        margin_fraction = (
+            float(margin_fraction) if margin_fraction is not None
+            else float(self.config.get("risk_derivatives_margin_fraction", 0.25))
+        )
+        risk_cap = float(self.config.get("risk_derivatives_max_risk_fraction", 0.02))
+        margin_cap = float(self.config.get("risk_derivatives_max_margin_fraction", 0.5))
+        if risk_fraction > risk_cap:
+            return no_order(
+                f"proposed risk_fraction {risk_fraction:g} exceeds the hard cap {risk_cap:g}"
+            )
+        if margin_fraction > margin_cap:
+            return no_order(
+                f"proposed margin_fraction {margin_fraction:g} exceeds the hard cap {margin_cap:g}"
+            )
         try:
             validate_bracket(side=side, entry=price, stop_loss=stop_loss, take_profit=take_profit)
             equity = float(book.cash)
             quantity = risk_limited_quantity(
                 side=side, equity=equity, entry=price, stop_loss=stop_loss,
                 take_profit=take_profit, leverage=leverage,
-                risk_fraction=float(self.config.get("risk_derivatives_risk_fraction", 0.01)),
-                margin_fraction=float(self.config.get("risk_derivatives_margin_fraction", 0.25)),
+                risk_fraction=risk_fraction,
+                margin_fraction=margin_fraction,
             )
         except (FuturesPlanError, TypeError, ValueError) as exc:
             return no_order(f"derivatives sizing refused: {exc}")
@@ -367,7 +446,8 @@ class DerivativesExecutor:
         return PlannedOrder(
             ticker=ticker, ccxt_symbol=ccxt_symbol, signal=signal,
             side=side, quantity=quantity, estimated_price=price, cost=cost,
-            market="derivatives", leverage=leverage,
+            market="derivatives", leverage=leverage, margin_mode=plan_margin_mode,
+            futures_execution_intent=futures_execution_intent,
             stop_loss=stop_loss, take_profit=take_profit,
         )
 
@@ -402,6 +482,26 @@ class DerivativesExecutor:
                     f"futures market changed from {order.ccxt_symbol!r} to "
                     f"{resolved_symbol!r}; nothing was sent"
                 )
+            # Binance rejects reduceOnly in Hedge Mode, so the protective legs
+            # could not be placed. Other venues keep their existing contract;
+            # nothing extra is assumed about their position-mode API.
+            if self._bridge.exchange_id == "binance":
+                position_mode = exchange.fetch_position_mode(
+                    order.ccxt_symbol, params={"subType": "linear"},
+                )
+                if not isinstance(position_mode, dict) or position_mode.get("hedged") is not False:
+                    raise ValueError(
+                        "venue is in hedge mode (or reported no position mode); "
+                        "reduceOnly protective legs need one-way mode; nothing was sent"
+                    )
+            # Margin mode before leverage and before the entry: the venue
+            # refuses a margin-type change once a position exists, so the
+            # agent's choice must be applied (or refused) while flat. Binance
+            # answers -4046 when the symbol already carries that margin type;
+            # that is the desired end state, not a failure.
+            if order.margin_mode is not None:
+                with contextlib.suppress(ccxt.MarginModeAlreadySet):
+                    exchange.set_margin_mode(order.margin_mode, order.ccxt_symbol)
             # Always pin the leverage -- including 1x: skipping the call at
             # 1x would leave the venue's per-symbol preset in charge of the
             # real leverage.
@@ -426,10 +526,36 @@ class DerivativesExecutor:
                 f"live derivatives order on {order.ccxt_symbol} failed: {exc!r}"
             ) from exc
 
+        actual_quantity = _positive_number(response.get("filled"))
+        actual_entry = _positive_number(response.get("average")) or _positive_number(response.get("price"))
+        live_position = None
+        if actual_quantity is None or actual_entry is None:
+            try:
+                from tradingagents.execution.futures_account import read_futures_positions
+
+                live_position = next((
+                    item for item in read_futures_positions(self._bridge)
+                    if item.symbol == order.ccxt_symbol
+                    and item.side == ("long" if order.side == "buy" else "short")
+                ), None)
+            except Exception:
+                live_position = None
+        if live_position is not None:
+            actual_quantity = _positive_number(live_position.contracts) or actual_quantity
+            actual_entry = _positive_number(live_position.entry_price) or actual_entry
+        actual_quantity = actual_quantity or float(amount)
+        actual_entry = actual_entry or float(order.estimated_price)
+        actual_order = order.model_copy(update={
+            "quantity": actual_quantity,
+            "estimated_price": actual_entry,
+        })
         try:
             self._bridge.audit_plan(
-                order, action=order.side or "no_order",
-                confirmed=confirm, order_id=order_id, phase="execute",
+                actual_order,
+                action=order.side or "no_order",
+                confirmed=confirm,
+                order_id=order_id,
+                phase="execute",
             )
         except OSError as exc:
             raise RuntimeError(
@@ -437,14 +563,15 @@ class DerivativesExecutor:
                 f"the audit log failed: {exc}"
             ) from exc
         if order.stop_loss is not None or order.take_profit is not None:
+            position_key = f"{order.ccxt_symbol}:{order.side}:{order_id or 'unknown'}"
             persisted = job_store.persist_futures_entry_state(
-                f"{order.ccxt_symbol}:{order.side}:{order_id or 'unknown'}",
+                position_key,
                 side="long" if order.side == "buy" else "short",
-                entry=float(order.estimated_price),
-                quantity=float(amount),
-                stop=float(order.stop_loss) if order.stop_loss is not None else float(order.estimated_price),
+                entry=actual_entry,
+                quantity=actual_quantity,
+                stop=float(order.stop_loss) if order.stop_loss is not None else actual_entry,
                 targets=[float(order.take_profit)] if order.take_profit is not None else [],
-                mark=float(order.estimated_price),
+                mark=actual_entry,
                 order_id=str(order_id) if order_id is not None else None,
             )
             if not persisted:
@@ -456,126 +583,72 @@ class DerivativesExecutor:
                     order_id=order_id,
                     phase="execute",
                 )
-            self._place_bracket(order, confirm, order_id)
+            self._place_bracket(actual_order, confirm, order_id)
         return order_id
 
     def _place_bracket(self, order: PlannedOrder, confirm: bool, entry_order_id: str | None) -> None:
-        """Attach exchange-side protective exits after a derivatives entry fill.
-
-        Failure creates a durable recovery task. The entry remains successful and
-        is never retried as a blind replacement; recovery reconciles venue orders,
-        retries only missing legs idempotently, and closes reduce-only if protection
-        cannot be established.
-        """
-        close_side = "sell" if order.side == "buy" else "buy"
-        exchange = self._bridge.client()
-        legs: list[tuple[str, dict[str, Any]]] = []
-        if order.stop_loss is not None:
-            legs.append(("stop-loss", {"stopLossPrice": order.stop_loss}))
-        if order.take_profit is not None:
-            legs.append(("take-profit", {"takeProfitPrice": order.take_profit}))
-        if not legs:
+        manager = BracketManager(self._bridge)
+        plan = self._scale_out_plan(order)
+        if plan is None:
+            manager.place(order, confirm, entry_order_id)
             return
-        placed_ids: list[str] = []
-        try:
-            for _leg_name, leg_params in legs:
-                response = exchange.create_order(
-                    order.ccxt_symbol, "market", close_side, order.quantity,
-                    None, {**leg_params, "reduceOnly": True},
-                )
-                if isinstance(response, dict) and response.get("id"):
-                    placed_ids.append(str(response["id"]))
-        except Exception as exc:  # entry already filled; preserve that fact
-            task_id = f"bracket:{order.ccxt_symbol}:{entry_order_id or 'unknown'}"
-            now = datetime.now(timezone.utc).isoformat()
-            job_store.create_bracket_recovery(
-                task_id, symbol=order.ccxt_symbol, entry_order_id=entry_order_id or "unknown",
-                close_side=close_side, quantity=float(order.quantity),
-                legs=[{"name": name, "params": params, "status": "placed" if index < len(placed_ids) else "pending",
-                       "order_id": placed_ids[index] if index < len(placed_ids) else None}
-                      for index, (name, params) in enumerate(legs)], now=now,
-            )
-            job_store.update_bracket_recovery(
-                task_id, status="pending", placed_ids=placed_ids, attempts=0,
-                last_error=repr(exc), now=now,
-            )
-            self._bridge.audit_plan(
-                order, action="bracket_failed",
-                reason=f"protective exits failed after entry fill; recovery task {task_id}: {exc!r}",
-                confirmed=confirm, order_id=entry_order_id, phase="execute",
-            )
-            return
-        bracket_id = ",".join(placed_ids) if placed_ids else None
-        self._bridge.audit_plan(
-            order, action="bracket_placed", confirmed=confirm, order_id=bracket_id,
-            reason="exchange-side conditional stopLoss/takeProfit attached after derivatives fill",
-            phase="execute",
+        manager.place_ladder(
+            order,
+            [(level.price, level.quantity) for level in plan.levels],
+            confirm,
+            entry_order_id,
         )
 
+    def _scale_out_plan(self, order: PlannedOrder):
+        """The agent's single TP is replaced by deliberate R tranches.
+
+        An invalid configuration falls back to the single bracket (audited)
+        rather than leaving the filled entry unprotected.
+        """
+        if self.config.get("risk_derivatives_scale_out_enabled") is not True:
+            return None
+        if order.stop_loss is None or order.quantity is None or order.side is None:
+            return None
+        try:
+            return plan_scale_out(
+                side="long" if order.side == "buy" else "short",
+                entry=float(order.estimated_price),
+                initial_stop=float(order.stop_loss),
+                contracts=float(order.quantity),
+                first_r=float(self.config.get("risk_derivatives_scale_out_first_r", 1.0)),
+                first_fraction=float(self.config.get("risk_derivatives_scale_out_first_fraction", 0.33)),
+                second_r=float(self.config.get("risk_derivatives_scale_out_second_r", 2.0)),
+                second_fraction=float(self.config.get("risk_derivatives_scale_out_second_fraction", 0.33)),
+            )
+        except (TypeError, ValueError) as exc:
+            self._bridge.audit_plan(
+                order, action="scale_out_refused", reason=f"single bracket used: {exc}",
+                confirmed=True, phase="execute",
+            )
+            return None
+
     def recover_bracket(self, task_id: str, *, confirm: bool = True) -> str:
-        """Retry missing protective legs idempotently; emergency-close after retry exhaustion."""
-        task = job_store.load_bracket_recovery(task_id)
-        if task is None:
-            raise KeyError(task_id)
-        if task["status"] in {"completed", "emergency_closed"}:
-            return task["status"]
+        """Repair protective exits only while live and derivatives gates are open."""
         if confirm is not True:
             raise PermissionError("bracket recovery requires confirm=True")
-        exchange = self._bridge.client()
-        existing = exchange.fetch_open_orders(task["symbol"]) if hasattr(exchange, "fetch_open_orders") else []
-        known = set(task["placed_ids"])
-        for item in existing or []:
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
-            params = item.get("info") if isinstance(item.get("info"), dict) else item
-            for leg in task["legs"]:
-                if leg.get("status") == "placed":
-                    continue
-                if item.get("side") == task["close_side"] and (
-                    leg["params"].get("stopLossPrice") == params.get("stopLossPrice")
-                    or leg["params"].get("takeProfitPrice") == params.get("takeProfitPrice")
-                ):
-                    leg["status"] = "placed"
-                    leg["order_id"] = str(item["id"])
-                    known.add(str(item["id"]))
-        try:
-            for leg in task["legs"]:
-                if leg.get("status") == "placed":
-                    continue
-                response = exchange.create_order(
-                    task["symbol"], "market", task["close_side"], task["quantity"],
-                    None, {**leg["params"], "reduceOnly": True},
-                )
-                if isinstance(response, dict) and response.get("id"):
-                    leg["status"] = "placed"
-                    leg["order_id"] = str(response["id"])
-                    known.add(str(response["id"]))
-            complete = all(leg.get("status") == "placed" for leg in task["legs"])
-            if not complete:
-                raise RuntimeError("one or more protective legs remain missing")
-            job_store.update_bracket_recovery(
-                task_id, status="completed", placed_ids=sorted(known),
-                attempts=task["attempts"] + 1, last_error=None,
-                now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
-            )
-            return "completed"
-        except Exception as exc:
-            emergency_error = None
-            try:
-                exchange.create_order(
-                    task["symbol"], "market", task["close_side"], task["quantity"],
-                    None, {"reduceOnly": True, "clientOrderId": f"emergency:{task_id}"},
-                )
-            except Exception as emergency_exc:
-                emergency_error = emergency_exc
-            finally:
-                job_store.update_bracket_recovery(
-                    task_id, status="emergency_closed", placed_ids=sorted(known),
-                    attempts=task["attempts"] + 1,
-                    last_error=repr(emergency_error or exc),
-                    now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
-                )
-            return "emergency_closed"
+        if self.config.get("exec_derivatives") is not True or not _env_derivatives_flag():
+            raise PermissionError("bracket recovery requires derivatives execution gates")
+        if self.effective_mode() != "live":
+            raise PermissionError("bracket recovery requires live execution gates")
+        return BracketManager(self._bridge).reconcile(
+            task_id, repair_missing=True, allow_sibling_cancel=True,
+        )
+
+    def monitor_bracket(self, task_id: str) -> str:
+        """Inspect protective exits; sibling cancellation requires both live gates."""
+        allow_cancel = (
+            self.config.get("exec_derivatives") is True
+            and _env_derivatives_flag()
+            and self.effective_mode() == "live"
+        )
+        return BracketManager(self._bridge).reconcile(
+            task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
+        )
 
     def effective_mode(self) -> str:
         """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).
@@ -597,3 +670,11 @@ class DerivativesExecutor:
         """Audit a gate refusal, then raise (fail-closed with a paper trail)."""
         self._bridge.audit_plan(order, action="derivatives_denied", reason=reason, phase=phase)
         return PermissionError(reason)
+
+
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None

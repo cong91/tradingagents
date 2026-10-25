@@ -40,6 +40,7 @@ import type {
   PerformancePayload,
 } from "./contract";
 import { EmptyState } from "./empty-state";
+import { formatHistoricalMoney, historicalCurrencies } from "./historical-currency";
 import type { PanelState } from "./use-panel";
 
 const STALE_AFTER_MS = 60_000; // badge "cũ" khi generated_at già hơn 60 giây
@@ -190,6 +191,7 @@ function OpenPositionsTable({ positions }: { positions: PerformanceOpenPosition[
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
             <th scope="col" className="py-2 pr-4 font-medium">Mã</th>
+            <th scope="col" className="py-2 pr-4 font-medium">Thị trường</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Giá vào</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Giá hiện tại</th>
@@ -197,29 +199,40 @@ function OpenPositionsTable({ positions }: { positions: PerformanceOpenPosition[
           </tr>
         </thead>
         <tbody className="divide-y">
-          {positions.map((position, index) => (
-            <tr key={`${position.ticker}-${position.entry_at ?? ""}-${index}`}>
-              <td className="py-2 pr-4 font-mono font-medium">{position.ticker}</td>
-              <td className="py-2 pr-4 text-right tabular-nums">
-                {formatAssetQuantity(position.qty, position.ticker)}
-              </td>
-              <td className="py-2 pr-4 text-right tabular-nums">
-                {formatUsdPrice(position.entry_price)}
-              </td>
-              <td className="py-2 pr-4 text-right tabular-nums">
-                {formatUsdPrice(position.current_price)}
-              </td>
-              <td
-                className={`py-2 text-right tabular-nums ${
-                  position.unrealized_pct != null ? pnlTextClass(position.unrealized_pct) : ""
-                }`}
-              >
-                {position.unrealized_pct != null
-                  ? `${formatSignedNumber(position.unrealized_pct, 2)} %`
-                  : "—"}
-              </td>
-            </tr>
-          ))}
+          {positions.map((position, index) => {
+            const isDerivatives = position.market === "derivatives";
+            return (
+              <tr key={`${position.ticker}-${position.entry_at ?? ""}-${index}`}>
+                <td className="py-2 pr-4 font-mono font-medium">{position.ticker}</td>
+                <td className="py-2 pr-4">
+                  <Badge variant="secondary">{position.market === "derivatives" ? "Futures" : "Spot"}</Badge>
+                  {position.leverage != null ? <span className="ml-2 text-xs text-muted-foreground">{formatQuantityValue(position.leverage)}x</span> : null}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums">
+                  {formatAssetQuantity(position.qty, position.ticker)}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums">
+                  {isDerivatives
+                    ? formatHistoricalMoney(position.entry_price, null)
+                    : formatUsdPrice(position.entry_price)}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums">
+                  {isDerivatives
+                    ? formatHistoricalMoney(position.current_price, null)
+                    : formatUsdPrice(position.current_price)}
+                </td>
+                <td
+                  className={`py-2 text-right tabular-nums ${
+                    position.unrealized_pct != null ? pnlTextClass(position.unrealized_pct) : ""
+                  }`}
+                >
+                  {position.unrealized_pct != null
+                    ? `${formatSignedNumber(position.unrealized_pct, 2)} %`
+                    : "—"}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -243,8 +256,10 @@ function RecentOrdersTable({ orders }: { orders: PerformanceOrder[] }) {
             <th scope="col" className="py-2 pr-4 font-medium">Thời gian</th>
             <th scope="col" className="py-2 pr-4 font-medium">Mã</th>
             <th scope="col" className="py-2 pr-4 font-medium">Lệnh</th>
+            <th scope="col" className="py-2 pr-4 font-medium">Thị trường</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Giá</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">Notional / margin</th>
             <th scope="col" className="py-2 font-medium">Chế độ</th>
           </tr>
         </thead>
@@ -252,6 +267,8 @@ function RecentOrdersTable({ orders }: { orders: PerformanceOrder[] }) {
           {orders.map((order, index) => {
             const action = actionBadge(order.action);
             const mode = modeBadge(order.mode);
+            const isDerivatives = order.market === "derivatives";
+            const { quote, settle } = historicalCurrencies(order.ccxt_symbol);
             return (
               <tr key={`${order.timestamp ?? ""}-${order.order_id ?? index}-${index}`}>
                 <td className="py-2 pr-4 whitespace-nowrap tabular-nums">
@@ -261,11 +278,20 @@ function RecentOrdersTable({ orders }: { orders: PerformanceOrder[] }) {
                 <td className="py-2 pr-4">
                   <Badge variant={action.variant}>{action.label}</Badge>
                 </td>
+                <td className="py-2 pr-4">
+                  <Badge variant="secondary">{order.market === "derivatives" ? "Futures" : "Spot"}</Badge>
+                  {order.leverage != null ? <span className="ml-2 text-xs text-muted-foreground">{formatQuantityValue(order.leverage)}x</span> : null}
+                </td>
                 <td className="py-2 pr-4 text-right tabular-nums">
                   {order.qty != null ? formatQuantityValue(order.qty) : "—"}
                 </td>
                 <td className="py-2 pr-4 text-right tabular-nums">
-                  {formatUsdPrice(order.price_est)}
+                  {formatHistoricalMoney(order.price_est, quote)}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums">
+                  {isDerivatives
+                    ? `${order.qty != null && order.price_est != null ? formatHistoricalMoney(Math.abs(order.qty * order.price_est), quote) : "—"} notional${order.cost != null ? ` · margin ${formatHistoricalMoney(order.cost, settle)}` : ""}`
+                    : "—"}
                 </td>
                 <td className="py-2">
                   <Badge variant={mode.variant}>{mode.label}</Badge>

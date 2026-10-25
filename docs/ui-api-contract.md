@@ -1,6 +1,6 @@
 # Web UI API Contract (`docs/ui-api-contract.md`)
 
-updated: 2026-10-01 (rev 3: §4 approve fail-closed → rebuild plan + `execute_order` + audit hai tầng, bỏ policy dry-fill-on-gate-closed; §5 daily job có `mode: live|mock` — mock tái dùng cơ chế của `runs.py`, enqueue per-coin, không bao giờ tự thực thi; §6 mới GET /api/portfolio; approval item + `daily_job_id`/`expires_at`; endpoint 17→18 · rev 3.1: approve pipeline 4 bước ĐÃ IMPLEMENT — dead-end claim-only xoá, refusals 409-mock/409-rebuild trước claim nên item còn pending/reject được; item + `executed`/`mode`/`order_id` · rev 4: §5 POST /api/daily nhận `auto: true` + `top_n` — quét tự động 1-click, server tự sàng universe crypto (ccxt public, top theo khối lượng) + cổ phiếu Mỹ (yfinance.screen, fallback danh sách tĩnh) qua `tradingagents/dataflows/screening.py`, payload job thêm `asset_types` + `screening`; ứng viên stock chỉ advisory — có tín hiệu, không sinh lệnh; ĐÃ IMPLEMENT cả hai phía · rev 4.1: sàng lọc nâng cấp theo tiêu chí thực chiến đã research — universe 40/asset (crypto top khối lượng, cổ phiếu mạnh 52 tuần sort theo `fiftytwowkpercentchange`, cap floor $2B), metrics thêm RSI(14) + ATR(14)% (stockstats) + khoảng cách đỉnh 52 tuần + breakout 20 phiên kèm RVOL≥2 + dollar-volume floor 20 phiên (crypto $5M / stock $10M — gate loại bỏ, không chỉ trừ điểm) + RS vs benchmark (BTC-USD / ^GSPC); phạt đu đỉnh (RSI≥75, RVOL≥4, ATR>20%) · ĐÃ IMPLEMENT) · rev 5: §12 mới GET /api/performance — metrics trade replay từ engine audit log (fill phase=execute FIFO long/short per ticker; summary win/loss/expectancy, open_positions per lot mark qua price seam, brackets, recent_orders 50 dòng mới nhất; log thiếu/rỗng là empty state, không đọc được → 503 `audit_log_unreadable` như /api/audit); §13 mới autoloop + halt — GET/POST /api/autoloop (vòng lặp tự chạy theo interval 15–1440 phút, enable fail-closed 409 `gate_closed` qua cổng auto-confirm của engine: config literal + env flag), POST /api/autoloop/run-now (202), POST /api/halt + POST /api/halt/reset — kill switch không gate, line `halt`/`halt_reset` trong engine audit log mà RiskGuard của mọi process replay · ĐÃ IMPLEMENT cả hai phía · rev 6: đường futures trong autoloop — DerivativesExecutor qua 3 cổng (exec_derivatives config + env + confirm per-order của _handle_plan), leverage cap 3.0, bracket futures reduceOnly; gates() thêm 2 nửa exec_derivatives (observability) · ĐÃ IMPLEMENT cả hai phía · status: design + implementation song song (đã implement: §1–§4, §7–§9 — approve chạy đủ pipeline execute từ rev 3.1; thiết kế: §5 rev 4.1 đã implement auto mode; §6) · rev 7 (2026-10-05): **job/run/agent-log chuyển từ in-memory + file sang SQLite** (`server/db.py`, `job_store.py`, `run_store.py`; `server/data/control.db`, stdlib `sqlite3`, WAL) — §5 mới `GET /api/daily` (lịch sử + `active_job_id`) và `POST /api/daily/{id}/cancel`, `GET /api/daily/{id}` fallback DB; §3 mới `GET /api/runs` + `run_events` persist để replay run cũ + stream đọc từ DB; cả hai registry reconcile job/run mồ côi (`running` → `interrupted`) lúc khởi động nên không còn 409 vĩnh viễn; `status` thêm `cancelled`/`interrupted`; `error` cấp job. ĐÃ IMPLEMENT cả hai phía (UI: lịch sử + băng đang chạy + nút Dừng) — endpoint 24→26
+updated: 2026-10-17 (rev 9: Futures currency metadata per account/position field, USD-equivalent Bybit Unified and OKX aggregates, explicit unsupported venue routing, Bybit settleCoin scope, and accurate stale activity timestamps)
 audience: frontend + backend implementer của control-panel UI cho TradingAgents
 
 Hợp đồng này bọc engine hiện có **mà không sửa mã lõi `tradingagents/`**. Mọi mapping
@@ -48,7 +48,7 @@ mục; danh sách thay đổi đầy đủ ở changelog cuối mục §11.
 | 500  | `internal_error`        | lỗi không lường trước |
 | 502  | `execute_failed`        | exchange từ chối/lỗi khi đặt lệnh thật qua approve (§4) |
 | 503  | `audit_log_unreadable`  | `exec_log_path` tồn tại nhưng không đọc được |
-| 503  | `exchange_unreachable`  | venue không đọc được balance/giá cho GET /api/portfolio (§6) |
+| 503 | `exchange_unreachable` | Spot venue không đọc được balance/mark trong `/api/portfolio`; Futures read lỗi riêng được biểu diễn trong section `futures` và không làm hỏng Spot snapshot |
 
 ### 0.2 Trạng thái frontend bắt buộc xử lý
 
@@ -133,7 +133,8 @@ Response 200:
 ```
 
 - `settings[]` phản ánh `_ENV_OVERRIDES`; `exec_base_url` xuất hiện read-only dù được đọc từ `TRADINGAGENTS_EXEC_BASE_URL`. PUT key này → `403 forbidden_key`. `exec_sandbox` chỉ dùng cho sandbox của sàn khác, không chọn Binance venue.
-- `settings[]` có các row editable từ `_ENV_OVERRIDES` và các row read-only bổ sung (`exec_base_url` cùng các path); `type` suy từ kiểu default trong `DEFAULT_CONFIG`.
+- `settings[]` bao gồm các numeric policy `risk_derivatives_*`: `profit_protection_enabled` (default true, chỉ quản lý state do bot mở), `break_even_r`=1, `lock_profit_r`=2, `trail_start_r`=3, `trail_distance_r`=1, `target_extension_r`=1, `min_stop_move_r`=0.1, `mark_max_age_seconds`=120. Scale-out: `scale_out_enabled`=false, `scale_out_first_r`=1, `scale_out_first_fraction`=0.33, `scale_out_second_r`=2, `scale_out_second_fraction`=0.33. Chúng không thuộc `gates_readonly` và không thể mở `exec_live`/`exec_derivatives`; hai cặp gate env/config vẫn độc lập.
+- Profit-protection thresholds là bội số của R (entry thực tế tới initial stop). Backend yêu cầu các R dương, `break_even < lock_profit < trail_start`; giá trị sai không gọi venue và trả state `invalid_policy_config` ở monitor. `min_stop_move_r` chặn thay SL khi chênh lệch quá nhỏ; `mark_max_age_seconds` khiến mark cũ trả `mark_stale` và không mutate. Monitor cũng từ chối khi account không phải One-way (`hedge_mode_unsupported`) hoặc không đọc được position mode (`position_mode_unavailable`).
 - Với Binance, `exec_base_url` chỉ chấp nhận HTTPS API host Demo hoặc production được allowlist. URL được chọn quyết định credential pair: Demo dùng `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET`; production dùng `BINANCE_API_KEY`/`BINANCE_SECRET`. Demo là default. Đổi profile cần sửa URL + đúng pair trong `.env` rồi restart; API GET chỉ expose URL và status/mask, PUT không đổi được URL.
 - `effective_exec_mode` độc lập với venue URL: `live` chỉ khi `exec_live is True` **và** `TRADINGAGENTS_EXEC_LIVE=true`; chọn Demo không tự mở gate.
 - Paths read-only (`results_dir`, `data_cache_dir`, `memory_log_path`, `exec_log_path`) và `exec_base_url` trả trong `settings[]` với `editable: false`.
@@ -156,7 +157,7 @@ Request:
 
 Xử lý:
 
-1. Validate từng key: phải thuộc 30 keys `_ENV_OVERRIDES`; coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
+1. Validate từng key: phải thuộc `_ENV_OVERRIDES` (trừ `exec_base_url` read-only); coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
 2. Áp in-memory: `set_config({key: value})` (`dataflows/config.py`) — có hiệu lực với run mới tạo sau đó; run đang chạy không thấy (bridge chụp config lúc dựng — `bridge.py:110-121`).
 3. Persist vào `.env` (upsert dòng `TRADINGAGENTS_…`, giữ nguyên các dòng khác và comment). Ghi `encoding="utf-8"`.
 4. Nếu key là `exec_sandbox` → cảnh báo không cần (an toàn); nếu key là `risk_*` → nhớ rằng giá trị mới chỉ dùng cho guard dựng sau (`bridge.py:147-156`).
@@ -167,13 +168,34 @@ Errors: 403 `forbidden_key` (key read-only hoặc key lạ), 422, 500 (không gh
 
 Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
 
+### Operator overrides — `GET /api/operator-config`, `PUT /api/operator-config`, `DELETE /api/operator-config/{key}`
+
+Nguồn: `server/operator_config.py`. Đây là các key mà `PUT /api/settings` **cố ý từ chối**: nửa cấu hình của ba cổng thực thi (`exec_live`, `exec_auto_confirm`, `exec_derivatives`) và ba trần rủi ro vận hành (`risk_max_derivatives_leverage`, `risk_max_derivatives_exposure_pct`, `risk_derivatives_scale_out_enabled`).
+
+Lưu trữ: **PostgreSQL** — bảng `control_operator_settings` (`server/migrations/0003_operator_settings.sql`), đọc lại lúc startup bởi `server/main.py:_apply_operator_config`. Không còn file `operator_config.json`; `server/data/` đã rỗng và không được mount vào container.
+
+GET trả `settings[]` với `key, type, group, label, hint, gate, value, default, override, stored_value, updated_at, updated_by`, cộng `gates`, `effective_exec_mode`, `allowlist`.
+
+PUT body: `{"settings": {key: value}, "confirm": bool, "reason": str, "actor": str}`.
+
+1. Key ngoài allowlist → `403 forbidden_key` (kèm `details.rejected` và `details.allowlist`).
+2. Sai kiểu → `422 coercion_error`.
+3. Có key thuộc nhóm cổng → bắt buộc `confirm: true` (`412 gate_confirmation_required`) **và** `reason` không rỗng (`422 reason_required`).
+4. Ghi PostgreSQL → `set_config` in-memory → audit `operator_config_updated` với `changes: {key: {from, to}}`, `gate_changes`, `reason`, `actor`.
+
+DELETE `/{key}` xoá override để quay về default engine (`DEFAULT_CONFIG`), audit `operator_config_reset`. Key không thuộc allowlist → 403; không có override → 404.
+
+**Cổng vẫn là hai khoá.** Bảng này chỉ giữ nửa cấu hình; nửa môi trường (`TRADINGAGENTS_EXEC_LIVE` / `_AUTO_CONFIRM` / `_DERIVATIVES`) vẫn được đọc fail-closed lúc gửi lệnh trong `bridge.py`.
+
+Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
+
 ---
 
 ## 2. Watchlist — `GET /api/watchlist`, `POST /api/watchlist`, `DELETE /api/watchlist/{symbol}`
 
 Nguồn: `exec_watchlist` default `["BTC-USD","ETH-USD"]` (`default_config.py:233-234`); chuẩn hóa biên giới của daily runner (`daily.py:95-111`).
 
-Lưu trữ: engine đọc `exec_watchlist` từ config; vì key không env-overridable, API layer giữ file state riêng `~/.tradingagents/webui/watchlist.json` và sync vào `DEFAULT_CONFIG["exec_watchlist"]` khi khởi động server và sau mỗi ghi. Endpoint `run_daily(watchlist=…)` nhận watchlist tường minh (`daily.py:114-128`) nên truyền trực tiếp, không phụ thuộc file.
+Lưu trữ: engine đọc `exec_watchlist` từ config; vì key không env-overridable, API layer giữ state trong PostgreSQL (bảng `control_watchlist`, `server/control_store.py`) và sync vào `DEFAULT_CONFIG["exec_watchlist"]` khi khởi động server và sau mỗi ghi. Endpoint `run_daily(watchlist=…)` nhận watchlist tường minh (`daily.py:114-128`) nên truyền trực tiếp, không phụ thuộc file.
 
 ### GET /api/watchlist
 
@@ -320,7 +342,7 @@ Live state nếu run thuộc process này, **ngược lại đọc từ database
 }
 ```
 
-- `status`: `queued | running | completed | failed | cancelled`.
+- `status`: `queued | running | completed | failed | cancelled | interrupted`.
 - `signal`: 5-tier hoặc `"REVIEW"` (`trading_graph.py:167-171`, `cli/run.py:361`).
 - `report_paths` tương ứng `save_reports` (`trading_graph.py:245-258`) và `_log_state` (`trading_graph.py:376-386`).
 
@@ -360,11 +382,12 @@ Danh sách `type` (phát sinh từ chính các nhánh xử lý chunk trong `cli/
 | `pm_decision` | pm | `{content}` — risk `judge_decision` |
 | `run_completed` | system | `{signal, is_review, report_paths}` — terminal |
 | `run_failed` | system | `{error: {code, message}}` — terminal |
+| `run_interrupted` | system | `{error: {code: "interrupted", message}}` — terminal; server restart/orphan reconciliation |
 
 Quy tắc:
 
 - Mỗi event có `seq` tăng dần; client reconnect gửi header `Last-Event-ID: <seq>` → server replay từ seq+1 (buffer trong bộ nhớ của run, hoặc từ `run_events` khi run không còn trong live set — rev 7).
-- Terminal event (`run_completed`/`run_failed`) rồi server đóng stream.
+- Terminal event (`run_completed`/`run_failed`/`run_interrupted`) rồi server đóng stream.
 - Run ở trạng thái completed khi client mở stream → server phát lại toàn bộ buffer rồi đóng (UI refresh trang vẫn xem lại được).
 - rev 7: run **đã xong từ lâu** (không còn trong `_runs`) vẫn mở được stream — server đọc `run_events` từ database, phát lại rồi đóng. Đây là đường để UI xem lại "agent đã làm gì" của một lần chạy cũ.
 - `replay: true` trên mọi event của run mock.
@@ -680,7 +703,7 @@ Errors: 404 (job không tồn tại ở cả live set lẫn database). Trạng t
 
 ## 6. Portfolio — `GET /api/portfolio` (màn Tổng quan)
 
-Nguồn: `bridge.sync_portfolio()` (`bridge.py:330-356` — `fetch_balance` → `PortfolioContext`, position theo pipeline ticker `BTC-USD`, bỏ quote) cho **positions**; và **realized P&L** từ replay FIFO của `risk.py` trên audit log: khớp sell↔buy FIFO per ticker trên `price_est`, bỏ qua line `phase="plan"` và line không phase có `confirmed=False` (chỉ line execute mới đếm — `risk.py:271-281`); sell không có lot mở = close basis-không-rõ, không tính vào P&L (`risk.py:15-17`); derivatives sell dư mở lot short, buy khớp ngược (`risk.py:296-338`). Server đọc log qua `server/audit.read_events()` (503 khi không đọc được — nhất quán execute-time fail-closed), rồi tái dùng `_replay` / `_consecutive_losses` / `_halted_today` của `risk.py` (seam private — risk §11.14; `_halted_today` đã được import sẵn ở `server/audit.py:74`).
+Nguồn: `bridge.sync_portfolio()` (`bridge.py:330-356`) cho **Spot cash/equity/positions**; riêng section **Futures** đọc read-only futures balance và positions qua `fetch_balance`/`fetch_positions` với tham số loại futures của venue. Cả hai được giữ tách biệt. **Spot realized P&L** lấy từ replay FIFO `risk.py` trên audit log chỉ sau khi bỏ các event `market="derivatives"`; Futures unrealized P&L lấy từ venue snapshot, không cộng vào Spot cash, equity hoặc realized P&L. Nếu bridge/Spot venue khởi tạo hoặc Spot balance/mark thất bại, endpoint trả 503 `exchange_unreachable`; nếu chỉ Futures read lỗi, endpoint vẫn 200 và trả `futures.status="error"`, `futures.error` chỉ nêu loại exception, kèm warning — không diễn giải lỗi đó thành vị thế rỗng.
 
 Request: `GET /api/portfolio` (không tham số bắt buộc).
 
@@ -711,6 +734,38 @@ Response 200:
     "unknown_basis_closes": 1,
     "consecutive_losses": 1
   },
+  "futures": {
+    "equity": 2100.0,
+    "wallet_balance": 2000.0,
+    "available_balance": 1800.0,
+    "unrealized_pnl": 100.0,
+    "venue_profile": "demo",
+    "equity_currency": null,
+    "wallet_balance_currency": null,
+    "available_balance_currency": null,
+    "unrealized_pnl_currency": null,
+    "account_scope": "derivatives",
+    "positions": [{
+      "symbol": "BTC/USDT:USDT",
+      "side": "short",
+      "contracts": 0.01,
+      "quantity": -0.01,
+      "entry_price": 100000.0,
+      "mark_price": 99000.0,
+      "liquidation_price": null,
+      "unrealized_pnl": 10.0,
+      "notional": 990.0,
+      "margin": 330.0,
+      "leverage": 3.0,
+      "margin_mode": "isolated",
+      "price_currency": "USDT",
+      "notional_currency": "USDT",
+      "margin_currency": "USDT",
+      "unrealized_pnl_currency": "USDT"
+    }],
+    "status": "ok",
+    "error": null
+  },
   "halted_today": false,
   "warnings": [],
   "stale_after": 30
@@ -719,19 +774,20 @@ Response 200:
 
 Định nghĩa từng field:
 
-- `cash`, `currency`, `positions[]` — từ `sync_portfolio` (`bridge.py:330-356`): `quantity` thực từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. Balance currency không map được vào bộ base crypto bị bỏ qua (`bridge.py:345-348`) — tính vào `warnings` của response.
-- `marked_price` = `bridge.fetch_price(ticker)` (`bridge.py:514-516`); null khi venue không mark được. Position không mark được tính **0** trong `equity_est` — cùng rule `_equity` (`risk.py:381-403`), ghi warning trong `warnings`.
-- `equity_est` = `cash + Σ quantity × marked_price`; `null` khi `cash` null và không có position (fail-open như guard — `risk.py:512-520`).
-- `average_price` + `basis_source`: từ **FIFO open lots** của `_replay` (`risk.py:248-339`) — trung bình có trọng số giá các lot dài còn mở của ticker; `basis_source: "fifo"` khi log có lot khớp, `null` khi không (position mở trước khi audit log bắt đầu = basis không xác định — `risk.py:15-17`); `unrealized_pnl` chỉ tính khi có basis + mark, ngược lại `null`.
-- `realized_pnl.total` — toàn bộ closed P&L có basis; `today` — chỉ closed trade của **UTC hôm nay** (khác con số guard dùng: guard cộng thêm unrealized của lot mở hôm nay — `risk.py:405-442`; UI phải ghi chú khác biệt này); `by_ticker` — replay từng ticker riêng (FIFO là per-ticker nên subset từng ticker cho kết quả đúng); `closed_trades` — số close đã khớp; `unknown_basis_closes` — close không có lot để khớp (bị loại khỏi P&L, `risk.py:15-17`); `consecutive_losses` = `_consecutive_losses` (`risk.py:342-359`) — cross-ticker, mới nhất trước.
-- `halted_today` — như `_halted_today` (`risk.py:163-173`); banner đỏ khi true (tham chiếu §7 audit).
-- `stale_after: 30` — màn Tổng quan auto-poll 30s; `cash`/`marked_price` là snapshot venue tại `generated_at`.
+- `cash`, `currency`, `positions[]`, `equity_est` — chỉ Spot, từ `sync_portfolio`: `quantity` thực từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. `equity_est = cash + Σ quantity × marked_price`; Futures wallet/equity/notional không được cộng vào đây.
+- Spot `marked_price` = `bridge.fetch_price(ticker)`; null khi venue không mark được. Position không mark được tính 0 trong `equity_est` và sinh warning.
+- `average_price` + `basis_source` lấy từ open FIFO lots của Spot audit fills chỉ; `unrealized_pnl` chỉ tính khi có basis + mark, ngược lại null. Futures fills không ảnh hưởng `realized_pnl`, `by_ticker`, `closed_trades` hay `consecutive_losses` của Spot section.
+- `realized_pnl.total` là Spot P&L đã chốt có basis; `today` chỉ gồm lệnh đóng theo UTC hôm nay, khác con số RiskGuard (có thể cộng thêm unrealized của lot mở trong ngày). `by_ticker`, `closed_trades`, `unknown_basis_closes` và `consecutive_losses` đều tính trên Spot-only FIFO replay.
+- `futures.status`: `ok` khi cả balance và positions được đọc, `error` khi một lần đọc futures thất bại, `unavailable` khi chưa vào effective live mode (không có request tới futures private endpoints). Khi `error`, các account fields vẫn null/positions rỗng nhưng phải hiển thị message lỗi, không phải trạng thái tài khoản rỗng.
+- `futures.positions[]`: `side` là hướng venue; `quantity` có dấu (long dương, short âm), `contracts` là độ lớn không dấu. `notional` luôn là magnitude tuyệt đối, không phải cash inflow hay P&L; `margin` là collateral/initial margin nếu venue trả, không suy ra từ notional khi thiếu; `unrealized_pnl` là số liệu venue báo, chưa chốt. Các trường `price_currency`, `notional_currency`, `margin_currency`, `unrealized_pnl_currency` gắn đơn vị riêng cho từng đại lượng; null nghĩa là venue/CCXT không xác định chắc chắn và UI không được suy ra từ Spot quote. OKX có thể trả notional USD trong khi margin/P&L theo settlement coin. `entry_price`, `mark_price`, `liquidation_price`, `leverage`, `margin_mode` cũng có thể null nếu venue không cung cấp.
+- `futures.equity_currency`, `wallet_balance_currency`, `available_balance_currency`, `unrealized_pnl_currency` lần lượt mô tả đơn vị của từng tổng account; không dùng chung một currency khi nguồn khác nhau. Bybit Unified `totalEquity`, `totalWalletBalance`, `totalAvailableBalance` và `totalPerpUPL` là giá trị quy đổi USD; OKX `totalEq`/`upl` là USD, còn wallet detail chỉ có currency khi một coin duy nhất rõ ràng (`ccy`). Những tổng này không trộn vào Spot metrics. Bybit positions được yêu cầu theo `settleCoin=exec_quote_currency`; các sàn khác ngoài Binance/Bybit/OKX trả section Futures error rõ ràng vì chưa có routing đã xác minh. `venue_profile` là `demo`/`production` khi xác định được từ Binance URL, nếu không thì null.
+- `stale_after: 30` — màn Tổng quan poll snapshot mỗi 30 giây; mọi số dư/mark phản ánh venue tại `generated_at`.
 
 Errors:
 
 | HTTP | code | ý nghĩa |
 |------|------|---------|
-| 503 | `exchange_unreachable` | `fetch_balance`/`fetch_ticker` fail — venue chậm/đứt; không fail-open hiển thị (khác approve: approve fail-open là chủ ý của engine, còn màn Tổng quan phải thấy rõ dữ liệu không có thật) |
+| 503 | `exchange_unreachable` | Spot venue không đọc được balance/mark trong `/api/portfolio`; Futures read lỗi riêng được biểu diễn trong section `futures` và không làm hỏng Spot snapshot |
 | 503 | `audit_log_unreadable` | `exec_log_path` không đọc được — nhất quán với execute-time fail-closed (`risk.py:122-147`) |
 
 Trạng thái: loading · **empty** (`cash: null`, `positions: []`, `realized_pnl.total: 0` — chưa có dữ liệu venue/log; hiển thị empty-state riêng, không coi là lỗi) · error 503 (retry) · stale 30s + auto-poll.
@@ -933,10 +989,10 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 16| GET   | `/api/history`                   | decision log + run tree |
 | 17| GET   | `/api/backtest`                  | `results_dir/backtest/*` + summarize |
 | 18| GET   | `/api/health`                    | mode/halt/key status |
-| 19| GET   | `/api/performance`               | đọc `exec_log_path` FIFO long-only (§12) |
-| 20| GET   | `/api/autoloop`                  | gates (thêm 2 nửa futures — chỉ quan sát) + state file `autoloop.json` (§13, §14) |
+| 19| GET   | `/api/performance`               | đọc `exec_log_path` FIFO Spot + Futures long/short (§12) |
+| 20| GET   | `/api/autoloop`                  | gates (thêm 2 nửa futures — chỉ quan sát) + state file `autoloop.json` (§13, §15) |
 | 21| POST  | `/api/autoloop`                  | fail-closed 409 gate_closed (§13) |
-| 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan`; crypto qua `DerivativesExecutor` khi `exec_derivatives` bật — futures long/short, đòn bẩy ≤3× (§14) |
+| 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan`; crypto qua `DerivativesExecutor` khi `exec_derivatives` bật — futures long/short, đòn bẩy ≤3× (§15) |
 | 23| POST  | `/api/halt`                      | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay |
 | 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
 | 25| GET   | `/api/runs`                      | lịch sử run (database) + `active_run_id` (§3 rev 7) |
@@ -968,20 +1024,21 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 
 - §4: approve fail-closed được giữ đúng như đã code (hiện `approvals.py:245-250`) và bổ sung pipeline 4 bước (rebuild → double-check → `execute_order` → audit hai tầng) khi `exec_live=True`; **bỏ** policy `dry_fill_on_gate_closed`; thêm lỗi `mock_not_executable`/502 `execute_failed`; item + `daily_job_id`/`expires_at`/`mock`; trạng thái `approved` rõ nghĩa claim. *Rev 3.1: pipeline đã implement, refusals trước claim.*
 - §5: worker server tự chạy vòng lặp per-coin trên seam engine (không gọi `run_daily`); `mode: "mock"` tái dùng machinery `runs.py`; enqueue per-coin (risk 13 cũ về enqueue-at-completion được giải quyết — xoá); job không bao giờ tự execute.
-- §6 mới: `GET /api/portfolio` (positions + realized P&L FIFO replay) — endpoint 18.
+- `performance.py` hỗ trợ FIFO Spot và Futures long/short theo market, không chỉ long-only; Futures mark dùng unified futures symbol.
 - §7–§11: renumber từ §6–§10; thêm mã lỗi 403 `forbidden_key`, 410 `expired`, 502 `execute_failed`, 503 `exchange_unreachable` vào §0.1; Base URL/origin §0 khớp code thật (`server/main.py:5,26-33`, `web/next.config.ts:7-9`).
 
 ---
 
-## 12. Performance — `GET /api/performance` (rev 5, màn Tổng quan)
+## 12. Performance — `GET /api/performance` (rev 8, màn Tổng quan)
 
-Nguồn: replay fill từ engine audit log (`exec_log_path`) qua `audit.read_events()` (`server/performance.py:202-205`) — KHÔNG đụng venue, trừ mark giá cho position mở.
+Nguồn: replay fill từ engine audit log (`exec_log_path`) qua `audit.read_events()` — không đụng venue, trừ mark giá cho position mở.
 
-Định nghĩa **fill**: dòng audit có `action ∈ {buy, sell}`, `phase == "execute"`, ticker khác rỗng và `qty > 0`, `price_est > 0` (`performance.py:71-81`) — dòng plan, risk rejection, awaiting-approval không bao giờ dịch chuyển position.
+Định nghĩa **fill**: dòng audit có `action ∈ {buy, sell}`, `phase == "execute"`, ticker khác rỗng và `qty > 0`, `price_est > 0` — dòng plan, risk rejection, awaiting-approval không bao giờ dịch chuyển position.
 
-- **FIFO theo ticker, hỗ trợ long và futures short** (`performance.py:84-127`): buy khớp short futures trước rồi phần dư mở long; sell khớp long trước, và phần dư chỉ mở short nếu `market="derivatives"`. Spot sell không có long basis tiếp tục bị bỏ khỏi P&L. Short hiển thị `qty` âm; realized/unrealized return tính theo hướng short.
+- FIFO tách theo `(ticker, market)`: Spot và derivatives không khớp chéo; derivatives hỗ trợ short. Futures mark dùng unified futures contract symbol; Spot mark tiếp tục dùng spot resolver. Không có mark → `current_price` và `unrealized_pct` là `null`.
 
 ### GET /api/performance
+
 
 Response 200:
 
@@ -1004,6 +1061,8 @@ Response 200:
       "entry_price": 50000.0,
       "current_price": 52500.0,
       "unrealized_pct": 5.0,
+      "market": "spot",
+      "leverage": null,
       "mode": "dry",
       "entry_at": "2026-10-01T03:00:00Z"
     }
@@ -1016,17 +1075,19 @@ Response 200:
       "action": "rejected_by_risk",
       "qty": null,
       "price_est": 50000.0,
+      "market": "spot",
+      "leverage": 1.0,
+      "cost": null,
       "mode": "dry",
-      "order_id": "order-2026-10-01T07:00:00Z"
+      "order_id": null
     }
   ]
 }
 ```
 
 - `summary` — win/loss trên round-trip đóng: `wins` = pnl > 0, `losses` = pnl ≤ 0 (loss giữ dấu âm), `expectancy_pct` = trung bình toàn bộ round-trip ⇒ `win_rate × avg_win + loss_rate × avg_loss == expectancy` (`performance.py:116-130`).
-- `open_positions[]` — một row per lot signed chưa khớp: lot long có `qty` dương, futures short có `qty` âm; `current_price` mark qua seam `price_fetcher` (default lazy `ExchangeBridge`, dựng lại khi exchange/url/sandbox config đổi — `performance.py:49-68`); không mark được → null. `mode`/`entry_at` lấy từ fill gốc.
-- `brackets` — đếm dòng `bracket_placed` / `bracket_failed` trên toàn log (`performance.py:156-161`) — sức khoẻ SL/TP giao venue.
-- `recent_orders[]` — tối đa 50 dòng (`RECENT_ORDERS_LIMIT`, `performance.py:27`) `phase == "execute"` mới nhất, mới nhất trước; shape tường minh 7 field, không lộ `_line_no` provenance (`performance.py:164-180`).
+- `open_positions[]` — mỗi lot chưa khớp có `qty` có dấu: long dương, Futures short âm; `market` là `spot` hoặc `derivatives`, `leverage` lấy từ fill nếu có. `current_price` mark qua seam theo market (Spot resolver hoặc unified futures symbol); không mark được → `null`, không biến thành giá 0. Với short, `unrealized_pct` dương khi mark thấp hơn entry.
+- `recent_orders[]` — tối đa 50 dòng `phase == "execute"` mới nhất, mới nhất trước; gồm `market`, `leverage`, `cost` cùng qty/price/order id. `cost` của derivatives là margin/cost kế hoạch hoặc fill do venue trả; UI hiển thị nó cùng notional theo nhãn trung tính, không phải cash inflow hay realized P&L. qty/price/cost thiếu phải hiển thị `—`.
 
 Errors: `503 audit_log_unreadable` (log tồn tại nhưng không đọc được — nhất quán `/api/audit`); **log thiếu hoặc rỗng là empty state 200 toàn số 0, không phải lỗi** (`performance.py:202-205`).
 
@@ -1038,7 +1099,7 @@ Trạng thái: loading · **empty** (chưa có fill nào — `summary` toàn 0, 
 
 Nguồn: `server/autoloop.py`. Scheduler là daemon thread re-read state file (`server/data/autoloop.json` — `paths.AUTOLOOP_PATH`, `server/paths.py:17`) mỗi wake, nên đổi interval/enabled có hiệu lực ở wake kế tiếp, không cần restart (`autoloop.py:152-172`). Một cycle = sàng universe (30 mã/asset → top 8, như daily auto scan) → pipeline LLM per candidate → **mọi plan resolve qua confirm policy của engine `_handle_plan`** (`tradingagents/execution/daily.py`) — plan không execute chỉ được audit; candidate stock chỉ advisory (không sinh plan). Cycle khi run/job active → skip + audit `autoloop_cycle_skipped` (`autoloop.py:198-218`).
 
-- **Enable fail-closed** (`autoloop.py:88-105, 373-381`): `all_open` = config `exec_auto_confirm is True` **và** env `TRADINGAGENTS_EXEC_AUTO_CONFIRM` true — đúng hai nửa đầu của confirm policy; hai nửa `exec_live` chỉ hiển thị để quan sát, không mở API này (live là quyết định của engine policy theo FR5). Rev 6: `gates` thêm 2 nửa `exec_derivatives_config`/`exec_derivatives_env` — cũng chỉ quan sát (futures là quyết định của executor policy, §14).
+- **Enable fail-closed** (`autoloop.py:88-105, 373-381`): `all_open` = config `exec_auto_confirm is True` **và** env `TRADINGAGENTS_EXEC_AUTO_CONFIRM` true — đúng hai nửa đầu của confirm policy; hai nửa `exec_live` chỉ hiển thị để quan sát, không mở API này (live là quyết định của engine policy theo FR5). Rev 6: `gates` thêm 2 nửa `exec_derivatives_config`/`exec_derivatives_env` — cũng chỉ quan sát (futures là quyết định của executor policy, §15).
 - **Kill switch không gate** (`autoloop.py:405-432`): `POST /api/halt` ghi `{"event": "halt", "timestamp", "reason"}` vào engine audit log — RiskGuard của MỌI process replay line này và từ chối phần còn lại của hôm nay cho tới reset hoặc UTC day roll (sticky, day-scoped — `risk.py:163-173`; timestamp là thứ làm halt day-scoped — `risk.py:111-119`). `halt_reset` hôm nay gỡ sticky cho tới breach/halt mới. Đổi so với §11.9 (risk cũ "không có endpoint reset halt trong v1"): rev 5 đưa reset thành endpoint tường minh `/api/halt/reset`.
 
 ### GET /api/autoloop
@@ -1107,7 +1168,19 @@ Trạng thái POSTs: loading · error 415/403 CSRF (§0) · stale (n/a — actio
 
 ---
 
-## 14. Đường futures trong autoloop (rev 6)
+## 14. Activity trên Overview (UI-only, read-only)
+
+Card `Hoạt động hiện tại` không tạo endpoint hoặc thay đổi execution state. Nó ghép bốn snapshot hiện có:
+
+- `GET /api/autoloop`: `running_cycle`, `last_cycle.telemetry.active_stage`, mã hiện tại, node/agent, elapsed, và kết quả gần nhất.
+- `GET /api/daily` → `active_job_id` → `GET /api/daily/{job_id}`: trạng thái queued/running/completed/failed/cancelled/interrupted, mã hiện tại, số kết quả và screening summary.
+- `GET /api/health` → `active_run_id` → `GET /api/runs/{id}`: ticker, trade date, run id và trạng thái compact; event feed đầy đủ vẫn thuộc Pipeline SSE.
+
+Khi worker đang queued/running, hook poll mỗi 5 giây; khi idle poll mỗi 15 giây. Các request có sequence guard để response cũ không ghi đè snapshot mới. Hook dùng `Promise.allSettled`: lỗi một nguồn giữ snapshot trước đó và đánh dấu chính nguồn đó stale/error; các panel còn lại vẫn hiển thị dữ liệu của chúng. Card có trạng thái loading/error/idle/stale riêng và link tới Settings, Scanner hoặc Pipeline.
+
+---
+
+## 15. Đường futures trong autoloop (rev 6)
 
 Ứng viên crypto của 1 chu kỳ autoloop đi qua `DerivativesExecutor` thay vì spot bridge khi config `exec_derivatives` là literal True — executor được dựng 1 lần/cycle (`autoloop.py:253-254`, seam test `_build_derivatives_executor` — `autoloop.py:338-344`); ứng viên stock vẫn chỉ advisory như §13.
 
@@ -1119,8 +1192,14 @@ Trạng thái POSTs: loading · error 415/403 CSRF (§0) · stale (n/a — actio
 
 Hai nửa (1)+(2) hiển thị trong `gates()` là `exec_derivatives_config`/`exec_derivatives_env` — **chỉ quan sát**, không tham gia `all_open` (`autoloop.py:116-118`); enable autoloop vẫn chỉ cần 2 nửa auto-confirm.
 
-**Đòn bẩy:** cycle xin `min(risk_max_derivatives_leverage, MAX_AUTO_LEVERAGE = 3.0)`; thiếu config entry → 1× (`_auto_leverage` — `autoloop.py:62, 347-353`). RiskGuard với `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền (từ chối được dưới trần hệ thống); executor pin leverage trên venue cho mỗi lệnh (`derivatives.py:321-324`).
+**Đòn bẩy, margin mode và ngân sách rủi ro do agent quyết định.** Trader đề xuất `FuturesExecutionProposal` (margin mode, leverage, `risk_fraction`, `margin_fraction`, entry/SL/TP, rationale); Portfolio Manager chốt lại sau tranh luận risk và trả về `futures_execution_proposal` trong state cuối. Autoloop chỉ **kiểm tra** đề xuất: thiếu proposal → `agent_proposal_missing` (không vào lệnh), vượt trần → từ chối chứ không tự hạ xuống, vì một lệnh bị resize không còn là quyết định của agent. Trần hiện hành: `MAX_AUTO_LEVERAGE = 3.0`, `risk_derivatives_max_risk_fraction` (mặc định 0.02), `risk_derivatives_max_margin_fraction` (mặc định 0.5). `risk_max_derivatives_leverage` vẫn là gate có thẩm quyền của RiskGuard và có thể từ chối dưới trần hệ thống. Executor gọi `set_margin_mode` trước `set_leverage`, rồi mới gửi entry, nên margin mode không còn phụ thuộc preset của sàn.
 
-**Position state (rev 8):** after a live derivatives entry is acknowledged and bracketed, the executor persists an initial `position_states` row keyed by unified symbol, side, and entry order id. It records planned entry, sent quantity, stop, target, and order provenance. `PositionManager` uses the DB CAS revision independently of the venue revision and deletes its snapshot when its adapter reconciles the venue flat. This is durable policy state, not a background polling service: the current autoloop does not instantiate a venue `PositionAdapter` for automatic trailing/partial management; exchange-side bracket and bracket recovery remain the active automatic protection path.
+**Nguồn vốn sizing là ví Futures, không phải spot.** Cycle đọc `read_futures_account()` và dựng `PortfolioContext` từ `equity` (fallback `available_balance`) của tài khoản derivatives; `ExchangeBridge.sync_portfolio()` là snapshot spot nên không dùng cho sizing futures. Chính dữ liệu đó (equity, available margin, vị thế mở, nến đóng 1h/4h, bracket ATR, các trần hard) được render thành `execution_context` gửi cho agent; digest của context nằm trong checkpoint signature nên resume không tái dùng quyết định của một snapshot khác.
+
+**Position state + profit protection:** sau live derivatives entry, executor ưu tiên `filled`/`average` từ response; nếu thiếu một trường, đọc vị thế futures exact symbol/side rồi dùng `contracts`, entry và mark của venue. State lưu `initial_stop`, `current_target`, venue + `bracket_task_id` và thời điểm quan sát. Background monitor poll 30 giây chỉ khi policy cùng cả derivatives/live config+env gates bật. Chính sách tính R từ entry thực tế tới initial stop; break-even/lock/trailing chỉ nâng stop theo hướng giảm rủi ro và target chỉ được đẩy xa hơn khi mark vượt target nhưng position vẫn mở.
+
+Bracket replacement đặt conditional leg mới trước, persist order ID/trigger rồi mới cancel leg cũ; timeout được reconcile theo strict symbol/side/type/reduceOnly/quantity/trigger. Cancel chưa xác nhận giữ retired ID trong SQLite để retry. Monitor lease atomic theo position key ngăn nhiều process cùng mutate; nhiều entry state cùng một Binance net position trả `ambiguous_net_position` và không tự chia size. Khi venue báo flat, chỉ xóa state sau khi các leg hiện hành/retired được xác nhận canceled hoặc filled.
+
+Policy không đảm bảo giá khớp/lợi nhuận trong gap, slippage, liquidation hay outage. Binance Futures mutation hiện là venue được hỗ trợ; venue khác fail-closed. Không tự đổi One-way/Hedge mode; `reduceOnly` rejection được ghi nhận và không đổi state policy.
 
 **Venue Binance:** mặc định chọn Demo qua `TRADINGAGENTS_EXEC_BASE_URL=https://demo-api.binance.com`; ccxt tự route futures tới `demo-fapi.binance.com`. Chuyển production bằng cách thay URL thành `https://api.binance.com`, dùng `BINANCE_API_KEY`/`BINANCE_SECRET`, rồi restart backend. Bridge chỉ nhận đúng hai profile HTTPS allowlist này và chọn key pair tương ứng. Các gate `exec_live` + `TRADINGAGENTS_EXEC_LIVE` vẫn độc lập; Demo order vẫn là live execution trên tài khoản Demo, không phải dry-run.

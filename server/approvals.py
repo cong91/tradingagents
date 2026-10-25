@@ -1,11 +1,10 @@
 """Approvals: GET /api/approvals + approve/reject (docs/ui-api-contract.md §4).
 
-The queue is new API-layer state, persisted as JSONL at
-``server/data/approvals.jsonl`` (one full snapshot line per item, rewritten
-atomically on change, so a crash cannot leave a half-written queue; the
-restart-recovery story lives in contract §11.1). Approve is the ONLY path that
-places a real order: gate ``exec_live`` fail-closed (``412`` when it is not a
-literal True), RiskGuard re-check fail-closed inside ``execute_order``, then
+The queue is API-layer state, persisted in PostgreSQL (``control_approvals``,
+see ``server/control_store.py``): one row per item, so a crash cannot leave a
+half-written queue and the queue survives a restart. Approve is the ONLY path
+that places a real order: gate ``exec_live`` fail-closed (``412`` when it is not
+a literal True), RiskGuard re-check fail-closed inside ``execute_order``, then
 the plan resolved to ``executed``/``execute_failed`` — an item claimed and
 dropped would be a dead-end state, so approve always finishes the transition.
 Plan data is synthetic for mock daily jobs (``mock: true``) and can never
@@ -16,7 +15,6 @@ execution log. Only ``POST /api/daily`` plans may enqueue items; the enqueue
 hook is exposed here for that integration.
 """
 
-import json
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -24,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Query, Request
 
-from server import audit as audit_log, paths
+from server import audit as audit_log, control_store
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config
 from tradingagents.execution.bridge import PreTradeRejection
@@ -41,34 +39,13 @@ _store_lock = threading.Lock()
 
 
 def _load_items() -> list[dict]:
-    path = paths.APPROVALS_PATH
-    if not path.exists():
-        return []
-    items = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return items
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # a torn last line must not take the whole queue down
-        if isinstance(item, dict) and item.get("id"):
-            items.append(item)
-    return items
+    return control_store.load_approvals()
 
 
 def _save_items(items: list[dict]) -> None:
-    paths.ensure_data_dir()
-    tmp_path = paths.APPROVALS_PATH.with_name(paths.APPROVALS_PATH.name + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        for item in items:
-            fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-    tmp_path.replace(paths.APPROVALS_PATH)
+    """Persist the queue: one row per item, updated in place."""
+    for item in items:
+        control_store.upsert_approval(item)
 
 
 def _next_id(items: list[dict]) -> str:
@@ -109,9 +86,7 @@ def _pending_item(items: list[dict], approval_id: str) -> dict:
 def enqueue(plan: dict) -> dict:
     """Add one planned order to the queue (the only producer is POST /api/daily)."""
     with _store_lock:
-        items = _load_items()
         item = {
-            "id": _next_id(items),
             "created_at": utc_now_iso(),
             "daily_job_id": plan.get("daily_job_id"),
             "run_id": plan.get("run_id"),
@@ -136,8 +111,7 @@ def enqueue(plan: dict) -> dict:
             "mode": None,
             "order_id": None,
         }
-        items.append(item)
-        _save_items(items)
+        item = control_store.insert_approval(item)
     return item
 
 
@@ -211,7 +185,7 @@ def _resolve(
             item["order_id"] = order_id
         if resolution is not None:
             item["resolution"] = resolution
-        _save_items(items)
+        control_store.save_approval(item)
         return item
 
 
@@ -285,7 +259,7 @@ async def approve_approval(approval_id: str, request: Request):
                 409, "conflict", f"approval {approval_id} carries no executable plan to rebuild"
             )
         item["status"] = "approved"  # claim: the idempotency fence (contract §4 step 3)
-        _save_items(items)
+        control_store.save_approval(item)
 
     warning: str | None = None
     try:
@@ -362,7 +336,7 @@ async def reject_approval(approval_id: str, request: Request):
         item["status"] = "rejected"
         item["resolution"] = reason
         item["resolved_at"] = utc_now_iso()
-        _save_items(items)
+        control_store.save_approval(item)
 
     audit_log.record("approval_denied", approval_id=item["id"], ticker=item["ticker"],
                      reason=reason, run_id=item["run_id"])

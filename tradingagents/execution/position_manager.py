@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from math import isfinite
 from typing import Protocol
 
@@ -76,8 +76,9 @@ class PositionManager:
         expected_revision = position.revision
         if durable is not None:
             prior = durable["snapshot"]
+            snapshot_fields = {field.name for field in fields(PositionSnapshot)}
             position = PositionSnapshot(**{
-                **prior,
+                **{key: value for key, value in prior.items() if key in snapshot_fields},
                 "mark": position.mark,
                 "quantity": position.quantity,
                 "revision": prior.get("revision", position.revision),

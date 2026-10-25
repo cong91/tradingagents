@@ -2,6 +2,8 @@
 
 import os
 import socket
+import threading
+import time
 
 import pytest
 
@@ -13,14 +15,19 @@ def _blank_settings_overlay():
     DEFAULT_CONFIG, so a contributor's own settings would become the defaults
     the suite asserts on. A blank value is still present, so load_dotenv leaves
     it alone, and the overlay reads it as unset. Tests of the overlay set their own.
+
+    ``TRADINGAGENTS_TEST_DATABASE_URL`` is test infrastructure, not engine
+    configuration: it must survive so the PostgreSQL-backed store tests can
+    reach the disposable server.
     """
     from dotenv import dotenv_values, find_dotenv
 
+    keep = {"TRADINGAGENTS_TEST_DATABASE_URL"}
     names = set(os.environ)
     for filename in (".env", ".env.enterprise"):
         names |= set(dotenv_values(find_dotenv(filename, usecwd=True)))
     for name in names:
-        if name.startswith("TRADINGAGENTS_"):
+        if name.startswith("TRADINGAGENTS_") and name not in keep:
             os.environ[name] = ""
 
 
@@ -133,3 +140,90 @@ def _isolate_config():
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     yield
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+
+
+_TEST_WORKER_PREFIXES = (
+    "server-run-",
+    "server-daily-",
+    "daily-",
+    "server-autoloop-scheduler",
+    "server-autoloop-screen",
+    "server-autoloop-cycle",
+    "server-autoloop-candidate",
+    "server-bracket-monitor",
+    "server-position-monitor",
+)
+_TEST_WORKER_SHUTDOWN_SECONDS = 10.0
+
+
+def _join_test_persistence_workers() -> None:
+    """Let request and monitor workers finish while the test schema still exists."""
+    deadline = time.monotonic() + _TEST_WORKER_SHUTDOWN_SECONDS
+    current = threading.current_thread()
+    while True:
+        workers = [
+            thread for thread in threading.enumerate()
+            if thread is not current
+            and thread.is_alive()
+            and thread.name.startswith(_TEST_WORKER_PREFIXES)
+        ]
+        if not workers:
+            return
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        remaining = [worker.name for worker in workers if worker.is_alive()]
+        if remaining or time.monotonic() >= deadline:
+            raise RuntimeError(
+                "test persistence workers did not stop before PostgreSQL schema cleanup: "
+                + ", ".join(remaining or [worker.name for worker in workers])
+            )
+
+
+@pytest.fixture
+def postgres_schema(monkeypatch):
+    """A private PostgreSQL schema for one test.
+
+    The control panel stores its state in PostgreSQL, so a unit test that
+    touches a store needs a database. Set ``TRADINGAGENTS_TEST_DATABASE_URL``
+    to a disposable server (the compose file under ``tests/`` starts one);
+    tests that need it are skipped, not silently run against SQLite, when it
+    is absent.
+    """
+    dsn = os.environ.get("TRADINGAGENTS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("TRADINGAGENTS_TEST_DATABASE_URL is not set; PostgreSQL-backed store tests need it")
+
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    database_name = conninfo_to_dict(dsn).get("dbname", "")
+    if not (
+        database_name == "test"
+        or database_name.startswith("test_")
+        or database_name.endswith(("_test", "_tests"))
+    ):
+        raise RuntimeError(
+            "TRADINGAGENTS_TEST_DATABASE_URL must target a dedicated test database "
+            "named test, test_*, *_test, or *_tests"
+        )
+
+    schema = f"test_{os.urandom(8).hex()}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+    scoped = make_conninfo(dsn, options=f"-csearch_path={schema}")
+    monkeypatch.setenv("TRADINGAGENTS_DATABASE_URL", scoped)
+    schema_safe_to_drop = True
+    try:
+        from server import postgres
+
+        postgres.migrate()
+        yield scoped
+    finally:
+        try:
+            _join_test_persistence_workers()
+        except RuntimeError:
+            schema_safe_to_drop = False
+            raise
+        if schema_safe_to_drop:
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(f'DROP SCHEMA "{schema}" CASCADE')

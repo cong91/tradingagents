@@ -19,8 +19,8 @@ from fastapi.testclient import TestClient
 
 from server import (
     approvals as approvals_mod,
+    control_store,
     daily as daily_mod,
-    paths as server_paths,
     portfolio as portfolio_mod,
     runs as runs_mod,
     settings as settings_mod,
@@ -88,7 +88,7 @@ def _today() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point all server state at tmp and start every test with an empty registry.
 
     ``watchlist._save_state`` deliberately syncs ``DEFAULT_CONFIG
@@ -99,11 +99,6 @@ def _server_state(tmp_path, monkeypatch):
     from tradingagents.default_config import DEFAULT_CONFIG
 
     saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
-    monkeypatch.setattr(server_paths, "OPERATOR_CONFIG_PATH", tmp_path / "operator_config.json")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
     set_config({"exec_live": False})
@@ -556,8 +551,13 @@ class _FakeExchange:
     def load_markets(self):
         return {"BTC/USDT": {"limits": {"cost": {"min": 10.0}}}}
 
-    def fetch_balance(self):
+    def fetch_balance(self, params=None):
+        if params:
+            return {"info": {"totalWalletBalance": "9500.0", "totalMarginBalance": "9500.0", "availableBalance": "9500.0", "totalUnrealizedProfit": "0.0"}}
         return {"total": {"BTC": 0.001, "USDT": 9500.0}, "free": {"USDT": 9500.0}}
+
+    def fetch_positions(self, symbols=None, params=None):
+        return []
 
     def amount_to_precision(self, symbol, amount):
         return f"{float(amount):.8f}"
@@ -611,7 +611,7 @@ def test_approve_dry_fills_and_resolves_item(client, tmp_path, monkeypatch):
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "conflict"
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "approval_granted" in trail
     assert "approval_executed" in trail
     engine_log = (tmp_path / "engine-audit.jsonl").read_text(encoding="utf-8")
@@ -762,7 +762,7 @@ def test_reject_records_reason_and_never_takes_the_gate(client, tmp_path):
     assert body["resolution"] == "too expensive"
     assert body["resolved_at"]
 
-    trail = (tmp_path / "server-audit.jsonl").read_text(encoding="utf-8")
+    trail = "\n".join(json.dumps(e) for e in control_store.load_server_audit())
     assert "approval_denied" in trail
 
     again = client.post(f"/api/approvals/{item['id']}/reject", json={})
@@ -1229,6 +1229,10 @@ def test_portfolio_dry_empty_audit_is_valid_empty_state(client, tmp_path):
     }
     assert body["halted_today"] is False
     assert body["warnings"] == []
+    assert body["futures"]["status"] == "unavailable"
+    assert body["futures"]["positions"] == []
+    assert body["futures"]["equity_currency"] is None
+    assert body["futures"]["wallet_balance_currency"] is None
 
 
 def test_portfolio_realized_pnl_is_fifo_replay_of_the_audit_log(client, tmp_path):
@@ -1254,6 +1258,31 @@ def test_portfolio_realized_pnl_is_fifo_replay_of_the_audit_log(client, tmp_path
     (position,) = body["positions"]  # the leftover 0.0008 lot @ 84000 stays open
     assert position["quantity"] == pytest.approx(0.0008)
     assert position["average_price"] == pytest.approx(84000.0)
+
+
+def test_portfolio_spot_realized_pnl_excludes_futures_fills(client, tmp_path):
+    today = _today()
+    spot = _trade(f"{today}T04:00:00+00:00", "buy", 0.01, 100.0)
+    spot["ticker"] = "NEAR-USD"
+    spot_close = _trade(f"{today}T05:00:00+00:00", "sell", 0.01, 110.0)
+    spot_close["ticker"] = "NEAR-USD"
+    futures_open = _trade(f"{today}T06:00:00+00:00", "sell", 0.01, 100.0)
+    futures_open.update({"ticker": "NEAR-USD", "market": "derivatives", "leverage": 3.0})
+    futures_close = _trade(f"{today}T07:00:00+00:00", "buy", 0.01, 150.0)
+    futures_close.update({"ticker": "NEAR-USD", "market": "derivatives", "leverage": 3.0})
+    audit_file = tmp_path / "audit.jsonl"
+    audit_file.write_text("".join(json.dumps(event) + "\n" for event in (
+        spot, spot_close, futures_open, futures_close,
+    )), encoding="utf-8")
+    set_config({"exec_log_path": str(audit_file)})
+
+    body = client.get("/api/portfolio").json()
+
+    assert body["realized_pnl"]["total"] == pytest.approx(0.1)
+    assert body["realized_pnl"]["today"] == pytest.approx(0.1)
+    assert body["realized_pnl"]["by_ticker"] == {"NEAR-USD": pytest.approx(0.1)}
+    assert body["realized_pnl"]["closed_trades"] == 1
+    assert body["realized_pnl"]["consecutive_losses"] == 0
 
 
 def test_portfolio_counts_unknown_basis_and_loss_streak(client, tmp_path):
@@ -1305,6 +1334,106 @@ def test_portfolio_live_mode_reads_venue_and_marks_positions(client, tmp_path, m
     assert position["unrealized_pnl"] == pytest.approx((83078.0 - 80000.0) * 0.001)
     assert body["equity_est"] == pytest.approx(9500.0 + 83.078)
     assert body["warnings"] == []
+
+
+def test_portfolio_live_futures_are_separate_from_spot_equity(client, tmp_path, monkeypatch):
+    set_config({"exec_live": True, "exec_log_path": str(tmp_path / "absent.jsonl")})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+
+    class _FuturesExchange(_FakeExchange):
+        def fetch_balance(self, params=None):
+            if params:
+                return {"info": {
+                    "totalWalletBalance": "2000.0",
+                    "totalMarginBalance": "2100.0",
+                    "availableBalance": "1800.0",
+                    "totalUnrealizedProfit": "100.0",
+                }}
+            return super().fetch_balance(params)
+
+        def fetch_positions(self, symbols=None, params=None):
+            return [{
+                "symbol": "BTC/USDT:USDT",
+                "side": "short",
+                "contracts": 0.01,
+                "entryPrice": 100000.0,
+                "markPrice": 99000.0,
+                "notional": -990.0,
+                "initialMargin": 330.0,
+                "leverage": 3.0,
+                "unrealizedPnl": 10.0,
+                "info": {"marginAsset": "USDT"},
+            }]
+
+        def market(self, symbol):
+            return {"quote": "USDT", "settle": "USDT", "inverse": False}
+
+    exchange = _FuturesExchange()
+
+    def build(config):
+        from tradingagents.execution.bridge import ExchangeBridge
+
+        return ExchangeBridge(config=config, exchange_factory=lambda: exchange)
+
+    monkeypatch.setattr(portfolio_mod, "_build_bridge", build)
+    response = client.get("/api/portfolio")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cash"] == 9500.0
+    assert body["equity_est"] == pytest.approx(9500.0 + 83.078)
+    futures = body["futures"]
+    assert futures["status"] == "ok"
+    assert futures["wallet_balance"] == 2000.0
+    assert futures["equity"] == 2100.0
+    assert futures["available_balance"] == 1800.0
+    assert futures["unrealized_pnl"] == 100.0
+    assert futures["account_scope"] == "derivatives"
+    assert futures["equity_currency"] is None
+    assert futures["wallet_balance_currency"] is None
+    (position,) = futures["positions"]
+    assert position["side"] == "short"
+    assert position["quantity"] == pytest.approx(-0.01)
+    assert position["entry_price"] == 100000.0
+    assert position["mark_price"] == 99000.0
+    assert position["notional"] == 990.0
+    assert position["margin"] == 330.0
+    assert position["leverage"] == 3.0
+    assert position["price_currency"] == "USDT"
+    assert position["notional_currency"] == "USDT"
+    assert position["margin_currency"] == "USDT"
+    assert position["unrealized_pnl_currency"] == "USDT"
+
+
+def test_portfolio_futures_read_failure_preserves_spot_snapshot(client, tmp_path, monkeypatch):
+    set_config({"exec_live": True, "exec_log_path": str(tmp_path / "absent.jsonl")})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+
+    class _FuturesFailure(_FakeExchange):
+        def fetch_positions(self, symbols=None, params=None):
+            raise RuntimeError("private endpoint response leaked secret")
+
+    exchange = _FuturesFailure()
+
+    def build(config):
+        from tradingagents.execution.bridge import ExchangeBridge
+
+        return ExchangeBridge(config=config, exchange_factory=lambda: exchange)
+
+    monkeypatch.setattr(portfolio_mod, "_build_bridge", build)
+    response = client.get("/api/portfolio")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cash"] == 9500.0
+    assert body["equity_est"] == pytest.approx(9500.0 + 83.078)
+    assert [position["ticker"] for position in body["positions"]] == ["BTC-USD"]
+    assert body["futures"]["status"] == "error"
+    assert body["futures"]["positions"] == []
+    assert body["futures"]["equity_currency"] is None
+    assert "RuntimeError" in body["futures"]["error"]
+    assert "secret" not in response.text
+    assert any("futures account read failed" in warning for warning in body["warnings"])
 
 
 def test_portfolio_live_position_without_basis_or_mark_is_honest(client, tmp_path, monkeypatch):

@@ -11,7 +11,6 @@ the other's dataclasses.
 """
 
 import json
-import sqlite3
 from datetime import datetime, timezone
 
 from server import db
@@ -23,16 +22,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _json(value) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def persist_run(fields: dict) -> None:
     """Upsert one run's row. Events are written separately, as they happen."""
     with db.session() as conn:
         conn.execute(
             """
-            INSERT INTO runs (run_id, ticker, trade_date, asset_type, mode, status,
+            INSERT INTO control_runs (run_id, ticker, trade_date, asset_type, mode, status,
                               signal, is_review, error, report_paths, analysts,
                               created_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s, %s)
+            ON CONFLICT (run_id) DO UPDATE SET
                 status = excluded.status,
                 signal = excluded.signal,
                 is_review = excluded.is_review,
@@ -49,10 +53,10 @@ def persist_run(fields: dict) -> None:
                 fields["mode"],
                 fields["status"],
                 fields.get("signal"),
-                1 if fields.get("is_review") else 0,
-                json.dumps(fields["error"], ensure_ascii=False) if fields.get("error") else None,
-                json.dumps(fields["report_paths"], ensure_ascii=False) if fields.get("report_paths") else None,
-                json.dumps(fields.get("analysts") or [], ensure_ascii=False),
+                bool(fields.get("is_review")),
+                _json(fields["error"]) if fields.get("error") else None,
+                _json(fields["report_paths"]) if fields.get("report_paths") else None,
+                _json(fields.get("analysts") or []),
                 fields["created_at"],
                 fields.get("finished_at"),
             ),
@@ -63,9 +67,10 @@ def append_event(run_id: str, event: dict) -> None:
     with db.session() as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO run_events (run_id, seq, ts, type, role, stage,
-                                              agent, replay, payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO control_run_events (run_id, seq, ts, type, role, stage,
+                                    agent, replay, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (run_id, seq) DO NOTHING
             """,
             (
                 run_id,
@@ -75,13 +80,13 @@ def append_event(run_id: str, event: dict) -> None:
                 event.get("role"),
                 event.get("stage"),
                 event.get("agent"),
-                1 if event.get("replay") else 0,
-                json.dumps(event.get("payload") or {}, ensure_ascii=False),
+                bool(event.get("replay")),
+                _json(event.get("payload") or {}),
             ),
         )
 
 
-def _row_to_run(row: sqlite3.Row) -> dict:
+def _row_to_run(row) -> dict:
     return {
         "run_id": row["run_id"],
         "ticker": row["ticker"],
@@ -91,9 +96,9 @@ def _row_to_run(row: sqlite3.Row) -> dict:
         "status": row["status"],
         "signal": row["signal"],
         "is_review": bool(row["is_review"]),
-        "error": json.loads(row["error"]) if row["error"] is not None else None,
-        "report_paths": json.loads(row["report_paths"]) if row["report_paths"] is not None else None,
-        "analysts": json.loads(row["analysts"]),
+        "error": row["error"],
+        "report_paths": row["report_paths"],
+        "analysts": row["analysts"],
         "created_at": row["created_at"],
         "finished_at": row["finished_at"],
     }
@@ -101,15 +106,15 @@ def _row_to_run(row: sqlite3.Row) -> dict:
 
 def load_run(run_id: str) -> dict | None:
     with db.read() as conn:
-        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-        return _row_to_run(row) if row is not None else None
+        row = conn.execute("SELECT * FROM control_runs WHERE run_id = %s", (run_id,)).fetchone()
+    return _row_to_run(row) if row is not None else None
 
 
 def load_events(run_id: str, after_seq: int = -1) -> list[dict]:
     """The persisted agent event stream, oldest first, from ``after_seq``."""
     with db.read() as conn:
         rows = conn.execute(
-            "SELECT * FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq",
+            "SELECT * FROM control_run_events WHERE run_id = %s AND seq > %s ORDER BY seq",
             (run_id, after_seq),
         ).fetchall()
     return [
@@ -121,7 +126,7 @@ def load_events(run_id: str, after_seq: int = -1) -> list[dict]:
             "stage": row["stage"],
             "agent": row["agent"],
             "replay": bool(row["replay"]),
-            "payload": json.loads(row["payload"]),
+            "payload": row["payload"],
         }
         for row in rows
     ]
@@ -130,16 +135,18 @@ def load_events(run_id: str, after_seq: int = -1) -> list[dict]:
 def list_runs(status: str | None = None, limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
     """(run summaries newest-first, total matching) — summaries carry an
     event count instead of the event stream."""
-    where = "" if status is None else "WHERE r.status = ?"
+    where = "" if status is None else "WHERE r.status = %s"
     params: tuple = () if status is None else (status,)
     with db.read() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM runs r {where}", params).fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) AS total FROM control_runs r {where}", params
+        ).fetchone()["total"]
         rows = conn.execute(
             f"""
-            SELECT r.*, (SELECT COUNT(*) FROM run_events e WHERE e.run_id = r.run_id) AS events_count
-            FROM runs r {where}
+            SELECT r.*, (SELECT COUNT(*) FROM control_run_events e WHERE e.run_id = r.run_id) AS events_count
+            FROM control_runs r {where}
             ORDER BY r.created_at DESC, r.run_id DESC
-            LIMIT ? OFFSET ?
+            LIMIT %s OFFSET %s
             """,
             (*params, limit, offset),
         ).fetchall()
@@ -152,21 +159,40 @@ def list_runs(status: str | None = None, limit: int = 20, offset: int = 0) -> tu
 
 
 def reconcile_orphans() -> list[str]:
-    """Close out runs a dead process left active; returns the ids it closed.
-
-    Same reasoning as ``job_store.reconcile_orphans``: the worker lock is
-    derived from run status, so an orphaned ``running`` row would block every
-    future run with nothing in the UI able to show or clear it.
-    """
+    """Close out runs a dead process left active and persist their final event."""
+    now = _now()
+    error = {
+        "code": "interrupted",
+        "message": "The server restarted before this analysis run completed.",
+    }
     with db.session() as conn:
         rows = conn.execute(
-            "SELECT run_id FROM runs WHERE status IN (?, ?) ORDER BY created_at",
+            "SELECT run_id FROM control_runs WHERE status IN (%s, %s) ORDER BY created_at",
             ACTIVE_STATUSES,
         ).fetchall()
         if not rows:
             return []
+        for row in rows:
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM control_run_events WHERE run_id = %s",
+                (row["run_id"],),
+            ).fetchone()["next"]
+            conn.execute(
+                """
+                INSERT INTO control_run_events (run_id, seq, ts, type, role, stage,
+                                        agent, replay, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (run_id, seq) DO NOTHING
+                """,
+                (
+                    row["run_id"], seq, now, "run_interrupted",
+                    "system", "system", None, False,
+                    _json({"error": error}),
+                ),
+            )
         conn.execute(
-            "UPDATE runs SET status = 'interrupted', finished_at = ? WHERE status IN (?, ?)",
-            (_now(), *ACTIVE_STATUSES),
+            "UPDATE control_runs SET status = 'interrupted', error = %s::jsonb, finished_at = %s "
+            "WHERE status IN (%s, %s)",
+            (_json(error), now, *ACTIVE_STATUSES),
         )
     return [row["run_id"] for row in rows]

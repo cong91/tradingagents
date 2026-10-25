@@ -87,6 +87,57 @@ class TraderAction(StrEnum):
     SELL = "Sell"
 
 
+class FuturesExecutionIntent(str, Enum):
+    """Whether the final PM decision authorizes a new futures entry."""
+
+    ENTER = "enter"
+    MANAGE_EXISTING = "manage_existing"
+    ABSTAIN = "abstain"
+
+
+class FuturesExecutionProposal(BaseModel):
+    """Agent-authored execution terms for one crypto futures opportunity."""
+
+    margin_mode: Literal["isolated", "cross"] = Field(
+        description="Choose isolated or cross margin based on account and position risk; justify the choice.",
+    )
+    leverage: int = Field(
+        ge=1,
+        le=125,
+        description="Proposed integer leverage based on volatility, stop distance, and available futures margin. Never maximize leverage by default.",
+    )
+    risk_fraction: float = Field(
+        gt=0,
+        le=0.05,
+        description="Maximum account-equity fraction to lose if the stop executes, expressed as a decimal (0.005 means 0.5%).",
+    )
+    margin_fraction: float = Field(
+        gt=0,
+        le=1,
+        description="Proposed fraction of futures equity to allocate as initial margin, expressed as a decimal.",
+    )
+    entry_price: float | None = Field(
+        default=None,
+        description="Preferred entry price in quote currency; omit when the setup has no defensible entry level.",
+    )
+    stop_loss: float | None = Field(
+        default=None,
+        description="Protective stop price in quote currency; below entry for a long or above entry for a short.",
+    )
+    take_profit: float | None = Field(
+        default=None,
+        description="Profit target in quote currency; above entry for a long or below entry for a short.",
+    )
+    rationale: str = Field(
+        description="Explain how evidence, volatility, stop distance, account state, and risk/reward support every selected execution term.",
+    )
+
+    @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
+    @classmethod
+    def _nullish_price_to_none(cls, value):
+        return _coerce_optional_float(value)
+
+
 # ---------------------------------------------------------------------------
 # Research Manager
 # ---------------------------------------------------------------------------
@@ -177,12 +228,27 @@ class TraderProposal(BaseModel):
             "distance to the price level it implies, or omit it."
         ),
     )
+    take_profit: float | None = Field(
+        default=None,
+        description="Optional take-profit as one absolute price in quote currency, never a percentage or range.",
+    )
     position_sizing: str | None = Field(
         default=None,
-        description="Optional sizing guidance, e.g. '5% of portfolio'.",
+        description="Optional sizing guidance, e.g. 'risk 0.5% of futures equity'.",
+    )
+    futures_execution: FuturesExecutionProposal | None = Field(
+        default=None,
+        description="For a crypto futures trade, propose margin mode, leverage, risk and margin budgets, and protective levels. Omit when not trading futures.",
+    )
+    futures_execution_intent: FuturesExecutionIntent = Field(
+        default=FuturesExecutionIntent.ABSTAIN,
+        description=(
+            "Choose enter only when opening a new futures position is authorized; choose "
+            "manage_existing for an existing-position reduction/exit; choose abstain otherwise."
+        ),
     )
 
-    @field_validator("entry_price", "stop_loss", mode="before")
+    @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
@@ -202,10 +268,33 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     ]
     # Named even when absent, so a reader can tell a level the trader chose not
     # to give from one the schema never asked for.
-    for label, value in (("Entry Price", proposal.entry_price),
-                         ("Stop Loss", proposal.stop_loss),
-                         ("Position Sizing", proposal.position_sizing)):
+    for label, value in (
+        ("Entry Price", proposal.entry_price),
+        ("Stop Loss", proposal.stop_loss),
+        ("Take Profit", proposal.take_profit),
+        ("Position Sizing", proposal.position_sizing),
+    ):
         parts.extend(["", f"**{label}**: {value if value is not None and value != '' else 'not provided'}"])
+    if proposal.futures_execution is not None:
+        futures = proposal.futures_execution
+        parts.extend([
+            "",
+            f"**Futures Execution Intent**: {proposal.futures_execution_intent.value}",
+            f"**Futures Entry**: {futures.entry_price if futures.entry_price is not None else 'not provided'}",
+            f"**Futures Stop Loss**: {futures.stop_loss if futures.stop_loss is not None else 'not provided'}",
+            f"**Futures Take Profit**: {futures.take_profit if futures.take_profit is not None else 'not provided'}",
+            f"**Futures Margin Mode**: {futures.margin_mode}",
+            f"**Futures Leverage**: {futures.leverage}x",
+            f"**Futures Risk Budget**: {futures.risk_fraction}",
+            f"**Futures Margin Budget**: {futures.margin_fraction}",
+            f"**Futures Execution Rationale**: {futures.rationale}",
+        ])
+    else:
+        parts.extend([
+            "",
+            f"**Futures Execution Intent**: {proposal.futures_execution_intent.value}",
+            "**Futures Execution**: not provided",
+        ])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
@@ -258,6 +347,18 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    futures_execution: FuturesExecutionProposal | None = Field(
+        default=None,
+        description="Final agent-approved futures terms. Required only when futures_execution_intent is enter.",
+    )
+    futures_execution_intent: FuturesExecutionIntent = Field(
+        default=FuturesExecutionIntent.ABSTAIN,
+        description=(
+            "For crypto futures choose enter only when opening a new position is authorized "
+            "and all terms are supported; choose manage_existing for reduce/exit/protection "
+            "of an existing position; choose abstain when no futures entry is authorized."
+        ),
+    )
 
     @field_validator("price_target", mode="before")
     @classmethod
@@ -266,13 +367,7 @@ class PortfolioDecision(BaseModel):
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
-    """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
-
-    Memory log, CLI display, and saved report files all read this markdown,
-    so the rendered output preserves the exact section headers (``**Rating**``,
-    ``**Executive Summary**``, ``**Investment Thesis**``) that downstream
-    parsers and the report writers already handle.
-    """
+    """Render the PortfolioDecision back to markdown, including its futures terms."""
     parts = [
         f"**Rating**: {decision.rating.value}",
         "",
@@ -280,11 +375,30 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         "",
         f"**Investment Thesis**: {decision.investment_thesis}",
     ]
-    # Named even when absent: a missing line reads as a field nobody asked for,
-    # so a reader cannot tell "no target" from "target not reported".
     target = decision.price_target if decision.price_target is not None else "not provided"
     parts.extend(["", f"**Price Target**: {target}"])
     parts.extend(["", f"**Time Horizon**: {decision.time_horizon or 'not provided'}"])
+    if decision.futures_execution is not None:
+        futures = decision.futures_execution
+        parts.extend([
+            "",
+            f"**Final Futures Execution Intent**: {decision.futures_execution_intent.value}",
+            "**Final Futures Execution Decision**",
+            f"- Margin Mode: {futures.margin_mode}",
+            f"- Leverage: {futures.leverage}x",
+            f"- Risk Budget: {futures.risk_fraction}",
+            f"- Margin Budget: {futures.margin_fraction}",
+            f"- Entry: {futures.entry_price if futures.entry_price is not None else 'not provided'}",
+            f"- Stop Loss: {futures.stop_loss if futures.stop_loss is not None else 'not provided'}",
+            f"- Take Profit: {futures.take_profit if futures.take_profit is not None else 'not provided'}",
+            f"- Rationale: {futures.rationale}",
+        ])
+    else:
+        parts.extend([
+            "",
+            f"**Final Futures Execution Intent**: {decision.futures_execution_intent.value}",
+            "**Final Futures Execution Decision**: not provided",
+        ])
     return "\n".join(parts)
 
 

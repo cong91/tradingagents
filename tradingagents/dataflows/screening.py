@@ -35,11 +35,13 @@ logger = logging.getLogger(__name__)
 
 # Stablecoins carry no trade thesis and skew volume rankings; exclude by base.
 _STABLECOIN_BASES = frozenset(
-    {"USDC", "USD1", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "AEUR"}
+    {"USDC", "USD1", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "AEUR", "RLUSD"}
 )
 
 # Per-asset 24h dollar-volume floor for a spot pair to enter the universe.
-MIN_CRYPTO_QUOTE_VOLUME_USD = 5_000_000
+# 10M keeps ~45 liquid Binance USDT pairs — far more than the 30-slot pool —
+# while cutting the thin long tail that only polls vendor data every cycle.
+MIN_CRYPTO_QUOTE_VOLUME_USD = 10_000_000
 # Stock screener floor: below this market cap slippage swamps the signal.
 _MIN_STOCK_MARKET_CAP = 2_000_000_000
 # Daily dollar-volume floor (20d average) for a candidate to be tradable at

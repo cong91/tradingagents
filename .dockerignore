@@ -13,3 +13,8 @@ results
 eval_results
 Dockerfile
 docker-compose.yml
+# Runtime/legacy state never belongs in an image: the control panel persists to
+# PostgreSQL and only operator_config.json is mounted at run time.
+server/data
+# Archived legacy stores kept for reference outside the build context.
+archive

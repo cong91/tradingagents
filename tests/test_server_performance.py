@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from server import paths as server_paths, performance as performance_mod
+from server import performance as performance_mod
 from server.contract import install_error_handlers
 from tradingagents.dataflows.config import set_config
 
@@ -62,16 +62,12 @@ def _no_network(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point the server's file state at tmp (TestClient's lifespan seeds the
     watchlist, so the real server/data/ must stay untouched)."""
     from tradingagents.default_config import DEFAULT_CONFIG
 
     saved_watchlist = DEFAULT_CONFIG.get("exec_watchlist")
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     yield
     DEFAULT_CONFIG["exec_watchlist"] = saved_watchlist
 
@@ -162,6 +158,8 @@ def test_performance_summary_positions_brackets_and_recent_orders(
         "entry_price": 50000.0,
         "current_price": 52500.0,
         "unrealized_pct": pytest.approx(5.0),
+        "market": "spot",
+        "leverage": None,
         "mode": "dry",
         "entry_at": "2026-10-01T03:00:00Z",
     }]
@@ -171,13 +169,31 @@ def test_performance_summary_positions_brackets_and_recent_orders(
     recent = body["recent_orders"]
     assert len(recent) == 8  # every execute line, plan line excluded
     assert set(recent[0].keys()) == {
-        "timestamp", "ticker", "action", "qty", "price_est", "mode", "order_id",
+        "timestamp", "ticker", "ccxt_symbol", "action", "qty", "price_est", "market", "leverage",
+        "cost", "mode", "order_id",
     }
+    assert recent[0]["market"] == "spot"
     assert recent[0]["action"] == "rejected_by_risk"  # newest first
     assert recent[0]["qty"] is None
     assert recent[-1]["action"] == "buy"
     assert recent[-1]["timestamp"] == "2026-10-01T01:00:00Z"
     assert not any(row["timestamp"] == "2026-10-01T00:30:00Z" for row in recent)
+
+
+def test_recent_futures_order_preserves_margin_cost():
+    result = performance_mod.compute_performance([
+        _fill(
+            "NEAR-USD", "sell", 3.0, 10.0, "2026-10-01T08:00:00Z",
+            market="derivatives", leverage=3.0, cost=10.0,
+            ccxt_symbol="NEAR/USDC:USDC",
+        ),
+    ], price_fetcher=lambda ticker: None)
+
+    order = result["recent_orders"][0]
+    assert order["market"] == "derivatives"
+    assert order["leverage"] == 3.0
+    assert order["cost"] == 10.0
+    assert order["ccxt_symbol"] == "NEAR/USDC:USDC"
 
 
 def test_performance_missing_log_is_all_zero_empty_state(client, tmp_path):
@@ -220,6 +236,8 @@ def test_fifo_closes_oldest_lot_first():
         "entry_price": 200.0,
         "current_price": None,
         "unrealized_pct": None,
+        "market": "spot",
+        "leverage": None,
         "mode": "dry",
         "entry_at": "2026-10-01T02:00:00Z",
     }]
@@ -249,13 +267,126 @@ def test_sell_without_open_lot_is_dropped():
     assert result["recent_orders"][0]["action"] == "sell"  # still visible in the execute tail
 
 
+def test_same_ticker_spot_fills_do_not_cover_futures_short():
+    events = [
+        _fill("BTC-USD", "sell", 0.1, 100.0, "2026-10-01T01:00:00Z", market="derivatives", leverage=3.0),
+        _fill("BTC-USD", "buy", 0.1, 110.0, "2026-10-01T02:00:00Z", market="spot"),
+    ]
+    result = performance_mod.compute_performance(
+        events,
+        price_fetcher=lambda ticker: None,
+        futures_price_fetcher=lambda ticker: 90.0,
+    )
+    positions = result["open_positions"]
+    assert [(row["market"], row["qty"]) for row in positions] == [
+        ("derivatives", -0.1),
+        ("spot", 0.1),
+    ]
+    assert positions[0]["leverage"] == 3.0
+    assert positions[0]["unrealized_pct"] == pytest.approx(10.0)
+
+
+def test_default_futures_price_fetcher_uses_resolved_contract(monkeypatch):
+    calls = []
+
+    class FakeBridge:
+        config = {"exec_exchange_id": "binance", "exec_base_url": "https://demo-fapi.binance.com"}
+        exchange_id = "binance"
+
+        def futures_symbol_for(self, ticker):
+            assert ticker == "INJ-USD"
+            return "INJ/USDT:USDT"
+
+        def client(self):
+            return self
+
+        def fetch_ticker(self, symbol):
+            calls.append(symbol)
+            return {"last": 23.5}
+
+    bridge = FakeBridge()
+    monkeypatch.setattr(performance_mod, "get_config", lambda: {
+        **bridge.config,
+        "exec_sandbox": False,
+    })
+    monkeypatch.setattr(performance_mod, "_default_bridge", bridge)
+    monkeypatch.setattr(performance_mod, "_default_bridge_venue", (
+        "binance", "https://demo-fapi.binance.com", False, "", (),
+    ))
+    assert performance_mod._default_futures_price_fetcher("INJ-USD") == 23.5
+    assert calls == ["INJ/USDT:USDT"]
+
+
+@pytest.mark.parametrize("fetcher_name", ["_default_price_fetcher", "_default_futures_price_fetcher"])
+@pytest.mark.parametrize("change", ["quote", "override"])
+def test_mark_bridge_refreshes_after_symbol_config_changes(monkeypatch, fetcher_name, change):
+    from copy import deepcopy
+
+    from tradingagents.execution import bridge as bridge_mod
+
+    config = {
+        "exec_exchange_id": "binance",
+        "exec_base_url": "https://demo-api.binance.com",
+        "exec_sandbox": False,
+        "exec_quote_currency": "USDT",
+        "exec_symbol_overrides": {},
+    }
+    built = []
+    symbols = []
+
+    class FakeBridge:
+        def __init__(self, config):
+            self.config = deepcopy(config)
+            built.append(self)
+
+        def futures_symbol_for(self, ticker):
+            quote = self.config["exec_quote_currency"]
+            return self.config["exec_symbol_overrides"].get(ticker, f"BTC/{quote}:{quote}")
+
+        def fetch_price(self, ticker):
+            return self.fetch_ticker(self.futures_symbol_for(ticker))["last"]
+
+        def client(self):
+            return self
+
+        def fetch_ticker(self, symbol):
+            symbols.append(symbol)
+            return {"last": 20.0 if symbol == "BTC/USDT:USDT" else 30.0}
+
+    monkeypatch.setattr(bridge_mod, "ExchangeBridge", FakeBridge)
+    monkeypatch.setattr(performance_mod, "get_config", lambda: deepcopy(config))
+    monkeypatch.setattr(performance_mod, "_default_bridge", None)
+    monkeypatch.setattr(performance_mod, "_default_bridge_venue", None)
+    fetch = getattr(performance_mod, fetcher_name)
+    assert fetch("BTC-USD") == 20.0
+    assert fetch("BTC-USD") == 20.0
+    assert len(built) == 1
+
+    if change == "quote":
+        config["exec_quote_currency"] = "USDC"
+        expected_symbol = "BTC/USDC:USDC"
+    else:
+        config["exec_symbol_overrides"]["BTC-USD"] = "WBTC/USDT:USDT"
+        expected_symbol = "WBTC/USDT:USDT"
+
+    assert fetch("BTC-USD") == 30.0
+    assert symbols[-1] == expected_symbol
+    assert len(built) == 2
+    assert fetch("BTC-USD") == 30.0
+    assert len(built) == 2
+
+
 def test_derivatives_short_round_trip_and_open_mark_are_short_aware():
     events = [
         _fill("BTC-USD", "sell", 0.1, 100.0, "2026-10-01T01:00:00Z", market="derivatives"),
         _fill("BTC-USD", "buy", 0.1, 80.0, "2026-10-01T02:00:00Z", market="derivatives"),
         _fill("ETH-USD", "sell", 0.2, 200.0, "2026-10-01T03:00:00Z", market="derivatives"),
     ]
-    result = performance_mod.compute_performance(events, price_fetcher=lambda ticker: 180.0)
+    result = performance_mod.compute_performance(
+        events,
+        price_fetcher=lambda ticker: pytest.fail("spot fetcher used for futures"),
+        futures_price_fetcher=lambda ticker: 180.0,
+    )
 
     assert result["summary"]["closed_trades"] == 1
     assert result["summary"]["avg_win_pct"] == pytest.approx(20.0)
@@ -265,11 +396,14 @@ def test_derivatives_short_round_trip_and_open_mark_are_short_aware():
         "entry_price": 200.0,
         "current_price": 180.0,
         "unrealized_pct": pytest.approx(10.0),
+        "market": "derivatives",
+        "leverage": None,
         "mode": "dry",
         "entry_at": "2026-10-01T03:00:00Z",
     }]
 
 
+def test_recent_orders_are_capped_and_newest_first():
     events = [
         _fill("BTC-USD", "buy", 0.001, 100.0 + i, f"2026-10-01T{600 + i}:00:00Z")
         for i in range(60)

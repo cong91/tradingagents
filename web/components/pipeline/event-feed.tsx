@@ -20,6 +20,7 @@ const TYPE_LABELS: Record<RunEvent["type"], string> = {
   pm_decision: "Quản lý danh mục",
   run_completed: "Hoàn tất",
   run_failed: "Thất bại",
+  run_interrupted: "Bị gián đoạn",
 };
 
 function eventTitle(event: RunEvent): string {
@@ -73,6 +74,14 @@ function eventBody(event: RunEvent): string | null {
           ? (error as { message: string }).message
           : "Lỗi không rõ nguyên nhân.";
       return `Lỗi: ${message}`;
+    }
+    case "run_interrupted": {
+      const error = payload["error"];
+      const message =
+        error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : "Server dừng trước khi phiên phân tích hoàn tất.";
+      return `Phiên bị gián đoạn: ${message}`;
     }
   }
 }

@@ -71,3 +71,7 @@ class AgentState(MessagesState):
     past_context: Annotated[str, "Memory log context for the Portfolio Manager (same-ticker decisions + cross-ticker lessons), written by the Memory Log step"]
     memory_note: Annotated[str, "What the Memory Log step could not settle or read this run, for the report; empty when all went well"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+    execution_context: Annotated[str, "Current venue/account and market facts provided to execution decision agents"]
+    futures_execution_proposal: Annotated[dict, "Final Portfolio Manager futures execution proposal, when one is supported"]
+    futures_execution_intent: Annotated[str, "Final futures intent: enter, manage_existing, or abstain"]
+    futures_execution_status: Annotated[str, "Futures structured-output status for diagnostics"]

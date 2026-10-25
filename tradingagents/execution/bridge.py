@@ -450,7 +450,28 @@ class ExchangeBridge:
         skipped with a log line; the quote currency becomes the cash.
         """
         exchange = self._exchange_or_raise()
-        balance = exchange.fetch_balance()
+        if self.exchange_id == "bybit":
+            balance = exchange.fetch_balance(params={"type": "spot"})
+            info = balance.get("info") if isinstance(balance, dict) else None
+            info = info if isinstance(info, dict) else {}
+            result = info.get("result") if isinstance(info.get("result"), dict) else {}
+            records = result.get("list") if isinstance(result.get("list"), list) else []
+            account_types = {
+                str(row["accountType"]).strip().upper()
+                for row in records
+                if isinstance(row, dict) and row.get("accountType")
+            }
+            if result.get("accountType"):
+                account_types.add(str(result["accountType"]).strip().upper())
+            account_type = next(iter(account_types)) if len(account_types) == 1 else None
+            if account_type != "SPOT":
+                scope = account_type or ("mixed" if account_types else "unknown")
+                raise RuntimeError(
+                    "Bybit spot-only snapshot unavailable: "
+                    f"wallet response accountType is {scope}"
+                )
+        else:
+            balance = exchange.fetch_balance()
         quote = str(self.config.get("exec_quote_currency") or "USDT").strip().upper()
         positions: list[Position] = []
         for currency, amount in (balance.get("total") or {}).items():
@@ -815,6 +836,10 @@ class ExchangeBridge:
             "market": getattr(order, "market", "spot"),
             "leverage": getattr(order, "leverage", 1.0),
         }
+        if event["market"] == "derivatives" and getattr(order, "cost", None) is not None:
+            event["cost"] = order.cost
+        if getattr(order, "margin_mode", None) is not None:
+            event["margin_mode"] = order.margin_mode
         if getattr(order, "stop_loss", None) is not None:
             event["stop_loss"] = order.stop_loss
         if getattr(order, "take_profit", None) is not None:

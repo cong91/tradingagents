@@ -32,6 +32,7 @@ import { OrderTable } from "./order-table";
 import { EmptyState } from "./empty-state";
 import { PortfolioCard } from "./portfolio-card";
 import { PerformanceCard } from "./performance-card";
+import { OverviewActivityCard } from "./activity-card";
 
 // Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8/§9):
 // audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6);
@@ -242,6 +243,8 @@ export function OverviewDashboard() {
         </div>
       </div>
 
+      <OverviewActivityCard />
+
       {halted ? (
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border-l-4 border-red-600 bg-red-50 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-100">
           <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
@@ -316,7 +319,7 @@ export function OverviewDashboard() {
             <CardHeader>
               <CardTitle>Lệnh thực thi gần đây</CardTitle>
               <CardDescription>
-                Từ nhật ký audit của engine — mua là tiền ra (−), bán là tiền vào (+).
+                Spot mua/bán hiển thị ước tính dòng tiền; Futures hiển thị notional và margin, không phải tiền vào hoặc lãi/lỗ đã chốt.
               </CardDescription>
               {audit.stale ? <StaleBadge /> : null}
             </CardHeader>

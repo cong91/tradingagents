@@ -462,15 +462,30 @@ def _finish(job: DailyJobState, error: str | None = None) -> None:
     """Settle a job's terminal status and write it down.
 
     A cancelled job keeps the status the cancel endpoint already gave it — the
-    worker must not resurrect a job the operator stopped.
+    worker must not resurrect a job the operator stopped. The durable row is
+    written BEFORE the live object flips terminal: the API reads ``_jobs``
+    first, so exposing "completed" ahead of the write lets a poll observe a
+    terminal job whose restart record still says "running".
     """
+    status = job.status if job.status == "cancelled" else (
+        "failed" if error is not None else "completed"
+    )
+    finished_at = job.finished_at or utc_now_iso()
+    payload = asdict(job)
+    payload.update(
+        status=status,
+        error=job.error if job.status == "cancelled" else error,
+        finished_at=finished_at,
+        current_ticker=None,
+        last_progress_at=finished_at,
+    )
+    job_store.persist(payload)
+    job.status = status
     if job.status != "cancelled":
-        job.status = "failed" if error is not None else "completed"
         job.error = error
-    job.finished_at = job.finished_at or utc_now_iso()
+    job.finished_at = finished_at
     job.current_ticker = None
-    job.last_progress_at = job.finished_at
-    _persist(job)
+    job.last_progress_at = finished_at
     audit_log.record("daily_job_completed", job_id=job.job_id, status=job.status,
                      mode=job.mode, tickers=list(job.tickers), error=job.error)
 

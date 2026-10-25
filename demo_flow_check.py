@@ -211,6 +211,7 @@ def layer_futures() -> None:
     plan = executor.plan_order(
         "BTC-USD", "Buy", portfolio, price=price, leverage=2.0,
         stop_loss=stop_loss, take_profit=take_profit,
+        futures_execution_intent="enter",
     )
     step("futures: plan_order sizes a leveraged long",
          plan.side == "buy" and plan.market == "derivatives" and (plan.quantity or 0) > 0,

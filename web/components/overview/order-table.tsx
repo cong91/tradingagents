@@ -1,12 +1,12 @@
 import { Badge } from "@/components/ui/badge";
-import { formatSignedCurrency } from "@/lib/format";
 import { EmptyState } from "./empty-state";
 import type { AuditItem } from "./contract";
+import {
+  formatHistoricalMoney,
+  formatHistoricalSignedMoney,
+  historicalCurrencies,
+} from "./historical-currency";
 
-const priceFormat = new Intl.NumberFormat("vi-VN", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
 const qtyFormat = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 8 });
 
 function formatTime(timestamp: string | null): string {
@@ -45,7 +45,7 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
             <th scope="col" className="py-2 pr-4 font-medium">Lệnh</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">Giá ước tính</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">Dòng tiền ước tính</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">Spot dòng tiền / Futures notional</th>
             <th scope="col" className="py-2 pr-4 font-medium">Chế độ</th>
             <th scope="col" className="py-2 font-medium">Order ID</th>
           </tr>
@@ -53,21 +53,28 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
         <tbody>
           {orders.map((order, index) => {
             const isBuy = order.action === "buy";
-            const qty = order.qty ?? 0;
-            const price = order.price_est ?? 0;
-            // Mua = tiền ra (−), bán = tiền vào (+) — luôn kèm đơn vị và dấu.
-            const flow = isBuy ? -(qty * price) : qty * price;
+            const qty = order.qty;
+            const price = order.price_est;
+            const isDerivatives = order.market === "derivatives";
+            const { quote, settle } = historicalCurrencies(order.ccxt_symbol);
+            const notional = qty != null && price != null ? Math.abs(qty * price) : null;
+            const flow = notional == null ? null : isBuy ? -notional : notional;
             return (
               <tr key={`${order.timestamp ?? ""}-${order.order_id ?? index}`} className="border-b last:border-0">
                 <td className="py-2 pr-4 whitespace-nowrap tabular-nums">{formatTime(order.timestamp)}</td>
                 <td className="py-2 pr-4 font-medium">{order.ticker ?? "—"}</td>
                 <td className="py-2 pr-4">
-                  <Badge variant="outline">{isBuy ? "Mua" : "Bán"}</Badge>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge variant="outline">{isBuy ? "Mua" : "Bán"}</Badge>
+                    <Badge variant="secondary">{isDerivatives ? "Futures" : "Spot"}</Badge>
+                  </div>
                 </td>
-                <td className="py-2 pr-4 text-right tabular-nums">{qtyFormat.format(qty)}</td>
-                <td className="py-2 pr-4 text-right tabular-nums">{priceFormat.format(price)} USD</td>
-                <td className={`py-2 pr-4 text-right tabular-nums ${flow > 0 ? "text-profit" : flow < 0 ? "text-loss" : ""}`}>
-                  {formatSignedCurrency(flow)}
+                <td className="py-2 pr-4 text-right tabular-nums">{qty != null ? qtyFormat.format(qty) : "—"}</td>
+                <td className="py-2 pr-4 text-right tabular-nums">{formatHistoricalMoney(price, quote)}</td>
+                <td className={`py-2 pr-4 text-right tabular-nums ${!isDerivatives && flow != null && flow !== 0 ? flow > 0 ? "text-profit" : "text-loss" : ""}`}>
+                  {isDerivatives
+                    ? `${formatHistoricalMoney(notional, quote)} notional${order.leverage != null ? ` · ${qtyFormat.format(order.leverage)}x · margin ${formatHistoricalMoney(order.cost, settle)}` : order.cost != null ? ` · margin ${formatHistoricalMoney(order.cost, settle)}` : ""}`
+                    : flow != null ? formatHistoricalSignedMoney(flow, quote) : "—"}
                 </td>
                 <td className="py-2 pr-4">
                   <Badge variant={order.mode === "live" ? "destructive" : "secondary"}>

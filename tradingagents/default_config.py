@@ -51,6 +51,23 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT":   "risk_max_consecutive_loss_count",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE":     "risk_max_derivatives_leverage",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT": "risk_max_derivatives_exposure_pct",
+    "TRADINGAGENTS_RISK_DERIVATIVES_MAX_RISK_FRACTION": "risk_derivatives_max_risk_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_MAX_MARGIN_FRACTION": "risk_derivatives_max_margin_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_RISK_FRACTION": "risk_derivatives_risk_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_MARGIN_FRACTION": "risk_derivatives_margin_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_PROFIT_PROTECTION_ENABLED": "risk_derivatives_profit_protection_enabled",
+    "TRADINGAGENTS_RISK_DERIVATIVES_BREAK_EVEN_R": "risk_derivatives_break_even_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_LOCK_PROFIT_R": "risk_derivatives_lock_profit_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TRAIL_START_R": "risk_derivatives_trail_start_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TRAIL_DISTANCE_R": "risk_derivatives_trail_distance_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TARGET_EXTENSION_R": "risk_derivatives_target_extension_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_MIN_STOP_MOVE_R": "risk_derivatives_min_stop_move_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_MARK_MAX_AGE_SECONDS": "risk_derivatives_mark_max_age_seconds",
+    "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_ENABLED": "risk_derivatives_scale_out_enabled",
+    "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_FIRST_R": "risk_derivatives_scale_out_first_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_FIRST_FRACTION": "risk_derivatives_scale_out_first_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_R": "risk_derivatives_scale_out_second_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_FRACTION": "risk_derivatives_scale_out_second_fraction",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
     "TRADINGAGENTS_EXEC_BASE_URL":                     "exec_base_url",
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
@@ -256,6 +273,31 @@ def build_default_config() -> dict:
         "risk_max_consecutive_loss_count": 3,
         "risk_max_derivatives_leverage": 1.0,
         "risk_max_derivatives_exposure_pct": 0.0,
+        # Decisions the futures agents own, and the ceilings the executor enforces
+        # on them. The agent proposes; a proposal above these caps is refused, never
+        # silently clamped to a different size.
+        "risk_derivatives_max_risk_fraction": 0.02,
+        "risk_derivatives_max_margin_fraction": 0.5,
+        "risk_derivatives_risk_fraction": 0.01,
+        "risk_derivatives_margin_fraction": 0.25,
+        "risk_derivatives_profit_protection_enabled": True,
+        "risk_derivatives_break_even_r": 1.0,
+        "risk_derivatives_lock_profit_r": 2.0,
+        "risk_derivatives_trail_start_r": 3.0,
+        "risk_derivatives_trail_distance_r": 1.0,
+        "risk_derivatives_target_extension_r": 1.0,
+        # Refuse tiny stop nudges that would churn conditional orders every poll,
+        # and treat a venue mark older than this as unusable (no mutation).
+        "risk_derivatives_min_stop_move_r": 0.1,
+        "risk_derivatives_mark_max_age_seconds": 120.0,
+        # Deliberate scale-out: two profit tranches at R multiples plus a runner
+        # managed by the trailing stop. OFF by default; the single bracket keeps
+        # the previous behaviour until an operator opts in.
+        "risk_derivatives_scale_out_enabled": False,
+        "risk_derivatives_scale_out_first_r": 1.0,
+        "risk_derivatives_scale_out_first_fraction": 0.33,
+        "risk_derivatives_scale_out_second_r": 2.0,
+        "risk_derivatives_scale_out_second_fraction": 0.33,
         # Execution bridge (L2): multi-exchange. ``exec_exchange_id`` selects the
         # ccxt class; credentials come from {ID}_API_KEY / {ID}_SECRET env vars.
         # ``exec_symbol_overrides`` maps a pipeline ticker to a full ccxt symbol

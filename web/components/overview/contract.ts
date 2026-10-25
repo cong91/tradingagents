@@ -91,6 +91,10 @@ export type AuditItem = {
   action: string | null;
   qty: number | null;
   price_est: number | null;
+  ccxt_symbol?: string | null;
+  market?: string | null;
+  leverage?: number | null;
+  cost?: number | null;
   mode: string | null;
   order_id: string | null;
   phase: string | null;
@@ -124,6 +128,41 @@ export type PortfolioPosition = {
   unrealized_pnl: number | null;
 };
 
+export type FuturesPosition = {
+  symbol: string | null;
+  side: string | null;
+  contracts: number | null;
+  quantity: number | null;
+  entry_price: number | null;
+  mark_price: number | null;
+  liquidation_price: number | null;
+  unrealized_pnl: number | null;
+  notional: number | null;
+  margin: number | null;
+  leverage: number | null;
+  margin_mode: string | null;
+  price_currency: string | null;
+  notional_currency: string | null;
+  margin_currency: string | null;
+  unrealized_pnl_currency: string | null;
+};
+
+export type FuturesPortfolio = {
+  equity: number | null;
+  wallet_balance: number | null;
+  available_balance: number | null;
+  unrealized_pnl: number | null;
+  venue_profile: string | null;
+  equity_currency: string | null;
+  wallet_balance_currency: string | null;
+  available_balance_currency: string | null;
+  unrealized_pnl_currency: string | null;
+  account_scope: "derivatives" | "trading" | "unified";
+  positions: FuturesPosition[];
+  status: "ok" | "error" | "unavailable";
+  error: string | null;
+};
+
 export type RealizedPnl = {
   total: number;
   /** Chỉ closed trade của UTC hôm nay (khác con số guard — guard cộng thêm
@@ -142,6 +181,7 @@ export type PortfolioPayload = {
   equity_est: number | null;
   positions: PortfolioPosition[];
   realized_pnl: RealizedPnl;
+  futures?: FuturesPortfolio | null;
   halted_today: boolean;
   warnings: string[];
   stale_after: number;
@@ -170,6 +210,8 @@ export type PerformanceOpenPosition = {
   /** null khi sàn không trả giá mark — chỉ để hiển thị, không làm lỗi response. */
   current_price: number | null;
   unrealized_pct: number | null;
+  market?: string | null;
+  leverage?: number | null;
   mode: string | null;
   entry_at: string | null;
 };
@@ -187,6 +229,10 @@ export type PerformanceOrder = {
   action: string | null;
   qty: number | null;
   price_est: number | null;
+  ccxt_symbol?: string | null;
+  market?: string | null;
+  leverage?: number | null;
+  cost?: number | null;
   mode: string | null;
   order_id: string | null;
 };

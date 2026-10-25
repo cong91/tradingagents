@@ -110,6 +110,29 @@ export function RunSummary({
     );
   }
 
+  if (run.status === "interrupted") {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
+          <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+          <div className="min-w-0">
+            <p className="font-medium">Phiên bị gián đoạn</p>
+            <p className="mt-0.5 break-words">
+              {run.error?.message ?? "Server dừng trước khi phiên phân tích hoàn tất."}
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Mã lỗi: {run.error?.code ?? "interrupted"} — dữ liệu đã nhận vẫn được giữ trong luồng sự kiện.
+            </p>
+          </div>
+        </div>
+        <Button variant="outline" className="min-touch" onClick={onNewRun}>
+          <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
+          Chạy phiên mới
+        </Button>
+      </div>
+    );
+  }
+
   if (run.status === "cancelled") {
     return (
       <div className="space-y-3">

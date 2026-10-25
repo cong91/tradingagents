@@ -48,6 +48,12 @@ class PlannedOrder(BaseModel):
     protective exit prices (ATR-derived at plan time): when present, a live
     entry fill is followed by exchange-side protective orders so the exits
     survive a server crash -- the exchange enforces them, not us.
+
+    ``futures_execution_intent`` carries the agent's explicit authorization to
+    open a NEW futures position. A bearish investment rating (Underweight/Sell)
+    is not that authorization by itself, so only ``"enter"`` is accepted and
+    ``DerivativesExecutor.execute_order`` re-checks it: a plan rebuilt or
+    crafted without it can never reach a derivatives venue.
     """
 
     ticker: str
@@ -62,8 +68,10 @@ class PlannedOrder(BaseModel):
     reason: str | None = None
     market: Literal["spot", "derivatives"] = "spot"
     leverage: float = 1.0
+    margin_mode: Literal["isolated", "cross"] | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
+    futures_execution_intent: Literal["enter"] | None = None
 
 
 def compute(

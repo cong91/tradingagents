@@ -21,16 +21,17 @@ RiskGuard of EVERY process replays — the rest of today is refused everywhere
 until a reset or the UTC day rolls over (risk.py:163-173). Disabling the
 loop is likewise never gated: turning a thing off is the safe direction.
 
-State: ``enabled``/``interval_minutes`` persist in ``paths.AUTOLOOP_PATH``
-(the scheduler re-reads the file every wake, so edits need no restart);
-``last_cycle`` is an in-memory summary of the most recent cycle only.
+State: ``enabled``/``interval_minutes`` persist in PostgreSQL (``control_settings``,
+see ``server/control_store.py``) and the scheduler re-reads them every wake, so
+edits need no restart; ``last_cycle`` is an in-memory summary of the most recent
+cycle only.
 """
 
 from __future__ import annotations
 
 import inspect
-import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -41,7 +42,13 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from server import audit as audit_log, daily as daily_mod, job_store, paths, runs as runs_mod
+from server import (
+    audit as audit_log,
+    control_store,
+    daily as daily_mod,
+    job_store,
+    runs as runs_mod,
+)
 from server.autoloop_telemetry import CycleTelemetry
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.agents.rating import RATINGS_5_TIER
@@ -50,29 +57,41 @@ from tradingagents.dataflows.market_data import fetch_closed_candles
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.daily import DailyResult, _handle_plan
+from tradingagents.execution.futures_account import read_futures_account
 from tradingagents.execution.futures_scheduler import closed_candle_pair
 from tradingagents.execution.futures_signals import FuturesSignalEnvelope
+from tradingagents.portfolio import PortfolioContext
 
 router = APIRouter(prefix="/api", tags=["autoloop"])
 
 # Auto-cycle tuning: how many universe entries to pull per market and how
 # many screened candidates graduate into the expensive LLM pipeline.
 AUTO_UNIVERSE_PER_ASSET = 30
-AUTO_TOP_N = 8
+# One candidate costs 8-10 sequential LLM calls. Eight of them overran the
+# 60-minute cycle budget in every observed run, so the cycle timed out with the
+# last candidates never analysed. Three leaves headroom for the retries a flaky
+# relay needs and still fills a cycle.
+AUTO_TOP_N = 3
+# Screen a wider pool than we run: preflight drops stocks (advisory-only under
+# futures execution) and symbols with no live contract, and a pool equal to
+# AUTO_TOP_N would leave nothing to run after those drops.
+AUTO_SCREEN_POOL = AUTO_TOP_N * 4
 SCREENING_TIMEOUT_SECONDS = 180.0
-# 8 candidates × ~8 sequential LLM calls each through a slow relay needs well
-# over 15 minutes; the scheduler skips interval ticks while the lock is held,
-# so a generous budget only delays the next cycle, it never overlaps one.
+# 3 candidates × ~10 min sequential LLM work through a slow relay fits inside
+# one hour; the scheduler skips interval ticks while the lock is held, so a
+# generous budget only delays the next cycle, it never overlaps one.
 CYCLE_TIMEOUT_SECONDS = 3600.0
 
 MIN_INTERVAL_MINUTES = 15
 MAX_INTERVAL_MINUTES = 1440
 DEFAULT_INTERVAL_MINUTES = 1440
 
-# Hard system ceiling on the leverage an auto cycle may REQUEST from the
-# derivatives path, regardless of the configured risk cap. The RiskGuard's
-# own ``risk_max_derivatives_leverage`` stays the authoritative gate (it can
-# still refuse below this); this constant only bounds what the cycle asks for.
+# Hard system ceiling on the leverage an auto cycle will accept from the
+# agents' FuturesExecutionProposal, regardless of the configured risk cap. The
+# RiskGuard's own ``risk_max_derivatives_leverage`` stays the authoritative gate
+# (it can still refuse below this); this constant only bounds the proposal the
+# cycle is willing to execute, and an over-cap proposal is refused rather than
+# clamped because a resized order would no longer be the decision made.
 MAX_AUTO_LEVERAGE = 3.0
 
 # Analyst sets per asset type, exactly like server/daily.py _analyze.
@@ -91,6 +110,7 @@ _cycle_lock = threading.Lock()
 _execution_lock = threading.Lock()
 _cycle_thread: threading.Thread | None = None  # last spawned cycle worker
 _scheduler_thread: threading.Thread | None = None
+_scheduler_stop = threading.Event()
 _wakeup = threading.Event()  # set on every state write so the loop re-reads at once
 _last_cycle: dict | None = None
 _last_telemetry: CycleTelemetry | None = None
@@ -150,7 +170,7 @@ def _screen_with_timeout(
             with telemetry.span("screening:stock_universe"):
                 stocks = stock_universe(config, AUTO_UNIVERSE_PER_ASSET)
             with telemetry.span("screening:metrics"):
-                candidates = screen_universe(crypto, stocks, trade_date, AUTO_TOP_N)
+                candidates = screen_universe(crypto, stocks, trade_date, AUTO_SCREEN_POOL)
             result_queue.put((crypto, stocks, candidates))
         except BaseException as exc:  # hand exception back to cycle thread
             result_queue.put(exc)
@@ -213,25 +233,20 @@ def gates() -> dict:
 
 
 def _load_state() -> dict:
-    """The persisted {enabled, interval_minutes, updated_at}; defaults when
-    missing or unreadable — a fresh install has the loop OFF, not an error."""
-    path = paths.AUTOLOOP_PATH
-    if not path.exists():
-        return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
+    """The persisted {enabled, interval_minutes, updated_at}; defaults when the
+    record is absent — a fresh install has the loop OFF, not an error."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        logger.warning("autoloop state file %s unreadable; treating as disabled", path)
+        data = control_store.load_autoloop_state()
+    except Exception:  # an unreadable store must not arm the loop
+        logger.warning("autoloop state unreadable; treating as disabled", exc_info=True)
         return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
-    return data if isinstance(data, dict) else {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
+    if not isinstance(data, dict) or not data:
+        return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
+    return data
 
 
 def _save_state(state: dict) -> None:
-    paths.ensure_data_dir()
-    tmp_path = paths.AUTOLOOP_PATH.with_name(paths.AUTOLOOP_PATH.name + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False)
-    tmp_path.replace(paths.AUTOLOOP_PATH)
+    control_store.save_autoloop_state(state)
 
 
 def _interval_from(state: dict) -> int:
@@ -269,10 +284,26 @@ def ensure_started() -> None:
     global _scheduler_thread
     if _scheduler_thread is not None and _scheduler_thread.is_alive():
         return
+    _scheduler_stop.clear()
     _scheduler_thread = threading.Thread(
         target=_scheduler_loop, name="server-autoloop-scheduler", daemon=True
     )
     _scheduler_thread.start()
+
+
+def stop() -> None:
+    """Stop the scheduler during application shutdown. Never raises: a stuck
+    scheduler is daemon-owned and dies with the process, and shutdown must
+    always reach the monitors that follow."""
+    global _scheduler_thread
+    _scheduler_stop.set()
+    _wakeup.set()
+    if _scheduler_thread is not None:
+        _scheduler_thread.join(timeout=1.0)
+        if _scheduler_thread.is_alive():
+            logger.warning("autoloop scheduler did not stop within 1s; leaving it to daemon exit")
+        else:
+            _scheduler_thread = None
 
 
 def _scheduler_loop() -> None:
@@ -281,18 +312,19 @@ def _scheduler_loop() -> None:
     First cycle runs at startup if enabled; subsequent cycles wait the full
     interval before running. The wakeup event allows immediate re-reads when
     settings change but does not bypass the interval between actual cycles.
+    A stop request never launches a new cycle, even one already waited on.
     """
     processed_update = object()
-    while True:
+    while not _scheduler_stop.is_set():
         state = _load_state()
         updated_at = state.get("updated_at")
         if updated_at != processed_update:
             processed_update = updated_at
-            if state.get("enabled"):
+            if state.get("enabled") and not _scheduler_stop.is_set():
                 _spawn_cycle()
         timed_out = not _wakeup.wait(timeout=_interval_from(state) * 60.0)
         _wakeup.clear()
-        if timed_out:
+        if timed_out and not _scheduler_stop.is_set():
             latest = _load_state()
             latest_update = latest.get("updated_at")
             if latest_update != processed_update:
@@ -315,6 +347,65 @@ def _spawn_cycle(graph_builder: Callable | None = None) -> str:
     _cycle_thread = thread
     thread.start()
     return "started"
+
+
+# --- candidate preflight ----------------------------------------------------
+
+
+def _preflight_candidates(
+    candidates: list[dict],
+    derivatives: Any | None,
+    *,
+    telemetry: CycleTelemetry | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Drop candidates that can never become an order, before the LLM pipeline.
+
+    In futures mode two kinds of screened candidate are guaranteed to end with
+    no order: stocks (the venue bridge only plans crypto) and symbols with no
+    live USDT-settled contract. Each one still costs a full 8-10 minute LLM
+    pipeline, which is how a cycle used to time out with its executable
+    candidates never analysed.
+
+    Returns ``(runnable, skipped)``. ``skipped`` entries are
+    ``{"ticker", "reason"}`` for the cycle summary and audit. A market-metadata
+    failure fails open: the per-candidate path re-checks and rejects on its own,
+    so an unreachable venue must not empty the cycle.
+    """
+    if derivatives is None:
+        return candidates, []  # spot mode: stocks still carry advisory value
+
+    bridge = getattr(derivatives, "_bridge", None)
+    if bridge is None:
+        return candidates, []
+
+    telemetry = telemetry or CycleTelemetry()
+    try:
+        with telemetry.span("preflight:futures_markets"):
+            markets = bridge.client().load_markets()
+    except Exception as exc:  # venue unreachable: leave the decision to the candidate path
+        logger.warning("autoloop preflight: futures markets unavailable (%s)", exc)
+        return candidates, []
+
+    runnable: list[dict] = []
+    skipped: list[dict] = []
+    for candidate in candidates:
+        ticker = str(candidate.get("ticker"))
+        asset_type = str(candidate.get("asset_type") or "crypto")
+        if asset_type != "crypto":
+            skipped.append({
+                "ticker": ticker,
+                "reason": "advisory only in futures mode — the venue bridge cannot plan a stock order",
+            })
+            continue
+        try:
+            bridge.futures_symbol_for(ticker, markets=markets)
+        except ValueError as exc:
+            reason = f"no active futures contract: {exc}"
+            skipped.append({"ticker": ticker, "reason": reason})
+            _record_futures_cycle_rejection(ticker, market_rejection_reason=str(exc))
+            continue
+        runnable.append(candidate)
+    return runnable, skipped
 
 
 def _run_cycle_locked(graph_builder: Callable | None = None) -> None:
@@ -424,16 +515,28 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             )
             _cycle_timeout(deadline, "screening")
         summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
+        _cycle_timeout(deadline, "venue setup")
+        with telemetry.span("venue_setup"):
+            bridge = _build_bridge(config)
+            derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
+
+        # Drop candidates that cannot end in an order before spending LLM time
+        # on them (futures mode: stocks and symbols without a live contract).
+        _cycle_timeout(deadline, "candidate preflight")
+        candidates, skipped = _preflight_candidates(candidates, derivatives, telemetry=telemetry)
+        if skipped:
+            summary["skipped"] = skipped
+            audit_log.record("autoloop_candidates_skipped", skipped=skipped)
+
         # Crypto candidates first: the venue bridge only executes crypto, so a
         # cycle that runs out of time must have already seen its executable
         # candidates rather than spending the budget on advisory-only stocks.
         # Stable sort — score order is preserved inside each group.
         candidates.sort(key=lambda entry: str(entry.get("asset_type") or "crypto") != "crypto")
+        # Cap after the drops: the screen returns a wider pool so filtering
+        # cannot leave the cycle with nothing to run.
+        candidates = candidates[:AUTO_TOP_N]
         summary["candidates"] = [str(entry["ticker"]) for entry in candidates]
-        _cycle_timeout(deadline, "venue setup")
-        with telemetry.span("venue_setup"):
-            bridge = _build_bridge(config)
-            derivatives = _build_derivatives_executor(config) if config.get("exec_derivatives") is True else None
         for candidate in candidates:
             _cycle_timeout(deadline, f"candidate {candidate.get('ticker')}")
             result = _run_candidate_with_timeout(
@@ -492,6 +595,9 @@ def _process_candidate(
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} start")
         futures_context = None
+        futures_account = None
+        futures_portfolio = None
+        execution_context = ""
         if asset_type == "crypto" and derivatives is not None:
             if deadline is not None:
                 _cycle_timeout(deadline, f"candidate {ticker} market context")
@@ -513,6 +619,25 @@ def _process_candidate(
                     phase="confirmation",
                 )
                 return result
+            with telemetry.span("futures_account", ticker):
+                try:
+                    futures_account = read_futures_account(derivatives._bridge)
+                except (PermissionError, ValueError) as exc:
+                    result.reason = f"futures_account_unavailable: {exc}"
+                    return result
+                futures_portfolio = _futures_portfolio(futures_account)
+            with telemetry.span("protective_bracket", ticker):
+                # Both directions: the agents need the engine's reference levels
+                # before they decide, and the entry path must reuse these reads
+                # rather than hitting the vendor a second time.
+                brackets = {
+                    "long": _bracket_prices(ticker, direction="long"),
+                    "short": _bracket_prices(ticker, direction="short"),
+                }
+            with telemetry.span("futures_decision_context", ticker):
+                execution_context = _futures_decision_context(
+                    futures_context, futures_account, ticker, config, brackets,
+                )
         with telemetry.span("graph_build", ticker):
             graph = build_graph(config, _ANALYSTS_CRYPTO if asset_type == "crypto" else _ANALYSTS_STOCK)
         with telemetry.span("graph_analysis", ticker):
@@ -521,9 +646,9 @@ def _process_candidate(
             parameters = inspect.signature(propagate).parameters
             if "telemetry" in parameters:
                 kwargs["telemetry"] = telemetry
-            if futures_context is not None and _accepts_market_snapshot(propagate):
-                kwargs["market_snapshot"] = futures_context
-            _, signal = propagate(ticker, _today_iso(), **kwargs)
+            if execution_context and _accepts_execution_context(propagate):
+                kwargs["execution_context"] = execution_context
+            state, signal = propagate(ticker, _today_iso(), **kwargs)
             if deadline is not None:
                 _cycle_timeout(deadline, f"candidate {ticker} analysis")
         result.signal = signal
@@ -534,10 +659,36 @@ def _process_candidate(
             )
             return result
         if derivatives is not None:
+            proposal = (
+                state.get("futures_execution_proposal")
+                if isinstance(state, dict) else None
+            )
+            intent = (
+                state.get("futures_execution_intent")
+                if isinstance(state, dict) else None
+            )
+            if intent is None:
+                intent = "structured_terms_unavailable"
+            if intent != "enter":
+                result.reason = {
+                    "abstain": "agent_abstained",
+                    "manage_existing": "position_management_only",
+                    "structured_terms_unavailable": "structured_terms_unavailable",
+                }.get(str(intent), f"invalid_futures_intent: {intent}")
+                _record_futures_cycle_rejection(
+                    ticker,
+                    unified_symbol=futures_context.get("unified_symbol"),
+                    signal=signal,
+                    signal_reason=result.reason,
+                    phase="proposal",
+                )
+                return result
             with telemetry.span("futures_planning", ticker):
                 _process_futures_candidate(
                     derivatives, ticker, signal, config, result,
-                    context=futures_context, deadline=deadline, cancelled=cancelled,
+                    context=futures_context, proposal=proposal,
+                    portfolio=futures_portfolio, brackets=brackets, intent=intent,
+                    deadline=deadline, cancelled=cancelled,
                     execution_lock=execution_lock, telemetry=telemetry,
                 )
             return result
@@ -602,6 +753,102 @@ def _candle_direction(candle: Any) -> str:
     if candle.close < candle.open:
         return "bearish"
     return "doji"
+
+
+def _futures_portfolio(snapshot: Any) -> PortfolioContext:
+    """Sizing book backed by the FUTURES wallet, not the spot balance.
+
+    ``ExchangeBridge.sync_portfolio`` reads the spot account, so sizing a
+    futures entry against it would risk money the derivatives wallet does not
+    hold. ``cash`` is the futures equity (wallet balance plus unrealized PnL);
+    open positions are deliberately not added again, because that equity
+    already contains their PnL and re-adding their notional would overstate
+    the denominator every percentage cap divides by. Open exposure is instead
+    reported to the decision agents in their context.
+    """
+    equity = snapshot.equity if snapshot.equity is not None else snapshot.available_balance
+    currency = snapshot.equity_currency or snapshot.available_balance_currency
+    return PortfolioContext(
+        cash=float(equity) if equity is not None else None,
+        currency=currency,
+    )
+
+
+def _direction_brackets(
+    ticker: str, brackets: dict | None = None,
+) -> tuple[tuple[float | None, float | None], tuple[float | None, float | None]]:
+    """(long, short) ATR brackets, reusing a caller's reads when supplied."""
+    if brackets is not None:
+        return brackets["long"], brackets["short"]
+    return _bracket_prices(ticker, direction="long"), _bracket_prices(ticker, direction="short")
+
+
+def _futures_decision_context(
+    market: dict, account: Any, ticker: str, config: dict,
+    brackets: dict | None = None,
+) -> str:
+    """Account, market, and hard-limit facts the futures agents decide against.
+
+    The agents own margin mode, leverage, and the risk/margin budgets, so they
+    need the real wallet and the venue's caps; the executor enforces the same
+    caps afterwards and refuses rather than substituting its own numbers.
+    """
+    def number(value: Any, suffix: str = "") -> str:
+        return f"{float(value):,.4f}{suffix}" if value is not None else "unavailable"
+
+    currency = account.equity_currency or account.available_balance_currency or ""
+    lines = [
+        f"Venue profile: {account.venue_profile or 'unreported'}",
+        f"Account scope: {account.account_scope}",
+        f"Futures equity: {number(account.equity, ' ' + currency if currency else '')}",
+        f"Available margin: {number(account.available_balance, ' ' + currency if currency else '')}",
+        f"Wallet balance: {number(account.wallet_balance, ' ' + currency if currency else '')}",
+        f"Unrealized PnL: {number(account.unrealized_pnl, ' ' + currency if currency else '')}",
+    ]
+    if account.positions:
+        lines.append("Open futures positions:")
+        for position in account.positions:
+            lines.append(
+                f"- {position.symbol} {position.side} contracts={position.contracts} "
+                f"entry={position.entry_price} mark={position.mark_price} "
+                f"leverage={position.leverage} margin_mode={position.margin_mode} "
+                f"uPnL={position.unrealized_pnl}"
+            )
+    else:
+        lines.append("Open futures positions: none")
+    lines.extend([
+        "",
+        f"Instrument: {market.get('unified_symbol')} (requested as {ticker})",
+        f"Closed 1h candle: open={market['one_hour'].open} high={market['one_hour'].high} "
+        f"low={market['one_hour'].low} close={market['one_hour'].close} "
+        f"direction={market.get('one_hour_direction')}",
+        f"Closed 4h candle: open={market['four_hour'].open} high={market['four_hour'].high} "
+        f"low={market['four_hour'].low} close={market['four_hour'].close} "
+        f"direction={market.get('four_hour_direction')}",
+    ])
+    long_bracket, short_bracket = _direction_brackets(ticker, brackets)
+    if long_bracket[0] is not None:
+        lines.append(f"Engine ATR bracket (long): stop={long_bracket[0]} target={long_bracket[1]}")
+    if short_bracket[0] is not None:
+        lines.append(f"Engine ATR bracket (short): stop={short_bracket[0]} target={short_bracket[1]}")
+    lines.extend([
+        "",
+        "Hard limits the execution layer enforces (a proposal outside them is refused, "
+        "not resized):",
+        f"- Maximum leverage: {MAX_AUTO_LEVERAGE:g}x",
+        f"- Maximum risk_fraction: {float(config.get('risk_derivatives_max_risk_fraction', 0.02)):g}",
+        f"- Maximum margin_fraction: {float(config.get('risk_derivatives_max_margin_fraction', 0.5)):g}",
+        f"- Maximum derivatives notional: "
+        f"{float(config.get('risk_max_derivatives_exposure_pct', 0.0)):g}% of equity",
+        f"- Maximum position per asset: "
+        f"{float(config.get('risk_max_position_pct_per_asset', 25.0)):g}% of equity",
+        f"- Maximum total exposure: "
+        f"{float(config.get('risk_max_total_exposure_pct', 80.0)):g}% of equity",
+        "A FuturesExecutionProposal is required for any entry: margin mode, leverage, "
+        "risk_fraction, margin_fraction, and an evidence-based rationale. Without one "
+        "no order is placed.",
+    ])
+    return "\n".join(lines)
 
 
 def _confirmation_state(context: dict, signal: str) -> tuple[bool, str]:
@@ -689,27 +936,122 @@ def _unified_mark_price(bridge: Any, symbol: str) -> float | None:
     return None
 
 
-def _accepts_market_snapshot(propagate: Callable) -> bool:
-    """Whether this graph's propagate() accepts the futures snapshot kwarg.
+def _accepts_execution_context(propagate: Callable) -> bool:
+    """Whether this graph's propagate() accepts the futures decision context.
 
     Signature inspection instead of sniffing the TypeError message: an
     unrelated TypeError that merely mentions the kwarg name must not
-    silently drop the futures context.
+    silently drop the account/market context the agents decide from.
     """
     try:
-        return "market_snapshot" in inspect.signature(propagate).parameters
+        return "execution_context" in inspect.signature(propagate).parameters
     except (TypeError, ValueError):
         return False
 
 
+def _proposal_terms(
+    proposal: Any, *, mark: float, direction: str, config: dict,
+) -> tuple[dict | None, str | None]:
+    """Validate the agents' futures terms; refuse instead of substituting.
+
+    The decision agents own these numbers. The cycle only checks that the
+    proposal exists, is internally consistent with the execution price, and
+    stays inside the system ceilings -- a proposal outside them is refused,
+    never silently clamped, because a clamped size would no longer be the
+    decision anyone made.
+    """
+    if not isinstance(proposal, dict) or not proposal:
+        return None, "agent_proposal_missing: no futures entry without agent execution terms"
+    margin_mode = str(proposal.get("margin_mode") or "").strip().lower()
+    rationale = str(proposal.get("rationale") or "").strip()
+    if not rationale:
+        return None, "agent_proposal_rejected: rationale is required"
+    if margin_mode not in ("isolated", "cross"):
+        return None, f"agent_proposal_rejected: margin_mode {margin_mode!r} is not isolated/cross"
+    try:
+        leverage_raw = proposal["leverage"]
+        leverage = float(leverage_raw)
+        risk_fraction = float(proposal["risk_fraction"])
+        margin_fraction = float(proposal["margin_fraction"])
+    except (KeyError, TypeError, ValueError):
+        return None, "agent_proposal_rejected: leverage, risk_fraction and margin_fraction are required"
+    if not isinstance(leverage_raw, int) or isinstance(leverage_raw, bool):
+        return None, "agent_proposal_rejected: leverage must be an integer"
+    if not all(math.isfinite(value) for value in (leverage, risk_fraction, margin_fraction)):
+        return None, "agent_proposal_rejected: numeric terms must be finite"
+    if leverage < 1 or leverage > MAX_AUTO_LEVERAGE:
+        return None, (
+            f"agent_proposal_rejected: leverage {leverage:g}x is outside "
+            f"1-{MAX_AUTO_LEVERAGE:g}x"
+        )
+    risk_cap = float(config.get("risk_derivatives_max_risk_fraction", 0.02))
+    margin_cap = float(config.get("risk_derivatives_max_margin_fraction", 0.5))
+    if not 0 < risk_fraction <= risk_cap:
+        return None, (
+            f"agent_proposal_rejected: risk_fraction {risk_fraction:g} is outside "
+            f"0-{risk_cap:g}"
+        )
+    if not 0 < margin_fraction <= margin_cap:
+        return None, (
+            f"agent_proposal_rejected: margin_fraction {margin_fraction:g} is outside "
+            f"0-{margin_cap:g}"
+        )
+    entry = proposal.get("entry_price")
+    if entry is not None:
+        try:
+            entry_value = float(entry)
+        except (TypeError, ValueError):
+            return None, "agent_proposal_rejected: entry_price is not a number"
+        if not math.isfinite(entry_value) or entry_value <= 0:
+            return None, "agent_proposal_rejected: entry_price must be positive and finite"
+        if abs(entry_value - mark) > max(mark * 0.001, 1e-12):
+            return None, "agent_proposal_rejected: non-market entry_price is unsupported by autoloop"
+    stop = proposal.get("stop_loss")
+    take = proposal.get("take_profit")
+    if (stop is not None) != (take is not None):
+        return None, "agent_proposal_rejected: stop_loss and take_profit must be proposed together"
+    if stop is not None:
+        try:
+            stop_value, take_value = float(stop), float(take)
+        except (TypeError, ValueError):
+            return None, "agent_proposal_rejected: stop_loss/take_profit are not numbers"
+        valid = (
+            stop_value < mark < take_value if direction == "long"
+            else stop_value > mark > take_value
+        )
+        if not valid:
+            return None, (
+                f"agent_proposal_rejected: {direction} bracket {stop_value}/{take_value} "
+                f"does not protect an entry at {mark}"
+            )
+    else:
+        stop_value = take_value = None
+    return {
+        "leverage": leverage,
+        "risk_fraction": risk_fraction,
+        "margin_fraction": margin_fraction,
+        "margin_mode": margin_mode,
+        "stop_loss": stop_value,
+        "take_profit": take_value,
+    }, None
+
+
 def _process_futures_candidate(
     derivatives: Any, ticker: str, signal: str, config: dict, result: DailyResult,
-    *, context: dict | None = None, deadline: float | None = None,
+    *, context: dict | None = None, proposal: Any = None, portfolio: Any = None,
+    brackets: dict | None = None, intent: str | None = None,
+    deadline: float | None = None,
     cancelled: threading.Event | None = None,
     execution_lock: threading.Lock | None = None,
     telemetry: CycleTelemetry | None = None,
 ) -> None:
-    """Run futures candidates through a prevalidated closed candle pair."""
+    """Run futures candidates through a prevalidated closed candle pair.
+
+    The entry terms come from the Portfolio Manager's FuturesExecutionProposal;
+    without one the candidate is rejected and durably recorded. The engine's
+    ATR bracket is the fallback only for the protective levels, never for the
+    margin mode, leverage, or budgets.
+    """
     telemetry = telemetry or CycleTelemetry()
     now = datetime.now(timezone.utc)
     context = context or _closed_futures_context(derivatives, ticker)
@@ -718,6 +1060,22 @@ def _process_futures_candidate(
         return
     candle_1h = context["one_hour"]
     candle_4h = context["four_hour"]
+    if intent is None:
+        intent = "structured_terms_unavailable"
+    if intent != "enter":
+        result.reason = {
+            "abstain": "agent_abstained",
+            "manage_existing": "position_management_only",
+            "structured_terms_unavailable": "structured_terms_unavailable",
+        }.get(str(intent), f"invalid_futures_intent: {intent}")
+        _record_futures_cycle_rejection(
+            ticker,
+            unified_symbol=context.get("unified_symbol"),
+            signal=signal,
+            signal_reason=result.reason,
+            phase="proposal",
+        )
+        return
     direction = _direction(signal)
     confirmation_ok, confirmation_reason = _confirmation_state(context, signal)
     if not confirmation_ok:
@@ -730,11 +1088,36 @@ def _process_futures_candidate(
         )
         return
     symbol = context["unified_symbol"]
+    if signal not in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT):
+        # No entry to decide, so no proposal is required and no cycle is
+        # claimed: burning the candle's cycle id on a Hold would block a later
+        # tradeable signal for the same closed pair.
+        result.reason = f"signal_not_tradeable: {signal}"
+        return
     with telemetry.span("futures_mark_price", ticker):
         mark = _unified_mark_price(derivatives._bridge, symbol)
-    with telemetry.span("protective_bracket", ticker):
-        stop, take = _bracket_prices(ticker, direction=direction)
-    if mark is None or stop is None or take is None:
+    if mark is None:
+        result.reason = "derivatives entry requires a price"
+        return
+    terms, proposal_error = _proposal_terms(
+        proposal, mark=mark, direction=direction, config=config,
+    )
+    if terms is None:
+        result.reason = proposal_error
+        _record_futures_cycle_rejection(
+            ticker,
+            unified_symbol=symbol,
+            signal=signal,
+            signal_reason=proposal_error,
+            phase="proposal",
+        )
+        return
+    stop, take = terms["stop_loss"], terms["take_profit"]
+    if stop is None or take is None:
+        with telemetry.span("protective_bracket", ticker):
+            long_bracket, short_bracket = _direction_brackets(ticker, brackets)
+            stop, take = long_bracket if direction == "long" else short_bracket
+    if stop is None or take is None:
         result.reason = "derivatives entry requires price and protective bracket"
         return
     if not (stop < mark < take if direction == "long" else stop > mark > take):
@@ -766,6 +1149,7 @@ def _process_futures_candidate(
             "confirmation_result": True,
             "confirmation_reason": "aligned_direction" if signal in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT) else "not_required_for_non_tradeable_signal",
             "snapshot": _snapshot_payload(context),
+            "agent_proposal": _snapshot_payload(proposal) if isinstance(proposal, dict) else {},
         },
     ):
         result.reason = "duplicate futures signal skipped"
@@ -774,11 +1158,15 @@ def _process_futures_candidate(
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} futures planning")
         with telemetry.span("portfolio_sync", ticker):
-            portfolio = derivatives._bridge.sync_portfolio()
+            book = portfolio if portfolio is not None else derivatives._bridge.sync_portfolio()
         with telemetry.span("planning", ticker):
             plan = derivatives.plan_order(
-                ticker, signal, portfolio=portfolio, price=mark,
-                leverage=_auto_leverage(config), stop_loss=stop, take_profit=take,
+                ticker, signal, portfolio=book, price=mark,
+                leverage=terms["leverage"], stop_loss=stop, take_profit=take,
+                risk_fraction=terms["risk_fraction"],
+                margin_fraction=terms["margin_fraction"],
+                margin_mode=terms["margin_mode"],
+                futures_execution_intent=intent,
             )
         result.plan = plan
         if deadline is not None:
@@ -787,7 +1175,7 @@ def _process_futures_candidate(
             _handle_plan(
                 derivatives,
                 plan,
-                portfolio,
+                book,
                 result,
                 execute_guard=lambda execute: _execute_with_deadline(
                     execute, deadline, cancelled, execution_lock
@@ -811,6 +1199,7 @@ def _process_futures_candidate(
                 "executed": result.executed,
                 "order_id": result.order_id,
                 "protection_state": protection_state,
+                "agent_proposal": _snapshot_payload(proposal),
                 "plan": getattr(plan, "__dict__", {}),
             },
             terminal=True,
@@ -830,23 +1219,6 @@ def _process_futures_candidate(
             terminal=True,
         )
         raise
-
-
-def recover_pending_brackets() -> list[dict]:
-    """Retry durable bracket tasks without recreating an entry order."""
-    config = get_config()
-    if config.get("exec_derivatives") is not True or not _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES"):
-        return []
-    executor = _build_derivatives_executor(config)
-    outcomes = []
-    for task in job_store.pending_bracket_recoveries():
-        task_id = task["task_id"]
-        try:
-            status = executor.recover_bracket(task_id, confirm=True)
-        except Exception as exc:
-            status = f"error:{type(exc).__name__}:{exc}"
-        outcomes.append({"task_id": task_id, "status": status})
-    return outcomes
 
 
 def _default_graph_builder(config: dict, analysts: tuple[str, ...]) -> Any:
@@ -873,18 +1245,13 @@ def _build_derivatives_executor(config: dict) -> Any:
     return DerivativesExecutor(config=config)
 
 
-def _auto_leverage(config: dict) -> float:
-    """Leverage the cycle requests from the derivatives path: the configured
-    ``risk_max_derivatives_leverage`` clamped to MAX_AUTO_LEVERAGE. A missing
-    config entry means 1x — the same default as RiskLimits."""
-    raw = config.get("risk_max_derivatives_leverage")
-    configured = 1.0 if raw is None else float(raw)
-    return min(configured, MAX_AUTO_LEVERAGE)
-
-
 def _direction(signal: str) -> str:
-    """Bracket direction for a 5-tier signal: Sell/Underweight open shorts on
-    the derivatives path, so their bracket mirrors the long side."""
+    """Map an authorized entry rating to its futures bracket direction.
+
+    Sell/Underweight become short only after the separate PM intent gate has
+    explicitly authorized a fresh ``enter`` decision; the rating alone is not
+    a futures authorization.
+    """
     return "short" if signal in (_SELL, _UNDERWEIGHT) else "long"
 
 

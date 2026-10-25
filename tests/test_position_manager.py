@@ -30,16 +30,14 @@ def test_short_management_uses_buy_reduce_only_actions():
     assert commands[-1].quantity <= 3
 
 
-def test_restart_reloads_durable_orders_and_duplicate_ticks_are_idempotent(monkeypatch, tmp_path):
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "positions.sqlite3")
+def test_restart_reloads_durable_orders_and_duplicate_ticks_are_idempotent(postgres_schema):
     adapter = FakePositionAdapter(PositionSnapshot("BTC-long", "long", 100, 2, 95, (110, 120), 110))
     assert PositionManager(adapter, trail_distance=3, state_store=job_store).tick("BTC-long")
     assert PositionManager(adapter, trail_distance=3, state_store=job_store).tick("BTC-long") == []
     assert len(adapter.commands) == 3
 
 
-def test_reconcile_uses_exchange_quantity_after_partial_fill(monkeypatch, tmp_path):
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "positions.sqlite3")
+def test_reconcile_uses_exchange_quantity_after_partial_fill(postgres_schema):
     adapter = FakePositionAdapter(PositionSnapshot("BTC-long", "long", 100, 2, 95, (110, 120), 110))
     PositionManager(adapter, state_store=job_store).tick("BTC-long")
     adapter.current = PositionSnapshot("BTC-long", "long", 100, 1, 95, (110, 120), 120, revision=1, completed_targets=(0,))
@@ -48,8 +46,7 @@ def test_reconcile_uses_exchange_quantity_after_partial_fill(monkeypatch, tmp_pa
     assert commands[0].quantity == 1
 
 
-def test_restart_saves_new_management_orders_using_durable_revision(monkeypatch, tmp_path):
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "positions.sqlite3")
+def test_restart_saves_new_management_orders_using_durable_revision(postgres_schema):
     adapter = FakePositionAdapter(PositionSnapshot(
         "BTC-long", "long", 100, 2, 95, (110, 120), 100, revision=0,
     ))
@@ -70,8 +67,25 @@ def test_restart_saves_new_management_orders_using_durable_revision(monkeypatch,
     assert durable["orders"]
 
 
-def test_flat_venue_position_deletes_its_durable_snapshot(monkeypatch, tmp_path):
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "positions.sqlite3")
+def test_position_manager_ignores_durable_policy_metadata_not_in_snapshot_model(postgres_schema):
+    store = job_store
+    position_key = "BTC-long"
+    store.persist_futures_entry_state(
+        position_key, side="long", entry=100, quantity=2, stop=95,
+        targets=[110], mark=100, order_id="entry-1",
+    )
+    durable = store.load_position_state(position_key)
+    durable["snapshot"].update({
+        "initial_stop": 95,
+        "current_target": 110,
+        "observed_at": "2026-10-19T00:00:00+00:00",
+    })
+    store.save_position_state(position_key, durable["revision"], durable)
+    adapter = FakePositionAdapter(PositionSnapshot(position_key, "long", 100, 2, 95, (110,), 100))
+
+    assert PositionManager(adapter, state_store=store).tick(position_key) == []
+
+
     store = job_store
     store.persist_futures_entry_state(
         "BTC-long", side="long", entry=100, quantity=2, stop=95,
@@ -83,6 +97,5 @@ def test_flat_venue_position_deletes_its_durable_snapshot(monkeypatch, tmp_path)
     assert store.load_position_state("BTC-long") is None
 
 
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "positions.sqlite3")
     assert job_store.save_position_state("BTC-long", 0, {"snapshot": {}, "orders": []})
     assert not job_store.save_position_state("BTC-long", 0, {"snapshot": {}, "orders": []})

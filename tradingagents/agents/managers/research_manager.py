@@ -56,6 +56,10 @@ Write these sections, in this order, starting with the recommendation on its own
             prompt,
             render_research_plan,
             "Research Manager",
+            structured_retry_instruction=(
+                "Return the ResearchPlan schema now. Do not answer with prose outside the "
+                "schema fields; keep recommendation, rationale, and strategic_actions explicit."
+            ),
         )
 
         new_investment_debate_state = {

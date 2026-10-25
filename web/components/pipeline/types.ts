@@ -1,7 +1,13 @@
 // Wire types cho màn M2 — khớp docs/ui-api-contract.md §3 và server/runs.py.
 // Chỉ mô tả dữ liệu trao đổi với backend; không chứa logic.
 
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
 
 export type RunMode = "live" | "mock";
 
@@ -58,7 +64,8 @@ export type RunEventType =
   | "risk_update"
   | "pm_decision"
   | "run_completed"
-  | "run_failed";
+  | "run_failed"
+  | "run_interrupted";
 
 /** Một event SSE (bên trong `data:` JSON — server/runs.py:126-141). */
 export interface RunEvent {

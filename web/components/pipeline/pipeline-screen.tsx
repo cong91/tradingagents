@@ -29,6 +29,7 @@ const STATUS_LABELS: Record<string, string> = {
   completed: "Hoàn tất",
   failed: "Thất bại",
   cancelled: "Đã huỷ",
+  interrupted: "Bị gián đoạn",
 };
 
 const ASSET_LABELS: Record<string, string> = {
@@ -50,11 +51,12 @@ function RunMeta({ run }: { run: RunPayload }) {
       <Badge variant={run.mode === "mock" ? "outline" : "secondary"}>
         {run.mode === "mock" ? "Mock (không gọi LLM)" : "Live (gọi LLM thật)"}
       </Badge>
-      <Badge
+          <Badge
         variant="outline"
         aria-live="polite"
         className={cn(
           run.status === "failed" && "border-loss/40 text-loss",
+          run.status === "interrupted" && "border-amber-500/40 text-amber-700 dark:text-amber-400",
           run.status === "completed" && "border-profit/40 text-profit",
         )}
       >
@@ -172,7 +174,10 @@ export function PipelineScreen() {
               Đang gửi yêu cầu tới backend…
             </p>
           )}
-          {(phase.phase === "streaming" || phase.phase === "completed" || phase.phase === "failed") &&
+          {(phase.phase === "streaming" ||
+            phase.phase === "completed" ||
+            phase.phase === "failed" ||
+            phase.phase === "interrupted") &&
             state.run && (
               <>
                 <RunMeta run={state.run} />
@@ -182,7 +187,7 @@ export function PipelineScreen() {
                     <StageTracker events={state.events} status={state.run.status} />
                   </>
                 )}
-                {(phase.phase === "completed" || phase.phase === "failed") && (
+                {(phase.phase === "completed" || phase.phase === "failed" || phase.phase === "interrupted") && (
                   <RunSummary run={state.run} onNewRun={reset} />
                 )}
               </>

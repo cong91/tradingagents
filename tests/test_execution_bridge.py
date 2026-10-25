@@ -105,6 +105,12 @@ class FakeExchange:
         return self.balance
 
 
+class BybitBalanceExchange(FakeExchange):
+    def fetch_balance(self, params=None):
+        self.calls.append(("fetch_balance", params))
+        return self.balance
+
+
 def make_bridge(tmp_path, monkeypatch, *, config=None, factory=None, env=None, risk_guard=None):
     """A bridge whose audit log lives in tmp_path, execution env scrubbed."""
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
@@ -1128,6 +1134,63 @@ def test_sync_portfolio_maps_known_coins_and_skips_unknown(tmp_path, monkeypatch
     assert book.cash == 1_000.0
     assert book.currency == "USDT"
     assert exchange.calls[0][0] == "fetch_balance"
+
+
+def test_bybit_spot_sync_rejects_unified_balance_scope(tmp_path, monkeypatch):
+    exchange = BybitBalanceExchange(balance={
+        "info": {"result": {"list": [{
+            "accountType": "UNIFIED",
+            "coin": [{"coin": "BTC", "walletBalance": "0.5"}],
+        }]}},
+        "total": {"BTC": 0.5, "USDT": 1_000.0},
+        "free": {"BTC": 0.5, "USDT": 1_000.0},
+    })
+    bridge = make_bridge(
+        tmp_path, monkeypatch, config={"exec_exchange_id": "bybit"},
+        factory=lambda: exchange,
+    )
+
+    with pytest.raises(RuntimeError, match="spot-only snapshot unavailable.*UNIFIED"):
+        bridge.sync_portfolio()
+
+    assert exchange.calls == [("fetch_balance", {"type": "spot"})]
+
+
+def test_bybit_spot_sync_accepts_explicit_spot_balance_scope(tmp_path, monkeypatch):
+    exchange = BybitBalanceExchange(balance={
+        "info": {"result": {"list": [{
+            "accountType": "SPOT",
+            "coin": [{"coin": "BTC", "walletBalance": "0.5"}],
+        }]}},
+        "total": {"BTC": 0.5, "USDC": 1_000.0},
+        "free": {"BTC": 0.5, "USDC": 900.0},
+    })
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_exchange_id": "bybit", "exec_quote_currency": "USDC"},
+        factory=lambda: exchange,
+    )
+
+    book = bridge.sync_portfolio()
+
+    assert {position.ticker for position in book.positions} == {"BTC-USD"}
+    assert book.cash == 900.0
+    assert book.currency == "USDC"
+    assert exchange.calls == [("fetch_balance", {"type": "spot"})]
+
+
+def test_bybit_spot_sync_rejects_untyped_balance_scope(tmp_path, monkeypatch):
+    exchange = BybitBalanceExchange(balance={
+        "total": {"BTC": 0.5, "USDT": 1_000.0},
+        "free": {"BTC": 0.5, "USDT": 1_000.0},
+    })
+    bridge = make_bridge(
+        tmp_path, monkeypatch, config={"exec_exchange_id": "bybit"},
+        factory=lambda: exchange,
+    )
+
+    with pytest.raises(RuntimeError, match="spot-only snapshot unavailable.*unknown"):
+        bridge.sync_portfolio()
 
 
 def test_sync_portfolio_tickers_match_position_lookup(tmp_path, monkeypatch):

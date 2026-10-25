@@ -22,9 +22,7 @@ from fastapi.testclient import TestClient
 
 from server import (
     daily as daily_mod,
-    db as db_mod,
     job_store,
-    paths as server_paths,
     run_store,
     runs as runs_mod,
 )
@@ -81,17 +79,12 @@ def _today() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _server_state(tmp_path, monkeypatch):
+def _server_state(tmp_path, monkeypatch, postgres_schema):
     """Point all server state — files and database — at tmp."""
-    monkeypatch.setattr(server_paths, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server_paths, "WATCHLIST_PATH", tmp_path / "watchlist.json")
-    monkeypatch.setattr(server_paths, "APPROVALS_PATH", tmp_path / "approvals.jsonl")
-    monkeypatch.setattr(server_paths, "SERVER_AUDIT_PATH", tmp_path / "server-audit.jsonl")
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
     # Each test gets a fresh file, so the once-per-path schema guard must reset
     # with it — otherwise the second test would skip CREATE TABLE on a new file.
-    monkeypatch.setattr(db_mod, "_initialized_for", None)
 
 
 @pytest.fixture()
@@ -100,9 +93,9 @@ def client(_server_state):
         yield test_client
 
 
-def _drain_sse(client: TestClient, url: str) -> list[dict]:
+def _drain_sse(client: TestClient, url: str, headers: dict | None = None) -> list[dict]:
     events = []
-    with client.stream("GET", url) as response:
+    with client.stream("GET", url, headers=headers) as response:
         assert response.status_code == 200
         for line in response.iter_lines():
             if line.startswith("data: "):
@@ -237,6 +230,31 @@ def test_job_and_its_agent_output_survive_a_restart(client, tmp_path):
     assert result["plan"]["side"] == "buy"  # the plan the agent produced, in full
     assert result["approval_id"]
     assert result["mock_source"].startswith("replay:")
+
+
+def test_finish_persists_terminal_row_before_exposing_it(monkeypatch):
+    """The API reads the live job first: flipping its status terminal before
+    the database write lets a poll see "completed" while the restart record
+    still says "running"."""
+    job = daily_mod.DailyJobState(
+        job_id="d_order", mode="mock", tickers=["BTC-USD"],
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    job.status = "running"
+    observed: list[tuple[str, str]] = []
+    real_persist = job_store.persist
+
+    def spy(payload):
+        observed.append((payload["status"], job.status))
+        real_persist(payload)
+
+    monkeypatch.setattr(daily_mod.job_store, "persist", spy)
+
+    daily_mod._finish(job)
+
+    assert observed == [("completed", "running")]
+    assert job.status == "completed"
+    assert job_store.load("d_order")["status"] == "completed"
 
 
 def test_job_progress_heartbeat_and_current_ticker_survive_restart(client):
@@ -379,9 +397,36 @@ def test_orphaned_run_is_reconciled_at_startup(client):
         "analysts": list(run.analysts), "created_at": run.created_at, "finished_at": None,
     })
 
+    run_store.append_event("r_orphan", {
+        "seq": 1,
+        "ts": f"{_today()}T00:00:01+00:00",
+        "type": "message",
+        "role": "analyst",
+        "stage": "analyst",
+        "agent": "Market Analyst",
+        "replay": False,
+        "payload": {"content": "partial evidence"},
+    })
+
     assert runs_mod.reconcile() == ["r_orphan"]
-    assert client.get("/api/runs/r_orphan").json()["status"] == "interrupted"
+    detail = client.get("/api/runs/r_orphan").json()
+    assert detail["status"] == "interrupted"
+    assert detail["error"]["code"] == "interrupted"
     assert client.get("/api/runs").json()["active_run_id"] is None
+    events = _drain_sse(client, "/api/runs/r_orphan/events")
+    assert [event["seq"] for event in events] == [1, 2]
+    assert events[0]["type"] == "message"
+    assert events[-1]["type"] == "run_interrupted"
+    assert events[-1]["payload"]["error"]["code"] == "interrupted"
+    resumed = _drain_sse(
+        client,
+        "/api/runs/r_orphan/events",
+        headers={"Last-Event-ID": "1"},
+    )
+    assert [event["seq"] for event in resumed] == [2]
+    assert run_store.load_events("r_orphan", after_seq=1)[0]["type"] == "run_interrupted"
+    assert runs_mod.reconcile() == []
+    assert [event["seq"] for event in run_store.load_events("r_orphan")] == [1, 2]
 
 
 def test_job_results_are_replaced_not_duplicated(client, tmp_path):

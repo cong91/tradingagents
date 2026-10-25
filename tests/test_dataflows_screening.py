@@ -216,6 +216,7 @@ def test_crypto_universe_via_module_seam(monkeypatch):
                 "BTC/USDT": {"quoteVolume": 1_000_000_000},
                 "USDC/USDT": {"quoteVolume": 3_000_000_000},
                 "DOGE/USDT": {"quoteVolume": 82_000_000},
+                "RLUSD/USDT": {"quoteVolume": 40_000_000},
                 "ZEC/USDT": {"quoteVolume": 4_000_000},
                 "ETH/BTC": {"quoteVolume": 9_000_000_000},
             }
@@ -232,7 +233,43 @@ def test_crypto_universe_via_module_seam(monkeypatch):
     )
     assert exchange.demo_enabled is True
     assert exchange.urls["api"]["public"].startswith("https://demo-api.binance.com/")
-    assert universe == ["BTC-USD", "DOGE-USD"]  # stablecoin dropped, thin dropped, non-USDT dropped
+    # stablecoin dropped, RLUSD stablecoin dropped, thin dropped, non-USDT dropped
+    assert universe == ["BTC-USD", "DOGE-USD"]
+
+
+def test_crypto_universe_volume_floor_excludes_mid_liquidity_pairs(monkeypatch):
+    """A pair above the old 5M floor but below the 10M floor stays out: the
+    universe pool is for assets that can actually carry an order."""
+    import sys
+    import types
+
+    class FakeExchange:
+        symbols = ["BTC/USDT", "LOW/USDT", "OK/USDT"]
+
+        def __init__(self, config):
+            self.demo_enabled = False
+
+        def enable_demo_trading(self, enabled):
+            self.demo_enabled = enabled
+
+        def market(self, symbol):
+            return {"base": symbol.split("/", 1)[0]}
+
+        def fetch_tickers(self):
+            return {
+                "BTC/USDT": {"quoteVolume": 1_000_000_000},
+                "LOW/USDT": {"quoteVolume": 7_000_000},   # above old 5M, below 10M
+                "OK/USDT": {"quoteVolume": 12_000_000},   # above the floor
+            }
+
+    fake_ccxt = types.SimpleNamespace(binance=FakeExchange)
+    monkeypatch.setitem(sys.modules, "ccxt", fake_ccxt)
+
+    universe = screening.crypto_universe(
+        {"exec_exchange_id": "binance", "exec_base_url": "https://demo-api.binance.com"},
+        top_n=5,
+    )
+    assert universe == ["BTC-USD", "OK-USD"]
 
 
 def test_crypto_universe_uses_production_only_when_configured(monkeypatch):

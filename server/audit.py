@@ -3,8 +3,8 @@
 Two concerns, one domain: reading the append-only execution audit JSONL the
 RiskGuard replays (``exec_log_path``, default ``~/.tradingagents/execution/
 audit.jsonl``), and appending the server's own action trail for every
-state-changing API action (``server/data/audit.jsonl``). Reading never fails
-open for the UI: an unreadable existing log answers ``503
+state-changing API action (PostgreSQL, see ``server/control_store.py``).
+Reading never fails open for the UI: an unreadable existing log answers ``503
 audit_log_unreadable``, consistent with the execute-time fail-closed read
 (risk.py:122-147). A missing log is a fresh install, not an error.
 """
@@ -15,17 +15,16 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query
 
-from server import paths
+from server import control_store
 from server.contract import ApiError, utc_now_iso
 from tradingagents.dataflows.config import get_config
-from tradingagents.execution.audit import append_event
 
 router = APIRouter(prefix="/api", tags=["audit"])
 
 
 def record(action: str, **details) -> None:
-    """Append one line to the server's own action trail (UTF-8 JSONL)."""
-    append_event(paths.SERVER_AUDIT_PATH, {
+    """Append one server action trail event to PostgreSQL."""
+    control_store.append_server_audit({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
         **details,

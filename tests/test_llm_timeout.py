@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import socket
 
@@ -76,8 +77,20 @@ def test_stream_transport_errors_are_retryable(error):
 
 
 @pytest.mark.unit
-def test_http_bad_request_is_not_retryable():
-    assert openai_client._is_connection_error(ValueError("bad_response_status_code")) is False
+@pytest.mark.parametrize("error", [
+    json.JSONDecodeError("empty relay event", "", 0),
+    ValueError("bad_response_status_code"),
+])
+def test_stream_error_retry_classification(error):
+    expected = isinstance(error, json.JSONDecodeError)
+    assert openai_client._is_connection_error(error) is expected
+
+
+@pytest.mark.unit
+def test_wrapped_json_decode_error_is_retryable():
+    outer = RuntimeError("relay parser failed")
+    outer.__cause__ = json.JSONDecodeError("truncated", "{", 1)
+    assert openai_client._is_connection_error(outer) is True
 
 
 @pytest.mark.unit
@@ -116,6 +129,28 @@ def _relay_chunk(content, *, status=None, incomplete_details=None):
     return ChatGenerationChunk(
         message=AIMessageChunk(content=content, response_metadata=metadata)
     )
+
+
+@pytest.mark.unit
+def test_invoke_retries_json_decode_error_and_discards_partial_stream(monkeypatch):
+    from langchain_openai import ChatOpenAI
+
+    monkeypatch.setattr(openai_client, "_CONNECTION_RETRY_WAIT", 0.0)
+    calls = 0
+
+    def stream(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield _relay_chunk("partial response")
+            raise json.JSONDecodeError("empty relay event", "", 0)
+        yield _relay_chunk("complete response", status="completed")
+
+    monkeypatch.setattr(ChatOpenAI, "_stream", stream)
+    response = _relay_model().invoke("Analyze market conditions")
+
+    assert calls == 2
+    assert response.content == "complete response"
 
 
 @pytest.mark.unit

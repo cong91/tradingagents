@@ -1,12 +1,54 @@
 services:
-  tradingagents:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tradingagents}
+      POSTGRES_USER: ${POSTGRES_USER:-tradingagents}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - tradingagents_postgres:/var/lib/postgresql/data
+    # Loopback-only by default so the one-off SQLite importer can run from the
+    # host. Set TRADINGAGENTS_POSTGRES_PORT empty to keep it off the host.
+    ports:
+      - "127.0.0.1:${TRADINGAGENTS_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tradingagents} -d ${POSTGRES_DB:-tradingagents}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
     build: .
     env_file:
       - .env
+    environment:
+      TRADINGAGENTS_DATABASE_URL: postgresql://${POSTGRES_USER:-tradingagents}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tradingagents}
+      TRADINGAGENTS_EXEC_LOG_PATH: /home/appuser/.tradingagents/execution/audit.jsonl
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${TRADINGAGENTS_API_PORT:-8000}:8000"
     volumes:
+      # Engine-owned artifacts only (reports, cache, memory log, checkpoints and
+      # the RiskGuard execution audit). Every control-panel record — including
+      # operator overrides — lives in PostgreSQL, so no server/data mount.
       - ${TRADINGAGENTS_DATA_DIR:-tradingagents_data}:/home/appuser/.tradingagents
-    tty: true
-    stdin_open: true
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      args:
+        API_INTERNAL_URL: http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "${TRADINGAGENTS_WEB_PORT:-3000}:3000"
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -20,17 +62,21 @@ services:
     env_file:
       - .env
     environment:
-      - TRADINGAGENTS_LLM_PROVIDER=ollama
-      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      TRADINGAGENTS_LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      TRADINGAGENTS_DATABASE_URL: postgresql://${POSTGRES_USER:-tradingagents}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tradingagents}
+      TRADINGAGENTS_EXEC_LOG_PATH: /home/appuser/.tradingagents/execution/audit.jsonl
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
     volumes:
       - ${TRADINGAGENTS_DATA_DIR:-tradingagents_data}:/home/appuser/.tradingagents
-    depends_on:
-      - ollama
-    tty: true
-    stdin_open: true
     profiles:
       - ollama
 
 volumes:
   tradingagents_data:
+  tradingagents_postgres:
   ollama_data:

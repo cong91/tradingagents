@@ -78,8 +78,7 @@ def test_short_risk_sizing_and_precision_caps():
         )
 
 
-def test_signal_claim_is_atomic_terminal_and_expired_lease_recoverable(tmp_path, monkeypatch):
-    monkeypatch.setattr("server.paths.db_path", lambda: tmp_path / "control.db")
+def test_signal_claim_is_atomic_terminal_and_expired_lease_recoverable(postgres_schema):
     now = "2026-10-07T00:00:00+00:00"
     assert job_store.claim_futures_signal("signal-1", now=now, lease_until="2026-10-07T01:00:00+00:00")
     assert not job_store.claim_futures_signal("signal-1", now=now, lease_until="2026-10-07T02:00:00+00:00")

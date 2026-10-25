@@ -243,6 +243,26 @@ class TestCheckpointSignature(unittest.TestCase):
         # never fire.
         self.assertIn("analysts=parallel", base)
 
+    def test_run_signature_invalidates_a_changed_futures_execution_context(self):
+        """A resumed run must not reuse a decision made against another
+        account balance or market snapshot."""
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        g = object.__new__(TradingAgentsGraph)
+        g.selected_analysts = ("market", "news")
+        g.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
+
+        first = g._run_signature("crypto", execution_context="Futures equity: 1000 USDT")
+        same = g._run_signature("crypto", execution_context="Futures equity: 1000 USDT")
+        changed = g._run_signature("crypto", execution_context="Futures equity: 1200 USDT")
+        absent = g._run_signature("crypto")
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, changed)
+        self.assertNotEqual(first, absent)
+        # The raw context never reaches the thread id.
+        self.assertNotIn("1000", first)
+
 
 if __name__ == "__main__":
     unittest.main()

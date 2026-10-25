@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -56,14 +57,10 @@ def _is_connection_error(exc: Exception) -> bool:
             )
         ):
             return True
-        if name in (
+        if isinstance(current, json.JSONDecodeError) or name in (
             "APIConnectionError", "APIConnectionErrorWrapper",
             "OpenAIConnectionError", "OpenAITimeoutError", "RemoteProtocolError",
             "ConnectError", "ConnectionError", "TimeoutError",
-            # Relays intermittently answer with an empty or truncated body
-            # that dies at JSON parse instead of raising a connection error;
-            # same mid-pipeline abort, same bounded-retry treatment.
-            "JSONDecodeError",
         ):
             return True
         cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
@@ -197,10 +194,11 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
                 wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
                 logger.warning(
                     "relay stream attempt failed before completion "
-                    "(attempt %d/%d, %s); retrying in %.1fs",
+                    "(attempt %d/%d, %s: %s); retrying in %.1fs",
                     attempt + 1,
                     _CONNECTION_RETRIES,
                     type(exc).__name__,
+                    str(exc)[:200],
                     wait,
                 )
                 if wait:
@@ -237,10 +235,11 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
                 wait = _CONNECTION_RETRY_WAIT * (attempt + 1)
                 logger.warning(
                     "async relay stream attempt failed before completion "
-                    "(attempt %d/%d, %s); retrying in %.1fs",
+                    "(attempt %d/%d, %s: %s); retrying in %.1fs",
                     attempt + 1,
                     _CONNECTION_RETRIES,
                     type(exc).__name__,
+                    str(exc)[:200],
                     wait,
                 )
                 if wait:
