@@ -15,6 +15,11 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_QUICK_THINK_PROVIDER":      "quick_think_provider",
     "TRADINGAGENTS_DEEP_THINK_BACKEND_URL":    "deep_think_backend_url",
     "TRADINGAGENTS_QUICK_THINK_BACKEND_URL":   "quick_think_backend_url",
+    # OpenRouter-only fallback chain per tier, comma-separated model IDs tried
+    # in order after the tier's primary model (sent as the request's "models"
+    # list, so OpenRouter fails over on 429/5xx/unavailable upstreams).
+    "TRADINGAGENTS_QUICK_FALLBACK_MODELS": "quick_fallback_models",
+    "TRADINGAGENTS_DEEP_FALLBACK_MODELS":  "deep_fallback_models",
     "TRADINGAGENTS_LLM_BACKEND_URL":      "backend_url",
     # Wire protocol for OpenAI-compatible endpoints: "chat" (default) speaks
     # Chat Completions; "responses" switches to /responses for endpoints that
@@ -152,6 +157,10 @@ def build_default_config() -> dict:
         "deep_think_provider": None,
         "quick_think_backend_url": None,
         "deep_think_backend_url": None,
+        # OpenRouter fallback chains (comma-separated model IDs; "" = primary
+        # only). Ignored for every other provider.
+        "quick_fallback_models": "",
+        "deep_fallback_models": "",
         # Provider-specific thinking configuration
         "google_thinking_level": None,      # "high", "minimal", etc.
         "openai_reasoning_effort": None,    # "medium", "high", "low"

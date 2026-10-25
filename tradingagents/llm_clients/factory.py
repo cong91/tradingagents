@@ -179,6 +179,13 @@ def tier_provider(config: dict, tier: str) -> str:
     return (config.get(f"{tier}_think_provider") or config["llm_provider"]).lower()
 
 
+def _fallback_models(config: dict, tier: str) -> list[str]:
+    """The tier's OpenRouter fallback chain from a comma-separated config value."""
+    raw = config.get(f"{tier}_fallback_models") or ""
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return [item.strip() for item in items if str(item).strip()]
+
+
 def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
     """The client for the ``quick`` or ``deep`` model tier (#1440).
 
@@ -192,5 +199,8 @@ def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
     else:
         base_url = config.get(f"{tier}_think_backend_url")
     kwargs = build_llm_kwargs({**config, "llm_provider": provider})
+    fallbacks = _fallback_models(config, tier)
+    if provider == "openrouter" and fallbacks:
+        kwargs["fallback_models"] = fallbacks
     return create_llm_client(provider=provider, model=config[f"{tier}_think_llm"], base_url=base_url,
                              **kwargs, **extra)
