@@ -6,11 +6,13 @@
 import {
   baseAssetOf,
   formatQuantityValue,
-  formatTimestampVi,
+  formatTimestamp,
   formatUsdPrice,
 } from "@/lib/format";
 
-export { formatTimestampVi as formatTimestamp };
+import { getMessages } from "@/lib/i18n/messages";
+
+export { formatTimestamp };
 
 /** "BTC-USD" → "BTC" (đơn vị của quantity). */
 export function baseAsset(ticker: string): string {
@@ -35,11 +37,13 @@ export function formatCashFlow(side: string, cost: number): string {
 }
 
 export function cashFlowLabel(side: string): string {
-  return side.toLowerCase() === "sell" ? "Tiền vào" : "Tiền ra";
+  const m = getMessages().scanner;
+  return side.toLowerCase() === "sell" ? m.cashIn : m.cashOut;
 }
 
 export function sideLabel(side: string): string {
-  return side.toLowerCase() === "sell" ? "Bán" : "Mua";
+  const m = getMessages().common;
+  return side.toLowerCase() === "sell" ? m.sell : m.buy;
 }
 
 export function elapsedLabel(fromIso: string, nowMs: number): string {
@@ -47,28 +51,14 @@ export function elapsedLabel(fromIso: string, nowMs: number): string {
   if (Number.isNaN(start)) return "";
   const seconds = Math.max(0, Math.floor((nowMs - start) / 1000));
   const minutes = Math.floor(seconds / 60);
-  if (minutes >= 1) return `${minutes} phút ${seconds % 60} giây`;
-  return `${seconds} giây`;
+  const m = getMessages().common;
+  if (minutes >= 1) return m.minutesSeconds(minutes, seconds % 60);
+  return m.seconds(seconds);
 }
 
-/** Nhãn tiếng Việt cho trạng thái job (contract §5 rev 7). */
+/** Nhãn trạng thái job theo locale (contract §5 rev 7); trạng thái lạ → nguyên văn. */
 export function jobStatusLabel(status: string): string {
-  switch (status) {
-    case "queued":
-      return "Đang chờ";
-    case "running":
-      return "Đang chạy";
-    case "completed":
-      return "Hoàn tất";
-    case "failed":
-      return "Thất bại";
-    case "cancelled":
-      return "Đã dừng";
-    case "interrupted":
-      return "Bị gián đoạn";
-    default:
-      return status;
-  }
+  return getMessages().scanner.jobStatus[status] ?? status;
 }
 
 /** Job đã kết thúc (mọi trạng thái không còn chiếm worker). */

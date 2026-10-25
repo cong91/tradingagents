@@ -8,6 +8,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { getMessages } from "@/lib/i18n/messages";
+
 import { FetchError } from "./contract";
 
 const MAX_TIMESTAMP_SKEW_MS = 5_000;
@@ -64,7 +66,7 @@ export function usePoll<T>(
       },
       (err: unknown) => {
         if (!active.current || sequence !== requestSequence.current) return;
-        const message = err instanceof Error ? err.message : "Lỗi không xác định";
+        const message = err instanceof Error ? err.message : getMessages().common.unknownError;
         const code = err instanceof FetchError ? err.code : "unknown_error";
         setState((prev) => {
           if (prev.status === "ready" || prev.status === "stale") {

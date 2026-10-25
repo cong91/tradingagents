@@ -15,20 +15,22 @@ import {
   XIcon,
 } from "lucide-react";
 import { cn } from "cn";
+import { useT } from "@/lib/i18n";
 
 const NAV_ITEMS = [
-  { label: "Tổng quan lợi nhuận", href: "/", icon: LayoutDashboardIcon },
-  { label: "Agent Pipeline", href: "/pipeline", icon: WorkflowIcon },
-  { label: "Tìm cặp giao dịch", href: "/scanner", icon: ScanSearchIcon },
-  { label: "Chu kỳ quét", href: "/cycles", icon: ListChecksIcon },
-  { label: "Duyệt lệnh", href: "/approvals", icon: ClipboardCheckIcon },
-  { label: "Cấu hình", href: "/settings", icon: SettingsIcon },
-  { label: "Lịch sử & Audit", href: "/audit", icon: HistoryIcon },
+  { key: "overview", href: "/", icon: LayoutDashboardIcon },
+  { key: "pipeline", href: "/pipeline", icon: WorkflowIcon },
+  { key: "scanner", href: "/scanner", icon: ScanSearchIcon },
+  { key: "cycles", href: "/cycles", icon: ListChecksIcon },
+  { key: "approvals", href: "/approvals", icon: ClipboardCheckIcon },
+  { key: "settings", href: "/settings", icon: SettingsIcon },
+  { key: "audit", href: "/audit", icon: HistoryIcon },
 ] as const;
 
 export function Sidebar() {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const t = useT();
 
   return (
     <aside className="flex w-full flex-col border-b bg-sidebar md:w-56 md:shrink-0 md:border-b-0 md:border-r">
@@ -36,7 +38,7 @@ export function Sidebar() {
         type="button"
         aria-controls="primary-navigation"
         aria-expanded={mobileOpen}
-        aria-label={mobileOpen ? "Đóng điều hướng chính" : "Mở điều hướng chính"}
+        aria-label={mobileOpen ? t.common.nav.closeMenu : t.common.nav.openMenu}
         className="min-touch flex items-center gap-2 px-4 text-sm font-medium md:hidden"
         onClick={() => setMobileOpen((open) => !open)}
       >
@@ -45,15 +47,15 @@ export function Sidebar() {
         ) : (
           <MenuIcon className="size-4" aria-hidden="true" />
         )}
-        <span>Điều hướng</span>
+        <span>{t.common.nav.menu}</span>
       </button>
       <nav
         id="primary-navigation"
-        aria-label="Điều hướng chính"
+        aria-label={t.common.nav.label}
         className={cn("flex-1 p-3 md:block", mobileOpen ? "block" : "hidden")}
       >
         <ul className="space-y-1">
-          {NAV_ITEMS.map(({ label, href, icon: Icon }) => {
+          {NAV_ITEMS.map(({ key, href, icon: Icon }) => {
             const active =
               href === "/" ? pathname === "/" : pathname.startsWith(href);
             return (
@@ -70,18 +72,18 @@ export function Sidebar() {
                   onClick={() => setMobileOpen(false)}
                 >
                   <Icon className="size-4 shrink-0" aria-hidden="true" />
-                  <span>{label}</span>
+                  <span>{t.common.nav[key]}</span>
                 </Link>
               </li>
             );
           })}
         </ul>
         <p className="mt-3 border-t pt-3 text-[11px] leading-snug text-muted-foreground md:hidden">
-          Công cụ nghiên cứu — không phải lời khuyên tài chính.
+          {t.common.disclaimer}
         </p>
       </nav>
       <p className="hidden border-t p-3 text-[11px] leading-snug text-muted-foreground md:block">
-        Công cụ nghiên cứu — không phải lời khuyên tài chính.
+        {t.common.disclaimer}
       </p>
     </aside>
   );

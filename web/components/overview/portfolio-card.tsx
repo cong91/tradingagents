@@ -40,6 +40,7 @@ import type {
   PortfolioPosition,
 } from "./contract";
 import type { PanelState } from "./use-panel";
+import { useT } from "@/lib/i18n";
 
 /** Backend chưa có GET /api/portfolio (đang hiện thực song song theo §6) —
  * trạng thái trung tính, không phải lỗi đỏ. */
@@ -58,41 +59,41 @@ function isEmptyPortfolio(data: PortfolioPayload): boolean {
 }
 
 function PortfolioSkeleton() {
+  const t = useT();
   return (
     <div
       className="flex h-40 items-center justify-center gap-2 rounded-lg border border-dashed text-sm text-muted-foreground"
       role="status"
     >
       <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
-      Đang tải danh mục…
+      {t.overview.portfolio.loading}
     </div>
   );
 }
 
 function MissingEndpointState({ onRetry }: { onRetry: () => void }) {
+  const t = useT();
   return (
     <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed px-6 py-8">
-      <p className="text-sm font-medium">Chưa có dữ liệu danh mục</p>
-      <p className="text-sm text-muted-foreground">
-        Backend chưa hiện thực GET /api/portfolio (hợp đồng §6). Card này sẽ có
-        dữ liệu sau khi server cập nhật.
-      </p>
+      <p className="text-sm font-medium">{t.overview.portfolio.missingTitle}</p>
+      <p className="text-sm text-muted-foreground">{t.overview.portfolio.missingBody}</p>
       <Button variant="outline" size="sm" className="min-touch" onClick={onRetry}>
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
 }
 
 function PortfolioError({ message, code, onRetry }: { message: string; code: string; onRetry: () => void }) {
+  const t = useT();
   return (
     <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed px-6 py-8">
       <p className="text-sm font-medium text-destructive">
-        Không đọc được danh mục ({code})
+        {t.overview.portfolio.cannotRead(code)}
       </p>
       <p className="text-sm text-muted-foreground">{message}</p>
       <Button variant="outline" size="sm" className="min-touch" onClick={onRetry}>
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
@@ -107,35 +108,44 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
-/** Số giờ đã giữ vị thế: "12.3h"; thiếu/không hợp lệ → null. */
+/** Hours held: "12.3h"; missing/invalid → null. */
 function formatHeldHours(value: number | null | undefined): string | null {
   if (value == null || !Number.isFinite(value)) return null;
   return `${value.toFixed(1)}h`;
 }
 
-/** Phí khứ hồi ước tính, luôn mang dấu trừ vì đây là chi phí: "-0.27 USDT". */
-function formatRoundTripFee(value: number | null | undefined, currency: string | null): string | null {
+/** Estimated round-trip fee, always negative since it is a cost: "-0.27 USDT". */
+function formatRoundTripFee(
+  value: number | null | undefined,
+  currency: string | null,
+  unknownCurrency: string,
+): string | null {
   if (value == null || !Number.isFinite(value)) return null;
-  return `-${Math.abs(value).toFixed(2)} ${currency || "đơn vị chưa rõ"}`;
+  return `-${Math.abs(value).toFixed(2)} ${currency || unknownCurrency}`;
 }
 
-/** Funding ròng: "funding +0.54 USDT"; null = chưa có bằng chứng đủ để cộng. */
-function formatFunding(value: number | null | undefined, currency: string | null): string | null {
+/** Net funding: "funding +0.54 USDT"; null = not enough evidence to add it up. */
+function formatFunding(
+  value: number | null | undefined,
+  currency: string | null,
+  unknownCurrency: string,
+): string | null {
   if (value == null || !Number.isFinite(value)) return null;
-  return `funding ${value > 0 ? "+" : value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)} ${currency || "đơn vị chưa rõ"}`;
+  return `funding ${value > 0 ? "+" : value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)} ${currency || unknownCurrency}`;
 }
 
-/** Cột "Giữ / phí": thời gian giữ · phí khứ hồi · funding; thiếu hết → "—". */
-function heldAndCostText(position: FuturesPosition): string {
+/** "Held / fees" column: hold time · round-trip fee · funding; all missing → "—". */
+function heldAndCostText(position: FuturesPosition, unknownCurrency: string): string {
   const parts = [
     formatHeldHours(position.held_hours),
-    formatRoundTripFee(position.round_trip_fee, position.round_trip_fee_currency ?? null),
-    formatFunding(position.funding, position.funding_currency ?? null),
+    formatRoundTripFee(position.round_trip_fee, position.round_trip_fee_currency ?? null, unknownCurrency),
+    formatFunding(position.funding, position.funding_currency ?? null, unknownCurrency),
   ].filter((part): part is string => part !== null);
   return parts.length > 0 ? parts.join(" · ") : "—";
 }
 
 function PositionRow({ position, currency }: { position: PortfolioPosition; currency: string | null }) {
+  const t = useT();
   return (
     <tr>
       <td className="py-2 pr-3 font-mono font-medium">{position.ticker}</td>
@@ -146,7 +156,7 @@ function PositionRow({ position, currency }: { position: PortfolioPosition; curr
         {position.average_price != null ? (
           formatMoney(position.average_price)
         ) : (
-          <span title="Vị thế mở trước khi audit log bắt đầu — giá vốn không xác định">
+          <span title={t.overview.portfolio.unknownBasis}>
             —
           </span>
         )}
@@ -173,13 +183,13 @@ function FuturesSection({
   futures: FuturesPortfolio | null | undefined;
   stale: boolean;
 }) {
+  const t = useT();
+  const c = t.overview.portfolio;
   if (!futures || futures.status === "unavailable") {
     return (
       <section className="space-y-2 border-t pt-4">
-        <h3 className="text-sm font-semibold">Vị thế Futures</h3>
-        <p className="text-sm text-muted-foreground">
-          Chưa đọc snapshot Futures. Snapshot chỉ được đọc khi chế độ giao dịch live đang bật.
-        </p>
+        <h3 className="text-sm font-semibold">{c.futuresPositions}</h3>
+        <p className="text-sm text-muted-foreground">{c.futuresUnavailable}</p>
       </section>
     );
   }
@@ -187,9 +197,9 @@ function FuturesSection({
   if (futures.status === "error") {
     return (
       <section className="space-y-2 border-t pt-4">
-        <h3 className="text-sm font-semibold">Vị thế Futures</h3>
+        <h3 className="text-sm font-semibold">{c.futuresPositions}</h3>
         <p role="alert" className="text-sm text-destructive">
-          Không đọc được tài khoản Futures: {futures.error ?? "lỗi không xác định"}. Dữ liệu này không phải danh mục rỗng.
+          {c.futuresError(futures.error ?? c.unknownErrorLower)}
         </p>
       </section>
     );
@@ -212,10 +222,10 @@ function FuturesSection({
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold">
           {futures.account_scope === "unified"
-            ? "Tài khoản Unified (có gồm Futures)"
+            ? c.accountUnified
             : futures.account_scope === "trading"
-              ? "Tài khoản giao dịch OKX (equity quy đổi USD)"
-              : "Tài khoản Futures"}
+              ? c.accountTrading
+              : c.accountFutures}
         </h3>
         {futures.venue_profile ? (
           <Badge variant={futures.venue_profile === "demo" ? "secondary" : "destructive"}>
@@ -224,16 +234,16 @@ function FuturesSection({
         ) : null}
       </div>
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Kpi label={`Số dư ví${futures.wallet_balance_currency ? ` (${futures.wallet_balance_currency})` : ""}`}>
+        <Kpi label={`${c.walletBalance}${futures.wallet_balance_currency ? ` (${futures.wallet_balance_currency})` : ""}`}>
           {formatMoney(futures.wallet_balance, futures.wallet_balance_currency)}
         </Kpi>
-        <Kpi label={`Equity${futures.equity_currency ? ` (${futures.equity_currency})` : ""}`}>
+        <Kpi label={`${c.equity}${futures.equity_currency ? ` (${futures.equity_currency})` : ""}`}>
           {formatMoney(futures.equity, futures.equity_currency)}
         </Kpi>
-        <Kpi label={`Khả dụng${futures.available_balance_currency ? ` (${futures.available_balance_currency})` : ""}`}>
+        <Kpi label={`${c.available}${futures.available_balance_currency ? ` (${futures.available_balance_currency})` : ""}`}>
           {formatMoney(futures.available_balance, futures.available_balance_currency)}
         </Kpi>
-        <Kpi label={`Lãi/lỗ chưa chốt${futures.unrealized_pnl_currency ? ` (${futures.unrealized_pnl_currency})` : ""}`}>
+        <Kpi label={`${c.unrealizedPnl}${futures.unrealized_pnl_currency ? ` (${futures.unrealized_pnl_currency})` : ""}`}>
           {futures.unrealized_pnl != null ? (
             <span className={pnlTextClass(futures.unrealized_pnl)}>
               {formatSignedCurrency(futures.unrealized_pnl, futures.unrealized_pnl_currency ?? "")}
@@ -242,36 +252,30 @@ function FuturesSection({
         </Kpi>
       </dl>
       {stale ? (
-        <p role="alert" className="text-sm text-destructive">
-          Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc; không thể xác nhận trạng thái Futures hiện tại.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.futuresStale}</p>
       ) : null}
       {!hasObservedAt ? (
-        <p role="alert" className="text-sm text-destructive">
-          Không xác định được thời điểm đọc vị thế Futures; không thể xác nhận dữ liệu hiện tại.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.futuresNoObservedAt}</p>
       ) : null}
       {!completePositionsRead ? (
-        <p role="alert" className="text-sm text-destructive">
-          Danh sách vị thế Futures có thể không đầy đủ; không thể xác nhận toàn bộ vị thế đang mở.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.futuresIncomplete}</p>
       ) : null}
       {positions !== null && positions.length > 0 ? (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
-            <caption className="sr-only">Các vị thế Futures do sàn báo cáo</caption>
+            <caption className="sr-only">{c.futuresCaption}</caption>
             <thead>
               <tr className="border-b text-left text-xs text-muted-foreground">
-                <th scope="col" className="py-2 pr-3 font-medium">Hợp đồng</th>
-                <th scope="col" className="py-2 pr-3 font-medium">Hướng</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Contracts / qty</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Entry</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Mark</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Notional</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Margin</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Đòn bẩy</th>
-                <th scope="col" className="py-2 pr-3 text-right font-medium">Giữ / phí</th>
-                <th scope="col" className="py-2 text-right font-medium">Lãi/lỗ chưa chốt</th>
+                <th scope="col" className="py-2 pr-3 font-medium">{c.contract}</th>
+                <th scope="col" className="py-2 pr-3 font-medium">{c.side}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.contractsQty}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.entry}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.mark}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.notional}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.margin}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.leverage}</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">{c.heldFees}</th>
+                <th scope="col" className="py-2 text-right font-medium">{c.unrealizedPnl}</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -288,7 +292,7 @@ function FuturesSection({
                   <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.notional, position.notional_currency)}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.margin, position.margin_currency)}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{position.leverage != null ? `${formatQuantityValue(position.leverage)}x` : "—"}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{heldAndCostText(position)}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{heldAndCostText(position, t.overview.unknownCurrency)}</td>
                   <td className={`py-2 text-right tabular-nums ${position.unrealized_pnl != null ? pnlTextClass(position.unrealized_pnl) : ""}`}>
                     {position.unrealized_pnl != null ? formatSignedCurrency(position.unrealized_pnl, position.unrealized_pnl_currency ?? "") : "—"}
                   </td>
@@ -298,17 +302,12 @@ function FuturesSection({
           </table>
         </div>
       ) : completePositionsRead && hasObservedAt && !stale ? (
-        <p className="text-sm text-muted-foreground">Sàn không báo vị thế Futures đang mở.</p>
+        <p className="text-sm text-muted-foreground">{c.noFuturesPositions}</p>
       ) : (
-        <p className="text-sm text-muted-foreground">Chưa thể xác nhận có vị thế Futures đang mở hay không.</p>
+        <p className="text-sm text-muted-foreground">{c.futuresUnconfirmed}</p>
       )}
-      <p className="text-xs text-muted-foreground">
-        Notional là giá trị danh nghĩa, margin là tài sản ký quỹ; cả hai không phải tiền lãi hay dòng tiền đã nhận.
-      </p>
-      <p className="text-xs text-muted-foreground">
-        Cột “Giữ / phí” là chi phí ước tính để tham khảo — phí khứ hồi và funding
-        không phải số tiền đã bị trừ khỏi số dư trong snapshot này.
-      </p>
+      <p className="text-xs text-muted-foreground">{c.notionalNote}</p>
+      <p className="text-xs text-muted-foreground">{c.heldFeesNote}</p>
     </section>
   );
 }
@@ -320,6 +319,8 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
   staleMessage: string | null;
   staleCode: string | null;
 }) {
+  const t = useT();
+  const c = t.overview.portfolio;
   const { realized_pnl: realized, currency } = data;
   const emptySpot = isEmptyPortfolio(data) && !stale;
   const staleEmptySpot = stale && isEmptyPortfolio(data);
@@ -327,56 +328,48 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
     <div className="space-y-4">
       {staleMessage !== null ? (
         <p role="alert" className="text-sm text-destructive">
-          Lần poll gần nhất lỗi ({staleCode}) — đang hiển thị dữ liệu cũ: {staleMessage}
+          {t.overview.staleNote(staleCode ?? "", staleMessage)}
         </p>
       ) : stale ? (
-        <p role="alert" className="text-sm text-destructive">
-          Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.snapshotStale}</p>
       ) : null}
 
       {data.halted_today === null ? (
-        <p role="alert" className="text-sm text-destructive">
-          Không xác định được trạng thái RiskGuard từ audit.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.riskGuardUnknown}</p>
       ) : null}
       {data.halted_today ? (
         <p className="flex items-center gap-2 rounded-lg border-l-4 border-red-600 bg-red-50 px-3 py-2 text-sm text-red-900 dark:bg-red-950 dark:text-red-100">
           <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
-          RiskGuard đã dừng giao dịch hôm nay.
+          {t.overview.haltedToday}
         </p>
       ) : null}
 
       {data.positions_source === "unavailable" ? (
-        <p role="alert" className="text-sm text-destructive">
-          Không xác định được số dư và vị thế Spot.
-        </p>
+        <p role="alert" className="text-sm text-destructive">{c.spotUnavailable}</p>
       ) : null}
       {staleEmptySpot ? (
         <p className="rounded-lg border border-dashed px-6 py-8 text-sm text-muted-foreground">
-          Snapshot Spot đã cũ; không thể xác nhận trạng thái Spot hiện tại.
+          {c.spotStale}
         </p>
       ) : emptySpot ? (
         <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed px-6 py-8 text-center">
           <InboxIcon className="size-6 text-muted-foreground" aria-hidden="true" />
-          <p className="text-sm font-medium">Chưa có dữ liệu Spot</p>
-          <p className="max-w-md text-sm text-muted-foreground">
-            Chưa có số dư Spot hoặc giao dịch Spot trong audit log. Phần Futures bên dưới được đọc độc lập từ sàn.
-          </p>
+          <p className="text-sm font-medium">{c.noSpotTitle}</p>
+          <p className="max-w-md text-sm text-muted-foreground">{c.noSpotBody}</p>
         </div>
       ) : (
         <>
           <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Kpi label="Tiền mặt Spot">{formatMoney(data.cash, currency)}</Kpi>
-            <Kpi label="Giá trị Spot ước tính">{formatMoney(data.equity_est, currency)}</Kpi>
-            <Kpi label="Spot audit đã chốt (tham khảo)">
+            <Kpi label={c.spotCash}>{formatMoney(data.cash, currency)}</Kpi>
+            <Kpi label={c.spotEquity}>{formatMoney(data.equity_est, currency)}</Kpi>
+            <Kpi label={c.spotRealizedTotal}>
               {realized ? (
                 <span className={pnlTextClass(realized.total)}>
                   {formatSignedCurrency(realized.total)}
                 </span>
               ) : "—"}
             </Kpi>
-            <Kpi label="Spot audit hôm nay (tham khảo)">
+            <Kpi label={c.spotRealizedToday}>
               {realized ? (
                 <span className={pnlTextClass(realized.today)}>
                   {formatSignedCurrency(realized.today)}
@@ -388,15 +381,15 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
           {data.positions.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <caption className="sr-only">Vị thế Spot đang mở theo từng mã</caption>
+                <caption className="sr-only">{c.spotCaption}</caption>
                 <thead>
                   <tr className="border-b text-left text-xs text-muted-foreground">
-                    <th scope="col" className="py-2 pr-3 font-medium">Mã</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">Khối lượng</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">Giá vốn audit</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">Giá thị trường</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">Giá trị</th>
-                    <th scope="col" className="py-2 font-medium">Lãi/lỗ theo audit</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">{c.ticker}</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">{c.quantity}</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">{c.costBasis}</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">{c.marketPrice}</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">{c.value}</th>
+                    <th scope="col" className="py-2 font-medium">{c.unrealizedEst}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
@@ -416,26 +409,20 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
         {!staleEmptySpot && realized ? (
           <>
             <p>
-              {realized.closed_trades} lượt đóng được ghi nhận trong audit log
+              {c.closedTrades(realized.closed_trades)}
               {realized.unknown_basis_closes > 0
-                ? ` · ${realized.unknown_basis_closes} lượt đóng không rõ giá vốn (loại khỏi P&L)`
+                ? c.unknownBasisCloses(realized.unknown_basis_closes)
                 : ""}
               {realized.consecutive_losses > 0
-                ? ` · ${realized.consecutive_losses} lỗ liên tiếp (cảnh báo RiskGuard)`
+                ? c.consecutiveLosses(realized.consecutive_losses)
                 : ""}
               .
             </p>
-            <p>
-              P&amp;L Spot là phép tính từ audit log, không xác nhận khớp lệnh hoặc
-              P&amp;L thực tế của tài khoản; đơn vị tiền tệ chưa được xác minh. Hôm nay
-              tính theo ngày UTC và khác con số RiskGuard dùng (cộng thêm lãi/lỗ tạm
-              tính của vị thế mở trong ngày). Giá vốn Spot cũng chỉ là tham khảo từ
-              audit log, không xác minh theo sàn.
-            </p>
+            <p>{c.todayNote}</p>
           </>
         ) : null}
         {data.warnings.map((warning) => (
-          <p key={warning}>Cảnh báo: {warning}</p>
+          <p key={warning}>{t.common.warning(warning)}</p>
         ))}
       </div>
     </div>
@@ -453,21 +440,19 @@ export function PortfolioCard({
   futuresStale: boolean;
   onRetry: () => void;
 }) {
+  const t = useT();
   const isStale = stale || state.status === "stale";
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Danh mục</CardTitle>
-        <CardDescription>
-          Snapshot danh mục khi khả dụng; P&amp;L Spot là phép tính tham khảo từ
-          audit log, chưa xác nhận khớp lệnh thực tế.
-        </CardDescription>
+        <CardTitle>{t.overview.portfolio.title}</CardTitle>
+        <CardDescription>{t.overview.portfolio.description}</CardDescription>
         <CardAction>
           <div className="flex items-center gap-2">
             {stale ? (
               <Badge variant="outline" className="gap-1">
                 <TriangleAlertIcon className="size-3" aria-hidden="true" />
-                Dữ liệu cũ
+                {t.common.staleData}
               </Badge>
             ) : null}
             <Button
@@ -481,7 +466,7 @@ export function PortfolioCard({
               ) : (
                 <RefreshCwIcon aria-hidden="true" />
               )}
-              Làm mới
+              {t.common.refresh}
             </Button>
           </div>
         </CardAction>
@@ -512,8 +497,7 @@ export function PortfolioCard({
       {state.status !== "loading" && state.status !== "error" ? (
         <CardContent className="pt-0">
           <p className="text-xs text-muted-foreground">
-            Cập nhật {formatDateTime(state.data.generated_at)} · thời điểm tạo phản
-            hồi HTTP, không phải thời điểm dữ liệu tại sàn; tự làm mới mỗi 30 giây.
+            {t.overview.portfolio.footer(formatDateTime(state.data.generated_at))}
           </p>
         </CardContent>
       ) : null}

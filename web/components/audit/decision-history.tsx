@@ -18,11 +18,14 @@ import { DataMeta, EmptyState, ErrorState, SectionSkeleton } from "./section-sta
 import { HistoryEntryRow } from "./history-entry";
 import { useSectionData } from "./use-section-data";
 import type { HistoryPayload } from "./types";
+import { useT } from "@/lib/i18n";
 
 const PAGE_STEP = 25;
 const STALE_SECONDS = 60;
 
 export function DecisionHistoryCard() {
+  const t = useT();
+  const c = t.audit.history;
   const [tickerInput, setTickerInput] = useState("");
   const [ticker, setTicker] = useState("");
   const [pendingOnly, setPendingOnly] = useState(false);
@@ -53,12 +56,8 @@ export function DecisionHistoryCard() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Lịch sử quyết định</CardTitle>
-        <CardDescription>
-          {
-            "GET /api/history — quyết định đã lưu trong decision log, ghép với tệp run trên đĩa. Quyết định \"Chưa settle\" chưa thể chấm điểm."
-          }
-        </CardDescription>
+        <CardTitle>{c.title}</CardTitle>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
           <DataMeta
             generatedAt={data?.generated_at ?? null}
@@ -72,13 +71,13 @@ export function DecisionHistoryCard() {
         <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-end">
           <div>
             <label htmlFor="history-ticker" className="text-xs text-muted-foreground">
-              Ticker
+              {t.audit.log.ticker}
             </label>
             <input
               id="history-ticker"
               value={tickerInput}
               onChange={(event) => setTickerInput(event.target.value)}
-              placeholder="Tất cả các ticker"
+              placeholder={c.tickerPlaceholder}
               className="mt-1 h-9 w-full rounded-lg border border-input bg-background px-3 text-sm md:max-w-64"
             />
           </div>
@@ -94,7 +93,7 @@ export function DecisionHistoryCard() {
               className="size-4 accent-[var(--primary)]"
             />
             <label htmlFor="history-pending-only" className="text-sm">
-              Chỉ quyết định chưa settle
+              {c.pendingOnly}
             </label>
           </div>
         </div>
@@ -105,26 +104,26 @@ export function DecisionHistoryCard() {
         )}
         {state.status === "ready" && state.data.items.length === 0 && (
           <EmptyState
-            title="Chưa có quyết định nào được ghi nhận"
+            title={c.emptyTitle}
             hint={
               data != null && data.total === 0 && ticker === "" && !pendingOnly
-                ? "Decision log trống hoặc chưa có phiên phân tích nào. Chạy một phiên ở M2 để tạo quyết định đầu tiên, kết quả sẽ tự xuất hiện ở đây."
-                : `Không có quyết định nào khớp bộ lọc hiện tại (tổng cộng ${data?.total ?? 0} quyết định). Thử xóa bộ lọc ticker hoặc bỏ tùy chọn \"chưa settle\".`
+                ? c.emptyHintFresh
+                : c.emptyHintFiltered(data?.total ?? 0)
             }
             actionHref="/pipeline"
-            actionLabel="Chạy phiên phân tích (M2)"
+            actionLabel={c.emptyAction}
           />
         )}
         {state.status === "ready" && state.data.items.length > 0 && (
           <>
             {data?.warning && (
               <p className="rounded-lg border border-amber-500/60 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-                Cảnh báo: {data.warning}
+                {t.common.warning(data.warning)}
               </p>
             )}
             {data && Object.keys(data.by_ticker).length > 1 && (
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-xs text-muted-foreground">Theo ticker:</span>
+                <span className="text-xs text-muted-foreground">{c.byTicker}</span>
                 {Object.entries(data.by_ticker).map(([symbol, count]) => (
                   <Badge key={symbol} variant="outline">
                     {symbol} · {count}
@@ -142,7 +141,7 @@ export function DecisionHistoryCard() {
             </ul>
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs text-muted-foreground">
-                Hiển thị {state.data.items.length}/{state.data.total} quyết định
+                {c.showing(state.data.items.length, state.data.total)}
               </p>
               {hasMore && (
                 <Button
@@ -151,7 +150,8 @@ export function DecisionHistoryCard() {
                   className="min-touch"
                   onClick={() => setLimit((current) => current + PAGE_STEP)}
                 >
-                  Tải thêm {PAGE_STEP}
+                  {c.loadMore(PAGE_STEP)}
+
                 </Button>
               )}
             </div>

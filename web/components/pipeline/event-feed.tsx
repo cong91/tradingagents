@@ -7,29 +7,16 @@ import { useEffect, useRef, useState } from "react";
 import { cn } from "cn";
 import type { RunEvent } from "./types";
 import { formatClock } from "./format";
+import { useT, type Messages } from "@/lib/i18n";
 
-const TYPE_LABELS: Record<RunEvent["type"], string> = {
-  run_started: "Bắt đầu phiên",
-  message: "Thông điệp",
-  tool_call: "Gọi công cụ",
-  analyst_status: "Analyst",
-  debate_update: "Tranh luận",
-  research_manager: "Quản lý nghiên cứu",
-  trader_update: "Trader",
-  risk_update: "Rủi ro",
-  pm_decision: "Quản lý danh mục",
-  run_completed: "Hoàn tất",
-  run_failed: "Thất bại",
-  run_interrupted: "Bị gián đoạn",
-};
-
-function eventTitle(event: RunEvent): string {
+function eventTitle(t: Messages, event: RunEvent): string {
   const agent = event.agent ? ` · ${event.agent}` : "";
-  return `${TYPE_LABELS[event.type] ?? event.type}${agent}`;
+  return `${t.pipeline.events.types[event.type] ?? event.type}${agent}`;
 }
 
-function eventBody(event: RunEvent): string | null {
+function eventBody(t: Messages, event: RunEvent): string | null {
   const payload = event.payload;
+  const e = t.pipeline.events;
   switch (event.type) {
     case "message":
       return typeof payload["content"] === "string"
@@ -47,7 +34,7 @@ function eventBody(event: RunEvent): string | null {
     }
     case "analyst_status": {
       const agent = typeof payload["agent"] === "string" ? payload["agent"] : "";
-      return payload["status"] === "completed" ? `${agent} hoàn tất` : `${agent} đang chạy`;
+      return payload["status"] === "completed" ? e.analystDone(agent) : e.analystRunning(agent);
     }
     case "debate_update":
     case "research_manager":
@@ -61,27 +48,27 @@ function eventBody(event: RunEvent): string | null {
       const analysts = Array.isArray(payload["analysts"])
         ? (payload["analysts"] as unknown[]).filter((a) => typeof a === "string").join(", ")
         : "";
-      return analysts !== "" ? `Analyst tham gia: ${analysts}` : null;
+      return analysts !== "" ? e.analystsJoined(analysts) : null;
     }
     case "run_completed": {
       const signal = typeof payload["signal"] === "string" ? payload["signal"] : "?";
-      return `Tín hiệu cuối: ${signal}`;
+      return e.finalSignal(signal);
     }
     case "run_failed": {
       const error = payload["error"];
       const message =
         error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string"
           ? (error as { message: string }).message
-          : "Lỗi không rõ nguyên nhân.";
-      return `Lỗi: ${message}`;
+          : t.pipeline.summary.failedUnknown;
+      return e.error(message);
     }
     case "run_interrupted": {
       const error = payload["error"];
       const message =
         error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string"
           ? (error as { message: string }).message
-          : "Server dừng trước khi phiên phân tích hoàn tất.";
-      return `Phiên bị gián đoạn: ${message}`;
+          : t.pipeline.summary.interruptedUnknown;
+      return e.interrupted(message);
     }
   }
 }
@@ -90,7 +77,8 @@ const PREVIEW_LIMIT = 220;
 
 function EventRow({ event }: { event: RunEvent }) {
   const [expanded, setExpanded] = useState(false);
-  const body = eventBody(event);
+  const t = useT();
+  const body = eventBody(t, event);
   const tone =
     event.type === "run_failed"
       ? "text-loss"
@@ -101,7 +89,7 @@ function EventRow({ event }: { event: RunEvent }) {
     <li className="border-b border-border/60 py-2 last:border-b-0">
       <div className="flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
         <span className="tabular-nums">{formatClock(event.ts)}</span>
-        <span className={cn("font-medium", tone)}>{eventTitle(event)}</span>
+        <span className={cn("font-medium", tone)}>{eventTitle(t, event)}</span>
         {event.replay && (
           <span className="rounded-full border px-1.5 text-[10px] uppercase tracking-wide">
             mock
@@ -124,7 +112,8 @@ function EventRow({ event }: { event: RunEvent }) {
           onClick={() => setExpanded((value) => !value)}
           className="mt-1 min-h-6 text-xs font-medium text-primary underline-offset-2 hover:underline"
         >
-          {expanded ? "Thu gọn" : "Xem toàn bộ"}
+          {expanded ? t.pipeline.events.collapse : t.pipeline.events.expand}
+
         </button>
       )}
     </li>

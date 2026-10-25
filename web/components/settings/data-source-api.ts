@@ -1,5 +1,5 @@
 // Fetch cho thẻ "Cookie nguồn dữ liệu" (Reddit, X).
-import { NETWORK_HINT, parseErrorResponse } from "@/lib/api";
+import { networkHint, parseErrorResponse } from "@/lib/api";
 
 import type { DataSourceProvider, DataSourcesPayload } from "./data-source-types";
 
@@ -19,7 +19,7 @@ export class DataSourceApiError extends Error {
 
 export function toDataSourceError(err: unknown): DataSourceApiError {
   if (err instanceof DataSourceApiError) return err;
-  return new DataSourceApiError(0, "network", NETWORK_HINT);
+  return new DataSourceApiError(0, "network", networkHint());
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {

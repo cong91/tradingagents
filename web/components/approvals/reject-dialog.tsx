@@ -18,6 +18,7 @@ import {
 
 import { describeActionError, type ActionError } from "./errors";
 import type { ApprovalItem } from "./types";
+import { useT } from "@/lib/i18n";
 
 export function RejectDialog({
   item,
@@ -33,6 +34,8 @@ export function RejectDialog({
   onConfirm: (reason: string | null) => void;
 }) {
   const [reason, setReason] = useState("");
+  const t = useT();
+  const c = t.approvals.rejectDialog;
 
   const trimmed = reason.trim();
   const canSubmit = !submitting; // lý do tùy chọn — server/approvals.py:180-182
@@ -48,23 +51,20 @@ export function RejectDialog({
       {item && (
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Từ chối kế hoạch {item.id}?</DialogTitle>
-            <DialogDescription>
-              Không có lệnh nào được gửi lên sàn. Quyết định và lý do được ghi
-              vào audit (approval_denied).
-            </DialogDescription>
+            <DialogTitle>{c.title(item.id)}</DialogTitle>
+            <DialogDescription>{c.description}</DialogDescription>
           </DialogHeader>
 
           <div className="grid gap-1.5">
             <label htmlFor="reject-reason" className="text-sm font-medium">
-              Lý do (tùy chọn — được ghi vào audit)
+              {c.reasonLabel}
             </label>
             <textarea
               id="reject-reason"
               value={reason}
               onChange={(event) => setReason(event.target.value)}
               rows={3}
-              placeholder="Ví dụ: không duyệt mức giá này"
+              placeholder={c.reasonPlaceholder}
               className="min-h-11 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             />
           </div>
@@ -85,7 +85,7 @@ export function RejectDialog({
               disabled={submitting}
               onClick={() => onOpenChange(false)}
             >
-              Hủy
+              {t.approvals.approveDialog.cancel}
             </Button>
             <Button
               variant="destructive"
@@ -96,7 +96,8 @@ export function RejectDialog({
               {submitting && (
                 <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
               )}
-              {submitting ? "Đang xử lý…" : "Từ chối kế hoạch"}
+              {submitting ? c.submitting : c.confirm}
+
             </Button>
           </DialogFooter>
         </DialogContent>

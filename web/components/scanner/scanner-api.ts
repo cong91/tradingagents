@@ -9,6 +9,7 @@ import type {
   WatchlistResponse,
 } from "./scanner-types";
 import { parseErrorResponse } from "@/lib/api";
+import { getMessages } from "@/lib/i18n/messages";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 
@@ -32,7 +33,7 @@ export function toApiHttpError(err: unknown): ApiHttpError {
   return new ApiHttpError(
     0,
     "network",
-    "Không kết nối được backend — hãy chắc chắn server FastAPI đang chạy (uvicorn server.main:app --port 8000).",
+    getMessages().scanner.networkError,
   );
 }
 

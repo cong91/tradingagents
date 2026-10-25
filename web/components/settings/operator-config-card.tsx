@@ -13,6 +13,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { formatDateTimeVi } from "./format-time";
+import { useT, type Messages } from "@/lib/i18n";
 import {
   operatorConfigApi,
   OperatorConfigApiError,
@@ -21,7 +22,7 @@ import {
 import {
   changedKeys,
   draftFrom,
-  GROUP_TITLES,
+
   type OperatorConfigPayload,
   type OperatorDraft,
   type OperatorSettingRow,
@@ -29,8 +30,12 @@ import {
 
 type Feedback = { role: "status" | "alert"; text: string };
 
-function formatValue(row: OperatorSettingRow, value: string | number | boolean | null): string {
-  if (row.type === "bool") return value === true ? "Bật" : "Tắt";
+function formatValue(
+  t: Messages,
+  row: OperatorSettingRow,
+  value: string | number | boolean | null
+): string {
+  if (row.type === "bool") return value === true ? t.common.on : t.common.off;
   if (value === null || value === undefined || value === "") return "—";
   return String(value);
 }
@@ -46,6 +51,7 @@ function RowField({
   disabled: boolean;
   onChange: (next: string | boolean) => void;
 }) {
+  const t = useT();
   const id = `operator-${row.key}`;
   if (row.type === "bool") {
     return (
@@ -58,7 +64,7 @@ function RowField({
           onChange={(event) => onChange(event.target.checked)}
           className="size-6 cursor-pointer accent-primary disabled:cursor-not-allowed"
         />
-        <span className="text-sm text-muted-foreground">{value === true ? "Bật" : "Tắt"}</span>
+        <span className="text-sm text-muted-foreground">{value === true ? t.common.on : t.common.off}</span>
       </label>
     );
   }
@@ -70,13 +76,15 @@ function RowField({
       value={typeof value === "string" ? value : ""}
       disabled={disabled}
       onChange={(event) => onChange(event.target.value)}
-      placeholder={formatValue(row, row.default)}
+      placeholder={formatValue(t, row, row.default)}
       className="h-11 w-full min-w-0 rounded-lg border border-input bg-background px-3 text-sm tabular-nums outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
     />
   );
 }
 
 export function OperatorConfigCard() {
+  const t = useT();
+  const c = t.settings.operator;
   const [payload, setPayload] = useState<OperatorConfigPayload | null>(null);
   const [draft, setDraft] = useState<OperatorDraft>({});
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
@@ -152,7 +160,7 @@ export function OperatorConfigCard() {
       setReason("");
       setFeedback({
         role: "status",
-        text: `Đã lưu ${changed.length} thay đổi vào PostgreSQL. Áp dụng cho phiên phân tích mới.`,
+        text: c.saved(changed.length),
       });
     } catch (err) {
       const apiError = err instanceof OperatorConfigApiError ? err : toOperatorError(err);
@@ -169,7 +177,7 @@ export function OperatorConfigCard() {
       const next = await operatorConfigApi.reset(key);
       setPayload(next);
       setDraft(draftFrom(next));
-      setFeedback({ role: "status", text: `Đã xoá override ${key} — quay về mặc định engine.` });
+      setFeedback({ role: "status", text: c.resetDone(key) });
     } catch (err) {
       const apiError = err instanceof OperatorConfigApiError ? err : toOperatorError(err);
       setFeedback({ role: "alert", text: apiError.message });
@@ -182,8 +190,8 @@ export function OperatorConfigCard() {
     return (
       <Card aria-busy="true">
         <CardHeader>
-          <CardTitle>Override vận hành</CardTitle>
-          <CardDescription>Đang tải từ PostgreSQL…</CardDescription>
+          <CardTitle>{c.title}</CardTitle>
+          <CardDescription>{c.loading}</CardDescription>
         </CardHeader>
       </Card>
     );
@@ -195,13 +203,13 @@ export function OperatorConfigCard() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <ShieldAlertIcon className="size-5 shrink-0 text-destructive" aria-hidden="true" />
-            Không tải được override vận hành
+            {c.loadFailed}
           </CardTitle>
           <CardDescription>{errorMessage}</CardDescription>
         </CardHeader>
         <CardContent>
           <Button className="min-touch" onClick={() => void load()}>
-            Thử lại
+            {t.common.retry}
           </Button>
         </CardContent>
       </Card>
@@ -213,19 +221,16 @@ export function OperatorConfigCard() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldAlertIcon className="size-4" aria-hidden="true" />
-          Override vận hành (PostgreSQL)
+          {c.titleFull}
         </CardTitle>
-        <CardDescription>
-          Nửa cấu hình của các cổng thực thi và trần rủi ro. Lưu trong PostgreSQL, tồn tại
-          qua restart. Không còn file JSON nào phải sửa tay.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          <Badge variant="outline">Chế độ: {payload.effective_exec_mode}</Badge>
+          <Badge variant="outline">{c.mode(payload.effective_exec_mode)}</Badge>
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-5">
         {groups.map(({ id, rows }) => {
-          const meta = GROUP_TITLES[id];
+          const meta = c.groups[id];
           return (
             <section key={id} className="space-y-2">
               <div>
@@ -244,17 +249,20 @@ export function OperatorConfigCard() {
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-sm font-medium">{row.label}</span>
                         {row.override ? (
-                          <Badge variant="secondary">đã đặt</Badge>
+                          <Badge variant="secondary">{c.overridden}</Badge>
                         ) : (
-                          <Badge variant="outline">mặc định</Badge>
+                          <Badge variant="outline">{c.default}</Badge>
                         )}
-                        {row.gate ? <Badge variant="destructive">cổng</Badge> : null}
+                        {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
                       </div>
                       <p className="mt-0.5 text-xs text-muted-foreground">{row.hint}</p>
                       <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-                        {row.key} · hiệu lực: {formatValue(row, row.value)} · mặc định:{" "}
-                        {formatValue(row, row.default)}
-                        {row.updated_at ? ` · cập nhật ${formatDateTimeVi(row.updated_at)}` : ""}
+                        {c.rowMeta(
+                          row.key,
+                          formatValue(t, row, row.value),
+                          formatValue(t, row, row.default),
+                          row.updated_at ? formatDateTimeVi(row.updated_at) : null
+                        )}
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
@@ -275,7 +283,7 @@ export function OperatorConfigCard() {
                           className="min-touch shrink-0"
                           disabled={saving}
                           onClick={() => void reset(row.key)}
-                          aria-label={`Xoá override ${row.label}`}
+                          aria-label={c.resetAria(row.label)}
                         >
                           <RotateCcwIcon aria-hidden="true" />
                         </Button>
@@ -291,12 +299,9 @@ export function OperatorConfigCard() {
         {needsConfirm ? (
           <div className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
             <p className="text-sm font-medium">
-              Thay đổi cổng thực thi: {gateChanges.join(", ")}
+              {c.gateChanges(gateChanges.join(", "))}
             </p>
-            <p className="text-xs text-muted-foreground">
-              Nửa cấu hình này có thể cho phép lệnh thật nếu nửa môi trường cũng mở. Cần xác
-              nhận và lý do — cả hai được ghi vào nhật ký thao tác.
-            </p>
+            <p className="text-xs text-muted-foreground">{c.gateWarning}</p>
             <label className="flex min-touch items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -304,13 +309,13 @@ export function OperatorConfigCard() {
                 onChange={(event) => setConfirmGate(event.target.checked)}
                 className="size-5 accent-destructive"
               />
-              Tôi hiểu và xác nhận thay đổi cổng
+              {c.confirm}
             </label>
             <input
               type="text"
               value={reason}
               onChange={(event) => setReason(event.target.value)}
-              placeholder="Lý do (bắt buộc, ví dụ: chạy demo theo yêu cầu vận hành)"
+              placeholder={c.reasonPlaceholder}
               className="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             />
           </div>
@@ -342,7 +347,7 @@ export function OperatorConfigCard() {
             ) : (
               <SaveIcon aria-hidden="true" />
             )}
-            Lưu {changed.length > 0 ? `(${changed.length})` : ""}
+            {c.save(changed.length)}
           </Button>
           <Button
             variant="ghost"
@@ -350,10 +355,11 @@ export function OperatorConfigCard() {
             disabled={saving || changed.length === 0}
             onClick={() => setDraft(draftFrom(payload))}
           >
-            Hoàn tác thay đổi chưa lưu
+            {c.undo}
           </Button>
           <span className="text-xs text-muted-foreground">
-            Cập nhật lúc {formatDateTimeVi(payload.generated_at)}
+            {c.updatedAt(formatDateTimeVi(payload.generated_at))}
+
           </span>
         </div>
       </CardContent>
