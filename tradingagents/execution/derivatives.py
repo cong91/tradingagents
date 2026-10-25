@@ -91,6 +91,9 @@ class DerivativesExecutor:
 
     def symbol_for(self, ticker: str) -> str:
         """Return the offline derivatives symbol shape for a ticker."""
+        pinned = self._bridge.pinned_futures_symbol(ticker)
+        if pinned:
+            return pinned
         override = self.config.get("exec_symbol_overrides")
         if isinstance(override, dict) and override.get(ticker):
             spot = str(override[ticker])

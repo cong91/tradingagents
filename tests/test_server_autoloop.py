@@ -940,6 +940,7 @@ class _StubDerivVenue(_StubVenue):
             "BTC/USDT:USDT": {
                 "base": "BTC", "quote": "USDT", "settle": "USDT",
                 "contract": True, "swap": True, "type": "swap", "active": True,
+                "linear": True,
             }
         }
 
@@ -986,6 +987,12 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
     monkeypatch.setattr(screening_mod, "screen_universe",
                         lambda crypto, stocks, date, top_n: [{"ticker": "BTC-USD", "asset_type": "crypto"}])
+
+    class _FakeRankingClient:
+        def fetch_tickers(self):
+            return {"BTC/USDT:USDT": {"quoteVolume": 1_000_000_000_000.0, "last": _STUB_PRICE}}
+
+    monkeypatch.setattr(screening_mod, "_public_futures_ranking_client", lambda config: _FakeRankingClient())
 
     def build(config):
         from tradingagents.execution.derivatives import DerivativesExecutor

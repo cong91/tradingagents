@@ -166,6 +166,117 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
     return out
 
 
+def _public_futures_ranking_client(config: dict):
+    """Production USD-M market data for liquidity ranking (public, no keys).
+
+    Demo Trading mirrors production prices but reports its own synthetic
+    volumes (ETH/USDC showed ~40x the real figure), so ranking on the demo
+    venue would rank by fake liquidity. Only public tickers are read here;
+    which contracts are tradable still comes from the execution venue.
+    """
+    exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
+    import ccxt
+
+    if exchange_id == "binance":
+        return ccxt.binanceusdm({"enableRateLimit": True})
+    exchange_class = getattr(ccxt, exchange_id, None)
+    if not isinstance(exchange_class, type):
+        raise VendorError(f"futures universe unavailable via {exchange_id}: unsupported exchange")
+    return exchange_class({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+
+
+def futures_universe(
+    venue_client,
+    settle_assets: set[str] | frozenset[str],
+    top_n: int,
+    *,
+    ranking_client=None,
+) -> list[dict]:
+    """Liquid perpetuals settled in ``settle_assets``, ranked by real 24h volume.
+
+    ``venue_client`` is the execution venue (it decides which contracts are
+    active and tradable); ``ranking_client`` supplies the volumes. One entry
+    per base: when a coin trades in several settle assets (BTC/USDT and
+    BTC/USDC) the more liquid contract wins, so a ticker maps to one contract.
+    Bases starting with a digit (1000PEPE, 1000000MOG) are excluded: their
+    contract price is a multiple of the coin price, which the Yahoo OHLCV the
+    analysts and brackets read cannot represent.
+    """
+    settles = {str(asset).strip().upper() for asset in settle_assets}
+    if not settles:
+        return []
+    try:
+        markets = venue_client.load_markets()
+    except Exception as exc:  # noqa: BLE001 — any ccxt/network failure degrades
+        raise VendorError(f"futures universe unavailable: {exc}") from exc
+
+    contracts: dict[str, dict] = {}
+    for symbol, market in markets.items():
+        if not isinstance(market, dict) or not isinstance(symbol, str):
+            continue
+        if market.get("type") != "swap" or market.get("contract") is not True:
+            continue
+        if market.get("active") is False or market.get("linear") is not True:
+            continue
+        settle = str(market.get("settle") or "").upper()
+        base = str(market.get("base") or "").upper()
+        if settle not in settles or str(market.get("quote") or "").upper() != settle:
+            continue
+        if not base or base[0].isdigit() or base in _STABLECOIN_BASES:
+            continue
+        # Binance also lists TradFi perpetuals (EQUITY/COMMODITY/INDEX) and
+        # PREMARKET contracts under coin-like bases (SPY, XAU, MU); their
+        # "BASE-USD" Yahoo series would be an unrelated asset. Venues without
+        # the field keep every linear swap.
+        info = market.get("info") if isinstance(market.get("info"), dict) else {}
+        underlying = info.get("underlyingType")
+        if underlying is not None and str(underlying).upper() != "COIN":
+            continue
+        contracts[symbol] = {"base": base, "settle": settle}
+
+    try:
+        tickers = (ranking_client or venue_client).fetch_tickers()
+    except Exception as exc:  # noqa: BLE001
+        raise VendorError(f"futures volume ranking unavailable: {exc}") from exc
+
+    best: dict[str, dict] = {}
+    for symbol, meta in contracts.items():
+        ticker = tickers.get(symbol) if isinstance(tickers, dict) else None
+        try:
+            quote_volume = float((ticker or {}).get("quoteVolume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if quote_volume < MIN_CRYPTO_QUOTE_VOLUME_USD:
+            continue
+        current = best.get(meta["base"])
+        if current is None or quote_volume > current["quote_volume"]:
+            try:
+                last_price = float((ticker or {}).get("last") or 0.0) or None
+            except (TypeError, ValueError):
+                last_price = None
+            best[meta["base"]] = {
+                "ticker": f"{meta['base']}-USD",
+                "futures_symbol": symbol,
+                "settle": meta["settle"],
+                "quote_volume": quote_volume,
+                "last_price": last_price,
+            }
+    ranked = sorted(best.values(), key=lambda row: -row["quote_volume"])
+    return ranked[:top_n]
+
+
+# A screened Yahoo close further than this from the contract's last price
+# means "BASE-USD" on Yahoo is a different asset sharing the ticker.
+MAX_PRICE_MISMATCH = 0.15
+
+
+def price_mismatch(yahoo_close: float | None, contract_last: float | None) -> float | None:
+    """Relative gap between the screened close and the contract price, or None."""
+    if not yahoo_close or not contract_last or yahoo_close <= 0 or contract_last <= 0:
+        return None
+    return abs(yahoo_close / contract_last - 1.0)
+
+
 def stock_universe(config: dict, top_n: int) -> list[str]:
     """Top ``top_n`` US equities ranked by 52-week performance as tickers.
 
@@ -202,7 +313,10 @@ def stock_universe(config: dict, top_n: int) -> list[str]:
 def _momentum(close, lookback: int) -> float | None:
     if len(close) < lookback + 1:
         return None
-    return (float(close.iloc[-1]) / float(close.iloc[-lookback - 1]) - 1.0) * 100.0
+    start = float(close.iloc[-lookback - 1])
+    if start <= 0:  # a zero/negative vendor print has no defined return
+        return None
+    return (float(close.iloc[-1]) / start - 1.0) * 100.0
 
 
 def _benchmark_momentum(asset_type: str, curr_date: str, lookback: int) -> float:

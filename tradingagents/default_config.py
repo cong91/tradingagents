@@ -244,6 +244,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "exec_live": False,
     "exec_log_path": os.getenv("TRADINGAGENTS_EXEC_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "execution", "audit.jsonl"),
     "exec_quote_currency": "USDT",
+    # Futures mode: linear contracts settled in these assets may be screened
+    # and traded, but only those the futures wallet actually holds a balance
+    # in (read at cycle start). exec_quote_currency is always included.
+    "exec_futures_settle_currencies": ["USDT", "USDC"],
     # Risk guard limits (L2, FR-K). Percent limits are fail-open by design:
     # when equity cannot be computed (no cash and nothing to mark) the check
     # is skipped and logged. The consecutive-loss cap is absolute â€” no
