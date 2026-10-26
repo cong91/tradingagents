@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -34,7 +34,7 @@ def fetch_closed_candles(exchange: Any, symbol: str, timeframe: str,
     """Fetch only candles fully closed at ``as_of``; never use the forming bar."""
     if as_of.tzinfo is None:
         raise ValueError("as_of must be timezone-aware")
-    cutoff = int(as_of.astimezone(timezone.utc).timestamp() * 1000)
+    cutoff = int(as_of.astimezone(UTC).timestamp() * 1000)
     duration = timeframe_ms(timeframe)
     query_since = max(0, cutoff - duration * limit)
     try:

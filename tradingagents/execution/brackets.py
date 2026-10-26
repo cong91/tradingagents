@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import ccxt
@@ -131,7 +131,7 @@ class BracketManager:
         job_store.update_bracket_recovery(
             task["task_id"], status=status, placed_ids=ids, attempts=task["attempts"],
             last_error=self.bridge._redact(error) if error else None,
-            now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
+            now=datetime.now(UTC).isoformat(), legs=task["legs"],
         )
         return status
 
@@ -186,7 +186,7 @@ class BracketManager:
             job_store.create_bracket_recovery(
                 task_id, symbol=order.ccxt_symbol, entry_order_id=entry_order_id or "unknown",
                 close_side=close_side, quantity=float(order.quantity), legs=legs,
-                now=datetime.now(timezone.utc).isoformat(), venue_key=_venue_key(self.bridge),
+                now=datetime.now(UTC).isoformat(), venue_key=_venue_key(self.bridge),
             )
             task = job_store.load_bracket_recovery(task_id)
             position_key = f"{order.ccxt_symbol}:{order.side}:{entry_order_id or 'unknown'}"

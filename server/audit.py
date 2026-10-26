@@ -10,7 +10,7 @@ audit_log_unreadable``, consistent with the execute-time fail-closed read
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Query
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api", tags=["audit"])
 def record(action: str, **details) -> None:
     """Append one server action trail event to PostgreSQL."""
     control_store.append_server_audit({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "action": action,
         **details,
     })
@@ -72,7 +72,7 @@ def halt_state(events: list[dict] | None = None) -> tuple[bool, str | None]:
         events, _ = read_events()
     from tradingagents.execution.risk import _halted_today
 
-    halted = _halted_today(events, datetime.now(timezone.utc).date())
+    halted = _halted_today(events, datetime.now(UTC).date())
     reason = None
     for event in events:
         if event.get("event") == "halt":

@@ -22,7 +22,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
@@ -145,7 +145,7 @@ def _analysts_for(asset_type: str) -> tuple[str, ...]:
 
 
 def _new_run_id(ticker: str) -> str:
-    base = f"r_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{safe_ticker_component(ticker).lower()}"
+    base = f"r_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{safe_ticker_component(ticker).lower()}"
     run_id = base
     suffix = 1
     while run_id in _runs:
@@ -179,7 +179,7 @@ def _valid_trade_date(value: str) -> bool:
         canonical = datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
     except ValueError:
         return False
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     return canonical and value <= today
 
 

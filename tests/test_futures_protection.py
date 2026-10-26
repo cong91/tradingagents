@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -78,7 +78,7 @@ class _ProtectionExchange:
         # default-mark test into a stale-mark test as the clock advances.
         return {
             "markPrice": "136.0",
-            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "timestamp": int(datetime.now(UTC).timestamp() * 1000),
         }
 
     def market(self, symbol):

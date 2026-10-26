@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from tradingagents.execution.futures_safety import validate_bracket
 
@@ -41,7 +41,7 @@ class FuturesSignalEnvelope:
         if any(value.tzinfo is None for value in
                (candle_open, candle_close, created_at, expires_at, confirmation_candle_open)):
             raise ValueError("signal timestamps must be timezone-aware")
-        if candle_close > created_at.astimezone(timezone.utc):
+        if candle_close > created_at.astimezone(UTC):
             raise ValueError("signal candle is not closed at creation time")
         if expires_at <= created_at:
             raise ValueError("signal expiry must be after creation")
@@ -49,21 +49,21 @@ class FuturesSignalEnvelope:
             raise ValueError("signal requires a direction and at least one target")
         side = "buy" if direction == "long" else "sell"
         validate_bracket(side=side, entry=entry, stop_loss=stop, take_profit=targets[0])
-        canonical_open = candle_open.astimezone(timezone.utc).isoformat()
-        material = f"futures:{symbol}:{confirmation_candle_open.astimezone(timezone.utc).isoformat()}:{candle_open.astimezone(timezone.utc).isoformat()}:{strategy_version}"
+        canonical_open = candle_open.astimezone(UTC).isoformat()
+        material = f"futures:{symbol}:{confirmation_candle_open.astimezone(UTC).isoformat()}:{candle_open.astimezone(UTC).isoformat()}:{strategy_version}"
         signal_id = hashlib.sha256(material.encode("utf-8")).hexdigest()
         return cls(signal_id, symbol, "1h", canonical_open,
-                   candle_close.astimezone(timezone.utc).isoformat(), direction,
+                   candle_close.astimezone(UTC).isoformat(), direction,
                    float(entry), float(stop), tuple(map(float, targets)),
-                   created_at.astimezone(timezone.utc).isoformat(),
-                   expires_at.astimezone(timezone.utc).isoformat(),
-                   confirmation_candle_open.astimezone(timezone.utc).isoformat(),
+                   created_at.astimezone(UTC).isoformat(),
+                   expires_at.astimezone(UTC).isoformat(),
+                   confirmation_candle_open.astimezone(UTC).isoformat(),
                    strategy, strategy_version)
 
     def validate_at(self, as_of: datetime) -> None:
         if as_of.tzinfo is None:
             raise ValueError("as_of must be timezone-aware")
-        if as_of.astimezone(timezone.utc).isoformat() >= self.expires_at:
+        if as_of.astimezone(UTC).isoformat() >= self.expires_at:
             raise ValueError("futures signal has expired")
 
     def to_json(self) -> str:

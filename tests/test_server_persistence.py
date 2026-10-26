@@ -14,7 +14,7 @@ import json
 import socket
 import time
 import weakref
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -75,7 +75,7 @@ def _no_network(request, monkeypatch):
 
 
 def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 @pytest.fixture(autouse=True)
@@ -140,7 +140,7 @@ def _state_log(tmp_path: Path, rating: str = "Buy") -> Path:
 def _plant_running_job(job_id: str = "d_running") -> None:
     """A job this process is working on, planted in both registries."""
     job = daily_mod.DailyJobState(job_id=job_id, mode="mock", tickers=["BTC-USD"],
-                                  created_at=datetime.now(timezone.utc).isoformat())
+                                  created_at=datetime.now(UTC).isoformat())
     job.status = "running"
     daily_mod._jobs[job_id] = job
     daily_mod._persist(job)
@@ -238,7 +238,7 @@ def test_finish_persists_terminal_row_before_exposing_it(monkeypatch):
     still says "running"."""
     job = daily_mod.DailyJobState(
         job_id="d_order", mode="mock", tickers=["BTC-USD"],
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     job.status = "running"
     observed: list[tuple[str, str]] = []
@@ -277,7 +277,7 @@ def test_running_job_persists_current_ticker_and_heartbeat(client):
         job_id="d_progress",
         mode="mock",
         tickers=["BTC-USD"],
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     job.status = "running"
     daily_mod._jobs[job.job_id] = job
@@ -293,7 +293,7 @@ def test_running_job_heartbeat_refreshes_during_slow_coin(client, monkeypatch):
         job_id="d_slow_progress",
         mode="mock",
         tickers=["BTC-USD"],
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     job.status = "running"
     daily_mod._jobs[job.job_id] = job

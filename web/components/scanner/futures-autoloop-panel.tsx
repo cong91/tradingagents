@@ -4,6 +4,7 @@ import { Activity, Loader2, RefreshCw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { FuturesCycleFunnel, AgentDecisionNote } from "./futures-cycle-funnel";
 import { formatTimestamp, formatUsd } from "./scanner-format";
 import type { FuturesCycle, FuturesCycleCandidate } from "./scanner-types";
 import { useFuturesCycles } from "./use-futures-cycles";
@@ -58,7 +59,9 @@ function renderCandidates(candidates: FuturesCycleCandidate[] | undefined) {
 }
 
 export function FuturesAutoloopPanel() {
-  const { cycles, runningCycle, enabled, intervalMinutes, loading, error, refresh } = useFuturesCycles();
+  const {
+    cycles, summary, symbols, runningCycle, enabled, intervalMinutes, loading, error, refresh,
+  } = useFuturesCycles();
 
   return (
     <Card>
@@ -74,6 +77,7 @@ export function FuturesAutoloopPanel() {
       </CardHeader>
       <CardContent className="space-y-3">
         {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+        <FuturesCycleFunnel summary={summary} symbols={symbols} />
         {loading && cycles.length === 0 ? (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" aria-hidden />
@@ -87,6 +91,9 @@ export function FuturesAutoloopPanel() {
         ) : null}
         {cycles.length > 0 ? (
           <div className="space-y-3">
+            <p className="border-t pt-3 text-xs font-medium text-muted-foreground">
+              20 chu kỳ gần nhất (mọi mã)
+            </p>
             {cycles.map((cycle) => <FuturesCycleRow key={cycle.cycle_id} cycle={cycle} />)}
           </div>
         ) : null}
@@ -126,7 +133,6 @@ function FuturesCycleRow({ cycle }: { cycle: FuturesCycle }) {
         <div><dt className="text-muted-foreground">Unified market</dt><dd className="font-mono break-all">{unifiedSymbol ?? cycle.symbol}</dd></div>
         <div><dt className="text-muted-foreground">Candle 4h mở / đóng</dt><dd>{formatTimestamp(cycle.four_hour_open)} / {valueLabel(snapshot.four_hour_close)}</dd></div>
         <div><dt className="text-muted-foreground">Candle 1h mở / đóng</dt><dd>{formatTimestamp(cycle.one_hour_open)} / {valueLabel(snapshot.one_hour_close)}</dd></div>
-        <div><dt className="text-muted-foreground">4h kế tiếp / gần nhất</dt><dd>{valueLabel(snapshot.next_four_hour_open)} / {valueLabel(snapshot.last_four_hour_close)}</dd></div>
         <div><dt className="text-muted-foreground">Hướng 1h</dt><dd>{directionLabel(snapshot.one_hour_direction)}</dd></div>
         <div><dt className="text-muted-foreground">Hướng 4h</dt><dd>{directionLabel(snapshot.four_hour_direction)}</dd></div>
         <div><dt className="text-muted-foreground">Confirmation 1h+4h</dt><dd>{confirmation == null ? label(payload.confirmation_reason) : confirmation ? "Đạt" : "Thiếu / từ chối"}</dd></div>
@@ -144,6 +150,7 @@ function FuturesCycleRow({ cycle }: { cycle: FuturesCycle }) {
         <div><dt className="text-muted-foreground">Recovery</dt><dd>{label(payload.recovery_state)}</dd></div>
       </dl>
       {renderCandidates(payload.candidates)}
+      <AgentDecisionNote note={payload.agent_decision_note} />
       {payload.market_rejection_reason || payload.confirmation_reason || payload.plan_reason || payload.reason || payload.reason_code || payload.error || payload.skipped_reason ? (
         <p className="mt-3 border-t pt-2 text-xs text-muted-foreground">
           {payload.reason_code ? `${payload.reason_code}: ` : ""}

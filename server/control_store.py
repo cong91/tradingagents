@@ -12,7 +12,7 @@ The execution audit the RiskGuard replays stays a JSONL file by design
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from server import db
 
@@ -22,7 +22,7 @@ def _json(value) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # --- approvals -------------------------------------------------------------

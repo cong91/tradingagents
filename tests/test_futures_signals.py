@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -6,7 +6,7 @@ from tradingagents.execution.futures_signals import FuturesSignalEnvelope
 
 
 def test_signal_stable_serialization_expiry_and_confirmation_boundary():
-    utc = timezone.utc
+    utc = UTC
     created = datetime(2026, 10, 7, 8, 0, 5, tzinfo=utc)
     envelope = FuturesSignalEnvelope.create(
         symbol="BTC/USDT:USDT", candle_open=datetime(2026, 10, 7, 7, tzinfo=utc),
@@ -39,7 +39,7 @@ def test_signal_stable_serialization_expiry_and_confirmation_boundary():
 
 
 def test_short_signal_requires_correct_bracket_geometry():
-    now = datetime(2026, 10, 7, 8, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 7, 8, tzinfo=UTC)
     with pytest.raises(ValueError, match="short"):
         FuturesSignalEnvelope.create(
             symbol="BTC/USDT:USDT", candle_open=now - timedelta(hours=1),

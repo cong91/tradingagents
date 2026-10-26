@@ -33,7 +33,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, Request
 
@@ -190,7 +190,7 @@ def active_job_id() -> str | None:
 
 
 def _new_job_id() -> str:
-    base = f"d_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    base = f"d_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
     job_id = base
     suffix = 1
     # History is in the database, so a restart no longer frees the namespace:
@@ -234,7 +234,7 @@ def _job_payload(job: DailyJobState) -> dict:
 
 
 def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 # --- worker -----------------------------------------------------------------

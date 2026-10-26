@@ -6,7 +6,7 @@ new tranches, verify them, and only then remove the leg they replace.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from server import job_store
@@ -139,4 +139,4 @@ def _cancel(bridge: Any, symbol: str, order_ids: list[str]) -> dict:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

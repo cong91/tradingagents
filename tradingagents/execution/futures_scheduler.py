@@ -1,6 +1,6 @@
 """UTC boundary helpers for closed futures candles."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 _TIMEFRAME = {"1h": timedelta(hours=1), "4h": timedelta(hours=4)}
 
@@ -13,10 +13,10 @@ def floor_boundary(value: datetime, timeframe: str) -> datetime:
         duration = _TIMEFRAME[timeframe]
     except KeyError as exc:
         raise ValueError(f"unsupported futures timeframe: {timeframe}") from exc
-    utc = value.astimezone(timezone.utc)
+    utc = value.astimezone(UTC)
     seconds = int(duration.total_seconds())
     epoch = int(utc.timestamp())
-    return datetime.fromtimestamp(epoch - epoch % seconds, timezone.utc)
+    return datetime.fromtimestamp(epoch - epoch % seconds, UTC)
 
 
 def last_closed_boundary(value: datetime, timeframe: str) -> tuple[datetime, datetime]:

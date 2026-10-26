@@ -12,7 +12,7 @@ the L1 audit cannot provide.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,8 +23,8 @@ from tradingagents.portfolio import PortfolioContext, Position
 
 pytestmark = pytest.mark.unit
 
-FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
-TOMORROW = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
+FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
+TOMORROW = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
 
 
 def freeze(monkeypatch, moment):
@@ -255,7 +255,7 @@ def test_unknown_basis_sells_are_skipped_not_counted(tmp_path, monkeypatch):
 def test_streak_counts_across_days(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
-    yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
     write_events(audit, [
         event("buy", 1.0, 100.0, day=yesterday, hour=8),
         event("sell", 1.0, 90.0, day=yesterday, hour=9),   # loss yesterday
@@ -309,7 +309,7 @@ def test_unrealized_pnl_on_lots_opened_today_is_marked_via_price_of(tmp_path, mo
 def test_lots_opened_before_today_are_not_marked_into_daily_pnl(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
-    yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
     write_events(audit, [event("buy", 2.0, 100.0, day=yesterday, hour=8)])
     # the open lot predates today: even a big mark-down today is not "today's loss"
     decision = guard(prices={"BTC-USD": 10.0}).check(plan(), PortfolioContext(cash=1_000.0), audit)

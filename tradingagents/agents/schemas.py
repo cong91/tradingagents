@@ -87,7 +87,7 @@ class TraderAction(StrEnum):
     SELL = "Sell"
 
 
-class FuturesExecutionIntent(str, Enum):
+class FuturesExecutionIntent(StrEnum):
     """Whether the final PM decision authorizes a new futures entry."""
 
     ENTER = "enter"

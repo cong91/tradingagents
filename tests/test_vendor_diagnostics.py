@@ -79,6 +79,7 @@ def test_sentiment_sources_emit_static_stages_before_llm(monkeypatch):
     monkeypatch.setattr(sentiment_analyst, "jev_screen", lambda ticker: None)
     monkeypatch.setattr(sentiment_analyst, "fetch_stocktwits_messages", lambda *args, **kwargs: "stocktwits")
     monkeypatch.setattr(sentiment_analyst, "fetch_reddit_posts", lambda *args, **kwargs: "reddit")
+    monkeypatch.setattr(sentiment_analyst, "fetch_x_posts", lambda *args, **kwargs: "x")
 
     def fake_invoke(*args):
         call_order.append("llm")
@@ -104,6 +105,7 @@ def test_sentiment_sources_emit_static_stages_before_llm(monkeypatch):
         "vendor:jev_screen",
         "vendor:stocktwits",
         "vendor:reddit",
+        "vendor:x",
         "llm",
     ]
     assert observer.stages == [
@@ -111,5 +113,6 @@ def test_sentiment_sources_emit_static_stages_before_llm(monkeypatch):
         ("vendor:jev_screen", None),
         ("vendor:stocktwits", None),
         ("vendor:reddit", None),
+        ("vendor:x", None),
     ]
     assert "SECRET_TICKER" not in repr(observer.stages)

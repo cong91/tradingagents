@@ -41,7 +41,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -819,7 +819,7 @@ class ExchangeBridge:
         FIFO replay never double-counts a plan that later executed.
         """
         event: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "ticker": order.ticker,
             "ccxt_symbol": order.ccxt_symbol,
             "signal": order.signal,

@@ -11,7 +11,7 @@ the other's dataclasses.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from server import db
 
@@ -19,7 +19,7 @@ ACTIVE_STATUSES = ("queued", "running")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _json(value) -> str:

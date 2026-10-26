@@ -6,7 +6,7 @@ reading. Endpoint modules build on this; ``main.py`` installs the handlers.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -16,7 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 def utc_now_iso() -> str:
     """UTC now as ISO-8601 with a ``Z`` suffix, the contract's timestamp form."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def envelope(code: str, message: str, details: dict | None = None) -> dict:

@@ -58,7 +58,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -97,7 +97,7 @@ def _utc_now() -> datetime:
     Single seam on purpose: tests freeze the day by monkeypatching this one
     function, so halt lines the guard appends carry the frozen day too.
     """
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _utc_today() -> date:

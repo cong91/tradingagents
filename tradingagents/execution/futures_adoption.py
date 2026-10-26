@@ -7,7 +7,7 @@ point leaves the venue exactly as it was.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from server import job_store
@@ -222,4 +222,4 @@ def _venue_key(bridge: Any) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

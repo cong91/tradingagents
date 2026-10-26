@@ -1,7 +1,7 @@
 """Offline end-to-end demo: injected adapters only, no venue/network access."""
 
 import socket
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -22,7 +22,7 @@ def test_demo_flow_closed_candles_signal_sizing_and_position_manager(monkeypatch
         raise AssertionError("network access forbidden in demo smoke")
 
     monkeypatch.setattr(socket, "socket", no_socket)
-    now = datetime(2026, 10, 7, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 7, 8, 0, tzinfo=UTC)
     one_hour, four_hour = closed_candle_pair(now)
     assert one_hour[1] <= now and four_hour[1] <= now
     envelope = FuturesSignalEnvelope.create(

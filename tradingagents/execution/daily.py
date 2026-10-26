@@ -48,7 +48,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -90,7 +90,7 @@ class DailyResult(BaseModel):
 
 def _today_iso() -> str:
     """UTC today as ``YYYY-MM-DD``; tests freeze the day by monkeypatching."""
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 def _normalize_watchlist(raw: Any) -> list[str]:

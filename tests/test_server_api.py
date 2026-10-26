@@ -10,7 +10,7 @@ import json
 import socket
 import time
 import weakref
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,7 +84,7 @@ def _no_network(request, monkeypatch):
 
 
 def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 @pytest.fixture(autouse=True)

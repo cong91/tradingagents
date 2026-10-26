@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -24,7 +24,7 @@ def test_closed_candles_exclude_forming_and_future_bars():
     exchange = Exchange()
     candles = fetch_closed_candles(
         exchange, "BTC/USDT", "1h",
-        as_of=datetime.fromtimestamp(7_200_000 / 1000, tz=timezone.utc),
+        as_of=datetime.fromtimestamp(7_200_000 / 1000, tz=UTC),
     )
     assert [c.open_time for c in candles] == [3_600_000]
     assert exchange.kwargs == ("BTC/USDT", "1h", 0, 100)
@@ -33,7 +33,7 @@ def test_closed_candles_exclude_forming_and_future_bars():
 
 @pytest.mark.parametrize("hour", [0, 4, 8, 12, 16, 20])
 def test_scheduler_uses_previous_closed_four_hour_candle_at_utc_edges(hour):
-    now = datetime(2026, 10, 7, hour, 0, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 7, hour, 0, 5, tzinfo=UTC)
     one_hour, four_hour = closed_candle_pair(now)
     assert one_hour == (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1), now.replace(minute=0, second=0, microsecond=0))
     assert four_hour[1].hour == hour
@@ -90,7 +90,7 @@ def test_signal_claim_is_atomic_terminal_and_expired_lease_recoverable(postgres_
 def test_scheduler_boundaries_never_select_forming_four_hour_candle():
     from datetime import datetime
 
-    now = datetime(2026, 10, 7, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 7, 8, 0, tzinfo=UTC)
     one_hour, four_hour = closed_candle_pair(now)
-    assert one_hour == (datetime(2026, 10, 7, 7, tzinfo=timezone.utc), datetime(2026, 10, 7, 8, tzinfo=timezone.utc))
-    assert four_hour == (datetime(2026, 10, 7, 4, tzinfo=timezone.utc), datetime(2026, 10, 7, 8, tzinfo=timezone.utc))
+    assert one_hour == (datetime(2026, 10, 7, 7, tzinfo=UTC), datetime(2026, 10, 7, 8, tzinfo=UTC))
+    assert four_hour == (datetime(2026, 10, 7, 4, tzinfo=UTC), datetime(2026, 10, 7, 8, tzinfo=UTC))

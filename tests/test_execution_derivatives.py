@@ -8,7 +8,7 @@ without confirm) is refused with an audit line and nothing sent.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import ccxt
 import pytest
@@ -21,7 +21,7 @@ from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
 
-FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
+FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 
 
 class FakeDerivExchange:

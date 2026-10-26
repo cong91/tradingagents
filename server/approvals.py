@@ -17,7 +17,7 @@ hook is exposed here for that integration.
 
 import re
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Query, Request
@@ -78,7 +78,7 @@ def _pending_item(items: list[dict], approval_id: str) -> dict:
         raise ApiError(409, "conflict", f"approval {approval_id} is already {item['status']}",
                        {"status": item["status"]})
     created = _parse_ts(item.get("created_at"))
-    if created is not None and datetime.now(timezone.utc) - created > timedelta(hours=EXPIRY_HOURS):
+    if created is not None and datetime.now(UTC) - created > timedelta(hours=EXPIRY_HOURS):
         raise ApiError(410, "expired", f"approval {approval_id} expired after {EXPIRY_HOURS}h")
     return item
 

@@ -96,8 +96,12 @@ export const scannerApi = {
   dailyJobs(pageSize = 20): Promise<DailyJobListResponse> {
     return requestJson<DailyJobListResponse>(`/api/daily?page_size=${pageSize}`);
   },
-  futuresCycles(limit = 20): Promise<FuturesCyclesResponse> {
-    return requestJson<FuturesCyclesResponse>(`/api/autoloop/cycles?limit=${limit}`, {
+  /** Có `symbol` thì chỉ lấy chu kỳ của mã đó (drill-down); tổng hợp
+   *  summary/symbols luôn là toàn bộ dữ liệu. */
+  futuresCycles(limit = 20, symbol?: string): Promise<FuturesCyclesResponse> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (symbol) params.set("symbol", symbol);
+    return requestJson<FuturesCyclesResponse>(`/api/autoloop/cycles?${params}`, {
       cache: "no-store",
     });
   },

@@ -1,7 +1,7 @@
 """Offline edge cases for the durable protective-exit lifecycle."""
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import ccxt
 import pytest
@@ -110,7 +110,7 @@ def test_ambiguous_matching_orders_are_not_adopted():
     exchange.orders["second-stop"]["info"]["algoId"] = "second-stop"
     job_store.update_bracket_recovery(
         task_id, status="pending", placed_ids=["2"], attempts=0, last_error=None,
-        now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
+        now=datetime.now(UTC).isoformat(), legs=task["legs"],
     )
     calls_before = len(exchange.calls)
 
@@ -373,7 +373,7 @@ def test_timed_out_repair_does_not_emergency_close():
     exchange.orders.pop(uncertain_id)
     job_store.update_bracket_recovery(
         task_id, status="pending", placed_ids=[task["legs"][0]["order_id"]], attempts=0,
-        last_error=None, now=datetime.now(timezone.utc).isoformat(), legs=task["legs"],
+        last_error=None, now=datetime.now(UTC).isoformat(), legs=task["legs"],
     )
     exchange.create_error = ccxt.RequestTimeout("no response")
     calls_before = len(exchange.calls)

@@ -37,7 +37,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -652,6 +652,8 @@ def _process_candidate(
             if deadline is not None:
                 _cycle_timeout(deadline, f"candidate {ticker} analysis")
         result.signal = signal
+        pm_decision = state.get("final_trade_decision") if isinstance(state, dict) else None
+        agent_note = (str(pm_decision).strip() or None) if pm_decision else None
         if asset_type != "crypto":
             result.reason = (
                 "advisory only — signal from the stock pipeline; the venue "
@@ -681,6 +683,8 @@ def _process_candidate(
                     signal=signal,
                     signal_reason=result.reason,
                     phase="proposal",
+                    snapshot=futures_context,
+                    agent_note=agent_note,
                 )
                 return result
             with telemetry.span("futures_planning", ticker):
@@ -690,6 +694,7 @@ def _process_candidate(
                     portfolio=futures_portfolio, brackets=brackets, intent=intent,
                     deadline=deadline, cancelled=cancelled,
                     execution_lock=execution_lock, telemetry=telemetry,
+                    agent_note=agent_note,
                 )
             return result
         if deadline is not None:
@@ -720,7 +725,7 @@ def _process_candidate(
 
 
 def _closed_futures_context(derivatives: Any, ticker: str) -> dict | None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     one_hour, four_hour = closed_candle_pair(now)
     symbol = derivatives.resolve_market(ticker) if hasattr(derivatives, "resolve_market") else derivatives.symbol_for(ticker)
     exchange = derivatives._bridge.client()
@@ -744,7 +749,44 @@ def _closed_futures_context(derivatives: Any, ticker: str) -> dict | None:
         "four_hour_close": candle_4h.close,
         "one_hour_direction": _candle_direction(candle_1h),
         "four_hour_direction": _candle_direction(candle_4h),
+        **_futures_derivative_metrics(exchange, symbol),
     }
+
+
+def _futures_derivative_metrics(exchange: Any, symbol: str) -> dict:
+    """Funding rate and open interest for the resolved contract.
+
+    The futures agents are asked to justify an entry against funding and
+    risk/reward, and without this read they report "funding unavailable" and
+    abstain. Each field degrades to None instead of failing the cycle: a venue
+    does not serve every metric on every market, and a missing metric must not
+    block the analysis that is the deliverable.
+    """
+    metrics: dict[str, Any] = {
+        "funding_rate": None,
+        "funding_datetime": None,
+        "mark_price": None,
+        "open_interest": None,
+        "open_interest_value": None,
+    }
+    try:
+        funding = exchange.fetch_funding_rate(symbol)
+    except Exception as exc:  # venue may not publish funding for this market
+        logger.info("funding rate unavailable for %s (%s)", symbol, exc)
+        funding = None
+    if isinstance(funding, dict):
+        metrics["funding_rate"] = funding.get("fundingRate")
+        metrics["funding_datetime"] = funding.get("fundingDatetime")
+        metrics["mark_price"] = funding.get("markPrice")
+    try:
+        interest = exchange.fetch_open_interest(symbol)
+    except Exception as exc:  # venue may not publish open interest
+        logger.info("open interest unavailable for %s (%s)", symbol, exc)
+        interest = None
+    if isinstance(interest, dict):
+        metrics["open_interest"] = interest.get("openInterestAmount")
+        metrics["open_interest_value"] = interest.get("openInterestValue")
+    return metrics
 
 
 def _candle_direction(candle: Any) -> str:
@@ -796,6 +838,9 @@ def _futures_decision_context(
     def number(value: Any, suffix: str = "") -> str:
         return f"{float(value):,.4f}{suffix}" if value is not None else "unavailable"
 
+    def percent(value: Any) -> str:
+        return f"{float(value) * 100:.4f}%" if value is not None else "unavailable"
+
     currency = account.equity_currency or account.available_balance_currency or ""
     lines = [
         f"Venue profile: {account.venue_profile or 'unreported'}",
@@ -825,6 +870,11 @@ def _futures_decision_context(
         f"Closed 4h candle: open={market['four_hour'].open} high={market['four_hour'].high} "
         f"low={market['four_hour'].low} close={market['four_hour'].close} "
         f"direction={market.get('four_hour_direction')}",
+        f"Funding rate: {percent(market.get('funding_rate'))} "
+        f"(next funding {market.get('funding_datetime') or 'unavailable'})",
+        f"Mark price: {number(market.get('mark_price'))}",
+        f"Open interest: {number(market.get('open_interest'))} "
+        f"contracts (notional {number(market.get('open_interest_value'))})",
     ])
     long_bracket, short_bracket = _direction_brackets(ticker, brackets)
     if long_bracket[0] is not None:
@@ -873,8 +923,9 @@ def _record_futures_cycle_rejection(
     signal: str | None = None,
     signal_reason: str | None = None,
     phase: str = "market",
+    agent_note: str | None = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     one_hour, four_hour = closed_candle_pair(now)
     cycle_id = f"futures:{ticker}:{four_hour[0].isoformat()}:{one_hour[0].isoformat()}:1"
     symbol = unified_symbol or ticker
@@ -886,6 +937,18 @@ def _record_futures_cycle_rejection(
         "signal": signal,
         "signal_reason": signal_reason,
     }
+    # A cycle that stops before entry still observed the closed candle pair, so
+    # record the same verdict the entry path would have reached. Without it the
+    # UI can only say "no data" for a cycle that did read the candles.
+    if snapshot and signal:
+        confirmed, derived_reason = _confirmation_state(snapshot, signal)
+        payload["confirmation_result"] = confirmed
+        if not confirmation_reason:
+            payload["confirmation_reason"] = derived_reason
+    # The Portfolio Manager's verbatim decision (rating, thesis, execution
+    # intent) is the only human-legible record of WHY a cycle was refused.
+    if agent_note:
+        payload["agent_decision_note"] = agent_note[:6000]
     if snapshot:
         payload["snapshot"] = _snapshot_payload(snapshot)
     # Create the row when absent, then always converge it to the terminal
@@ -1044,6 +1107,7 @@ def _process_futures_candidate(
     cancelled: threading.Event | None = None,
     execution_lock: threading.Lock | None = None,
     telemetry: CycleTelemetry | None = None,
+    agent_note: str | None = None,
 ) -> None:
     """Run futures candidates through a prevalidated closed candle pair.
 
@@ -1053,7 +1117,7 @@ def _process_futures_candidate(
     margin mode, leverage, or budgets.
     """
     telemetry = telemetry or CycleTelemetry()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     context = context or _closed_futures_context(derivatives, ticker)
     if context is None:
         result.reason = "confirmation_missing: closed 1h/4h candle pair unavailable"
@@ -1074,6 +1138,8 @@ def _process_futures_candidate(
             signal=signal,
             signal_reason=result.reason,
             phase="proposal",
+            snapshot=context,
+            agent_note=agent_note,
         )
         return
     direction = _direction(signal)
@@ -1085,6 +1151,9 @@ def _process_futures_candidate(
             unified_symbol=context.get("unified_symbol"),
             confirmation_reason=confirmation_reason,
             phase="confirmation",
+            snapshot=context,
+            signal=signal,
+            agent_note=agent_note,
         )
         return
     symbol = context["unified_symbol"]
@@ -1110,6 +1179,8 @@ def _process_futures_candidate(
             signal=signal,
             signal_reason=proposal_error,
             phase="proposal",
+            snapshot=context,
+            agent_note=agent_note,
         )
         return
     stop, take = terms["stop_loss"], terms["take_profit"]
@@ -1124,16 +1195,16 @@ def _process_futures_candidate(
         result.reason = "invalid protective bracket"
         return
     expires_at = now + (
-        datetime.fromtimestamp(candle_4h.close_time / 1000, timezone.utc)
-        - datetime.fromtimestamp(candle_4h.open_time / 1000, timezone.utc)
+        datetime.fromtimestamp(candle_4h.close_time / 1000, UTC)
+        - datetime.fromtimestamp(candle_4h.open_time / 1000, UTC)
     )
     envelope = FuturesSignalEnvelope.create(
         symbol=symbol,
-        candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, timezone.utc),
-        candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, timezone.utc),
+        candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, UTC),
+        candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, UTC),
         direction=direction, entry=mark, stop=stop, targets=(take,),
         created_at=now, expires_at=expires_at,
-        confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, timezone.utc),
+        confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, UTC),
         strategy="autoloop", strategy_version="1",
     )
     if not job_store.claim_futures_cycle(
@@ -1200,6 +1271,7 @@ def _process_futures_candidate(
                 "order_id": result.order_id,
                 "protection_state": protection_state,
                 "agent_proposal": _snapshot_payload(proposal),
+                "agent_decision_note": agent_note,
                 "plan": getattr(plan, "__dict__", {}),
             },
             terminal=True,
@@ -1284,10 +1356,16 @@ def _result_summary(result: DailyResult) -> dict:
 
 
 def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 # --- endpoints ----------------------------------------------------------------
+
+# Zero-filled bucket order for the /autoloop/cycles funnel summary.
+_CYCLE_SUMMARY_BUCKETS = (
+    "market_rejected", "confirmation_rejected", "proposal_rejected", "entered",
+    "in_flight", "interrupted", "other",
+)
 
 
 def _payload() -> dict:
@@ -1321,12 +1399,25 @@ def _cycle_payload(cycle: dict) -> dict:
 
 
 @router.get("/autoloop/cycles")
-def get_autoloop_cycles(limit: int = 20):
+def get_autoloop_cycles(limit: int = 20, symbol: str | None = None):
     if limit < 1 or limit > 100:
         raise ApiError(400, "validation_error", '"limit" must be between 1 and 100')
+    if symbol is not None and not symbol.strip():
+        raise ApiError(400, "validation_error", '"symbol" must be a non-empty string when provided')
+    symbol_filter = (symbol.strip() or None) if symbol else None
+    summary = job_store.futures_cycle_summary()
     return {
         "generated_at": utc_now_iso(),
-        "items": [_cycle_payload(item) for item in job_store.list_futures_cycles(limit=limit)],
+        "items": [
+            _cycle_payload(item)
+            for item in job_store.list_futures_cycles(limit=limit, symbol=symbol_filter)
+        ],
+        "summary": {
+            **dict.fromkeys(_CYCLE_SUMMARY_BUCKETS, 0),
+            **summary,
+            "total": sum(summary.values()),
+        },
+        "symbols": job_store.futures_cycle_symbol_rollup(),
         "enabled": bool(_load_state().get("enabled", False)),
         "interval_minutes": _interval_from(_load_state()),
         "running_cycle": _cycle_lock.locked(),
@@ -1397,7 +1488,7 @@ async def halt_now(request: Request):
     # halt line without one would be ignored by _halted_today.
     append_event(get_config()["exec_log_path"], {
         "event": "halt",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "reason": "manual halt from the control panel",
     })
     audit_log.record("autoloop_halt")
@@ -1411,7 +1502,7 @@ async def reset_halt(request: Request):
     await json_body(request)  # CSRF §0: application/json required, body may be {}
     append_event(get_config()["exec_log_path"], {
         "event": "halt_reset",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     })
     audit_log.record("autoloop_halt_reset")
     return {"generated_at": utc_now_iso(), "halted": False}

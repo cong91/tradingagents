@@ -60,7 +60,9 @@ class TestStockTwitsCryptoSymbols:
             ("AMD", "AMD"),
             ("BRK-B", "BRK-B"),       # dashed class share: untouched
             ("GOLD", "GOLD"),         # real equity (aliases elsewhere): untouched here
-            ("XYZ-USD", "XYZ-USD"),   # unknown base: not treated as crypto
+            ("BNB-USD", "BNB.X"),     # pair outside the spot allow-list still maps
+            ("UNI-USD", "UNI.X"),
+            ("XYZ-USD", "XYZ.X"),     # any BASE-USD pair is a crypto request
         ],
     )
     def test_symbol_mapping(self, ticker, expected):

@@ -15,7 +15,7 @@ closed at the end of each stage.
 import contextlib
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
 
@@ -123,7 +123,7 @@ def layer_spot() -> None:
     # Cap the entry at ~50 USDT: this is a plumbing test, not a position.
     tiny_qty = round(min(50.0 / price, plan.quantity), 6)
     plan = plan.model_copy(update={"quantity": tiny_qty, "cost": tiny_qty * price})
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     stop, take = atr_targets("BTC-USD", today, "crypto")
     if stop and take:
         plan = plan.model_copy(update={"stop_loss": stop, "take_profit": take})

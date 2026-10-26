@@ -2,7 +2,7 @@
 
 import json
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -18,12 +18,12 @@ pytestmark = pytest.mark.unit
 @pytest.fixture
 def clock(monkeypatch):
     clock = SimpleNamespace(now=100.0)
-    origin = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
+    origin = datetime(2026, 10, 14, 12, tzinfo=UTC)
 
     class ClockDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
-            assert tz == timezone.utc
+            assert tz == UTC
             return origin + timedelta(seconds=clock.now - 100.0)
 
     monkeypatch.setattr(telemetry_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))

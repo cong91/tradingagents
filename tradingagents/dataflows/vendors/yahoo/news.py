@@ -9,7 +9,7 @@ from dateutil.relativedelta import relativedelta
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.date_window import coverage_gap, in_window
 from tradingagents.dataflows.errors import VendorUnavailableError
-from tradingagents.dataflows.symbols import normalize_symbol
+from tradingagents.dataflows.symbols import crypto_base, futures_base, normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import yf_retry
 
 
@@ -84,6 +84,15 @@ def _format_articles(articles: list[dict]) -> str:
     return out
 
 
+def _news_query(ticker: str, canonical: str) -> str:
+    """The term Yahoo's search feed answers news for.
+
+    A crypto pair's articles are tagged with the base (``BNB``), not the pair
+    (``BNB-USD``), so a pair that found nothing falls back to its base.
+    """
+    return crypto_base(ticker) or futures_base(ticker) or canonical
+
+
 def get_news_yfinance(
     ticker: str,
     start_date: str,
@@ -108,6 +117,10 @@ def get_news_yfinance(
     articles = [_extract_article_data(a) for a in feed]
     if not feed:
         found, answered = _search_news(canonical, article_limit)
+        if not found and canonical != _news_query(ticker, canonical):
+            # A crypto pair's articles are tagged with the base ("BNB"), not the
+            # pair ("BNB-USD"); search the base before reporting an absence.
+            found, answered = _search_news(_news_query(ticker, canonical), article_limit)
         if not answered:
             raise VendorUnavailableError(f"Yahoo Finance returned no news response for {canonical}")
         if not found:

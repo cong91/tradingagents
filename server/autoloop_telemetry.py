@@ -5,7 +5,7 @@ import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -167,7 +167,7 @@ class CycleTelemetry(BaseCallbackHandler):
             "ticker": ticker,
             "node": node,
             "started": time.monotonic(),
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
             "path": (*path, stage),
         }
         self._spans[span_id] = span

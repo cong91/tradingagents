@@ -187,6 +187,12 @@ class TestCryptoSearchTerm:
     def test_crypto_pair_searches_base(self):
         assert self._captured_ticker("BTC-USD") == "BTC"
 
+    def test_pair_outside_the_spot_allow_list_searches_base(self):
+        # BNB/UNI are liquid pairs but absent from the Yahoo spot allow-list;
+        # searching the pair form matched almost nothing (#1421).
+        assert self._captured_ticker("BNB-USD") == "BNB"
+        assert self._captured_ticker("UNI-USD") == "UNI"
+
     def test_equity_passes_through(self):
         assert self._captured_ticker("NVDA") == "NVDA"
 

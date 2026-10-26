@@ -132,6 +132,28 @@ def _ticker_with(articles, monkeypatch, search_news=(), search_quotes=("AAPL",))
 
 
 @pytest.mark.unit
+def test_empty_ticker_stream_falls_back_to_the_search_feed(monkeypatch):
+    # yfinance 1.7 answers 200 with an empty ticker stream for every symbol
+    # (AAPL included), so an empty stream must not be read as "no news".
+    found = [{"title": "FOUND", "publisher": "P", "link": "l",
+              "providerPublishTime": _epoch("2026-09-10")}]
+    _ticker_with([], monkeypatch, search_news=found)
+    out = ynews.get_news_yfinance("AAPL", "2026-09-01", "2026-09-14")
+    assert "FOUND" in out
+    assert "unavailable" not in out
+
+
+@pytest.mark.unit
+def test_search_fallback_queries_the_crypto_base_not_the_pair(monkeypatch):
+    # Yahoo's search feed answers "BNB-USD" with nothing and "BNB" with coverage,
+    # so the base query runs before the vendor reports an absence.
+    searched = _ticker_with([], monkeypatch)
+    with pytest.raises(ynews.VendorUnavailableError):
+        ynews.get_news_yfinance("BNB-USD", "2026-09-01", "2026-09-14")
+    assert searched[-1] == "BNB"
+
+
+@pytest.mark.unit
 def test_ticker_news_window_before_feed_coverage_is_unavailable(monkeypatch):
     # Yahoo serves only recent articles: a historical window gets none of them,
     # which must read as "cannot answer", not "no news happened".

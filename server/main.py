@@ -30,6 +30,8 @@ from server import (
     bracket_monitor,
     control_store,
     daily,
+    data_source_credentials,
+    data_sources,
     health,
     history,
     job_store,
@@ -107,6 +109,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     _open_state_db()
     _apply_operator_config()
     watchlist.ensure_seeded()
+    # Session cookies for the sentiment vendors live encrypted in PostgreSQL;
+    # push them into the engine so the first analysis after a restart reads them.
+    undecryptable = data_source_credentials.push_to_engine()
+    if undecryptable:
+        logger.warning(
+            "stored data-source credentials could not be decrypted: %s; "
+            "re-import them from the Cấu hình screen",
+            ", ".join(sorted(undecryptable)),
+        )
     with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
         autoloop.ensure_started()
     bracket_monitor.start()
@@ -156,5 +167,6 @@ for _router in (
     health.router,
     performance.router,
     autoloop.router,
+    data_sources.router,
 ):
     app.include_router(_router)

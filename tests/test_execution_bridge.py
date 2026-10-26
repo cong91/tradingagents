@@ -14,7 +14,7 @@ testable.
 
 import json
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import ccxt
 import pytest
@@ -36,7 +36,7 @@ AUDIT_FIELDS = (
 # The risk guard's clock is frozen for the whole module so day-scoped checks
 # (halt stickiness, daily P&L) are deterministic; injected control events use
 # the same day. Bridge audit timestamps use the real clock and are unaffected.
-FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
+FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 
 
 class FakeExchange:

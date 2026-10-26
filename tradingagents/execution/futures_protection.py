@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from server import job_store
@@ -219,7 +219,7 @@ def _manage_one_with_lease(
         "targets": [float(leg["params"]["takeProfitPrice"]) for leg in target_legs],
         "scale_out": ladder,
         "phase": decision.phase,
-        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "observed_at": datetime.now(UTC).isoformat(),
         "highest_mark": max(float(snapshot.get("highest_mark", mark)), mark) if side == "long" else snapshot.get("highest_mark"),
         "lowest_mark": min(float(snapshot.get("lowest_mark", mark)), mark) if side == "short" else snapshot.get("lowest_mark"),
     }
@@ -252,7 +252,7 @@ def _fresh_mark(
     if timestamp is None:
         return None, "mark_timestamp_unavailable"
     try:
-        age_ms = datetime.now(timezone.utc).timestamp() * 1000 - float(timestamp)
+        age_ms = datetime.now(UTC).timestamp() * 1000 - float(timestamp)
     except (TypeError, ValueError):
         return None, "mark_timestamp_unavailable"
     if age_ms < -5_000 or age_ms > max_age_seconds * 1000:
