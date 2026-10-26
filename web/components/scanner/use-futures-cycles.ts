@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { scannerApi } from "./scanner-api";
-import type { FuturesCycle } from "./scanner-types";
+import type { FuturesCycle, FuturesCycleSummary, FuturesCycleSymbolRollup } from "./scanner-types";
 
 const POLL_INTERVAL_MS = 10_000;
 
 export interface FuturesCycleState {
   cycles: FuturesCycle[];
+  summary: FuturesCycleSummary | null;
+  symbols: FuturesCycleSymbolRollup[];
   runningCycle: boolean;
   enabled: boolean;
   intervalMinutes: number | null;
@@ -18,6 +20,8 @@ export interface FuturesCycleState {
 
 export function useFuturesCycles(): FuturesCycleState {
   const [cycles, setCycles] = useState<FuturesCycle[]>([]);
+  const [summary, setSummary] = useState<FuturesCycleSummary | null>(null);
+  const [symbols, setSymbols] = useState<FuturesCycleSymbolRollup[]>([]);
   const [runningCycle, setRunningCycle] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [intervalMinutes, setIntervalMinutes] = useState<number | null>(null);
@@ -28,6 +32,8 @@ export function useFuturesCycles(): FuturesCycleState {
     scannerApi.futuresCycles().then(
       (body) => {
         setCycles(body.items);
+        setSummary(body.summary ?? null);
+        setSymbols(body.symbols ?? []);
         setRunningCycle(body.running_cycle ?? false);
         setEnabled(body.enabled ?? false);
         setIntervalMinutes(body.interval_minutes ?? null);
@@ -45,5 +51,8 @@ export function useFuturesCycles(): FuturesCycleState {
     return () => clearInterval(id);
   }, [load]);
 
-  return { cycles, runningCycle, enabled, intervalMinutes, loading, error, refresh: load };
+  return {
+    cycles, summary, symbols, runningCycle, enabled, intervalMinutes,
+    loading, error, refresh: load,
+  };
 }

@@ -141,6 +141,9 @@ export interface FuturesCyclePayload {
   confirmation_reason?: string | null;
   /** tradeable_signal | signal_not_tradeable */
   signal_reason?: string | null;
+  /** Nguyên văn quyết định của Quản lý danh mục (Rating / Thesis / Execution
+   *  Intent) — lý do con người đọc được vì sao chu kỳ bị từ chối hoặc vào lệnh. */
+  agent_decision_note?: string | null;
   /** Lý do no_order từ kế hoạch (Hold, minimum, risk refusal...). */
   plan_reason?: string | null;
   /** executed | awaiting_approval | not_executed | failed */
@@ -158,8 +161,12 @@ export interface FuturesCyclePayload {
     one_hour_direction?: string | null;
     four_hour_direction?: string | null;
     confirmation?: boolean;
-    next_four_hour_open?: number | string;
-    last_four_hour_close?: number | string;
+    /** Funding rate + open interest của hợp đồng futures (rev 7). */
+    funding_rate?: number | null;
+    funding_datetime?: string | null;
+    mark_price?: number | null;
+    open_interest?: number | null;
+    open_interest_value?: number | null;
   };
   plan?: {
     side?: string;
@@ -181,9 +188,40 @@ export interface FuturesCyclePayload {
   skipped_reason?: string | null;
 }
 
+/** Phễu kết quả mọi chu kỳ đã ghi nhận (GET /api/autoloop/cycles). */
+export interface FuturesCycleSummary {
+  market_rejected: number;
+  confirmation_rejected: number;
+  proposal_rejected: number;
+  entered: number;
+  in_flight: number;
+  interrupted: number;
+  other: number;
+  total: number;
+}
+
+/** Tổng hợp chu kỳ theo mã: số lần rơi vào từng bucket + tín hiệu/lý do mới nhất. */
+export interface FuturesCycleSymbolRollup {
+  symbol: string;
+  total: number;
+  entered: number;
+  proposal_rejected: number;
+  confirmation_rejected: number;
+  market_rejected: number;
+  in_flight: number;
+  interrupted: number;
+  last_updated: string;
+  last_signal: string | null;
+  last_signal_reason: string | null;
+  last_market_rejection_reason: string | null;
+  last_confirmation_reason: string | null;
+}
+
 export interface FuturesCyclesResponse {
   generated_at: string;
   items: FuturesCycle[];
+  summary?: FuturesCycleSummary;
+  symbols?: FuturesCycleSymbolRollup[];
   running_cycle?: boolean;
   enabled?: boolean;
   interval_minutes?: number;
