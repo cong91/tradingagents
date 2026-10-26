@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/card";
 import { AutoloopCard } from "./autoloop-card";
 import { CredentialsCard } from "./credentials-card";
+import { DataSourceCard } from "./data-source-card";
 import { formatDateTimeVi } from "./format-time";
 import { GatesCard } from "./gates-card";
 import { OperatorConfigCard } from "./operator-config-card";
@@ -178,6 +179,8 @@ export function SettingsScreen() {
               effectiveMode={payload.effective_exec_mode}
             />
           </div>
+          {/* Cookie Reddit/X: đọc/ghi PostgreSQL, mã hoá; độc lập với payload /api/settings. */}
+          <DataSourceCard />
           {/* Vòng tự động tự fetch GET /api/autoloop — độc lập với payload /api/settings. */}
           <AutoloopCard />
           {/* Override vận hành: đọc/ghi PostgreSQL, thay cho operator_config.json. */}

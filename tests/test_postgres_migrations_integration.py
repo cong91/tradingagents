@@ -88,6 +88,7 @@ def test_migrate_applies_once_and_checks_checksum(postgres_dsn, monkeypatch):
         "0001_core_ledger.sql",
         "0002_control_plane.sql",
         "0003_operator_settings.sql",
+        "0004_data_source_credentials.sql",
     ]
     assert postgres.migrate() == []
 
@@ -137,9 +138,10 @@ def test_migrate_serializes_concurrent_invocations(postgres_dsn):
             "0001_core_ledger.sql",
             "0002_control_plane.sql",
             "0003_operator_settings.sql",
+            "0004_data_source_credentials.sql",
         ]
         with psycopg.connect(dsn) as conn:
-            assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 3
+            assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 4
             assert conn.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
     finally:
         if worker.is_alive():

@@ -16,6 +16,7 @@ dependencies = [
     "langgraph>=0.4.8",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "ccxt>=4.5",
+    "cryptography>=42",
     "pandas>=2.3.0",
     "python-dotenv>=1.0.0",
     "pytz>=2025.2",
