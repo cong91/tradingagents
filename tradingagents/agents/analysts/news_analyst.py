@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.context import get_instrument_context_from_state, get_language_instruction
+from tradingagents.agents.tool_calls import invoke_with_tool_retry
 from tradingagents.agents.tools import (
     get_global_news,
     get_macro_indicators,
@@ -53,7 +54,7 @@ def create_news_analyst(llm):
         prompt = prompt.partial(instrument_context=instrument_context)
 
         chain = prompt | llm.bind_tools(TOOLS)
-        result = chain.invoke(state["messages"])
+        result = invoke_with_tool_retry(chain, state["messages"])
 
         report = ""
 

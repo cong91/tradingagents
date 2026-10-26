@@ -23,7 +23,7 @@ from datetime import datetime
 from urllib.request import Request, urlopen
 
 from tradingagents.dataflows.date_window import coverage_gap, in_window
-from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.dataflows.symbols import crypto_base, futures_base
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,12 @@ def _stocktwits_symbol(ticker: str) -> str:
     """Map a crypto pair to StockTwits' ``<BASE>.X`` convention.
 
     StockTwits lists crypto as ``BTC.X`` (Yahoo's ``BTC-USD`` form 404s), so any
-    crypto symbol resolves to its base plus ``.X``; other symbols pass through
-    upper-cased.
+    crypto pair resolves to its base plus ``.X``; other symbols pass through
+    upper-cased. ``crypto_base`` only knows a fixed spot allow-list, while
+    ``futures_base`` parses any ``BASE-USD``/``BASE-USDT`` pair, so a coin
+    outside that list (BNB, UNI) still maps instead of 404ing on the pair.
     """
-    base = crypto_base(ticker)
+    base = crypto_base(ticker) or futures_base(ticker)
     return f"{base}.X" if base else ticker.strip().upper()
 
 

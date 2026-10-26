@@ -106,7 +106,7 @@ def test_global_news_empty_after_filter_is_informative(monkeypatch):
     assert "unavailable" in out and "not an absence" in out
 
 
-def _ticker_with(articles, monkeypatch):
+def _ticker_with(articles, monkeypatch, search_articles=()):
     class FakeTicker:
         def __init__(self, *a, **k):
             pass
@@ -115,6 +115,36 @@ def _ticker_with(articles, monkeypatch):
             return articles
 
     monkeypatch.setattr(ynews.yf, "Ticker", FakeTicker)
+    # The search-feed fallback runs whenever the ticker stream is empty; stub it
+    # so a unit test never reaches the network.
+    monkeypatch.setattr(ynews, "_search_news", lambda query, limit: list(search_articles))
+
+
+@pytest.mark.unit
+def test_empty_ticker_stream_falls_back_to_the_search_feed(monkeypatch):
+    # yfinance 1.7 answers 200 with an empty ticker stream for every symbol
+    # (AAPL included), so an empty stream must not be read as "no news".
+    found = [{"title": "FOUND", "publisher": "P", "link": "l",
+              "providerPublishTime": _epoch("2026-09-10")}]
+    _ticker_with([], monkeypatch, search_articles=found)
+    out = ynews.get_news_yfinance("AAPL", "2026-09-01", "2026-09-14")
+    assert "FOUND" in out
+    assert "unavailable" not in out
+
+
+@pytest.mark.unit
+def test_search_fallback_queries_the_crypto_base_not_the_pair(monkeypatch):
+    # Yahoo's search feed answers "BNB-USD" with nothing and "BNB" with coverage.
+    seen = {}
+
+    def fake_search(query, limit):
+        seen["query"] = query
+        return []
+
+    _ticker_with([], monkeypatch)
+    monkeypatch.setattr(ynews, "_search_news", fake_search)
+    ynews.get_news_yfinance("BNB-USD", "2026-09-01", "2026-09-14")
+    assert seen["query"] == "BNB"
 
 
 @pytest.mark.unit

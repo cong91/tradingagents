@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.context import get_instrument_context_from_state, get_language_instruction
+from tradingagents.agents.tool_calls import invoke_with_tool_retry
 from tradingagents.agents.tools import get_indicators, get_stock_data, get_verified_market_snapshot
 
 # The tools this analyst is offered; its tool node is built from the same tuple.
@@ -75,7 +76,7 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
 
         chain = prompt | llm.bind_tools(TOOLS)
 
-        result = chain.invoke(state["messages"])
+        result = invoke_with_tool_retry(chain, state["messages"])
 
         report = ""
 

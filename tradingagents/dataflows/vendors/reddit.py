@@ -1,23 +1,31 @@
 """Reddit search fetcher for ticker-specific discussion posts.
 
-Reads Reddit's public Atom/RSS search feed, searching all subreddits in one
-combined request. The JSON search endpoint is WAF-blocked (``HTTP 403``) for
-anonymous clients (#862), so RSS is the only path; it carries no score or comment
-counts. On a 429 we back off once, honouring ``Retry-After``.
+Two paths, chosen by whether the operator supplied a Reddit session cookie:
+
+* **Cookies configured** — the JSON search endpoint
+  (``/r/{sub}/search.json``). Anonymous clients get a WAF ``HTTP 403`` (#862),
+  but a logged-in session is served the real JSON, which carries score and
+  comment counts and does not hit the anonymous per-IP limit that forces the
+  RSS path into 60-second back-offs.
+* **No cookies** — the public Atom/RSS search feed, one combined request for
+  all subreddits. It carries no score or comment counts.
+
+On a 429 the RSS path backs off once, honouring ``Retry-After``.
 
 A fetch that fails is reported as ``<unavailable>``, never as "no posts found":
 the two are different claims, and passing a rate-limited fetch off as silence
 hands the sentiment analyst a signal that was never observed (#1295).
 
-No API key required. Returns formatted plaintext blocks ready for prompt
-injection and degrades gracefully — returns a placeholder string rather than
-raising, so callers never special-case missing data.
+Returns formatted plaintext blocks ready for prompt injection and degrades
+gracefully — returns a placeholder string rather than raising, so callers never
+special-case missing data.
 """
 
 from __future__ import annotations
 
 import html
 import http.client
+import json
 import logging
 import random
 import re
@@ -29,8 +37,9 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from tradingagents.dataflows import credentials
 from tradingagents.dataflows.date_window import coverage_gap, in_window
-from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.dataflows.symbols import crypto_base, futures_base
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +75,7 @@ def _coverage_dates(posts) -> list:
 
 
 _RSS = "https://www.reddit.com/r/{sub}/search.rss?{qs}"
+_JSON = "https://www.reddit.com/r/{sub}/search.json?{qs}"
 # A descriptive, identified User-Agent (per Reddit's API etiquette). Reddit
 # blocks generic/anonymous tokens like bare "Mozilla/5.0" or "curl/…" but
 # serves this one on both endpoints; the RSS feed accepts it even when the
@@ -231,6 +241,51 @@ def _fetch_subreddit_rss(
     return posts
 
 
+def _fetch_subreddit_json(
+    ticker: str,
+    sub: str,
+    limit: int,
+    timeout: float,
+) -> list[dict] | None:
+    """Authenticated search: the JSON endpoint behind the operator's session cookie.
+
+    Returns ``[]`` when the search matched nothing and ``None`` when the fetch
+    failed — the same contract as the RSS path, because the caller must keep
+    "observed silence" and "could not observe" apart.
+    """
+    url = _JSON.format(sub=sub, qs=_search_qs(ticker, limit))
+    headers = {
+        "User-Agent": _UA,
+        "Accept": "application/json",
+        # Reddit serves the JSON search only to a logged-in session; the cookie
+        # header is the whole reason this path exists.
+        "Cookie": credentials.cookie_header("reddit") or "",
+    }
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(_read_capped(resp).decode("utf-8", "replace"))
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        logger.warning("Reddit JSON fetch failed for r/%s · %s: %s", sub, ticker, exc)
+        return None
+
+    children = ((payload.get("data") or {}).get("children") or []) if isinstance(payload, dict) else []
+    posts = []
+    for child in children[:limit]:
+        data = child.get("data") if isinstance(child, dict) else None
+        if not isinstance(data, dict):
+            continue
+        posts.append({
+            "title": data.get("title") or "",
+            "created_utc": data.get("created_utc"),
+            "selftext": data.get("selftext") or "",
+            "subreddit": data.get("subreddit") or (sub if "+" not in sub else ""),
+            "score": data.get("score"),
+            "num_comments": data.get("num_comments"),
+        })
+    return posts
+
+
 def fetch_reddit_posts(
     ticker: str,
     subreddits: Iterable[str] = DEFAULT_SUBREDDITS,
@@ -259,10 +314,16 @@ def fetch_reddit_posts(
     """
     # Crypto reaches us as a Yahoo pair (BTC-USD); search Reddit for the base
     # ("BTC") so the query actually matches discussion instead of near-nothing.
-    ticker = crypto_base(ticker) or ticker
+    # crypto_base only knows a fixed spot allow-list, so futures_base parses a
+    # pair for coins outside it (BNB, UNI) rather than searching the pair form.
+    ticker = crypto_base(ticker) or futures_base(ticker) or ticker
     subreddits = list(subreddits)
     label = ", ".join(f"r/{s}" for s in subreddits)
-    fetched = _fetch_subreddit_rss(ticker, "+".join(subreddits), _FEED_PAGE, timeout)
+    combined = "+".join(subreddits)
+    if credentials.is_configured("reddit"):
+        fetched = _fetch_subreddit_json(ticker, combined, _FEED_PAGE, timeout)
+    else:
+        fetched = _fetch_subreddit_rss(ticker, combined, _FEED_PAGE, timeout)
     if fetched is None:
         return f"<Reddit unavailable: fetch failed ({label}); this is not an absence of discussion>"
 
@@ -314,8 +375,13 @@ def fetch_reddit_posts(
             selftext = (p.get("selftext") or "").replace("\n", " ").strip()
             if len(selftext) > 240:
                 selftext = selftext[:240] + "…"
+            # Only the authenticated JSON path carries engagement; the RSS feed
+            # has no score or comment count, so it must not claim zero.
+            engagement = ""
+            if p.get("score") is not None or p.get("num_comments") is not None:
+                engagement = f" (score {p.get('score', '?')}, {p.get('num_comments', '?')} comments)"
             lines.append(
-                f"  [{created_str}] {title}"
+                f"  [{created_str}] {title}{engagement}"
                 + (f"\n    body excerpt: {selftext}" if selftext else "")
             )
         blocks.append("\n".join(lines))

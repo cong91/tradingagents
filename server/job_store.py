@@ -256,10 +256,62 @@ def load_futures_cycle(cycle_id: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
-def list_futures_cycles(limit: int = 20) -> list[dict]:
+def list_futures_cycles(limit: int = 20, symbol: str | None = None) -> list[dict]:
+    query = "SELECT * FROM futures_cycles"
+    params: list = []
+    if symbol:
+        query += " WHERE symbol = %s"
+        params.append(symbol)
+    query += " ORDER BY updated_at DESC LIMIT %s"
+    params.append(limit)
+    with db.read() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def futures_cycle_summary() -> dict[str, int]:
+    """Outcome funnel over every recorded cycle row.
+
+    Buckets mirror the scan pipeline: market screen → candle confirmation →
+    agent proposal → executed entry, plus in-flight/interrupted leftovers.
+    """
     with db.read() as conn:
         rows = conn.execute(
-            "SELECT * FROM futures_cycles ORDER BY updated_at DESC LIMIT %s", (limit,)
+            """SELECT CASE
+                     WHEN status = 'completed' AND phase = 'entry' THEN 'entered'
+                     WHEN status IN ('claimed', 'running') THEN 'in_flight'
+                     WHEN status IN ('interrupted', 'recovery_pending', 'failed') THEN 'interrupted'
+                     WHEN status = 'rejected' AND phase = 'market' THEN 'market_rejected'
+                     WHEN status = 'rejected' AND phase = 'confirmation' THEN 'confirmation_rejected'
+                     WHEN status = 'rejected' AND phase = 'proposal' THEN 'proposal_rejected'
+                     ELSE 'other'
+                   END AS bucket,
+                   count(*) AS count
+               FROM futures_cycles GROUP BY 1"""
+        ).fetchall()
+    return {row["bucket"]: row["count"] for row in rows}
+
+
+def futures_cycle_symbol_rollup() -> list[dict]:
+    """Per-symbol funnel counts plus the newest cycle's signal and reasons."""
+    with db.read() as conn:
+        rows = conn.execute(
+            """SELECT symbol,
+                      count(*) AS total,
+                      count(*) FILTER (WHERE status = 'completed' AND phase = 'entry') AS entered,
+                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'proposal') AS proposal_rejected,
+                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'confirmation') AS confirmation_rejected,
+                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'market') AS market_rejected,
+                      count(*) FILTER (WHERE status IN ('claimed', 'running')) AS in_flight,
+                      count(*) FILTER (WHERE status IN ('interrupted', 'recovery_pending', 'failed')) AS interrupted,
+                      max(updated_at) AS last_updated,
+                      (array_agg(payload->>'signal' ORDER BY updated_at DESC))[1] AS last_signal,
+                      (array_agg(payload->>'signal_reason' ORDER BY updated_at DESC))[1] AS last_signal_reason,
+                      (array_agg(payload->>'market_rejection_reason' ORDER BY updated_at DESC))[1] AS last_market_rejection_reason,
+                      (array_agg(payload->>'confirmation_reason' ORDER BY updated_at DESC))[1] AS last_confirmation_reason
+               FROM futures_cycles
+               GROUP BY symbol
+               ORDER BY last_updated DESC"""
         ).fetchall()
     return [dict(row) for row in rows]
 

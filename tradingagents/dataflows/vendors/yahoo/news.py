@@ -9,7 +9,7 @@ from dateutil.relativedelta import relativedelta
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.date_window import coverage_gap, in_window
 from tradingagents.dataflows.errors import NoMarketDataError
-from tradingagents.dataflows.symbols import normalize_symbol
+from tradingagents.dataflows.symbols import crypto_base, futures_base, normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.ohlcv import yf_retry
 
 
@@ -58,6 +58,37 @@ def _extract_article_data(article: dict) -> dict:
         }
 
 
+def _news_query(ticker: str, canonical: str) -> str:
+    """The term Yahoo's search feed answers news for.
+
+    The feed returns nothing for a crypto pair (``BNB-USD``) while the base
+    (``BNB``) carries the coin's coverage, so a pair searches by its base.
+    """
+    return crypto_base(ticker) or futures_base(ticker) or canonical
+
+
+def _search_news(query: str, limit: int) -> list:
+    """Latest articles for ``query`` from Yahoo's search feed."""
+    search = yf_retry(
+        lambda: yf.Search(query=query, news_count=limit, enable_fuzzy_query=True)
+    )
+    return list(search.news or [])
+
+
+def _ticker_news(ticker: str, canonical: str, limit: int) -> list:
+    """Raw articles for a symbol, falling back to the search feed.
+
+    yfinance 1.7's ``Ticker.get_news`` answers 200 with an empty stream for
+    every symbol, so an empty ticker stream alone cannot be read as "no news".
+    The search feed still serves the same articles, so ask it before reporting
+    an absence.
+    """
+    articles = yf_retry(lambda: yf.Ticker(canonical).get_news(count=limit)) or []
+    if articles:
+        return list(articles)
+    return _search_news(_news_query(ticker, canonical), limit)
+
+
 def get_news_yfinance(
     ticker: str,
     start_date: str,
@@ -81,8 +112,7 @@ def get_news_yfinance(
     canonical = normalize_symbol(ticker)
     resolved = "" if canonical == ticker else f" (resolved to {canonical})"
     try:
-        stock = yf.Ticker(canonical)
-        news = yf_retry(lambda: stock.get_news(count=article_limit)) or []
+        news = _ticker_news(ticker, canonical, article_limit)
 
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")

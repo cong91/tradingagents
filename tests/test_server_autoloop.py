@@ -211,6 +211,83 @@ def test_autoloop_validates_body(client, tmp_path):
     assert control_store.load_autoloop_state() == {}
 
 
+# --- GET /api/autoloop/cycles: funnel summary + per-symbol drill-down ----------
+
+
+def _seed_cycle(cycle_id: str, symbol: str, *, status: str, phase: str,
+                payload: dict | None = None) -> None:
+    from server import job_store
+
+    assert job_store.claim_futures_cycle(
+        cycle_id, symbol=symbol, four_hour_open="2026-10-25T04:00:00+00:00",
+        one_hour_open="2026-10-25T07:00:00+00:00", strategy_version="1",
+    )
+    job_store.update_futures_cycle(
+        cycle_id, status=status, phase=phase, payload=payload or {}, terminal=True,
+    )
+
+
+def test_autoloop_cycles_summary_and_symbol_rollup(client):
+    _seed_cycle(
+        "c-market", "SNDKB-USD", status="rejected", phase="market",
+        payload={"market_rejection_reason": "no active USDT-settled futures contract"},
+    )
+    _seed_cycle(
+        "c-confirm", "BTC/USDT:USDT", status="rejected", phase="confirmation",
+        payload={"signal": "Buy", "confirmation_reason": "doji_candle"},
+    )
+    _seed_cycle(
+        "c-abstain", "AAVE/USDT:USDT", status="rejected", phase="proposal",
+        payload={"signal": "Underweight", "signal_reason": "agent_abstained"},
+    )
+    _seed_cycle(
+        "c-entered", "UNI/USDT:USDT", status="completed", phase="entry",
+        payload={"signal": "Sell", "signal_reason": "tradeable_signal"},
+    )
+
+    body = client.get("/api/autoloop/cycles").json()
+
+    assert body["summary"] == {
+        "market_rejected": 1, "confirmation_rejected": 1, "proposal_rejected": 1,
+        "entered": 1, "in_flight": 0, "interrupted": 0, "other": 0, "total": 4,
+    }
+    rollup = {row["symbol"]: row for row in body["symbols"]}
+    assert set(rollup) == {"SNDKB-USD", "BTC/USDT:USDT", "AAVE/USDT:USDT", "UNI/USDT:USDT"}
+    assert rollup["AAVE/USDT:USDT"]["total"] == 1
+    assert rollup["AAVE/USDT:USDT"]["proposal_rejected"] == 1
+    assert rollup["AAVE/USDT:USDT"]["last_signal"] == "Underweight"
+    assert rollup["AAVE/USDT:USDT"]["last_signal_reason"] == "agent_abstained"
+    assert rollup["SNDKB-USD"]["market_rejected"] == 1
+    assert rollup["SNDKB-USD"]["last_market_rejection_reason"] == (
+        "no active USDT-settled futures contract"
+    )
+    assert rollup["UNI/USDT:USDT"]["entered"] == 1
+    assert body["symbols"][0]["last_updated"] >= body["symbols"][-1]["last_updated"]
+
+
+def test_autoloop_cycles_symbol_filter_and_validation(client):
+    _seed_cycle(
+        "f-aave", "AAVE/USDT:USDT", status="rejected", phase="proposal",
+        payload={"signal": "Sell", "signal_reason": "agent_abstained"},
+    )
+    _seed_cycle(
+        "f-bnb", "BNB/USDT:USDT", status="rejected", phase="proposal",
+        payload={"signal": "Underweight", "signal_reason": "agent_abstained"},
+    )
+
+    body = client.get(
+        "/api/autoloop/cycles", params={"symbol": "AAVE/USDT:USDT"},
+    ).json()
+    assert [item["symbol"] for item in body["items"]] == ["AAVE/USDT:USDT"]
+    # the summary/rollup stay global — the filter only narrows the items list
+    assert body["summary"]["total"] == 2
+    assert len(body["symbols"]) == 2
+
+    response = client.get("/api/autoloop/cycles", params={"symbol": "   "})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 # --- scheduler -----------------------------------------------------------------
 
 
@@ -531,10 +608,12 @@ def _agent_proposal(**overrides) -> dict:
 class _FakeGraph:
     """propagate() returns a fixed signal/state and records the calls it saw."""
 
-    def __init__(self, signal: str, proposal: dict | None = None, intent: str = "enter"):
+    def __init__(self, signal: str, proposal: dict | None = None, intent: str = "enter",
+                 note: str | None = None):
         self._signal = signal
         self._proposal = _agent_proposal() if proposal is None else proposal
         self._intent = intent
+        self._note = note
         self.calls: list[tuple[str, str, str]] = []
 
     def propagate(self, ticker: str, trade_date: str, asset_type: str | None = None):
@@ -543,6 +622,8 @@ class _FakeGraph:
             "futures_execution_proposal": self._proposal,
             "futures_execution_intent": self._intent,
         }
+        if self._note is not None:
+            state["final_trade_decision"] = self._note
         return state, self._signal
 
 
@@ -1158,6 +1239,50 @@ def test_run_cycle_derivatives_doji_candle_is_confirmation_missing(tmp_path, mon
     assert cycle["payload"]["unified_symbol"] == "BTC/USDT:USDT"
 
 
+_PM_DECISION = (
+    "**Rating**: Sell\n\n"
+    "**Executive Summary**: Momentum is weak but funding is neutral.\n\n"
+    "**Investment Thesis**: Wait for a cleaner breakdown.\n\n"
+    "**Futures Execution Intent**: abstain"
+)
+
+
+def test_run_cycle_abstain_records_pm_decision_note(tmp_path, monkeypatch):
+    """The Portfolio Manager's verbatim decision must survive on the rejected
+    cycle: it is the only human-legible record of why an analysed candidate
+    was refused entry."""
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    results = autoloop_mod._run_cycle(
+        lambda config, analysts: _FakeGraph("Sell", intent="abstain", note=_PM_DECISION)
+    )
+
+    (btc,) = results
+    assert btc.reason == "agent_abstained"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected" and cycle["phase"] == "proposal"
+    assert cycle["payload"]["agent_decision_note"] == _PM_DECISION
+
+
+def test_run_cycle_abstain_without_pm_note_omits_the_key(tmp_path, monkeypatch):
+    """Older engines (and the stock path) carry no PM prose: the payload must
+    simply omit the key rather than store null noise."""
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    results = autoloop_mod._run_cycle(
+        lambda config, analysts: _FakeGraph("Sell", intent="abstain")
+    )
+
+    (btc,) = results
+    assert btc.reason == "agent_abstained"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert "agent_decision_note" not in cycle["payload"]
+
+
 def test_run_cycle_derivatives_direction_mismatch_is_confirmation_missing(tmp_path, monkeypatch):
     """Short against bullish closed candles is the wrong-direction mirror of
     the Short happy path: confirmation_missing with direction_mismatch, and
@@ -1495,3 +1620,136 @@ def _market_context(ticker: str = "BTC-USD"):
         "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
     }
+
+
+@pytest.mark.unit
+def test_derivative_metrics_reads_funding_and_open_interest():
+    """The trader is told to justify leverage against funding, so the cycle has
+    to hand it the venue's funding rate and open interest."""
+
+    class Venue:
+        def fetch_funding_rate(self, symbol):
+            return {"fundingRate": 0.0001, "fundingDatetime": "2026-10-26T08:00:00Z",
+                    "markPrice": 737.06}
+
+        def fetch_open_interest(self, symbol):
+            return {"openInterestAmount": 30_960_870_652.53, "openInterestValue": 2.2e10}
+
+    metrics = autoloop_mod._futures_derivative_metrics(Venue(), "BNB/USDT:USDT")
+    assert metrics["funding_rate"] == pytest.approx(0.0001)
+    assert metrics["funding_datetime"] == "2026-10-26T08:00:00Z"
+    assert metrics["mark_price"] == pytest.approx(737.06)
+    assert metrics["open_interest"] == pytest.approx(30_960_870_652.53)
+    assert metrics["open_interest_value"] == pytest.approx(2.2e10)
+
+
+@pytest.mark.unit
+def test_derivative_metrics_degrades_when_the_venue_cannot_answer():
+    """A venue that does not publish these metrics must not fail the cycle."""
+
+    class Venue:
+        def fetch_funding_rate(self, symbol):
+            raise RuntimeError("not supported")
+
+        def fetch_open_interest(self, symbol):
+            raise RuntimeError("not supported")
+
+    metrics = autoloop_mod._futures_derivative_metrics(Venue(), "BNB/USDT:USDT")
+    assert metrics["funding_rate"] is None
+    assert metrics["open_interest"] is None
+
+
+@pytest.mark.unit
+def test_decision_context_reports_funding_and_open_interest():
+    """The numbers must reach the prompt, and an unavailable metric must say so
+    instead of silently disappearing."""
+
+    class Account:
+        venue_profile = "binanceusdm"
+        account_scope = "futures"
+        equity = 1_000.0
+        available_balance = 900.0
+        wallet_balance = 950.0
+        unrealized_pnl = 50.0
+        positions = []
+        equity_currency = "USDT"
+        available_balance_currency = "USDT"
+
+    market = _market_context()
+    market.update({
+        "funding_rate": 0.0001,
+        "funding_datetime": "2026-10-26T08:00:00Z",
+        "mark_price": 737.06,
+        "open_interest": 30_960_870_652.53,
+        "open_interest_value": 2.2e10,
+    })
+    context = autoloop_mod._futures_decision_context(market, Account(), "BNB-USD", {})
+
+    assert "Funding rate: 0.0100%" in context
+    assert "2026-10-26T08:00:00Z" in context
+    assert "Open interest: 30,960,870,652.5300" in context
+
+    missing = autoloop_mod._futures_decision_context(_market_context(), Account(), "BNB-USD", {})
+    assert "Funding rate: unavailable" in missing
+    assert "Open interest: unavailable" in missing
+
+
+@pytest.mark.unit
+def test_rejected_cycle_persists_the_candle_snapshot(monkeypatch):
+    """A cycle that stops at the proposal still read the closed candles; without
+    the snapshot the UI can only report "no data" for a cycle that had data."""
+    claimed, updated = {}, {}
+
+    def fake_claim(cycle_id, **kwargs):
+        claimed.update(kwargs)
+        return True
+
+    def fake_update(cycle_id, **kwargs):
+        updated.update(kwargs)
+
+    monkeypatch.setattr(autoloop_mod.job_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(autoloop_mod.job_store, "update_futures_cycle", fake_update)
+
+    autoloop_mod._record_futures_cycle_rejection(
+        "BNB-USD",
+        unified_symbol="BNB/USDT:USDT",
+        signal="Buy",
+        signal_reason="agent_abstained",
+        phase="proposal",
+        snapshot=_market_context("BNB-USD"),
+        agent_note="**Rating**: Underweight",
+    )
+
+    payload = claimed["payload"]
+    assert payload["snapshot"]["one_hour_direction"] == "bullish"
+    assert payload["snapshot"]["four_hour_close"] == pytest.approx(105.0)
+    assert payload["confirmation_result"] is True
+    assert payload["confirmation_reason"] == "aligned_direction"
+    assert updated["phase"] == "proposal" and updated["status"] == "rejected"
+
+
+@pytest.mark.unit
+def test_rejected_cycle_records_a_direction_mismatch(monkeypatch):
+    """A short signal against bullish candles must persist the mismatch, so the
+    UI can say why instead of reporting no data."""
+    claimed = {}
+
+    def fake_claim(cycle_id, **kwargs):
+        claimed.update(kwargs)
+        return True
+
+    monkeypatch.setattr(autoloop_mod.job_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(autoloop_mod.job_store, "update_futures_cycle", lambda *a, **k: None)
+
+    autoloop_mod._record_futures_cycle_rejection(
+        "BNB-USD",
+        unified_symbol="BNB/USDT:USDT",
+        signal="Underweight",
+        signal_reason="agent_abstained",
+        phase="proposal",
+        snapshot=_market_context("BNB-USD"),
+    )
+
+    payload = claimed["payload"]
+    assert payload["confirmation_result"] is False
+    assert payload["confirmation_reason"] == "direction_mismatch"
