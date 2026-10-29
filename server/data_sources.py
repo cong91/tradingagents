@@ -33,9 +33,10 @@ def get_data_sources():
 async def put_data_source(provider: str, request: Request):
     """Store one provider's cookie export.
 
-    Body: ``{"cookies": <export>, "options": {...}, "actor": "..."}``. ``cookies``
-    accepts Cookie-Editor / EditThisCookie exports (a list of ``{name, value}``
-    objects), a ``{name: value}`` map, or either wrapped in ``{"cookies": ...}``.
+    Body: ``{"cookies": <export>, "actor": "..."}``. ``cookies`` accepts
+    Cookie-Editor / EditThisCookie exports (a list of ``{name, value}`` objects),
+    a ``{name: value}`` map, or either wrapped in ``{"cookies": ...}``.
+    X requires non-empty ``auth_token`` and ``ct0`` cookies; options are unsupported.
     """
     from server import audit as audit_log
 

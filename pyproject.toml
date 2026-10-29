@@ -26,6 +26,8 @@ dependencies = [
     "requests>=2.32.4",
     "rich>=14.0.0",
     "typer>=0.21.0",
+    # Cookie-only auth and current X web handling are newer than the PyPI release.
+    "twscrape @ https://github.com/vladkens/twscrape/archive/63f61a518e576ea5c132f1156c03dda0520d76c1.zip",
     "stockstats>=0.6.5",
     "typing-extensions>=4.14.0",
     "yfinance>=1.7.0",

@@ -8,14 +8,12 @@ export type DataSourceSummary = {
   configured: boolean;
   /** false = key mã hoá đã đổi hoặc mất: phải import lại cookie. */
   decryptable: boolean;
+  /** Cookie bắt buộc đã có; không xác nhận phiên còn hiệu lực trên nhà cung cấp. */
+  valid: boolean;
   cookie_count: number;
   cookie_names: string[];
-  option_keys: string[];
-  /** Tên các option là bí mật (vd bearer_token) — chỉ hiện trạng thái. */
-  secret_options: string[];
   updated_at: string | null;
   updated_by: string | null;
-  supported_options: string[];
 };
 
 export type DataSourcesPayload = {
@@ -26,30 +24,17 @@ export type DataSourcesPayload = {
 
 export const PROVIDER_META: Record<
   DataSourceProvider,
-  { title: string; description: string; options: { key: string; label: string; hint?: string }[] }
+  { title: string; description: string }
 > = {
   reddit: {
     title: "Reddit",
     description:
       "Cookie phiên đăng nhập cho phép tìm kiếm bằng JSON (có điểm và số bình luận). Không có cookie thì hệ thống dùng RSS công khai, bị giới hạn ~1 request/phút và không có điểm.",
-    options: [],
   },
   x: {
     title: "X (Twitter)",
     description:
-      "X từ chối mọi tìm kiếm ẩn danh. Dùng bearer token của API v2 (ổn định, có hạn mức) hoặc cookie phiên đăng nhập kèm graphql_query_id.",
-    options: [
-      {
-        key: "bearer_token",
-        label: "Bearer token (API v2)",
-        hint: "Ưu tiên dùng nếu có. Bỏ trống thì hệ thống dùng cookie phiên.",
-      },
-      {
-        key: "graphql_query_id",
-        label: "GraphQL query id",
-        hint: "Chỉ cần khi dùng cookie. X đổi id này mỗi lần deploy — chép lại từ x.com khi tìm kiếm báo lỗi 403.",
-      },
-    ],
+      "X cần cookie phiên đăng nhập gồm auth_token và ct0. Dán JSON cookie từ x.com; hệ thống tự xử lý tìm kiếm bằng phiên đã lưu.",
   },
 };
 

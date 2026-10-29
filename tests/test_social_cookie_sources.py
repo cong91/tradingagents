@@ -1,17 +1,11 @@
-"""Authenticated vendor paths: Reddit via cookie, X via bearer token or cookie.
-
-Reddit's JSON search answers 403 to anonymous clients (verified live), so a
-configured session cookie is what makes score/comment counts available at all.
-X rejects anonymous search outright (403 GraphQL / 401 API v2), so its vendor
-must say "not configured" rather than imply nobody is talking about the ticker.
-"""
+"""Reddit authenticated source: cookie search preserves engagement and failures."""
 import json
 from unittest.mock import patch
 
 import pytest
 
 from tradingagents.dataflows import credentials
-from tradingagents.dataflows.vendors import reddit, x_social
+from tradingagents.dataflows.vendors import reddit
 
 
 @pytest.fixture(autouse=True)
@@ -97,75 +91,3 @@ class TestRedditAuthenticatedPath:
             out = reddit.fetch_reddit_posts("BTC-USD", subreddits=("stocks",))
         assert "unavailable" in out.lower()
         assert "not an absence" in out
-
-
-@pytest.mark.unit
-class TestXSearchTerm:
-    def test_crypto_pair_searches_its_cashtag(self):
-        assert x_social._search_term("BTC-USD") == "$BTC"
-        assert x_social._search_term("BNB-USD") == "$BNB"
-
-    def test_equity_passes_through(self):
-        assert x_social._search_term("NVDA") == "NVDA"
-
-
-@pytest.mark.unit
-class TestXNotConfigured:
-    def test_unconfigured_x_says_so_instead_of_implying_silence(self):
-        out = x_social.fetch_x_posts("BTC-USD")
-        assert "no credentials configured" in out
-        assert "not an absence" in out
-
-
-@pytest.mark.unit
-class TestXBearerPath:
-    def test_bearer_token_uses_api_v2(self, monkeypatch):
-        credentials.set_provider_credentials("x", options={"bearer_token": "tok"})
-        payload = {"data": [{"text": "BTC moon", "created_at": "2026-10-25T10:00:00Z",
-                             "public_metrics": {"like_count": 5, "retweet_count": 2}}]}
-        seen = {}
-
-        def fake_urlopen(req, timeout=None):
-            seen["url"] = req.full_url
-            seen["auth"] = req.headers.get("Authorization")
-            return _json_response(payload)
-
-        with patch.object(x_social, "urlopen", side_effect=fake_urlopen):
-            out = x_social.fetch_x_posts("BTC-USD", limit=10)
-        assert "search/recent" in seen["url"]
-        assert seen["auth"] == "Bearer tok"
-        assert "BTC moon" in out and "likes 5" in out
-
-
-@pytest.mark.unit
-class TestXGraphqlPath:
-    def test_missing_query_id_is_a_configuration_error(self):
-        credentials.set_provider_credentials("x", [{"name": "auth_token", "value": "a"},
-                                                    {"name": "ct0", "value": "c"}])
-        out = x_social.fetch_x_posts("BTC-USD")
-        assert "graphql_query_id is missing" in out
-
-    def test_missing_ct0_is_reported(self):
-        credentials.set_provider_credentials(
-            "x", [{"name": "auth_token", "value": "a"}],
-            options={"graphql_query_id": "q1"},
-        )
-        out = x_social.fetch_x_posts("BTC-USD")
-        assert "missing ct0" in out
-
-    def test_graphql_timeline_is_parsed(self):
-        credentials.set_provider_credentials(
-            "x", [{"name": "auth_token", "value": "a"}, {"name": "ct0", "value": "c"}],
-            options={"graphql_query_id": "q1"},
-        )
-        result = {"legacy": {
-            "full_text": "BTC ripping", "created_at": "2026-10-25T10:00:00Z",
-            "favorite_count": 9, "retweet_count": 1,
-        }}
-        entry = {"content": {"itemContent": {"tweet_results": {"result": result}}}}
-        payload = {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {
-            "instructions": [{"entries": [entry]}],
-        }}}}}
-        with patch.object(x_social, "urlopen", return_value=_json_response(payload)):
-            out = x_social.fetch_x_posts("BTC-USD", limit=10)
-        assert "BTC ripping" in out and "likes 9" in out
