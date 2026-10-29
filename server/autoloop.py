@@ -1456,6 +1456,7 @@ def _accepts_execution_context(propagate: Callable) -> bool:
 
 def _proposal_terms(
     proposal: Any, *, mark: float, direction: str, config: dict,
+    reference_mark: float | None = None,
 ) -> tuple[dict | None, str | None]:
     """Validate the agents' futures terms; refuse instead of substituting.
 
@@ -1464,6 +1465,12 @@ def _proposal_terms(
     stays inside the system ceilings -- a proposal outside them is refused,
     never silently clamped, because a clamped size would no longer be the
     decision anyone made.
+
+    ``reference_mark`` is the mark the agents were shown. It is a second
+    accepted anchor for ``entry_price``: analysis takes minutes on a moving
+    pair, so a live mark can drift past the 1e-3 tolerance from the number the
+    agent was told to be consistent with. The bracket and the plan still use
+    the live ``mark``.
     """
     if not isinstance(proposal, dict) or not proposal:
         return None, "agent_proposal_missing: no futures entry without agent execution terms"
@@ -1509,7 +1516,13 @@ def _proposal_terms(
             return None, "agent_proposal_rejected: entry_price is not a number"
         if not math.isfinite(entry_value) or entry_value <= 0:
             return None, "agent_proposal_rejected: entry_price must be positive and finite"
-        if abs(entry_value - mark) > max(mark * 0.001, 1e-12):
+
+        def on_mark(anchor: float | None) -> bool:
+            if anchor is None or not math.isfinite(anchor) or anchor <= 0:
+                return False
+            return abs(entry_value - anchor) <= max(anchor * 0.001, 1e-12)
+
+        if not on_mark(mark) and not on_mark(reference_mark):
             return None, "agent_proposal_rejected: non-market entry_price is unsupported by autoloop"
     stop = proposal.get("stop_loss")
     take = proposal.get("take_profit")
@@ -1695,7 +1708,8 @@ def _process_futures_candidate(
         )
         return
     terms, proposal_error = _proposal_terms(
-        proposal, mark=mark, direction=direction, config=config,
+        proposal, mark=mark, reference_mark=context.get("mark_price"),
+        direction=direction, config=config,
     )
     if terms is None:
         result.reason = proposal_error

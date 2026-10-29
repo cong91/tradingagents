@@ -2171,6 +2171,33 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
     assert captured["margin_mode"] == "cross"
 
 
+def test_proposal_entry_matching_the_snapshot_mark_survives_a_moved_live_price():
+    """The agents are shown one mark and told to make entry consistent with it.
+
+    Validating that entry against a freshly fetched mark instead refused
+    proposals the agent made exactly as instructed: on a moving pair the price
+    drifts more than the 0.1% tolerance within the seconds the analysis takes.
+    """
+    proposal = _agent_proposal(entry_price=100.0)
+
+    terms, reason = autoloop_mod._proposal_terms(
+        proposal, mark=101.0, reference_mark=100.0, direction="long", config={},
+    )
+
+    assert reason is None
+    assert terms is not None
+
+
+def test_proposal_entry_matching_neither_mark_is_still_refused():
+    terms, reason = autoloop_mod._proposal_terms(
+        _agent_proposal(entry_price=105.0), mark=101.0, reference_mark=100.0,
+        direction="long", config={},
+    )
+
+    assert terms is None
+    assert "non-market entry_price" in (reason or "")
+
+
 def test_proposal_above_the_hard_caps_is_refused_not_clamped():
     """An over-cap proposal is refused: silently resizing it would execute a
     decision no agent made."""
