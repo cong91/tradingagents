@@ -60,6 +60,35 @@ def test_a_holding_under_a_broker_alias_is_the_analyzed_instrument(held, analyze
 
 
 @pytest.mark.unit
+def test_unknown_quantity_is_described_not_raised():
+    # quantity is nullable (derivatives books report notional instead); the
+    # render must describe the unknown count, never raise TypeError mid-graph.
+    book = PortfolioContext.model_validate({
+        "positions": [
+            {"ticker": "AAPL", "quantity": None},
+            {"ticker": "MSFT", "quantity": None},
+        ],
+    })
+    text = book.render("AAPL")
+    assert "AAPL: quantity unknown" in text
+    assert "MSFT quantity unknown" in text
+
+
+@pytest.mark.unit
+def test_load_then_render_survives_a_null_quantity(tmp_path):
+    # A portfolio JSON with quantity:null is a legitimate derivatives-shaped
+    # state; the load -> render chain must run clean instead of blowing up
+    # between the boundary and the agents.
+    path = tmp_path / "p.json"
+    path.write_text(
+        json.dumps({"positions": [{"ticker": "AAPL", "quantity": None}]}), encoding="utf-8",
+    )
+    text = load_portfolio(path).render("AAPL")
+    assert "quantity unknown" in text
+>>>>>>> 084076f (fix: fail-closed RiskGuard account state and nullable portfolio quantities)
+
+
+@pytest.mark.unit
 def test_absent_context_is_reported_as_not_provided():
     notice = get_portfolio_context_from_state({"company_of_interest": "AAPL"})
     assert "not provided" in notice.lower()

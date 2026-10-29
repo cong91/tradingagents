@@ -58,19 +58,24 @@ def _venue_position(bridge, position, open_lots, warnings) -> dict:
         raise ApiError(503, "exchange_unreachable",
                        f"venue cannot mark {position.ticker}: {exc}") from exc
     average, basis = _fifo_basis(open_lots.get(position.ticker))
-    if marked is None:
+    quantity = position.quantity
+    if quantity is None:
+        warnings.append(
+            f"position {position.ticker} has unknown quantity; equity_est is unavailable"
+        )
+    elif marked is None:
         warnings.append(
             f"position {position.ticker} cannot be marked; it counts 0 in equity_est"
         )
     return {
         "ticker": position.ticker,
-        "quantity": position.quantity,
+        "quantity": quantity,
         "average_price": average,
         "basis_source": basis,
         "marked_price": marked,
-        "market_value": position.quantity * marked if marked is not None else None,
-        "unrealized_pnl": (marked - average) * position.quantity
-        if marked is not None and average is not None else None,
+        "market_value": quantity * marked if quantity is not None and marked is not None else None,
+        "unrealized_pnl": (marked - average) * quantity
+        if quantity is not None and marked is not None and average is not None else None,
     }
 
 
@@ -140,14 +145,14 @@ def get_portfolio():
                 "audit log; cash and market marks are unavailable"
             )
 
-    # equity_est mirrors RiskGuard._equity (risk.py:381-403): None only when cash
-    # is unknown AND there are no positions; unmarked positions count 0.
+    # Unknown quantities leave equity unavailable; known but unmarked positions
+    # retain the partial estimate reported in the warnings above.
     equity: float | None = None
-    if cash is not None or positions:
+    if (cash is not None or positions) and all(p["quantity"] is not None for p in positions):
         equity = float(cash or 0.0)
         for position in positions:
-            if position["marked_price"] is not None:
-                equity += position["quantity"] * position["marked_price"]
+            if position["market_value"] is not None:
+                equity += position["market_value"]
 
     by_ticker: dict[str, float] = {}
     trade_tickers = sorted({event["ticker"] for event in spot_events

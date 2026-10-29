@@ -39,9 +39,19 @@ match a buy to its sell:
   PortfolioContext. When it cannot be computed (no portfolio, or cash None
   with no positions), the percentage checks are skipped fail-open with the
   reason recorded on the decision -- the halt machinery above still fires.
+  A book that is present but not usable is the opposite case and fails
+  closed: non-finite (inf/NaN) cash, quantity, mark price or notional --
+  whether from a schema bypass (``model_copy``) or a hand-built context --
+  refuses the order, because an infinite denominator would drive every
+  percentage cap toward zero. Likewise, an existing position whose exposure
+  cannot be valued in the book's currency (no mark, a non-positive or
+  non-finite value, or an unconvertible currency) refuses capped orders:
+  unknown exposure is never counted as zero or dropped from the totals.
 
 Fail-open, deliberately: a ``price_of`` that raises or returns None is
-treated as "no price", the affected value is skipped and logged. Only the
+treated as "no price" for equity and unrealized P&L, and that value is
+skipped and logged (an understated denominator only tightens the checks);
+the exposure caps above still refuse rather than drop the position. Only the
 consecutive-loss cap is immune to missing data. One deliberate exception to
 the fail-open stance: the execute-time re-check (``check(...,
 fail_closed=True)``, called wherever a real order is about to be sent)
@@ -56,13 +66,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tradingagents.execution.audit import append_event
 from tradingagents.portfolio import PortfolioContext
@@ -72,15 +83,39 @@ logger = logging.getLogger(__name__)
 _QTY_EPSILON = 1e-12
 
 
+def _finite_number(raw: Any) -> bool:
+    """True when ``raw`` converts to a finite float (rejects inf/NaN/garbage)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(value)
+
+
+def _non_finite_account_fields(portfolio: PortfolioContext) -> list[str]:
+    """Book fields the percentage math cannot use, as ``ticker.field`` labels."""
+    bad: list[str] = []
+    if portfolio.cash is not None and not _finite_number(portfolio.cash):
+        bad.append("cash")
+    for position in portfolio.positions:
+        ticker = str(getattr(position, "ticker", "") or "") or "?"
+        for name in ("quantity", "mark_price", "notional"):
+            raw = getattr(position, name, None)
+            if raw is not None and not _finite_number(raw):
+                bad.append(f"{ticker}.{name}")
+    return bad
+
+
 class RiskLimits(BaseModel):
     """The six FR-K limits; defaults mirror DEFAULT_CONFIG's risk_* keys."""
 
-    max_daily_loss_pct: float = 5.0
-    max_position_pct_per_asset: float = 25.0
-    max_total_exposure_pct: float = 80.0
-    max_consecutive_loss_count: int = 3
-    max_derivatives_leverage: float = 1.0
-    max_derivatives_exposure_pct: float = 0.0
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
+    max_daily_loss_pct: float = Field(default=5.0, ge=0)
+    max_position_pct_per_asset: float = Field(default=25.0, ge=0)
+    max_total_exposure_pct: float = Field(default=80.0, ge=0)
+    max_consecutive_loss_count: int = Field(default=3, ge=1)
+    max_derivatives_leverage: float = Field(default=1.0, ge=0)
+    max_derivatives_exposure_pct: float = Field(default=0.0, ge=0)
 
 
 class RiskDecision(BaseModel):
@@ -286,12 +321,18 @@ def _replay(events: list[dict[str, Any]]) -> tuple[list[_ClosedTrade], dict[str,
         quantity = event.get("qty")
         price = event.get("price_est")
         ticker = event.get("ticker")
-        if when is None or ticker is None:
+        if when is None or not isinstance(ticker, str) or not ticker.strip():
             continue
         if not isinstance(quantity, (int, float)) or not isinstance(price, (int, float)):
             continue
         quantity = float(quantity)
         price = float(price)
+        if not math.isfinite(quantity) or not math.isfinite(price):
+            # A non-finite line is as unusable as a corrupt one: NaN compares
+            # false everywhere, so carrying it into the FIFO P&L would make
+            # the daily-loss cap silently skip while still looking healthy.
+            logger.warning("risk: skipping audit line with non-finite qty/price")
+            continue
         if quantity <= 0 or price <= 0:
             continue
         day = when.date()
@@ -372,18 +413,92 @@ class RiskGuard:
 
     def _price(self, ticker: str) -> float | None:
         try:
-            price = self.price_of(ticker)
+            price = float(self.price_of(ticker))
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning("risk: price_of(%r) failed: %r", ticker, exc)
+            return None
         except Exception as exc:  # noqa: BLE001 - a marking failure is "no price"
             logger.warning("risk: price_of(%r) failed: %r", ticker, exc)
             return None
-        return float(price) if price else None
+        return price if math.isfinite(price) and price > 0 else None
+
+    def _position_exposure(self, position: Any, currency: str | None = None) -> float | None:
+        """Return gross exposure in account currency; ``None`` means unknown.
+
+        Unknown exposure must fail closed: the caller refuses the order
+        instead of counting the position as zero or dropping it from the
+        totals. A spot position without a ``price_currency`` is priced in the
+        book's declared currency (``PortfolioContext.currency`` labels cash
+        and prices); a declared mismatching quotation is converted through
+        the mark only when the pair is base<->quote, otherwise it stays
+        unknown.
+        """
+        def currency_key(value: Any) -> str | None:
+            normalized = str(value or "").strip().upper()
+            return normalized or None
+
+        def finite_positive(raw: Any) -> float | None:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return value if math.isfinite(value) and value > 0 else None
+
+        target = currency_key(currency)
+        base = currency_key(getattr(position, "base_currency", None))
+        quote = currency_key(getattr(position, "price_currency", None))
+
+        def convert(value: float, source: str | None, rate: float | None) -> float | None:
+            """Translate ``value`` from ``source`` into the account currency."""
+            if target is None or source is None:
+                return None
+            if source == target:
+                return value
+            if rate is None:
+                return None
+            if source == base and target == quote and base and quote:
+                converted = value * rate
+            elif source == quote and target == base and base and quote:
+                converted = value / rate
+            else:
+                return None
+            return finite_positive(converted)
+
+        market = getattr(position, "market", "spot")
+        mark = finite_positive(getattr(position, "mark_price", None))
+        notional_raw = getattr(position, "notional", None)
+        if market == "derivatives" and notional_raw is not None:
+            notional = finite_positive(notional_raw)
+            if notional is None:
+                return None
+            return convert(
+                notional,
+                currency_key(getattr(position, "notional_currency", None)),
+                mark,
+            )
+        if mark is None:
+            mark = finite_positive(self._price(getattr(position, "ticker", "")))
+        try:
+            quantity = float(getattr(position, "quantity", None))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if mark is None or not math.isfinite(quantity):
+            return None
+        value = abs(quantity) * mark
+        if not math.isfinite(value) or value <= 0:
+            return None
+        if market == "derivatives":
+            return convert(value, quote, mark)
+        # Spot: an undeclared quote follows the book convention; a declared
+        # one must match the account currency or be convertible base<->quote.
+        return value if quote is None else convert(value, quote, mark)
 
     def _equity(self, portfolio: PortfolioContext | None) -> float | None:
-        """cash + position values at current prices; None when not computable.
+        """Return cash/equity plus markable spot holdings when computable.
 
-        A position whose price cannot be marked contributes 0, which
-        understates equity and therefore only makes the percentage checks
-        stricter -- the conservative direction.
+        Futures autoloop books already carry account equity as cash. Their
+        positions are included in exposure checks, but not added to this
+        denominator a second time.
         """
         if portfolio is None:
             return None
@@ -391,15 +506,36 @@ class RiskGuard:
             return None
         equity = float(portfolio.cash or 0.0)
         for position in portfolio.positions:
-            price = self._price(position.ticker)
-            if price is not None:
-                equity += position.quantity * price
-            else:
+            if getattr(position, "market", "spot") == "derivatives":
+                continue
+            ticker = str(getattr(position, "ticker", "") or "")
+            quantity = getattr(position, "quantity", None)
+            price = self._price(ticker)
+            if price is None:
+                # Counting an unmarkable spot position as 0 understates equity,
+                # which only makes the percentage checks stricter. The exposure
+                # caps separately refuse such an order instead of dropping it.
                 logger.warning(
                     "risk: cannot mark position %r (%s); counting it as 0 in equity",
-                    position.ticker,
-                    position.quantity,
+                    ticker,
+                    quantity,
                 )
+                continue
+            try:
+                contribution = float(quantity) * price
+            except (TypeError, ValueError, OverflowError):
+                contribution = None
+            if contribution is None or not math.isfinite(contribution):
+                # quantity is nullable (derivatives share the Position schema);
+                # a None or overflowing unit count must never raise here --
+                # the exposure caps refuse such an order instead.
+                logger.warning(
+                    "risk: position %r has unusable quantity %s; counting it as 0 in equity",
+                    ticker,
+                    quantity,
+                )
+                continue
+            equity += contribution
         return equity
 
     def _daily_pnl(
@@ -454,12 +590,24 @@ class RiskGuard:
         Halted always wins: the audit log is the shared, cross-process state,
         so a halt appended by any process blocks every check until reset or
         day rollover. Percentage checks run only when equity is computable;
-        the consecutive-loss cap always runs. ``fail_closed=True`` marks an
+        the consecutive-loss cap always runs. A non-finite account state
+        (cash, position quantity/mark price/notional) refuses fail-closed --
+        an infinite denominator would silently disarm every percentage cap.
+        ``fail_closed=True`` marks an
         execute-time re-check (a send is being decided): an audit log that
         exists but cannot be read then REFUSES the order instead of passing,
         because the halt and streak state is unverifiable. Plan-time checks
         keep the documented fail-open read.
         """
+        # model_copy can bypass Pydantic validation; revalidate at the send
+        # boundary and keep the coerced instance, so the comparisons below
+        # never mix floats with the raw bypassed values.
+        try:
+            self.limits = RiskLimits.model_validate(vars(self.limits))
+        except (AttributeError, ValidationError, TypeError, ValueError) as exc:
+            return RiskDecision(
+                allowed=False, halted=False, reason=f"invalid risk limits: {exc}",
+            )
         path = Path(audit_log).expanduser()
         events = _read_events(path, fail_closed=fail_closed)
         if events is None:
@@ -493,20 +641,136 @@ class RiskGuard:
             self._append_halt(path, reason)
             return RiskDecision(allowed=False, halted=True, reason=reason)
 
-        equity = self._equity(portfolio)
+        # Validate the candidate before marking the book or calculating any
+        # percentage exposure. A bad value must never reach fail-open handling.
+        reasons: list[str] = []
+        side = getattr(order_plan, "side", None)
+        is_derivatives = getattr(order_plan, "market", "spot") == "derivatives"
+        cost = getattr(order_plan, "cost", None)
+        quantity = getattr(order_plan, "quantity", None)
+        leverage_raw = getattr(order_plan, "leverage", 1.0)
+        supplied_notional = getattr(order_plan, "notional", None)
+        leverage = 1.0
+        notional = None
+
+        if side is not None:
+            invalid_fields: list[str] = []
+            for name, raw, required in (
+                ("cost", cost, side == "buy" or is_derivatives),
+                ("quantity", quantity, True),
+                ("leverage", leverage_raw, True),
+                ("notional", supplied_notional, False),
+            ):
+                if raw is None and not required:
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    invalid_fields.append(name)
+                    continue
+                if not math.isfinite(value) or value <= 0:
+                    invalid_fields.append(name)
+                    continue
+                if name == "leverage":
+                    leverage = value
+            if invalid_fields:
+                return RiskDecision(
+                    allowed=False,
+                    halted=False,
+                    reason=(
+                        "invalid order terms: "
+                        + ", ".join(invalid_fields)
+                        + " must be finite and positive"
+                    ),
+                )
+            if side == "buy" or is_derivatives:
+                notional = float(cost) * leverage
+                if not math.isfinite(notional) or notional <= 0:
+                    return RiskDecision(
+                        allowed=False,
+                        halted=False,
+                        reason="invalid order terms: notional must be finite and positive",
+                    )
+                try:
+                    price = float(getattr(order_plan, "estimated_price", None))
+                    quantity_value = float(quantity)
+                except (TypeError, ValueError, OverflowError):
+                    return RiskDecision(
+                        allowed=False,
+                        halted=False,
+                        reason="invalid order terms: estimated_price and quantity are required",
+                    )
+                if not math.isfinite(price) or price <= 0:
+                    return RiskDecision(
+                        allowed=False,
+                        halted=False,
+                        reason="invalid order terms: estimated_price must be finite and positive",
+                    )
+                actual_notional = quantity_value * price
+                if not math.isfinite(actual_notional) or actual_notional <= 0:
+                    return RiskDecision(
+                        allowed=False,
+                        halted=False,
+                        reason="invalid order terms: actual notional must be finite and positive",
+                    )
+                if not math.isclose(actual_notional, notional, rel_tol=1e-9, abs_tol=0.0):
+                    return RiskDecision(
+                        allowed=False,
+                        halted=False,
+                        reason=(
+                            "inconsistent order terms: quantity * estimated_price "
+                            f"({actual_notional:g}) does not match cost * leverage ({notional:g})"
+                        ),
+                    )
+                notional = max(notional, actual_notional)
 
         # The derivatives leverage cap needs no denominator, so it is
         # evaluated BEFORE the equity-None fail-open branch: a 100x plan is
         # refused even when equity cannot be computed.
-        reasons: list[str] = []
-        side = getattr(order_plan, "side", None)
-        cost = getattr(order_plan, "cost", None)
-        is_derivatives = getattr(order_plan, "market", "spot") == "derivatives"
-        leverage = float(getattr(order_plan, "leverage", 1.0) or 1.0)
         if is_derivatives and side is not None and leverage > self.limits.max_derivatives_leverage:
             reasons.append(
                 f"leverage {leverage:g} exceeds the derivatives limit "
                 f"{self.limits.max_derivatives_leverage:g}"
+            )
+
+        # A book that is present but not usable (schema validation bypassed
+        # via model_copy, or a hand-built context) must refuse, not fail open:
+        # an infinite or NaN denominator drives every percentage cap toward
+        # zero and silently disarms them.
+        if portfolio is not None:
+            bad_fields = _non_finite_account_fields(portfolio)
+            if bad_fields:
+                return RiskDecision(
+                    allowed=False,
+                    halted=False,
+                    reason=(
+                        "non-finite account state ("
+                        + ", ".join(bad_fields)
+                        + "); failing closed"
+                    ),
+                )
+            unknown_spot_quantity = next(
+                (
+                    position for position in portfolio.positions
+                    if getattr(position, "market", "spot") == "spot"
+                    and getattr(position, "quantity", None) is None
+                ),
+                None,
+            )
+            if unknown_spot_quantity is not None:
+                ticker = str(getattr(unknown_spot_quantity, "ticker", "") or "?")
+                return RiskDecision(
+                    allowed=False,
+                    halted=False,
+                    reason=f"existing spot position {ticker} has unknown quantity; failing closed",
+                )
+
+        equity = self._equity(portfolio)
+        if equity is not None and not math.isfinite(equity):
+            return RiskDecision(
+                allowed=False,
+                halted=False,
+                reason="account equity is not finite; failing closed",
             )
 
         if equity is None:
@@ -521,6 +785,15 @@ class RiskGuard:
 
         # Daily-loss cap (FR-K4): a breach halts the rest of the UTC day.
         pnl = self._daily_pnl(closed, open_lots, today, considered_from)
+        if not math.isfinite(pnl):
+            # Finite inputs can still overflow in the P&L arithmetic. NaN
+            # compares false to everything, so letting it through would skip
+            # the loss cap entirely; refuse instead.
+            return RiskDecision(
+                allowed=False,
+                halted=False,
+                reason="daily P&L is not finite; failing closed",
+            )
         if pnl < 0:
             loss_pct = (-pnl / equity) * 100 if equity > 0 else float("inf")
             if loss_pct > self.limits.max_daily_loss_pct:
@@ -534,46 +807,51 @@ class RiskGuard:
 
         # Position/exposure caps: buys always; derivatives sells too (a short
         # adds real exposure). Spot sells reduce exposure and stay uncapped.
-        # Notional is absolute so a signed/malformed cost cannot slip past.
-        if (side == "buy" or is_derivatives) and cost is not None and cost != 0:
-            margin = abs(float(cost))
-            notional = margin * leverage
-            ticker = getattr(order_plan, "ticker", "")
-            position = portfolio.position_in(ticker) if portfolio is not None else None
-            marked = 0.0
-            if position is not None:
-                price = self._price(position.ticker)
-                if price is not None:
-                    marked = position.quantity * price
-                else:
+        if (side == "buy" or is_derivatives) and notional is not None:
+            ticker = str(getattr(order_plan, "ticker", "") or "")
+            ticker_key = ticker.strip().upper()
+            current_asset = 0.0
+            total_exposure = 0.0
+            derivatives_exposure = 0.0
+            for position in (portfolio.positions if portfolio is not None else []):
+                position_ticker = str(getattr(position, "ticker", "") or "")
+                market_symbol = getattr(position, "market_symbol", None)
+                same_asset = position_ticker.strip().upper() == ticker_key or (
+                    market_symbol is not None
+                    and str(market_symbol).strip().upper() == ticker_key
+                )
+                exposure = self._position_exposure(position, portfolio.currency)
+                if exposure is None:
+                    # An unvalued position is unknown exposure even when it is
+                    # neither this order's asset nor derivatives: spot books
+                    # from sync_portfolio carry no mark price, and silently
+                    # dropping it understates the totals.
                     reasons.append(
-                        f"existing position {ticker} cannot be marked; "
-                        "per-asset cap evaluated on the planned exposure alone"
+                        f"existing position {position_ticker or '?'} has unknown "
+                        "or unconvertible exposure"
                     )
-            # Per-asset cap: spot adds the cost basis, derivatives the
-            # NOTIONAL -- margin is only a fraction of the asset exposure at
-            # leverage (200 margin at 10x moves 2000 of the asset), and a
-            # cost-basis reading would let a leveraged plan dwarf equity.
-            per_asset = notional if is_derivatives else margin
-            position_pct = ((marked + per_asset) / equity) * 100 if equity > 0 else float("inf")
+                    continue
+                if same_asset:
+                    current_asset += exposure
+                total_exposure += exposure
+                if getattr(position, "market", "spot") == "derivatives":
+                    derivatives_exposure += exposure
+
+            per_asset = notional if is_derivatives else float(cost)
+            position_pct = ((current_asset + per_asset) / equity) * 100 if equity > 0 else float("inf")
             if position_pct > self.limits.max_position_pct_per_asset:
                 reasons.append(
                     f"position {ticker} would reach {position_pct:.2f}% of equity, "
                     f"above the per-asset limit {self.limits.max_position_pct_per_asset:.2f}%"
                 )
-            exposure_pct = 0.0
-            for other in (portfolio.positions if portfolio is not None else []):
-                other_price = self._price(other.ticker)
-                if other_price is not None:
-                    exposure_pct += other.quantity * other_price
-            exposure_pct = ((exposure_pct + notional) / equity) * 100 if equity > 0 else float("inf")
+            exposure_pct = ((total_exposure + notional) / equity) * 100 if equity > 0 else float("inf")
             if exposure_pct > self.limits.max_total_exposure_pct:
                 reasons.append(
                     f"total exposure would reach {exposure_pct:.2f}% of equity, "
                     f"above the limit {self.limits.max_total_exposure_pct:.2f}%"
                 )
             if is_derivatives:
-                deriv_pct = (notional / equity) * 100 if equity > 0 else float("inf")
+                deriv_pct = ((derivatives_exposure + notional) / equity) * 100 if equity > 0 else float("inf")
                 if deriv_pct > self.limits.max_derivatives_exposure_pct:
                     reasons.append(
                         f"derivatives notional would reach {deriv_pct:.2f}% of equity, "

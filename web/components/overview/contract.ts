@@ -117,7 +117,7 @@ export type AuditPayload = {
 
 export type PortfolioPosition = {
   ticker: string;
-  quantity: number;
+  quantity: number | null;
   /** Trung bình có trọng số lot FIFO còn mở; null = basis không xác định. */
   average_price: number | null;
   /** "fifo" khi log có lot khớp; null khi không. */
