@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
@@ -123,6 +124,35 @@ def _public_exchange(config: dict):
     return exchange
 
 
+def _futures_bases(exchange: Any, quote: str) -> set[str]:
+    """Bases with an active ``quote``-quoted, ``quote``-settled contract.
+
+    Discovery ranks by *spot* volume, but a futures cycle can only trade a
+    base with a real contract. Without this filter the pool fills with live
+    spot pairs that have no perpetual (SOXLB, SNDKB, MCLB...), and every one
+    of them burns a market-phase cycle before being rejected.
+    """
+    markets = exchange.load_markets()
+    if not isinstance(markets, dict):
+        raise VendorError("futures metadata unavailable: exchange returned no market map")
+    bases: set[str] = set()
+    for market in markets.values():
+        if not isinstance(market, dict):
+            continue
+        if market.get("contract") is not True or market.get("active") is False:
+            continue
+        if str(market.get("type") or "").lower() not in {"swap", "future"}:
+            continue
+        if str(market.get("quote") or "").upper() != quote:
+            continue
+        if str(market.get("settle") or "").upper() != quote:
+            continue
+        base = str(market.get("base") or "").upper()
+        if base:
+            bases.add(base)
+    return bases
+
+
 def crypto_universe(config: dict, top_n: int) -> list[str]:
     """Top ``top_n`` liquid crypto as pipeline tickers (``BTC-USD`` form).
 
@@ -132,12 +162,24 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
     set does not know are kept: the OHLCV vendor resolves any Yahoo-listed
     ``BASE-USD`` and the bridge plans through ``exec_symbol_overrides`` if one
     of them ever earns a plan.
+
+    When derivatives trading is armed (``exec_derivatives is True``) only bases
+    the venue actually quotes a contract for are kept: a futures cycle can
+    trade nothing else, so spot-only bases are pure noise there and used to
+    burn a market-phase cycle each. The spot path keeps them. The mode comes
+    from ``config`` rather than a parameter so every caller and test double
+    keeps the same two-argument shape.
     """
     exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
+    futures_only = config.get("exec_derivatives") is True
 
     try:
         exchange = _public_exchange(config)
         tickers = exchange.fetch_tickers()
+        quote = str(config.get("exec_quote_currency") or "USDT").strip().upper()
+        tradable = _futures_bases(exchange, quote) if futures_only else None
+    except VendorError:
+        raise
     except Exception as exc:  # noqa: BLE001 — any ccxt/network failure degrades
         raise VendorError(f"crypto universe unavailable via {exchange_id}: {exc}") from exc
 
@@ -152,6 +194,8 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
         except (TypeError, ValueError):
             continue
         if base in _STABLECOIN_BASES or quote_volume < MIN_CRYPTO_QUOTE_VOLUME_USD:
+            continue
+        if tradable is not None and base.upper() not in tradable:
             continue
         ranked.append((f"{base}-USD", quote_volume))
 

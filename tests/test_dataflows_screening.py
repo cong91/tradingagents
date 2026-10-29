@@ -237,6 +237,69 @@ def test_crypto_universe_via_module_seam(monkeypatch):
     assert universe == ["BTC-USD", "DOGE-USD"]
 
 
+def test_futures_only_universe_drops_bases_without_a_contract(monkeypatch):
+    """A futures cycle can only trade bases with a real contract.
+
+    Spot discovery ranks by spot volume, so live spot pairs with no perpetual
+    (the SOXLB/SNDKB class) used to fill the pool and burn a market-phase cycle
+    each. Arming derivatives in config keeps them out before screening is paid
+    for.
+    """
+    import sys
+    import types
+
+    class FakeExchange:
+        def __init__(self, config):
+            self.demo_enabled = False
+
+        def enable_demo_trading(self, enabled):
+            self.demo_enabled = enabled
+
+        def market(self, symbol):
+            return {"base": symbol.split("/", 1)[0]}
+
+        def fetch_tickers(self):
+            return {
+                "BTC/USDT": {"quoteVolume": 1_000_000_000},
+                "SNDKB/USDT": {"quoteVolume": 900_000_000},
+                "BCH/USDT": {"quoteVolume": 500_000_000},
+                "SOL/USDT": {"quoteVolume": 400_000_000},
+            }
+
+        def load_markets(self):
+            return {
+                "BTC/USDT:USDT": {
+                    "base": "BTC", "quote": "USDT", "settle": "USDT",
+                    "type": "swap", "contract": True, "active": True,
+                },
+                "BCH/USDT:USDT": {
+                    "base": "BCH", "quote": "USDT", "settle": "USDT",
+                    "type": "swap", "contract": True, "active": True,
+                },
+                # spot-only base: no perpetual exists
+                "SNDKB/USDT": {
+                    "base": "SNDKB", "quote": "USDT", "settle": None,
+                    "type": "spot", "contract": False, "active": True,
+                },
+                # contract exists but is not USDT-settled
+                "SOL/USD:SOL": {
+                    "base": "SOL", "quote": "USD", "settle": "SOL",
+                    "type": "swap", "contract": True, "active": True,
+                },
+            }
+
+    monkeypatch.setitem(sys.modules, "ccxt", types.SimpleNamespace(binance=FakeExchange))
+    config = {"exec_exchange_id": "binance", "exec_base_url": "https://demo-api.binance.com"}
+    futures_config = {**config, "exec_derivatives": True}
+
+    assert screening.crypto_universe(config, top_n=10) == [
+        "BTC-USD", "SNDKB-USD", "BCH-USD", "SOL-USD",
+    ]
+    assert screening.crypto_universe(futures_config, top_n=10) == [
+        "BTC-USD", "BCH-USD",
+    ]
+
+
 def test_crypto_universe_volume_floor_excludes_mid_liquidity_pairs(monkeypatch):
     """A pair above the old 5M floor but below the 10M floor stays out: the
     universe pool is for assets that can actually carry an order."""
