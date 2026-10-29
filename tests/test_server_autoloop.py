@@ -1623,6 +1623,38 @@ def test_run_cycle_derivatives_off_whitelist_near_plans_and_prices_through_unifi
     assert cycle["symbol"] == "NEAR/USDT:USDT"
 
 
+def test_abandoned_cycle_worker_cannot_persist_a_stale_futures_row(tmp_path, monkeypatch):
+    """A timed-out candidate keeps running on its own thread until its blocking
+    call returns. Everything it does afterwards belongs to a cycle that already
+    closed: persisting a row there is how a stale funnel entry (and, in tests, a
+    write into a schema that has since been dropped) appeared. The write gate
+    must refuse while order submission is refused.
+    """
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+    derivatives = DerivativesExecutor(config=get_config(), exchange_factory=_StubDerivVenue)
+
+    cancelled = threading.Event()
+    cancelled.set()
+    result = autoloop_mod.DailyResult(ticker="BTC-USD")
+
+    # A cycle that already claimed its signal (cycle_id + payload present) goes
+    # straight to the terminal rejection write.
+    autoloop_mod._process_futures_candidate(
+        derivatives, "BTC-USD", "Sell", get_config(), result,
+        intent="abstain", cancelled=cancelled,
+        cycle_id="futures:BTC/USDT:USDT:stale:1",
+        cycle_payload={"requested_ticker": "BTC-USD", "execution_status": "in_progress"},
+    )
+
+    assert job_store.list_futures_cycles(limit=5) == []
+
+
 def test_run_cycle_derivatives_planning_failure_preserves_decision_telemetry(
     tmp_path, monkeypatch,
 ):

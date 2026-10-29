@@ -160,6 +160,21 @@ def _execution_allowed(deadline: float | None, cancelled: threading.Event | None
     )
 
 
+def _cycle_writes_allowed(
+    deadline: float | None, cancelled: threading.Event | None
+) -> bool:
+    """Whether a candidate may still persist rows for its cycle.
+
+    ``_run_candidate_with_timeout`` abandons the worker on timeout: it sets
+    ``cancelled`` and returns, but the thread keeps running until its blocking
+    call (an LLM graph, a venue read) finishes. Every write after that point
+    would land in a cycle that already closed -- a stale funnel row, and in
+    tests a row for a schema that has since been dropped or replaced. Writes
+    are therefore gated by the same predicate as order submission.
+    """
+    return _execution_allowed(deadline, cancelled)
+
+
 def _raise_if_execution_closed(
     deadline: float | None, cancelled: threading.Event | None, stage: str
 ) -> None:
@@ -1550,6 +1565,15 @@ def _process_futures_candidate(
     """
     telemetry = telemetry or CycleTelemetry()
     now = datetime.now(timezone.utc)
+
+    def persist_progress(cycle: str, /, **kwargs: Any) -> None:
+        if _cycle_writes_allowed(deadline, cancelled):
+            persist_futures_cycle_progress(cycle, **kwargs)
+
+    def record_rejection(*args: Any, **kwargs: Any) -> None:
+        if _cycle_writes_allowed(deadline, cancelled):
+            _record_futures_cycle_rejection(*args, **kwargs)
+
     # Guard decisions appended before this function belongs to earlier
     # candidates (or none); planning and execution for THIS candidate append
     # from here on, so the row's risk_guard fields slice from this mark.
@@ -1558,7 +1582,7 @@ def _process_futures_candidate(
     context = context or _closed_futures_context(derivatives, ticker)
     if context is None:
         result.reason = "confirmation_missing: closed 1h/4h candle pair unavailable"
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker, confirmation_reason="closed 1h/4h candle pair unavailable",
             phase="confirmation", signal=signal, cycle_id=cycle_id,
             telemetry=decision_data, agent_note=agent_note,
@@ -1575,6 +1599,9 @@ def _process_futures_candidate(
             "snapshot": futures_snapshot_payload(context),
             "execution_status": "in_progress",
         }
+        if not _cycle_writes_allowed(deadline, cancelled):
+            result.reason = "cycle closed before the candidate could claim its signal"
+            return
         if not claim_futures_cycle(
             cycle_id,
             symbol=context["unified_symbol"],
@@ -1594,7 +1621,7 @@ def _process_futures_candidate(
             "manage_existing": "position_management_only",
             "structured_terms_unavailable": "structured_terms_unavailable",
         }.get(str(intent), f"invalid_futures_intent: {intent}")
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=context.get("unified_symbol"),
             signal=signal,
@@ -1616,7 +1643,7 @@ def _process_futures_candidate(
     confirmation_ok, confirmation_reason = _confirmation_state(context, signal)
     if not confirmation_ok:
         result.reason = "confirmation_missing"
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=context.get("unified_symbol"),
             confirmation_reason=confirmation_reason,
@@ -1637,7 +1664,7 @@ def _process_futures_candidate(
     symbol = context["unified_symbol"]
     if signal not in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT):
         result.reason = f"signal_not_tradeable: {signal}"
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker, unified_symbol=symbol, signal=signal,
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
@@ -1654,7 +1681,7 @@ def _process_futures_candidate(
         mark = _unified_mark_price(derivatives._bridge, symbol)
     if mark is None:
         result.reason = "derivatives entry requires a price"
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker, unified_symbol=symbol, signal=signal,
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
@@ -1672,7 +1699,7 @@ def _process_futures_candidate(
     )
     if terms is None:
         result.reason = proposal_error
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=symbol,
             signal=signal,
@@ -1700,7 +1727,7 @@ def _process_futures_candidate(
     if stop is None or take is None:
         result.reason = "derivatives entry requires price and protective bracket"
         proposal_validation = {"valid": False, "reason": result.reason}
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker, unified_symbol=symbol, signal=signal,
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
@@ -1715,7 +1742,7 @@ def _process_futures_candidate(
     if not (stop < mark < take if direction == "long" else stop > mark > take):
         result.reason = "invalid protective bracket"
         proposal_validation = {"valid": False, "reason": result.reason}
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker, unified_symbol=symbol, signal=signal,
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
@@ -1759,7 +1786,7 @@ def _process_futures_candidate(
         },
     })
     phase_timestamps["proposal_validated_at"] = utc_now_iso()
-    persist_futures_cycle_progress(
+    persist_progress(
         cycle_id, phase="proposal", payload={**cycle_payload, "phase_timestamps": phase_timestamps},
         timestamp=phase_timestamps["proposal_validated_at"],
     )
@@ -1776,7 +1803,7 @@ def _process_futures_candidate(
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} futures planning")
         phase_timestamps["planning_started_at"] = utc_now_iso()
-        persist_futures_cycle_progress(
+        persist_progress(
             cycle_id, phase="planning",
             payload={**cycle_payload, "phase_timestamps": phase_timestamps},
             timestamp=phase_timestamps["planning_started_at"],
@@ -1810,7 +1837,7 @@ def _process_futures_candidate(
         cycle_payload["risk_guard"] = risk_decisions[-1] if risk_decisions else {
             "allowed": None, "halted": None, "reason": "not_called",
         }
-        persist_futures_cycle_progress(
+        persist_progress(
             cycle_id, phase="planning",
             payload={**cycle_payload, "phase_timestamps": phase_timestamps},
             timestamp=phase_timestamps["planning_finished_at"],
@@ -1818,7 +1845,7 @@ def _process_futures_candidate(
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} execution")
         phase_timestamps["execution_started_at"] = utc_now_iso()
-        persist_futures_cycle_progress(
+        persist_progress(
             cycle_id, phase="execution",
             payload={**cycle_payload, "phase_timestamps": phase_timestamps,
                      "execution_status": "in_progress"},
@@ -1887,7 +1914,7 @@ def _process_futures_candidate(
         # (rejected / risk_rejected) so the funnel never mixes refusals into
         # execution failures.
         if isinstance(exc, PermissionError) and str(exc).startswith("risk guard"):
-            persist_futures_cycle_progress(
+            persist_progress(
                 cycle_id,
                 status="rejected",
                 phase="execution" if phase_timestamps.get("execution_started_at") else "planning",
@@ -1909,7 +1936,7 @@ def _process_futures_candidate(
                 terminal=True,
             )
             raise
-        persist_futures_cycle_progress(
+        persist_progress(
             cycle_id,
             status="failed",
             phase="execution",
