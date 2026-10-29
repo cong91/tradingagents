@@ -211,6 +211,20 @@ def test_invalid_risk_value_raises(monkeypatch, env_var):
         default_config_module.build_default_config()
 
 
+@pytest.mark.parametrize("env_var", [
+    "TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT",
+    "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT",
+])
+def test_non_finite_risk_value_raises(monkeypatch, env_var):
+    monkeypatch.setenv(env_var, "nan")
+    with pytest.raises(ValueError, match=env_var):
+        importlib.reload(default_config_module)
+    monkeypatch.delenv(env_var, raising=False)
+    importlib.reload(default_config_module)
+
+
 def test_exchange_id_accepts_any_string(monkeypatch):
     config = _config_with_env(monkeypatch, TRADINGAGENTS_EXEC_EXCHANGE_ID="not-a-number")
     assert config["exec_exchange_id"] == "not-a-number"

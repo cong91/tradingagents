@@ -1,3 +1,4 @@
+import math
 import os
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
@@ -99,7 +100,10 @@ def _coerce(value: str, reference):
     if isinstance(reference, int) and not isinstance(reference, bool):
         return int(value)
     if isinstance(reference, float):
-        return float(value)
+        coerced = float(value)
+        if not math.isfinite(coerced):
+            raise ValueError(f"expected a finite number, got {value!r}")
+        return coerced
     return value
 
 

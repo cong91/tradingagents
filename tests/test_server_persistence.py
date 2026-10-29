@@ -445,3 +445,190 @@ def test_job_results_are_replaced_not_duplicated(client, tmp_path):
 
     assert len(job_store.load(job_id)["results"]) == 1
     assert client.get(f"/api/daily/{job_id}").json()["results"][0]["approval_id"]
+
+
+# --- futures_cycles: the store contract the telemetry layer leans on ----------
+
+
+def test_terminal_futures_cycle_row_is_immutable(postgres_schema):
+    """Once a row lands terminal the store refuses every later write: the audit
+    record a rejection produced can never be overwritten into an entry."""
+    from server.futures_cycle_telemetry import claim_cycle, persist_rejection
+
+    cycle_id = "futures:BTC/USDT:USDT:x:y:1"
+    assert claim_cycle(
+        cycle_id, symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        payload={"requested_ticker": "BTC-USD", "unified_symbol": "BTC/USDT:USDT"},
+    )
+    persist_rejection(
+        cycle_id, symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        phase="proposal",
+        payload={"signal": "Buy", "signal_reason": "agent_abstained",
+                 "execution_status": "not_started", "order_id": None},
+    )
+
+    job_store.update_futures_cycle(
+        cycle_id, status="completed", phase="entry",
+        payload={"execution_status": "executed", "order_id": "LIVE-1"},
+        terminal=True,
+    )
+    row = job_store.load_futures_cycle(cycle_id)
+    assert row["status"] == "rejected" and row["phase"] == "proposal"
+    assert row["payload"]["execution_status"] == "not_started"
+    assert row["payload"]["order_id"] is None
+
+
+def test_merge_keeps_recorded_values_against_late_nones(postgres_schema):
+    """A rejection write that omits a field must not null out what an earlier
+    phase recorded (analysis wrote signal_reason before the confirmation gate
+    refused), while real corrections still overwrite."""
+    from server.futures_cycle_telemetry import claim_cycle, persist_progress
+
+    cycle_id = "futures:ETH/USDT:USDT:x:y:1"
+    assert claim_cycle(
+        cycle_id, symbol="ETH/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        payload={"signal_reason": "tradeable_signal", "signal": "Sell",
+                 "execution_status": "in_progress"},
+    )
+    persist_progress(
+        cycle_id, phase="confirmation",
+        payload={"confirmation_result": False,
+                 "confirmation_reason": "direction_mismatch",
+                 "signal_reason": None, "execution_status": "not_started"},
+    )
+    row = job_store.load_futures_cycle(cycle_id)
+    payload = row["payload"]
+    assert payload["signal_reason"] == "tradeable_signal"  # a None never erases
+    assert payload["signal"] == "Sell"
+    assert payload["execution_status"] == "not_started"  # non-None overwrites
+    assert payload["confirmation_reason"] == "direction_mismatch"
+
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("confirmation_rejected", 0) == 0  # row is still in-flight
+    assert summary.get("in_flight") == 1
+
+
+def test_merge_is_none_safe_at_store_level(postgres_schema):
+    """The merge rule itself: None on the incoming side cannot erase a recorded
+    value, at any nesting level."""
+    merged = job_store._merge_payload(
+        {"a": "kept", "b": None, "c": {"d": "kept", "e": None}},
+        {"a": None, "b": "new", "c": {"d": None, "e": "new", "f": None}},
+    )
+    assert merged == {
+        "a": "kept", "b": "new", "c": {"d": "kept", "e": "new", "f": None},
+    }
+
+
+def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history(
+    postgres_schema,
+):
+    """The store's own funnel mapping, pinned at the SQL layer: ``entered``
+    only when the payload confirms execution (execution_status=executed and
+    never negated by executed=false); awaiting approval, plan risk refusal,
+    no order and execute failure each keep their own bucket; legacy rows whose
+    terminal write predates the phase split are mapped at read time from the
+    outcome their payload recorded — the stored rows are never rewritten."""
+    def _seed(cycle_id, symbol, *, status, phase, payload):
+        from server.futures_cycle_telemetry import claim_cycle
+
+        assert claim_cycle(
+            cycle_id, symbol=symbol, four_hour_open="x", one_hour_open="y", payload={},
+        )
+        job_store.update_futures_cycle(
+            cycle_id, status=status, phase=phase, payload=payload, terminal=True,
+        )
+
+    _seed(
+        "m-executed", "BTC/USDT:USDT", status="completed", phase="entry",
+        payload={"execution_status": "executed", "executed": True},
+    )
+    _seed(
+        "m-approval", "ETH/USDT:USDT", status="rejected", phase="execution",
+        payload={"execution_status": "awaiting_approval", "executed": False,
+                 "execution_reason": "awaiting approval (auto-confirm env gate closed)"},
+    )
+    _seed(
+        "m-risk", "SOL/USDT:USDT", status="rejected", phase="planning",
+        payload={"execution_status": "risk_rejected", "executed": False,
+                 "execution_reason": "risk guard halted trading: exposure cap"},
+    )
+    _seed(
+        "m-noorder", "XRP/USDT:USDT", status="rejected", phase="execution",
+        payload={"execution_status": "not_executed", "executed": False,
+                 "plan_reason": "sizing refused: risk budget below minimum"},
+    )
+    _seed(
+        "m-failed", "ADA/USDT:USDT", status="failed", phase="execution",
+        payload={"execution_status": "failed", "executed": False,
+                 "failure_reason": "RuntimeError: venue down"},
+    )
+    # A theoretical interrupted+failed shape must not be double-counted in the
+    # rollup: execution_failed owns every execution_status=failed row, so
+    # interrupted reads 0 for it (the summary's bucket order already does).
+    _seed(
+        "m-edge", "EDGE/USDT:USDT", status="interrupted", phase="execution",
+        payload={"execution_status": "failed", "executed": False,
+                 "failure_reason": "RuntimeError: process died after fill"},
+    )
+    # Legacy shapes from the pre-split contract, plus a completed/entry row
+    # whose payload contradicts itself with executed=false: mapped by the
+    # outcome they recorded, never promoted to an entry.
+    _seed(
+        "m-legacy-approval", "BNB/USDT:USDT", status="completed", phase="entry",
+        payload={"execution_status": "awaiting_approval"},
+    )
+    _seed(
+        "m-contradiction", "DOT/USDT:USDT", status="completed", phase="entry",
+        payload={"execution_status": "executed", "executed": False},
+    )
+
+    assert job_store.futures_cycle_summary() == {
+        "entered": 1,
+        "awaiting_approval": 2,
+        "risk_rejected": 1,
+        "not_executed": 1,
+        "execution_failed": 2,
+        "other": 1,
+    }
+
+    rows = {row["symbol"]: row for row in job_store.futures_cycle_symbol_rollup()}
+    assert rows["BTC/USDT:USDT"]["entered"] == 1
+    assert rows["BTC/USDT:USDT"]["last_execution_status"] == "executed"
+    assert rows["BTC/USDT:USDT"]["last_executed"] == "true"
+    assert rows["ETH/USDT:USDT"]["entered"] == 0
+    assert rows["ETH/USDT:USDT"]["awaiting_approval"] == 1
+    assert rows["ETH/USDT:USDT"]["last_execution_status"] == "awaiting_approval"
+    assert rows["SOL/USDT:USDT"]["risk_rejected"] == 1
+    assert rows["SOL/USDT:USDT"]["last_execution_status"] == "risk_rejected"
+    assert rows["XRP/USDT:USDT"]["not_executed"] == 1
+    assert rows["ADA/USDT:USDT"]["execution_failed"] == 1
+    assert rows["ADA/USDT:USDT"]["last_status"] == "failed"
+    assert rows["ADA/USDT:USDT"]["last_execution_reason"] == "RuntimeError: venue down"
+    # the interrupted+failed edge belongs to execution_failed only, and the
+    # named buckets stay disjoint so "other" plus the named ones equal total
+    assert rows["EDGE/USDT:USDT"]["execution_failed"] == 1
+    assert rows["EDGE/USDT:USDT"]["interrupted"] == 0
+    assert rows["EDGE/USDT:USDT"]["other"] == 0
+    assert rows["EDGE/USDT:USDT"]["last_execution_reason"] == (
+        "RuntimeError: process died after fill"
+    )
+    assert rows["BNB/USDT:USDT"]["entered"] == 0
+    assert rows["BNB/USDT:USDT"]["awaiting_approval"] == 1
+    # the legacy row recorded no executed field at all: '' keeps executed meaning
+    assert rows["BNB/USDT:USDT"]["last_executed"] == ""
+    assert rows["DOT/USDT:USDT"]["entered"] == 0
+    assert rows["DOT/USDT:USDT"]["awaiting_approval"] == 0
+    # a self-contradicting legacy row can never claim the latest-outcome slot
+    assert rows["DOT/USDT:USDT"]["last_executed"] == "false"
+    assert rows["DOT/USDT:USDT"]["other"] == 1
+    assert rows["DOT/USDT:USDT"]["total"] == 1
+
+    # History is read-time-mapped, never rewritten: every seeded row still
+    # carries exactly the terminal shape it was written with.
+    contradiction = job_store.load_futures_cycle("m-contradiction")
+    assert contradiction["status"] == "completed"
+    assert contradiction["payload"]["execution_status"] == "executed"
+    assert contradiction["payload"]["executed"] is False
+    assert job_store.load_futures_cycle("m-approval")["status"] == "rejected"
+    assert job_store.load_futures_cycle("m-failed")["phase"] == "execution"

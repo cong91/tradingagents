@@ -20,6 +20,8 @@ Two rules shape this surface:
 
 from __future__ import annotations
 
+import math
+
 from fastapi import APIRouter, Request
 
 from server import audit as audit_log, control_store
@@ -97,7 +99,10 @@ def _coerce(key: str, value):
     if expected == "float":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{key} expects a number, got {value!r}")
-        return float(value)
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{key} expects a finite non-negative number, got {value!r}")
+        return value
     raise ValueError(f"{key} has an unsupported declared type {expected!r}")
 
 

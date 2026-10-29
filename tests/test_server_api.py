@@ -508,7 +508,10 @@ def _enqueue(**overrides) -> dict:
     plan = {
         "run_id": "r_test", "ticker": "BTC-USD", "ccxt_symbol": "BTC/USDT",
         "signal": "Buy", "side": "buy", "quantity": 0.0012, "price_est": 83078.0,
-        "cost": 99.69,
+        # RiskGuard's cost/quantity consistency check is exact (rel_tol=1e-9),
+        # so the fixture notional must equal quantity * price_est, not a 2-dp
+        # rounding of it.
+        "cost": 0.0012 * 83078.0,
     }
     plan.update(overrides)
     return approvals_mod.enqueue(plan)

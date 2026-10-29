@@ -41,6 +41,10 @@ class Propagator:
             "futures_execution_proposal": {},
             "futures_execution_intent": "abstain",
             "futures_execution_status": "not_applicable",
+            "trader_investment_plan": "",
+            "trader_decision_telemetry": {},
+            "final_trade_decision": "",
+            "pm_decision_telemetry": {},
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",

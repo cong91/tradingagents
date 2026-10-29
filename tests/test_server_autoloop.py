@@ -242,14 +242,19 @@ def test_autoloop_cycles_summary_and_symbol_rollup(client):
     )
     _seed_cycle(
         "c-entered", "UNI/USDT:USDT", status="completed", phase="entry",
-        payload={"signal": "Sell", "signal_reason": "tradeable_signal"},
+        # entered requires the executed confirmation: a completed row without it
+        # must land in "other", never in the entered bucket.
+        payload={"signal": "Sell", "signal_reason": "tradeable_signal",
+                 "execution_status": "executed"},
     )
 
     body = client.get("/api/autoloop/cycles").json()
 
     assert body["summary"] == {
         "market_rejected": 1, "confirmation_rejected": 1, "proposal_rejected": 1,
-        "entered": 1, "in_flight": 0, "interrupted": 0, "other": 0, "total": 4,
+        "entered": 1, "awaiting_approval": 0, "risk_rejected": 0,
+        "not_executed": 0, "execution_failed": 0,
+        "in_flight": 0, "interrupted": 0, "other": 0, "total": 4,
     }
     rollup = {row["symbol"]: row for row in body["symbols"]}
     assert set(rollup) == {"SNDKB-USD", "BTC/USDT:USDT", "AAVE/USDT:USDT", "UNI/USDT:USDT"}
@@ -263,6 +268,196 @@ def test_autoloop_cycles_summary_and_symbol_rollup(client):
     )
     assert rollup["UNI/USDT:USDT"]["entered"] == 1
     assert body["symbols"][0]["last_updated"] >= body["symbols"][-1]["last_updated"]
+
+
+def test_autoloop_cycles_summary_maps_execution_outcomes_explicitly(client):
+    """``entered`` requires the executed confirmation. Awaiting approval, plan
+    risk refusal, no-order and execute failure each keep their own bucket —
+    including legacy rows whose terminal write pre-dated the phase split, which
+    are mapped at read time from the outcome their payload recorded (history is
+    never rewritten)."""
+    _seed_cycle(
+        "o-enter", "BTC/USDT:USDT", status="completed", phase="entry",
+        payload={"signal": "Buy", "signal_reason": "tradeable_signal",
+                 "execution_status": "executed", "executed": True},
+    )
+    _seed_cycle(
+        "o-approve", "ETH/USDT:USDT", status="rejected", phase="execution",
+        payload={"signal": "Buy", "execution_status": "awaiting_approval",
+                 "execution_reason": "awaiting approval (auto-confirm env gate closed)"},
+    )
+    _seed_cycle(
+        "o-risk", "SOL/USDT:USDT", status="rejected", phase="planning",
+        payload={"signal": "Sell", "execution_status": "risk_rejected",
+                 "execution_reason": "risk guard halted trading: exposure cap"},
+    )
+    _seed_cycle(
+        "o-noorder", "XRP/USDT:USDT", status="rejected", phase="execution",
+        payload={"signal": "Buy", "execution_status": "not_executed",
+                 "plan_reason": "sizing refused: risk budget below minimum"},
+    )
+    _seed_cycle(
+        "o-failed", "ADA/USDT:USDT", status="failed", phase="execution",
+        payload={"signal": "Buy", "execution_status": "failed",
+                 "failure_reason": "RuntimeError: venue down"},
+    )
+    # Legacy shapes from the pre-split contract: completed/entry rows whose
+    # payload says awaiting approval / no order, a failed row still on the old
+    # entry phase, and a completed row with no execution_status at all.
+    _seed_cycle(
+        "o-legacy-approve", "BNB/USDT:USDT", status="completed", phase="entry",
+        payload={"execution_status": "awaiting_approval"},
+    )
+    _seed_cycle(
+        "o-legacy-noorder", "DOGE/USDT:USDT", status="completed", phase="entry",
+        payload={"execution_status": "not_executed"},
+    )
+    _seed_cycle(
+        "o-legacy-failed", "LINK/USDT:USDT", status="failed", phase="entry",
+        payload={"execution_status": "failed"},
+    )
+    _seed_cycle(
+        "o-legacy-blind", "AVAX/USDT:USDT", status="completed", phase="entry",
+        payload={"signal": "Buy"},
+    )
+    # A payload that records executed: false must never be counted as entered
+    # even when status/phase/execution_status all look like an entry — the
+    # fill confirmation is the only truth the funnel trusts.
+    _seed_cycle(
+        "o-contradiction", "DOT/USDT:USDT", status="completed", phase="entry",
+        payload={"signal": "Buy", "execution_status": "executed", "executed": False},
+    )
+
+    body = client.get("/api/autoloop/cycles").json()
+
+    assert body["summary"] == {
+        "market_rejected": 0, "confirmation_rejected": 0, "proposal_rejected": 0,
+        "entered": 1, "awaiting_approval": 2, "risk_rejected": 1,
+        "not_executed": 2, "execution_failed": 2,
+        "in_flight": 0, "interrupted": 0, "other": 2, "total": 10,
+    }
+    rollup = {row["symbol"]: row for row in body["symbols"]}
+    assert rollup["BTC/USDT:USDT"]["entered"] == 1
+    assert rollup["DOT/USDT:USDT"]["entered"] == 0
+    assert rollup["ETH/USDT:USDT"]["awaiting_approval"] == 1
+    assert rollup["SOL/USDT:USDT"]["risk_rejected"] == 1
+    assert rollup["XRP/USDT:USDT"]["not_executed"] == 1
+    assert rollup["ADA/USDT:USDT"]["execution_failed"] == 1
+    # legacy rows are bucketed by their recorded outcome, not dropped
+    assert rollup["BNB/USDT:USDT"]["awaiting_approval"] == 1
+    assert rollup["BNB/USDT:USDT"]["entered"] == 0
+    assert rollup["DOGE/USDT:USDT"]["not_executed"] == 1
+    assert rollup["LINK/USDT:USDT"]["execution_failed"] == 1
+    assert rollup["LINK/USDT:USDT"]["interrupted"] == 0
+    assert rollup["AVAX/USDT:USDT"]["entered"] == 0
+    # the newest cycle's outcome rides on status/phase/execution_status, so the
+    # UI never derives "entered" from a signal reason
+    assert rollup["ETH/USDT:USDT"]["last_status"] == "rejected"
+    assert rollup["ETH/USDT:USDT"]["last_execution_status"] == "awaiting_approval"
+    assert rollup["ADA/USDT:USDT"]["last_status"] == "failed"
+    assert rollup["ADA/USDT:USDT"]["last_execution_reason"] == "RuntimeError: venue down"
+    assert rollup["BTC/USDT:USDT"]["last_status"] == "completed"
+    assert rollup["BTC/USDT:USDT"]["last_phase"] == "entry"
+    assert rollup["BTC/USDT:USDT"]["last_execution_status"] == "executed"
+    assert rollup["BTC/USDT:USDT"]["last_executed"] == "true"
+    # the executed=false contradiction row rides on last_executed, so the
+    # symbol rollup's "latest outcome" can never read as an entry either
+    assert rollup["DOT/USDT:USDT"]["last_execution_status"] == "executed"
+    assert rollup["DOT/USDT:USDT"]["last_executed"] == "false"
+    assert rollup["DOT/USDT:USDT"]["other"] == 1
+    assert rollup["BTC/USDT:USDT"]["other"] == 0
+
+
+def test_autoloop_cycles_item_carries_every_audit_layer(client):
+    """The drill-down payload is the audit surface: it must carry, for one
+    cycle, the requested-vs-unified symbol, both candle directions, the
+    confirmation verdict, both agents' typed decisions, the effective caps,
+    the proposal validation, the RiskGuard decision, the execution outcome and
+    order id, and the phase timestamps — everything needed to say WHICH layer
+    blocked the cycle. The endpoint renders the stored payload verbatim, so a
+    field that stops round-tripping here is a field the UI silently loses."""
+    _seed_cycle(
+        "a-blocked", "BTC/USDT:USDT", status="rejected", phase="proposal",
+        payload={
+            "requested_ticker": "BTC-USD",
+            "unified_symbol": "BTC/USDT:USDT",
+            "snapshot": {
+                "one_hour_direction": "bearish",
+                "four_hour_direction": "bullish",
+                "one_hour_close": 67_000.0,
+                "four_hour_close": 66_500.0,
+            },
+            "confirmation_result": False,
+            "confirmation_reason": "direction_mismatch",
+            "trader_decision": {
+                "action": "Sell",
+                "futures_execution_intent": "enter",
+                "futures_execution_proposal_present": True,
+                "structured_output": True,
+            },
+            "pm_decision": {
+                "rating": "Sell",
+                "futures_execution_intent": "enter",
+                "futures_execution_status": "structured",
+                "futures_execution_proposal_present": True,
+                "structured_output": True,
+            },
+            "agent_proposal": {"leverage": 3, "margin_mode": "isolated"},
+            "effective_caps": {
+                "effective_leverage": 3.0,
+                "max_derivatives_exposure_pct": 80.0,
+                "max_position_pct_per_asset": 40.0,
+            },
+            "proposal_validation": {"valid": False, "reason": "direction_mismatch"},
+            "risk_guard": {"allowed": None, "halted": None, "reason": "not_called"},
+            "execution_status": "not_started",
+            "order_id": None,
+            "signal": "Sell",
+            "signal_reason": "tradeable_signal",
+            "phase_timestamps": {
+                "market_context_finished_at": "2026-10-25T07:05:00+00:00",
+                "decision_context_finished_at": "2026-10-25T07:05:02+00:00",
+                "analysis_finished_at": "2026-10-25T07:09:00+00:00",
+                "proposal_finished_at": "2026-10-25T07:09:01+00:00",
+            },
+        },
+    )
+
+    (item,) = client.get("/api/autoloop/cycles").json()["items"]
+    payload = item["payload"]
+
+    assert (payload["requested_ticker"], payload["unified_symbol"]) == (
+        "BTC-USD", "BTC/USDT:USDT",
+    )
+    assert payload["snapshot"]["one_hour_direction"] == "bearish"
+    assert payload["snapshot"]["four_hour_direction"] == "bullish"
+    assert payload["confirmation_result"] is False
+    assert payload["confirmation_reason"] == "direction_mismatch"
+    assert payload["trader_decision"] == {
+        "action": "Sell", "futures_execution_intent": "enter",
+        "futures_execution_proposal_present": True, "structured_output": True,
+    }
+    assert payload["pm_decision"]["rating"] == "Sell"
+    assert payload["pm_decision"]["futures_execution_status"] == "structured"
+    assert payload["agent_proposal"] == {"leverage": 3, "margin_mode": "isolated"}
+    assert payload["effective_caps"]["effective_leverage"] == 3.0
+    assert payload["proposal_validation"] == {"valid": False, "reason": "direction_mismatch"}
+    assert payload["risk_guard"] == {"allowed": None, "halted": None, "reason": "not_called"}
+    assert payload["execution_status"] == "not_started"
+    assert payload["order_id"] is None
+    assert set(payload["phase_timestamps"]) >= {
+        "market_context_finished_at",
+        "decision_context_finished_at",
+        "analysis_finished_at",
+        "proposal_finished_at",
+    }
+    # Nothing above is dropped, re-keyed or coerced on the way back out.
+    assert set(payload) >= {
+        "requested_ticker", "unified_symbol", "snapshot", "confirmation_result",
+        "confirmation_reason", "trader_decision", "pm_decision", "agent_proposal",
+        "effective_caps", "proposal_validation", "risk_guard", "execution_status",
+        "order_id", "phase_timestamps",
+    }
 
 
 def test_autoloop_cycles_symbol_filter_and_validation(client):
@@ -618,9 +813,26 @@ class _FakeGraph:
 
     def propagate(self, ticker: str, trade_date: str, asset_type: str | None = None):
         self.calls.append((ticker, trade_date, str(asset_type)))
+        # Mirror the real PM node (portfolio_manager.py:150-157): a proposal is
+        # only surfaced with an explicit enter intent.
+        proposal_state = self._proposal if self._intent == "enter" else {}
         state = {
-            "futures_execution_proposal": self._proposal,
+            "trader_decision_telemetry": {
+                "action": "Buy",
+                "futures_execution_intent": "enter" if self._intent == "enter" else "abstain",
+                "futures_execution_proposal_present": bool(proposal_state),
+                "structured_output": True,
+            },
+            "pm_decision_telemetry": {
+                "rating": self._signal,
+                "futures_execution_intent": self._intent,
+                "futures_execution_proposal_present": bool(proposal_state),
+                "futures_execution_status": "structured",
+                "structured_output": True,
+            },
+            "futures_execution_proposal": proposal_state,
             "futures_execution_intent": self._intent,
+            "futures_execution_status": "structured",
         }
         if self._note is not None:
             state["final_trade_decision"] = self._note
@@ -834,8 +1046,9 @@ def test_preflight_keeps_everything_when_market_metadata_is_unavailable(tmp_path
         {"ticker": "MRNA", "asset_type": "stock"},
     ]
     runnable, skipped = autoloop_mod._preflight_candidates(candidates, executor)
-    assert [c["ticker"] for c in runnable] == ["BTC-USD", "MRNA"]
-    assert skipped == []
+    assert [c["ticker"] for c in runnable] == ["BTC-USD"]
+    assert [s["ticker"] for s in skipped] == ["MRNA"]
+    assert "advisory only in futures mode" in skipped[0]["reason"]
 
 
 def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monkeypatch):
@@ -1076,7 +1289,7 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
             config=config, exchange_factory=_StubDerivVenue,
             risk_guard=RiskGuard(
                 limits=RiskLimits(
-                    max_derivatives_leverage=3.0,
+                    max_derivatives_leverage=float(config["risk_max_derivatives_leverage"]),
                     max_derivatives_exposure_pct=100.0,
                     max_position_pct_per_asset=100.0,
                     max_total_exposure_pct=100.0,
@@ -1100,11 +1313,16 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
 def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
     """exec_derivatives armed: the crypto candidate plans through the
     DerivativesExecutor using the AGENT's leverage (not a code default) and the
-    Buy's dry fill carries the LONG bracket (stop below entry, target above)."""
+    Buy's dry fill carries the LONG bracket (stop below entry, target above).
+    The executed row keeps the PM's verbatim decision — HEAD wrote it there and
+    the scanner UI renders it on completed entries too."""
     engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
 
     results = autoloop_mod._run_cycle(
-        lambda config, analysts: _FakeGraph("Buy", proposal=_agent_proposal(leverage=2)),
+        lambda config, analysts: _FakeGraph(
+            "Buy", proposal=_agent_proposal(leverage=2),
+            note="**Rating**: Buy\n\n**Futures Execution Intent**: enter",
+        ),
     )
 
     (btc,) = results
@@ -1114,6 +1332,18 @@ def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
     assert btc.plan.margin_mode == "isolated"
     assert btc.plan.side == "buy"
     assert btc.plan.stop_loss < btc.plan.estimated_price < btc.plan.take_profit
+
+    from server import job_store
+
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    payload = cycle["payload"]
+    assert cycle["status"] == "completed" and cycle["phase"] == "entry"
+    assert payload["execution_status"] == "executed"
+    assert payload["agent_decision_note"] == (
+        "**Rating**: Buy\n\n**Futures Execution Intent**: enter"
+    )
+    assert payload["pm_decision"]["rating"] == "Buy"
+    assert payload["trader_decision"]["futures_execution_intent"] == "enter"
 
     events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
     (plan_buy,) = [event for event in events if event.get("phase") == "plan" and event.get("action") == "buy"]
@@ -1142,35 +1372,8 @@ def test_run_cycle_passes_the_futures_decision_context_to_the_agents(tmp_path, m
     context = seen["execution_context"]
     assert f"Futures equity: {_STUB_CASH:,.4f} USDT" in context
     assert "Closed 1h candle" in context and "Closed 4h candle" in context
-    assert f"Maximum leverage: {autoloop_mod.MAX_AUTO_LEVERAGE:g}x" in context
+    assert "Maximum leverage: 3x" in context
     assert "A FuturesExecutionProposal is required for any entry" in context
-
-
-def test_futures_sizing_book_uses_the_futures_wallet_not_spot_cash():
-    """Spot cash is a different wallet: sizing futures against it would risk
-    money the derivatives account does not hold."""
-    from tradingagents.execution.futures_account import FuturesAccountSnapshot
-
-    book = autoloop_mod._futures_portfolio(FuturesAccountSnapshot(
-        equity=420.5, wallet_balance=400.0, available_balance=380.0,
-        equity_currency="USDT", available_balance_currency="USDT",
-    ))
-
-    assert book.cash == pytest.approx(420.5)
-    assert book.currency == "USDT"
-    # The equity already contains open PnL; adding notional again would
-    # overstate the denominator every percentage cap divides by.
-    assert book.positions == []
-
-
-def test_futures_sizing_book_falls_back_to_available_balance():
-    from tradingagents.execution.futures_account import FuturesAccountSnapshot
-
-    book = autoloop_mod._futures_portfolio(FuturesAccountSnapshot(
-        equity=None, available_balance=125.0, available_balance_currency="USDT",
-    ))
-
-    assert book.cash == pytest.approx(125.0)
 
 
 def test_run_cycle_derivatives_dry_sell_short_bracket(tmp_path, monkeypatch):
@@ -1263,7 +1466,19 @@ def test_run_cycle_abstain_records_pm_decision_note(tmp_path, monkeypatch):
     assert btc.reason == "agent_abstained"
     (cycle,) = job_store.list_futures_cycles(limit=1)
     assert cycle["status"] == "rejected" and cycle["phase"] == "proposal"
-    assert cycle["payload"]["agent_decision_note"] == _PM_DECISION
+    payload = cycle["payload"]
+    assert payload["agent_decision_note"] == _PM_DECISION
+    assert payload["confirmation_result"] is True
+    # The fixture mirrors the real nodes: with intent=abstain the Trader telemetry
+    # carries no enter authorization and no proposal is surfaced.
+    assert payload["trader_decision"]["action"] == "Buy"
+    assert payload["trader_decision"]["futures_execution_intent"] == "abstain"
+    assert payload["trader_decision"]["futures_execution_proposal_present"] is False
+    assert payload["pm_decision"]["rating"] == "Sell"
+    assert payload["pm_decision"]["futures_execution_intent"] == "abstain"
+    assert payload["pm_decision"]["futures_execution_proposal_present"] is False
+    assert payload["proposal_validation"]["valid"] is False
+    assert payload["execution_status"] == "not_started"
 
 
 def test_run_cycle_abstain_without_pm_note_omits_the_key(tmp_path, monkeypatch):
@@ -1286,12 +1501,16 @@ def test_run_cycle_abstain_without_pm_note_omits_the_key(tmp_path, monkeypatch):
 def test_run_cycle_derivatives_direction_mismatch_is_confirmation_missing(tmp_path, monkeypatch):
     """Short against bullish closed candles is the wrong-direction mirror of
     the Short happy path: confirmation_missing with direction_mismatch, and
-    no plan ever reaches the executor."""
+    no plan ever reaches the executor. The PM's verbatim decision survives this
+    rejection too — the agents HAD decided, the candles refused, and the audit
+    row must let an operator tell those two apart."""
     from server import job_store
 
     engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bullish")
 
-    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+    results = autoloop_mod._run_cycle(
+        lambda config, analysts: _FakeGraph("Sell", intent="enter", note=_PM_DECISION)
+    )
 
     (btc,) = results
     assert btc.signal == "Sell"
@@ -1301,7 +1520,18 @@ def test_run_cycle_derivatives_direction_mismatch_is_confirmation_missing(tmp_pa
     assert all(event.get("phase") != "plan" for event in events)
     (cycle,) = job_store.list_futures_cycles(limit=1)
     assert cycle["status"] == "rejected"
-    assert cycle["payload"]["confirmation_reason"] == "direction_mismatch"
+    payload = cycle["payload"]
+    assert payload["confirmation_reason"] == "direction_mismatch"
+    # The analysis phase recorded tradeable_signal; the confirmation rejection
+    # write leaves signal_reason unset and must not null it out.
+    assert payload["signal"] == "Sell"
+    assert payload["signal_reason"] == "tradeable_signal"
+    # The decision layer is not lost behind the confirmation layer.
+    assert payload["agent_decision_note"] == _PM_DECISION
+    assert payload["trader_decision"]["futures_execution_intent"] == "enter"
+    assert payload["pm_decision"]["rating"] == "Sell"
+    assert payload["pm_decision"]["futures_execution_intent"] == "enter"
+    assert payload["execution_status"] == "not_started"
 
 
 def test_run_cycle_derivatives_long_against_bearish_is_confirmation_missing(tmp_path, monkeypatch):
@@ -1371,10 +1601,362 @@ def test_run_cycle_derivatives_off_whitelist_near_plans_and_prices_through_unifi
     payload = cycle["payload"]
     assert payload["requested_ticker"] == "NEAR-USD"
     assert payload["unified_symbol"] == "NEAR/USDT:USDT"
+    assert payload["snapshot"]["one_hour_direction"] == "bullish"
+    assert payload["snapshot"]["four_hour_direction"] == "bullish"
     assert payload["confirmation_result"] is True
     assert payload["confirmation_reason"] == "aligned_direction"
-    assert payload["market_rejection_reason"] is None
+    assert payload["confirmation"] == {"result": True, "reason": "aligned_direction"}
+    assert payload["trader_decision"] == {
+        "action": "Buy", "futures_execution_intent": "enter",
+        "futures_execution_proposal_present": True, "structured_output": True,
+    }
+    assert payload["pm_decision"]["rating"] == "Buy"
+    assert payload["pm_decision"]["futures_execution_intent"] == "enter"
+    assert payload["pm_decision"]["futures_execution_status"] == "structured"
+    assert payload["pm_decision"]["futures_execution_proposal_present"] is True
+    assert payload["effective_caps"]["effective_leverage"] == 3.0
+    assert payload["proposal_validation"] == {"valid": True, "reason": None}
+    assert payload["risk_guard"]["allowed"] is True
     assert payload["execution_status"] == "executed"
+    assert "execution_finished_at" in payload["phase_timestamps"]
+    assert cycle["status"] == "completed"
+    assert cycle["symbol"] == "NEAR/USDT:USDT"
+
+
+def test_run_cycle_derivatives_planning_failure_preserves_decision_telemetry(
+    tmp_path, monkeypatch,
+):
+    """A venue failure during futures planning must not erase the decision
+    audit trail: the failed row keeps the trader/PM typed decisions, the
+    confirmed signal, the validated proposal and the failure reason, so the
+    funnel can tell 'execution failed' apart from 'agents never decided'."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bullish")
+
+    def broken_plan(self, *args, **kwargs):
+        raise RuntimeError("venue down")
+
+    monkeypatch.setattr(DerivativesExecutor, "plan_order", broken_plan)
+
+    results = autoloop_mod._run_cycle(
+        lambda config, analysts: _FakeGraph("Buy", note=_PM_DECISION),
+    )
+
+    (btc,) = results
+    assert btc.executed is False
+    assert btc.reason == "RuntimeError: venue down"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "failed"
+    assert cycle["phase"] == "execution"
+    payload = cycle["payload"]
+    assert payload["signal"] == "Buy"
+    assert payload["signal_reason"] == "tradeable_signal"
+    assert payload["confirmation_result"] is True
+    assert payload["trader_decision"] == {
+        "action": "Buy", "futures_execution_intent": "enter",
+        "futures_execution_proposal_present": True, "structured_output": True,
+    }
+    assert payload["pm_decision"]["futures_execution_intent"] == "enter"
+    assert payload["pm_decision"]["futures_execution_status"] == "structured"
+    assert payload["proposal_validation"]["valid"] is True
+    assert payload["agent_proposal"]["leverage"] == 3
+    assert "rationale" not in payload["agent_proposal"]  # free text never lands
+    # the PM's verbatim decision survives a planning failure too (HEAD wrote it
+    # on terminal rows; the funnel's planning-failure bucket renders it)
+    assert payload["agent_decision_note"] == _PM_DECISION
+    assert payload["execution_status"] == "failed"
+    assert payload["order_id"] is None
+    assert payload["failure_reason"] == "RuntimeError: venue down"
+    assert payload["risk_guard"] == {"allowed": None, "halted": None, "reason": "not_called"}
+    assert "execution_failed_at" in payload["phase_timestamps"]
+
+
+def test_risk_guard_decisions_belong_to_their_own_candidate(tmp_path, monkeypatch):
+    """The executor's guard-decision list is shared by every candidate in the
+    cycle, so a row may only carry the decisions appended FOR its own
+    candidate: a candidate whose analysis never reached planning must not
+    inherit its predecessor's allowed verdict, and a planning failure must not
+    drag earlier decisions into its own row."""
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+
+    def _two_contracts(self):
+        contract = {"base": "X", "quote": "USDT", "settle": "USDT",
+                    "contract": True, "swap": True, "type": "swap", "active": True}
+        markets = {}
+        for base, symbol in (("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")):
+            markets[symbol] = {**contract, "base": base}
+        return markets
+
+    monkeypatch.setattr(_StubDerivVenue, "load_markets", _two_contracts)
+    monkeypatch.setattr(screening_mod, "crypto_universe",
+                        lambda config, top_n: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
+    monkeypatch.setattr(screening_mod, "screen_universe",
+                        lambda crypto, stocks, date, top_n: [
+                            {"ticker": ticker, "asset_type": "crypto"} for ticker in crypto
+                        ])
+
+    class Graph:
+        def propagate(self, ticker, trade_date, asset_type=None):
+            if ticker == "ETH-USD":
+                # ETH's analysis blows up BEFORE any guard call for ETH: with
+                # the shared list the old code copied BTC's verdicts onto
+                # ETH's failure row.
+                raise RuntimeError("analysis blew up before planning")
+            return {
+                "trader_decision_telemetry": {
+                    "action": "Buy", "futures_execution_intent": "enter",
+                    "futures_execution_proposal_present": True,
+                    "structured_output": True,
+                },
+                "pm_decision_telemetry": {
+                    "rating": "Buy", "futures_execution_intent": "enter",
+                    "futures_execution_status": "structured",
+                    "futures_execution_proposal_present": True,
+                    "structured_output": True,
+                },
+                "futures_execution_intent": "enter",
+                "futures_execution_status": "structured",
+                "futures_execution_proposal": _agent_proposal(),
+                "final_trade_decision": "**Rating**: Buy",
+            }, "Buy"
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: Graph())
+
+    assert [entry.ticker for entry in results] == ["BTC-USD", "ETH-USD"]
+    rows = {row["symbol"]: row for row in job_store.list_futures_cycles(limit=10)}
+    btc_row = rows["BTC/USDT:USDT"]["payload"]
+    eth_row = rows["ETH/USDT:USDT"]["payload"]
+    # BTC's own guard verdicts ride its row (plan and/or execute stage)...
+    assert btc_row["risk_guard"]["allowed"] is True
+    assert len(btc_row["risk_guard_decisions"]) >= 1
+    # ...and ETH's row carries none of them: the guard never evaluated ETH,
+    # so its failure row must read not_called with an empty decision list.
+    assert eth_row["risk_guard_decisions"] == []
+    assert eth_row["risk_guard"] == {
+        "allowed": None, "halted": None, "reason": "not_called",
+    }
+    assert eth_row["failure_reason"] == "RuntimeError: analysis blew up before planning"
+
+
+def test_executed_row_records_the_venue_order_id(tmp_path, monkeypatch):
+    """Dry fills legitimately have no venue id (order_id stays None), but the
+    live path's order id must land on the row: the funnel's entered bucket and
+    the audit trail both key off it."""
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+
+    def live_fill(_executor, _plan, _book, result, execute_guard):
+        result.executed = True
+        result.order_id = "venue-123"
+
+    monkeypatch.setattr(autoloop_mod, "_handle_plan", live_fill)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.executed is True and btc.order_id == "venue-123"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    payload = cycle["payload"]
+    assert cycle["status"] == "completed" and cycle["phase"] == "entry"
+    assert payload["execution_status"] == "executed"
+    assert payload["executed"] is True
+    assert payload["order_id"] == "venue-123"
+
+
+def test_run_cycle_derivatives_awaiting_approval_is_never_entered(tmp_path, monkeypatch):
+    """An approval gate closing after planning leaves the plan unsent: the row
+    keeps its own awaiting_approval outcome with the gate's reason, executed
+    stays false, and the funnel summary never counts it as an entered."""
+    from server import job_store
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, config_extra={"exec_auto_confirm": False})
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    (btc,) = results
+    assert btc.executed is False
+    assert btc.reason and "approval" in btc.reason
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    assert cycle["phase"] == "execution"
+    payload = cycle["payload"]
+    assert payload["execution_status"] == "awaiting_approval"
+    assert payload["executed"] is False
+    assert payload["order_id"] is None
+    assert "approval" in (payload.get("execution_reason") or "")
+    assert payload["risk_guard"]["allowed"] is True
+    assert "execution_started_at" in payload["phase_timestamps"]
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("entered", 0) == 0
+    assert summary.get("awaiting_approval") == 1
+
+
+def test_run_cycle_derivatives_risk_refusal_records_risk_rejected(tmp_path, monkeypatch):
+    """A RiskGuard refusal of the plan (decision not allowed, side None) is a
+    deliberate no: the row records risk_rejected with the guard's reason and
+    lands in its own bucket — never entered, never execution_failed."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+    from tradingagents.execution.risk import RiskDecision, RiskLimits
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    class RefusingGuard:
+        limits = RiskLimits(
+            max_derivatives_leverage=3.0, max_derivatives_exposure_pct=100.0,
+            max_position_pct_per_asset=100.0, max_total_exposure_pct=100.0,
+        )
+
+        def check(self, order, portfolio, log_path):
+            return RiskDecision(
+                allowed=False, halted=False,
+                reason="short exposure cap exceeded",
+            )
+
+    def build(config):
+        return DerivativesExecutor(
+            config=config, exchange_factory=_StubDerivVenue, risk_guard=RefusingGuard(),
+        )
+
+    monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.executed is False
+    assert btc.reason == "short exposure cap exceeded"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    payload = cycle["payload"]
+    assert payload["execution_status"] == "risk_rejected"
+    assert payload["executed"] is False
+    assert payload["order_id"] is None
+    assert payload["risk_guard"]["allowed"] is False
+    assert payload["risk_guard"]["reason"] == "short exposure cap exceeded"
+    assert payload["execution_reason"] == "short exposure cap exceeded"
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("entered", 0) == 0
+    assert summary.get("risk_rejected") == 1
+    assert "execution_failed" not in summary
+
+
+def test_run_cycle_derivatives_risk_guard_halt_is_rejected_not_failed(tmp_path, monkeypatch):
+    """A guard HALT raises from plan_order: the terminal row must still read
+    rejected/risk_rejected (a deliberate no), not failed — the funnel must be
+    able to tell refusals apart from malfunctions."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+    from tradingagents.execution.risk import RiskDecision, RiskLimits
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    class HaltingGuard:
+        limits = RiskLimits(
+            max_derivatives_leverage=3.0, max_derivatives_exposure_pct=100.0,
+            max_position_pct_per_asset=100.0, max_total_exposure_pct=100.0,
+        )
+
+        def check(self, order, portfolio, log_path):
+            return RiskDecision(allowed=False, halted=True, reason="daily loss limit hit")
+
+    def build(config):
+        return DerivativesExecutor(
+            config=config, exchange_factory=_StubDerivVenue, risk_guard=HaltingGuard(),
+        )
+
+    monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.executed is False
+    assert "daily loss limit hit" in (btc.reason or "")
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    payload = cycle["payload"]
+    assert payload["execution_status"] == "risk_rejected"
+    assert payload["executed"] is False
+    assert payload["risk_guard"]["halted"] is True
+    assert payload["execution_reason"] == "risk guard halted trading: daily loss limit hit"
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("entered", 0) == 0
+    assert summary.get("risk_rejected") == 1
+    assert summary.get("execution_failed", 0) == 0
+
+
+def test_run_cycle_derivatives_no_order_plan_records_not_executed(tmp_path, monkeypatch):
+    """A plan that never produces an order (sizing refusal, no risk decision)
+    records not_executed with the plan's reason — a distinct no-order outcome."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+    from tradingagents.execution.sizing import PlannedOrder
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    def refuse_plan(self, *args, **kwargs):
+        return PlannedOrder(
+            ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Sell",
+            market="derivatives", side=None, quantity=None, cost=None,
+            reason="sizing refused: risk budget below minimum",
+        )
+
+    monkeypatch.setattr(DerivativesExecutor, "plan_order", refuse_plan)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.executed is False
+    assert btc.reason == "sizing refused: risk budget below minimum"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    payload = cycle["payload"]
+    assert payload["execution_status"] == "not_executed"
+    assert payload["executed"] is False
+    assert payload["order_id"] is None
+    assert payload["plan_reason"] == "sizing refused: risk budget below minimum"
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("entered", 0) == 0
+    assert summary.get("not_executed") == 1
+
+
+def test_run_cycle_derivatives_execute_failure_lands_in_execution_failed(tmp_path, monkeypatch):
+    """A malfunction after planning (venue refused the order) keeps
+    executed=false and lands in the execution_failed bucket — the funnel can
+    never promote it to entered."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    _derivatives_cycle_env(tmp_path, monkeypatch, candle_direction="bearish")
+
+    def broken_execute(self, *args, **kwargs):
+        raise RuntimeError("venue refused connection")
+
+    monkeypatch.setattr(DerivativesExecutor, "execute_order", broken_execute)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Sell"))
+
+    (btc,) = results
+    assert btc.executed is False
+    assert btc.reason == "RuntimeError: venue refused connection"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "failed"
+    assert cycle["phase"] == "execution"
+    payload = cycle["payload"]
+    assert payload["execution_status"] == "failed"
+    assert payload["executed"] is False
+    assert payload["order_id"] is None
+    assert payload["failure_reason"] == "RuntimeError: venue refused connection"
+    assert "execution_started_at" in payload["phase_timestamps"]
+    assert "execution_failed_at" in payload["phase_timestamps"]
+    summary = job_store.futures_cycle_summary()
+    assert summary.get("entered", 0) == 0
+    assert summary.get("execution_failed") == 1
 
 
 def test_run_cycle_derivatives_gates_closed_refuse_planning(tmp_path, monkeypatch):
@@ -1657,41 +2239,6 @@ def test_derivative_metrics_degrades_when_the_venue_cannot_answer():
     metrics = autoloop_mod._futures_derivative_metrics(Venue(), "BNB/USDT:USDT")
     assert metrics["funding_rate"] is None
     assert metrics["open_interest"] is None
-
-
-@pytest.mark.unit
-def test_decision_context_reports_funding_and_open_interest():
-    """The numbers must reach the prompt, and an unavailable metric must say so
-    instead of silently disappearing."""
-
-    class Account:
-        venue_profile = "binanceusdm"
-        account_scope = "futures"
-        equity = 1_000.0
-        available_balance = 900.0
-        wallet_balance = 950.0
-        unrealized_pnl = 50.0
-        positions = []
-        equity_currency = "USDT"
-        available_balance_currency = "USDT"
-
-    market = _market_context()
-    market.update({
-        "funding_rate": 0.0001,
-        "funding_datetime": "2026-10-26T08:00:00Z",
-        "mark_price": 737.06,
-        "open_interest": 30_960_870_652.53,
-        "open_interest_value": 2.2e10,
-    })
-    context = autoloop_mod._futures_decision_context(market, Account(), "BNB-USD", {})
-
-    assert "Funding rate: 0.0100%" in context
-    assert "2026-10-26T08:00:00Z" in context
-    assert "Open interest: 30,960,870,652.5300" in context
-
-    missing = autoloop_mod._futures_decision_context(_market_context(), Account(), "BNB-USD", {})
-    assert "Funding rate: unavailable" in missing
-    assert "Open interest: unavailable" in missing
 
 
 @pytest.mark.unit

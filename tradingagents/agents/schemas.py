@@ -126,10 +126,15 @@ class FuturesExecutionProposal(BaseModel):
     )
     take_profit: float | None = Field(
         default=None,
-        description="Profit target in quote currency; above entry for a long or below entry for a short.",
+        description="Profit target in quote currency; above entry for a long or below entry for a short. The reward-to-stop distance must justify the entry after funding carry.",
     )
     rationale: str = Field(
-        description="Explain how evidence, volatility, stop distance, account state, and risk/reward support every selected execution term.",
+        description=(
+            "Explain how evidence, volatility, stop distance, account state, and risk/reward "
+            "support every selected execution term. Cite the closed 1h/4h candles for the "
+            "direction, the mark/ATR bracket levels for the prices, and the funding rate for "
+            "carry; if a context metric was unavailable, name it as a risk factor."
+        ),
     )
 
     @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
@@ -238,7 +243,12 @@ class TraderProposal(BaseModel):
     )
     futures_execution: FuturesExecutionProposal | None = Field(
         default=None,
-        description="For a crypto futures trade, propose margin mode, leverage, risk and margin budgets, and protective levels. Omit when not trading futures.",
+        description=(
+            "For a crypto futures trade, propose margin mode, leverage, risk and margin budgets, "
+            "and protective levels. A Buy is a long proposal and a Sell is a short proposal when "
+            "the closed candles confirm the direction. Omit when not trading futures or when a "
+            "required context item is missing; never invent numbers to fill the fields."
+        ),
     )
     futures_execution_intent: FuturesExecutionIntent = Field(
         default=FuturesExecutionIntent.ABSTAIN,
@@ -356,7 +366,10 @@ class PortfolioDecision(BaseModel):
         description=(
             "For crypto futures choose enter only when opening a new position is authorized "
             "and all terms are supported; choose manage_existing for reduce/exit/protection "
-            "of an existing position; choose abstain when no futures entry is authorized."
+            "of an existing position; choose abstain when no futures entry is authorized. "
+            "The enter bar is symmetric: Buy/Overweight authorizes a fresh long and "
+            "Sell/Underweight a fresh short when the closed candles confirm the direction. "
+            "A qualifying setup must not default to abstain."
         ),
     )
 

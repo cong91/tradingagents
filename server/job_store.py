@@ -22,6 +22,7 @@ from server import db
 # Statuses a job can be left in by a process that died mid-flight. Anything
 # still active when a new process starts was orphaned — see reconcile_orphans.
 ACTIVE_STATUSES = ("queued", "running")
+_FUTURES_TERMINAL_STATUSES = ("completed", "rejected", "failed", "interrupted")
 
 
 def _now() -> str:
@@ -225,9 +226,15 @@ def update_futures_cycle(cycle_id: str, *, status: str, phase: str,
     now = _now()
     with db.session() as conn:
         row = conn.execute(
-            "SELECT payload FROM futures_cycles WHERE cycle_id = %s", (cycle_id,)
+            "SELECT status, phase, payload FROM futures_cycles WHERE cycle_id = %s FOR UPDATE",
+            (cycle_id,),
         ).fetchone()
-        existing = row["payload"] if row else None
+        if row is None:
+            return
+        current_status = row["status"]
+        if current_status in _FUTURES_TERMINAL_STATUSES:
+            return
+        existing = row["payload"]
         merged = _merge_payload(existing or {}, payload or {})
         conn.execute(
             """UPDATE futures_cycles SET status = %s, phase = %s, payload = %s::jsonb,
@@ -238,9 +245,18 @@ def update_futures_cycle(cycle_id: str, *, status: str, phase: str,
 
 
 def _merge_payload(existing: dict, incoming: dict) -> dict:
-    """Merge terminal fields into the claim snapshot without losing observability."""
+    """Merge terminal fields into the claim snapshot without losing observability.
+
+    An incoming ``None`` never erases a value already on the row: a rejection
+    write that leaves ``signal_reason`` unset must not null out the
+    ``tradeable_signal`` the analysis phase recorded. Deliberate non-None
+    corrections (e.g. ``execution_status`` in_progress -> not_started) still
+    overwrite.
+    """
     merged = dict(existing)
     for key, value in incoming.items():
+        if value is None and merged.get(key) is not None:
+            continue
         if isinstance(merged.get(key), dict) and isinstance(value, dict):
             merged[key] = _merge_payload(merged[key], value)
         else:
@@ -273,17 +289,31 @@ def futures_cycle_summary() -> dict[str, int]:
     """Outcome funnel over every recorded cycle row.
 
     Buckets mirror the scan pipeline: market screen → candle confirmation →
-    agent proposal → executed entry, plus in-flight/interrupted leftovers.
+    agent proposal → executed entry. ``entered`` requires the executed
+    confirmation in the payload AND a payload that never negates it — a row
+    recording ``executed: false`` can never be counted as an entry, whatever
+    terminal shape it carries. A plan that was never sent or filled lands in
+    its own bucket instead: awaiting approval, plan risk refusal, no order, or
+    execute failure. Legacy rows written before the phase split are mapped at
+    read time from the outcome their payload recorded (explicit mapping below);
+    history is never rewritten.
     """
     with db.read() as conn:
         rows = conn.execute(
             """SELECT CASE
-                     WHEN status = 'completed' AND phase = 'entry' THEN 'entered'
+                     WHEN status = 'completed' AND phase = 'entry'
+                          AND payload->>'execution_status' = 'executed'
+                          AND COALESCE(payload->>'executed', 'true') <> 'false'
+                          THEN 'entered'
                      WHEN status IN ('claimed', 'running') THEN 'in_flight'
+                     WHEN payload->>'execution_status' = 'failed' THEN 'execution_failed'
                      WHEN status IN ('interrupted', 'recovery_pending', 'failed') THEN 'interrupted'
                      WHEN status = 'rejected' AND phase = 'market' THEN 'market_rejected'
                      WHEN status = 'rejected' AND phase = 'confirmation' THEN 'confirmation_rejected'
                      WHEN status = 'rejected' AND phase = 'proposal' THEN 'proposal_rejected'
+                     WHEN payload->>'execution_status' = 'awaiting_approval' THEN 'awaiting_approval'
+                     WHEN payload->>'execution_status' = 'risk_rejected' THEN 'risk_rejected'
+                     WHEN payload->>'execution_status' = 'not_executed' THEN 'not_executed'
                      ELSE 'other'
                    END AS bucket,
                    count(*) AS count
@@ -298,13 +328,42 @@ def futures_cycle_symbol_rollup() -> list[dict]:
         rows = conn.execute(
             """SELECT symbol,
                       count(*) AS total,
-                      count(*) FILTER (WHERE status = 'completed' AND phase = 'entry') AS entered,
+                      count(*) FILTER (WHERE status = 'completed' AND phase = 'entry'
+                                       AND payload->>'execution_status' = 'executed'
+                                       AND COALESCE(payload->>'executed', 'true') <> 'false') AS entered,
+                      count(*) FILTER (WHERE payload->>'execution_status' = 'awaiting_approval') AS awaiting_approval,
+                      count(*) FILTER (WHERE payload->>'execution_status' = 'risk_rejected') AS risk_rejected,
+                      count(*) FILTER (WHERE payload->>'execution_status' = 'not_executed') AS not_executed,
+                      count(*) FILTER (WHERE payload->>'execution_status' = 'failed') AS execution_failed,
                       count(*) FILTER (WHERE status = 'rejected' AND phase = 'proposal') AS proposal_rejected,
                       count(*) FILTER (WHERE status = 'rejected' AND phase = 'confirmation') AS confirmation_rejected,
                       count(*) FILTER (WHERE status = 'rejected' AND phase = 'market') AS market_rejected,
                       count(*) FILTER (WHERE status IN ('claimed', 'running')) AS in_flight,
-                      count(*) FILTER (WHERE status IN ('interrupted', 'recovery_pending', 'failed')) AS interrupted,
+                      count(*) FILTER (WHERE (status IN ('interrupted', 'recovery_pending')
+                                              OR (status = 'failed'
+                                                  AND COALESCE(payload->>'execution_status', '') <> 'failed'))
+                                             AND COALESCE(payload->>'execution_status', '') <> 'failed') AS interrupted,
+                      count(*) FILTER (WHERE NOT (
+                                           (status = 'completed' AND phase = 'entry'
+                                            AND payload->>'execution_status' = 'executed'
+                                            AND COALESCE(payload->>'executed', 'true') <> 'false')
+                                           OR status IN ('claimed', 'running')
+                                           OR payload->>'execution_status'
+                                              IN ('failed', 'awaiting_approval', 'risk_rejected', 'not_executed')
+                                           OR status IN ('interrupted', 'recovery_pending', 'failed')
+                                           OR (status = 'rejected'
+                                               AND phase IN ('market', 'confirmation', 'proposal'))
+                                         )) AS other,
                       max(updated_at) AS last_updated,
+                      (array_agg(status ORDER BY updated_at DESC))[1] AS last_status,
+                      (array_agg(phase ORDER BY updated_at DESC))[1] AS last_phase,
+                      (array_agg(COALESCE(payload->>'execution_status', '')
+                                 ORDER BY updated_at DESC))[1] AS last_execution_status,
+                      (array_agg(COALESCE(payload->>'executed', '')
+                                 ORDER BY updated_at DESC))[1] AS last_executed,
+                      (array_agg(COALESCE(payload->>'execution_reason', payload->>'plan_reason',
+                                          payload->>'failure_reason')
+                                 ORDER BY updated_at DESC))[1] AS last_execution_reason,
                       (array_agg(payload->>'signal' ORDER BY updated_at DESC))[1] AS last_signal,
                       (array_agg(payload->>'signal_reason' ORDER BY updated_at DESC))[1] AS last_signal_reason,
                       (array_agg(payload->>'market_rejection_reason' ORDER BY updated_at DESC))[1] AS last_market_rejection_reason,

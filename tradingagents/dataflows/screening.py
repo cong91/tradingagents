@@ -26,6 +26,7 @@ with human-readable ``reasons``. Point-in-time integrity holds because
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 
 from tradingagents.dataflows.errors import VendorError
@@ -380,17 +381,23 @@ def screen_universe(
     curr_date: str,
     top_n: int,
     lookback: int = 20,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict]:
     """Rank both universes by screen score; return the top ``top_n`` as dicts.
 
     Tickers keep the asset type of the universe they came from — that type
     decides the LLM analysts and the advisory/plan path downstream. Each
-    universe shares its class benchmark for the relative-strength bonus.
+    universe shares its class benchmark for the relative-strength bonus. When
+    ``cancel_event`` is set, stop before beginning the next asset/ticker.
     """
     candidates: list[Candidate] = []
     for asset_type, tickers in (("crypto", crypto), ("stock", stocks)):
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         benchmark = _benchmark_momentum(asset_type, curr_date, lookback)
         for ticker in tickers:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             candidate = screen_one(
                 ticker, curr_date, asset_type=asset_type,
                 benchmark_momentum=benchmark, lookback=lookback,

@@ -61,6 +61,7 @@ class AgentState(MessagesState):
     investment_plan: Annotated[str, "Investment plan from the Research Manager"]
 
     trader_investment_plan: Annotated[str, "Transaction proposal from the Trader"]
+    trader_decision_telemetry: Annotated[dict, "Redacted typed Trader decision metadata"]
 
     # risk management team discussion step
     risk_debate_state: Annotated[
@@ -68,6 +69,7 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision from the Portfolio Manager"]
     final_rating: Annotated[str, "The Portfolio Manager's 5-tier rating, or REVIEW when it has none"]
+    pm_decision_telemetry: Annotated[dict, "Redacted typed Portfolio Manager decision metadata"]
     past_context: Annotated[str, "Memory log context for the Portfolio Manager (same-ticker decisions + cross-ticker lessons), written by the Memory Log step"]
     memory_note: Annotated[str, "What the Memory Log step could not settle or read this run, for the report; empty when all went well"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
