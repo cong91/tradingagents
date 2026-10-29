@@ -709,7 +709,14 @@ def test_default_factory_reads_production_credentials_from_env(monkeypatch):
     bridge_module._default_exchange_factory(
         "binance", base_url="https://api.binance.com"
     )
-    assert captured == {"apiKey": "env-key", "secret": "env-secret", "enableRateLimit": True}
+    assert captured == {
+        "apiKey": "env-key",
+        "secret": "env-secret",
+        "enableRateLimit": True,
+        # Binance needs ccxt's measured clock offset: a host ~1s fast fails
+        # every signed request with -1021 (test_binance_venue_config pins this).
+        "options": {"adjustForTimeDifference": True},
+    }
 
 
 def test_default_factory_demo_uses_demo_credentials(monkeypatch):
