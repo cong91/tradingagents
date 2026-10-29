@@ -153,7 +153,7 @@ def _futures_bases(exchange: Any, quote: str) -> set[str]:
     return bases
 
 
-def crypto_universe(config: dict, top_n: int) -> list[str]:
+def crypto_universe(config: dict, top_n: int, *, futures_only: bool = False) -> list[str]:
     """Top ``top_n`` liquid crypto as pipeline tickers (``BTC-USD`` form).
 
     Public exchange data only — no credentials are read or sent. The ranking
@@ -163,15 +163,13 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
     ``BASE-USD`` and the bridge plans through ``exec_symbol_overrides`` if one
     of them ever earns a plan.
 
-    When derivatives trading is armed (``exec_derivatives is True``) only bases
-    the venue actually quotes a contract for are kept: a futures cycle can
+    ``futures_only`` keeps only bases the venue actually quotes a contract for
+    (active swap/future, same quote and settle currency). A futures cycle can
     trade nothing else, so spot-only bases are pure noise there and used to
-    burn a market-phase cycle each. The spot path keeps them. The mode comes
-    from ``config`` rather than a parameter so every caller and test double
-    keeps the same two-argument shape.
+    burn a market-phase cycle each. It is opt-in: the spot and stock paths pass
+    the same config with derivatives armed and must keep seeing spot pairs.
     """
     exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
-    futures_only = config.get("exec_derivatives") is True
 
     try:
         exchange = _public_exchange(config)

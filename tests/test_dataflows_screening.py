@@ -242,8 +242,8 @@ def test_futures_only_universe_drops_bases_without_a_contract(monkeypatch):
 
     Spot discovery ranks by spot volume, so live spot pairs with no perpetual
     (the SOXLB/SNDKB class) used to fill the pool and burn a market-phase cycle
-    each. Arming derivatives in config keeps them out before screening is paid
-    for.
+    each. ``futures_only`` keeps them out before screening is paid for; the
+    spot path (same config, derivatives armed) must still see them.
     """
     import sys
     import types
@@ -290,12 +290,11 @@ def test_futures_only_universe_drops_bases_without_a_contract(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "ccxt", types.SimpleNamespace(binance=FakeExchange))
     config = {"exec_exchange_id": "binance", "exec_base_url": "https://demo-api.binance.com"}
-    futures_config = {**config, "exec_derivatives": True}
 
     assert screening.crypto_universe(config, top_n=10) == [
         "BTC-USD", "SNDKB-USD", "BCH-USD", "SOL-USD",
     ]
-    assert screening.crypto_universe(futures_config, top_n=10) == [
+    assert screening.crypto_universe(config, top_n=10, futures_only=True) == [
         "BTC-USD", "BCH-USD",
     ]
 

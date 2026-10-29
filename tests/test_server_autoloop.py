@@ -2171,6 +2171,30 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
     assert captured["margin_mode"] == "cross"
 
 
+def test_futures_screening_asks_the_universe_seam_for_contracts_only():
+    """The autoloop's futures mode must opt into the contract filter, while a
+    seam written before the flag keeps working with two arguments."""
+    seen: list[dict] = []
+
+    def with_flag(config, limit, *, futures_only=False):
+        seen.append({"limit": limit, "futures_only": futures_only})
+        return ["BTC-USD"]
+
+    def without_flag(config, limit):
+        seen.append({"limit": limit, "futures_only": None})
+        return ["BTC-USD"]
+
+    autoloop_mod._call_crypto_universe(with_flag, {}, 60, True)
+    autoloop_mod._call_crypto_universe(without_flag, {}, 60, True)
+    autoloop_mod._call_crypto_universe(with_flag, {}, 30, False)
+
+    assert seen == [
+        {"limit": 60, "futures_only": True},
+        {"limit": 60, "futures_only": None},
+        {"limit": 30, "futures_only": False},
+    ]
+
+
 def test_proposal_entry_matching_the_snapshot_mark_survives_a_moved_live_price():
     """The agents are shown one mark and told to make entry consistent with it.
 

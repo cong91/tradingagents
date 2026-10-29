@@ -196,6 +196,31 @@ def _execute_with_deadline(
         return execute()
 
 
+def _call_crypto_universe(
+    crypto_universe: Callable, config: dict, limit: int, futures_mode: bool,
+) -> list[str]:
+    """Call the universe seam, opting into the futures-only filter when armed.
+
+    ``crypto_universe`` is injected by tests and by the daily spot path; only
+    the autoloop's futures mode wants contract-bearing bases, so the flag is
+    passed only when the callable declares it. A seam that predates the flag
+    keeps its two-argument shape (same pattern as ``cancel_event`` below).
+    """
+    if not futures_mode:
+        return crypto_universe(config, limit)
+    try:
+        parameters = inspect.signature(crypto_universe).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_flag = "futures_only" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_flag:
+        return crypto_universe(config, limit, futures_only=True)
+    return crypto_universe(config, limit)
+
+
 def _screen_with_timeout(
     crypto_universe: Callable,
     stock_universe: Callable,
@@ -230,7 +255,7 @@ def _screen_with_timeout(
                 else (AUTO_FUTURES_SCREEN_POOL if futures_mode else AUTO_UNIVERSE_PER_ASSET)
             )
             with telemetry.span("screening:crypto_universe"):
-                crypto = crypto_universe(config, crypto_limit)
+                crypto = _call_crypto_universe(crypto_universe, config, crypto_limit, futures_mode)
             if cancel_screening.is_set():
                 return
             if futures_mode:
