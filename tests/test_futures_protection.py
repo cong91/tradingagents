@@ -582,3 +582,277 @@ def test_time_stop_past_the_deadline_after_minimum_r_keeps_the_position():
     assert result == [{"position_key": position_key, "status": "updated"}]
     assert not [call for call in exchange.calls if call[0] == "create" and "clientOrderId" in call[4]]
     assert job_store.load_position_state(position_key) is not None
+
+
+class _FundingExchange(_ProtectionExchange):
+    """Adds the funding endpoints the time stop consults at the deadline."""
+
+    def __init__(self, *, positions, funding_rows=(), funding_rate=None, mark_price=None):
+        super().__init__(positions=positions, mark_price=mark_price)
+        self.funding_rows = funding_rows
+        self.funding_rate = funding_rate
+        self.funding_calls = []
+
+    def fetch_funding_history(self, symbol, since=None, limit=None, params=None):
+        self.funding_calls.append(("funding_history", symbol, since))
+        if isinstance(self.funding_rows, Exception):
+            raise self.funding_rows
+        return list(self.funding_rows)
+
+    def fetch_funding_rate(self, symbol, params=None):
+        self.funding_calls.append(("funding_rate", symbol, params))
+        if isinstance(self.funding_rate, Exception):
+            raise self.funding_rate
+        return self.funding_rate
+
+
+def _short_position_state():
+    position_key, task_id = _linked_position(side="short", stop=110.0, target=70.0)
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _FundingExchange(
+        positions=[{
+            "symbol": "TIA/USDT:USDT", "side": "short", "contracts": 1.0,
+            "entryPrice": 100.0, "markPrice": 105.0,
+        }],
+    )
+    return position_key, task_id, exchange
+
+
+_TIME_STOP_CONFIG = {
+    "risk_derivatives_profit_protection_enabled": True,
+    "risk_derivatives_max_hold_hours": 72.0,
+    "risk_derivatives_time_stop_min_r": 1.0,
+}
+
+
+def test_strong_funding_blocks_the_time_stop_and_records_the_reason():
+    position_key, _task_id, exchange = _short_position_state()
+    # Mark 105 on entry 100 puts the short at -0.5R; +30 USDT of funding
+    # against a 10 USDT initial risk is +3.0R, enough to hold the position.
+    exchange.funding_rows = [{"amount": 15.0}, {"amount": 15.0}]
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "time_stop_blocked_by_funding",
+    }]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["phase"] == "time_stop_blocked_by_funding"
+    assert snapshot["cumulative_funding_r"] == pytest.approx(3.0)
+    assert snapshot["round_trip_fee_r"] == pytest.approx(0.01)  # 0.001 * 100 / 10
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert bridge.audit == []
+
+
+def test_earning_short_inside_the_settlement_window_postpones_the_time_stop():
+    position_key, _task_id, exchange = _short_position_state()
+    # +2 USDT of funding lifts the effective R only to -0.31, so the time stop
+    # would close — but the next settlement pays this short and is 30m away.
+    settlement_ms = int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000)
+    exchange.funding_rows = [{"amount": 2.0}]
+    exchange.funding_rate = {"fundingRate": 0.0001, "nextFundingTimestamp": settlement_ms}
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "time_stop_postponed_funding",
+    }]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["phase"] == "time_stop_postponed_funding"
+    assert datetime.fromisoformat(snapshot["observed_at"]).tzinfo is not None
+    assert snapshot["cumulative_funding_r"] == pytest.approx(0.2)
+    assert datetime.fromisoformat(snapshot["time_stop_postponed_for"]) == (
+        datetime.fromtimestamp(settlement_ms / 1000, tz=UTC)
+    )
+    assert [event["action"] for event in bridge.audit] == ["time_stop_postponed"]
+
+
+def test_a_second_settlement_inside_the_window_closes_instead_of_deferring():
+    position_key, _task_id, exchange = _short_position_state()
+    exchange.funding_rows = [{"amount": 2.0}]
+    exchange.funding_rate = {
+        "fundingRate": 0.0001,
+        "nextFundingTimestamp": int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000),
+    }
+    bridge = _ProtectionBridge(exchange)
+
+    first = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+    assert first == [{"position_key": position_key, "status": "time_stop_postponed_funding"}]
+
+    # The held-through settlement passes and the next one is still inside the
+    # 90m window: holding again would defer the time stop one cycle at a time
+    # forever, so the position closes instead.
+    exchange.funding_rate = {
+        "fundingRate": 0.0001,
+        "nextFundingTimestamp": int((datetime.now(UTC) + timedelta(minutes=45)).timestamp() * 1000),
+    }
+    exchange.orders = _resting_leg_orders()
+
+    second = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    assert second == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert job_store.load_position_state(position_key) is None
+
+
+def test_strong_funding_blocks_the_time_stop_on_the_brackets_original_size():
+    position_key, _task_id, exchange = _short_position_state()
+    # A scale-out tranche already left: the venue reports half the original
+    # contracts while the funding history accrued on the full size.
+    exchange.positions[0]["contracts"] = 0.5
+    exchange.funding_rows = [{"amount": 15.0}, {"amount": 15.0}]
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "time_stop_blocked_by_funding",
+    }]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    # 30 USDT over the original 10 USDT initial risk is 3.0R; dividing by the
+    # shrunken 5 USDT remainder would claim 6.0R.
+    assert snapshot["cumulative_funding_r"] == pytest.approx(3.0)
+
+
+class _FlakyClientBridge(_ProtectionBridge):
+    """A bridge whose client read hiccups exactly once, at the funding read.
+
+    One mutation pass reaches ``client()`` four times: positions read,
+    position mode, mark price, then the funding reads (the close re-reads it
+    afterwards). Letting only the funding call fail — as a single dropped
+    connection would — exercises the fallback without breaking the gates
+    around it or the close that follows.
+    """
+
+    def __init__(self, exchange):
+        super().__init__(exchange)
+        self._client_calls = 0
+
+    def client(self):
+        self._client_calls += 1
+        if self._client_calls == 4:
+            raise RuntimeError("client unavailable")
+        return self.exchange
+
+
+def test_unavailable_venue_client_notes_the_funding_fallback():
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 105.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _FlakyClientBridge(exchange), allow_mutation=True, config=_TIME_STOP_CONFIG,
+    )
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "time_stop_closed",
+        "funding_note": "funding_history_unavailable",
+    }]
+    assert job_store.load_position_state(position_key) is None
+
+
+def test_paying_long_closes_at_the_deadline_despite_the_upcoming_settlement():
+    position_key, task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _FundingExchange(
+        positions=[{
+            "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+            "entryPrice": 100.0, "markPrice": 105.0,
+        }],
+        funding_rows=[{"amount": -2.0}],
+        funding_rate={
+            "fundingRate": 0.0001,
+            "nextFundingTimestamp": int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000),
+        },
+    )
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    # A long pays a positive funding rate: the close must not wait for it.
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert len([call for call in exchange.calls if call[0] == "create"]) == 1
+    assert job_store.load_position_state(position_key) is None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+
+
+def test_failed_funding_history_treats_funding_as_zero_and_notes_it():
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _FundingExchange(
+        positions=[{
+            "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+            "entryPrice": 100.0, "markPrice": 105.0,
+        }],
+        funding_rows=RuntimeError("venue down"),
+    )
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_TIME_STOP_CONFIG,
+    )
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "time_stop_closed",
+        "funding_note": "funding_history_unavailable",
+    }]
+    assert job_store.load_position_state(position_key) is None
+
+
+def test_disabled_postpone_window_closes_without_reading_the_schedule():
+    position_key, _task_id, exchange = _short_position_state()
+    exchange.funding_rows = [{"amount": 2.0}]
+    exchange.funding_rate = {
+        "fundingRate": 0.0001,
+        "nextFundingTimestamp": int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000),
+    }
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={**_TIME_STOP_CONFIG, "risk_derivatives_time_stop_postpone_minutes": 0.0},
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert not [call for call in exchange.funding_calls if call[0] == "funding_rate"]
+    assert job_store.load_position_state(position_key) is None
+
+
+def test_funding_is_only_consulted_once_the_raw_boundary_trips():
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    # Mark 115 on entry 100 is +1.5R: above the time-stop minimum before any
+    # funding is considered, so the venue must not be asked.
+    exchange = _FundingExchange(
+        positions=[{
+            "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+            "entryPrice": 100.0, "markPrice": 115.0,
+        }],
+        funding_rows=[{"amount": 100.0}],
+        funding_rate={
+            "fundingRate": 0.0001,
+            "nextFundingTimestamp": int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000),
+        },
+    )
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_TIME_STOP_CONFIG,
+    )
+
+    assert result == [{"position_key": position_key, "status": "updated"}]
+    assert exchange.funding_calls == []

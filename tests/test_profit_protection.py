@@ -340,3 +340,180 @@ def test_exit_reason_stays_none_on_existing_branches(mark, expected_phase):
 
     assert result.phase == expected_phase
     assert result.exit_reason is None
+
+
+def test_positive_funding_holds_a_short_past_the_time_stop():
+    result = evaluate_profit_protection(
+        side="short",
+        entry=100.0,
+        initial_stop=110.0,
+        current_stop=110.0,
+        current_target=70.0,
+        mark=105.0,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+        cumulative_funding_r=2.0,
+        round_trip_fee_r=0.05,
+    )
+
+    # Favorable R is -0.5; funding adds +2.0 and the fee takes 0.05, so the
+    # effective R of 1.45 holds the position past the deadline.
+    assert result.exit_reason is None
+    assert result.phase == "time_stop_blocked_by_funding"
+    assert result.stop == pytest.approx(110.0)
+    assert result.target == pytest.approx(70.0)
+
+
+def test_negative_funding_closes_a_long_earlier_than_price_r_alone():
+    result = evaluate_profit_protection(
+        side="long",
+        entry=100.0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        current_target=130.0,
+        mark=111.0,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+        cumulative_funding_r=-0.5,
+        round_trip_fee_r=0.05,
+    )
+
+    # Price R alone is 1.1 and would survive the deadline; funding paid and
+    # the exit fee drag the effective R down to 0.55, below the minimum.
+    assert result.exit_reason == "time_stop"
+    assert result.phase == "time_stop"
+
+
+def test_the_same_long_without_funding_survives_the_deadline():
+    result = evaluate_profit_protection(
+        side="long",
+        entry=100.0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        current_target=130.0,
+        mark=111.0,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+    )
+
+    assert result.exit_reason is None
+    assert result.phase == "break_even"
+
+
+@pytest.mark.parametrize(
+    ("cumulative_funding_r", "round_trip_fee_r", "expected"),
+    [
+        (1.0, 0.9, "time_stop"),      # fee sinks the effective R to 0.3
+        (1.0, 0.0, "time_stop_blocked_by_funding"),
+        (0.7, 0.0, "time_stop"),      # funding alone leaves effective R at 0.9
+    ],
+)
+def test_round_trip_fee_r_drags_the_effective_r_down(
+    cumulative_funding_r, round_trip_fee_r, expected
+):
+    result = evaluate_profit_protection(
+        side="short",
+        entry=100.0,
+        initial_stop=110.0,
+        current_stop=110.0,
+        current_target=70.0,
+        mark=98.0,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+        cumulative_funding_r=cumulative_funding_r,
+        round_trip_fee_r=round_trip_fee_r,
+    )
+
+    # Favorable R is 0.2; with +1.0R funding the fee is what decides whether
+    # the position survives the deadline.
+    assert result.phase == expected
+    assert result.exit_reason == ("time_stop" if expected == "time_stop" else None)
+
+
+def test_break_even_level_stays_price_based_when_funding_blocks_the_time_stop():
+    result = evaluate_profit_protection(
+        side="long",
+        entry=100.0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        current_target=130.0,
+        mark=107.0,
+        break_even_r=0.5,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+        cumulative_funding_r=0.5,
+        round_trip_fee_r=0.05,
+    )
+
+    # Favorable R 0.7 tripped the raw boundary; funding rescued it. The stop
+    # still advances to the price-based break-even level, untouched by funding.
+    assert result.phase == "time_stop_blocked_by_funding"
+    assert result.stop == pytest.approx(100.0)
+
+    # Without the rescue the same position fires the time stop instead.
+    stopped = evaluate_profit_protection(
+        side="long",
+        entry=100.0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        current_target=130.0,
+        mark=107.0,
+        break_even_r=0.5,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+    )
+
+    assert stopped.exit_reason == "time_stop"
+
+
+def test_trailing_level_stays_price_based_and_well_earned_profit_is_not_blocked():
+    result = evaluate_profit_protection(
+        side="long",
+        entry=100.0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        current_target=130.0,
+        mark=133.0,
+        held_hours=80.0,
+        max_hold_hours=72.0,
+        time_stop_min_r=1.0,
+        cumulative_funding_r=-0.2,
+        round_trip_fee_r=0.1,
+    )
+
+    # Effective R is 3.0 at the trail start; the trailing stop keeps its
+    # price-based distance and the phase stays trailing, not blocked.
+    assert result.phase == "trailing"
+    assert result.stop == pytest.approx(123.0)
+    assert result.exit_reason is None
+
+
+@pytest.mark.parametrize(
+    "adjustment",
+    [
+        {"cumulative_funding_r": float("nan")},
+        {"cumulative_funding_r": float("inf")},
+        {"cumulative_funding_r": float("-inf")},
+        {"round_trip_fee_r": float("nan")},
+        {"round_trip_fee_r": float("inf")},
+        {"round_trip_fee_r": float("-inf")},
+        {"cumulative_funding_r": "junk"},
+    ],
+)
+def test_non_finite_funding_adjustments_are_rejected(adjustment):
+    with pytest.raises(ValueError, match="finite"):
+        evaluate_profit_protection(
+            side="long",
+            entry=100.0,
+            initial_stop=90.0,
+            current_stop=90.0,
+            current_target=130.0,
+            mark=110.0,
+            **adjustment,
+        )

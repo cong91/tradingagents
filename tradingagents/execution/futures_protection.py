@@ -9,6 +9,11 @@ from typing import Any
 from server import job_store
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.futures_account import FuturesPosition, read_futures_positions
+from tradingagents.execution.futures_funding import (
+    evaluate_time_stop_postpone,
+    fetch_funding_income,
+    funding_schedule,
+)
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -186,25 +191,91 @@ def _manage_one_with_lease(
     current_stop = float(stop_leg["params"]["stopLossPrice"])
     current_target = None if ladder else float(target_legs[0]["params"]["takeProfitPrice"])
     max_hold_hours = _positive_or_none(config.get("risk_derivatives_max_hold_hours", 72.0))
-    decision = evaluate_profit_protection(
-        side=side,
-        entry=entry,
-        initial_stop=initial_stop,
-        current_stop=current_stop,
-        current_target=current_target,
-        mark=mark,
-        break_even_r=float(config.get("risk_derivatives_break_even_r", 1.0)),
-        lock_profit_r=float(config.get("risk_derivatives_lock_profit_r", 2.0)),
-        trail_start_r=float(config.get("risk_derivatives_trail_start_r", 3.0)),
-        trail_distance_r=float(config.get("risk_derivatives_trail_distance_r", 1.0)),
-        target_extension_r=float(config.get("risk_derivatives_target_extension_r", 1.0)),
-        min_stop_move_r=float(config.get("risk_derivatives_min_stop_move_r", 0.1)),
-        round_trip_fee_rate=float(config.get("risk_derivatives_round_trip_fee_rate", 0.001)),
-        held_hours=held_hours,
-        max_hold_hours=max_hold_hours,
-        time_stop_min_r=float(config.get("risk_derivatives_time_stop_min_r", 1.0)),
-    )
+    policy_kwargs = {
+        "side": side,
+        "entry": entry,
+        "initial_stop": initial_stop,
+        "current_stop": current_stop,
+        "current_target": current_target,
+        "mark": mark,
+        "break_even_r": float(config.get("risk_derivatives_break_even_r", 1.0)),
+        "lock_profit_r": float(config.get("risk_derivatives_lock_profit_r", 2.0)),
+        "trail_start_r": float(config.get("risk_derivatives_trail_start_r", 3.0)),
+        "trail_distance_r": float(config.get("risk_derivatives_trail_distance_r", 1.0)),
+        "target_extension_r": float(config.get("risk_derivatives_target_extension_r", 1.0)),
+        "min_stop_move_r": float(config.get("risk_derivatives_min_stop_move_r", 0.1)),
+        "round_trip_fee_rate": float(config.get("risk_derivatives_round_trip_fee_rate", 0.001)),
+        "held_hours": held_hours,
+        "max_hold_hours": max_hold_hours,
+        "time_stop_min_r": float(config.get("risk_derivatives_time_stop_min_r", 1.0)),
+    }
+    decision = evaluate_profit_protection(**policy_kwargs)
+    # The venue is only consulted once the raw price boundary has tripped:
+    # funding and fees never fire the time stop on their own, they adjudicate
+    # it once the position is already past its deadline.
+    boundary_tripped = decision.exit_reason == "time_stop"
+    client = None
+    cumulative_funding_r: float | None = None
+    round_trip_fee_r: float | None = None
+    funding_note: str | None = None
+    if boundary_tripped:
+        try:
+            client = bridge.client()
+        except Exception:
+            client = None
+        cumulative_funding_r, round_trip_fee_r, funding_note = _time_stop_funding_inputs(
+            client, symbol, opened_at, entry, initial_stop,
+            _initial_position_size(task, quantity), config,
+        )
+        decision = evaluate_profit_protection(
+            **policy_kwargs,
+            cumulative_funding_r=cumulative_funding_r,
+            round_trip_fee_r=round_trip_fee_r,
+        )
     if decision.exit_reason == "time_stop":
+        postponed_for = _parse_opened_at(snapshot.get("time_stop_postponed_for"))
+        postpone, postpone_reason, postponed_settlement = _settlement_postpone_verdict(
+            client, symbol, side, observed_at, config, postponed_for,
+        )
+        if postpone:
+            snapshot = {
+                **snapshot,
+                "phase": "time_stop_postponed_funding",
+                "observed_at": datetime.now(UTC).isoformat(),
+                "cumulative_funding_r": cumulative_funding_r,
+                "round_trip_fee_r": round_trip_fee_r,
+                "time_stop_postponed_for": postponed_settlement.isoformat(),
+            }
+            if not job_store.save_position_state(
+                position_key, state["revision"], {**state, "snapshot": snapshot},
+            ):
+                return {"position_key": position_key, "status": "revision_conflict"}
+            audit = getattr(bridge, "audit_plan", None)
+            if callable(audit):
+                audit(
+                    PlannedOrder(
+                        ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
+                        side=task["close_side"], quantity=contracts, estimated_price=mark,
+                        market="derivatives",
+                    ),
+                    action="time_stop_postponed", confirmed=True, order_id=bracket_task_id,
+                    reason=f"held {held_hours:.1f}h past {max_hold_hours}h; {postpone_reason}",
+                    phase="execute",
+                )
+            outcome = {"position_key": position_key, "status": "time_stop_postponed_funding"}
+            if funding_note:
+                outcome["funding_note"] = funding_note
+            return outcome
+        close_reason = (
+            f"held {held_hours:.1f}h past {max_hold_hours}h without reaching "
+            f"{config.get('risk_derivatives_time_stop_min_r', 1.0)}R"
+        )
+        if cumulative_funding_r is not None:
+            close_reason += (
+                f"; funding {cumulative_funding_r:+.2f}R, fee {round_trip_fee_r:.2f}R"
+            )
+        if funding_note:
+            close_reason += f"; {funding_note}"
         status = manager.close_position(bracket_task_id, reason="time_stop", allow_mutation=True)
         if status != "time_stop_closed":
             return {"position_key": position_key, "status": status}
@@ -218,10 +289,13 @@ def _manage_one_with_lease(
                     market="derivatives",
                 ),
                 action="time_stop_closed", confirmed=True, order_id=bracket_task_id,
-                reason=f"held {held_hours:.1f}h past {max_hold_hours}h without reaching {config.get('risk_derivatives_time_stop_min_r', 1.0)}R",
+                reason=close_reason,
                 phase="execute",
             )
-        return {"position_key": position_key, "status": "time_stop_closed"}
+        outcome = {"position_key": position_key, "status": "time_stop_closed"}
+        if funding_note:
+            outcome["funding_note"] = funding_note
+        return outcome
     stop_changed = not _same(decision.stop, current_stop)
     target_changed = decision.target is not None and not _same(decision.target, current_target)
     stop_size_changed = not _same(contracts, stop_leg.get("quantity", task["quantity"]))
@@ -260,12 +334,20 @@ def _manage_one_with_lease(
         "highest_mark": max(float(snapshot.get("highest_mark", mark)), mark) if side == "long" else snapshot.get("highest_mark"),
         "lowest_mark": min(float(snapshot.get("lowest_mark", mark)), mark) if side == "short" else snapshot.get("lowest_mark"),
     }
+    if cumulative_funding_r is not None:
+        # The time-stop boundary was examined with these figures; the UI reads
+        # them to see why a past-deadline position is still open.
+        snapshot["cumulative_funding_r"] = cumulative_funding_r
+        snapshot["round_trip_fee_r"] = round_trip_fee_r
     if not job_store.save_position_state(
         position_key,
         state["revision"],
         {**state, "snapshot": snapshot},
     ):
         return {"position_key": position_key, "status": "revision_conflict"}
+    if boundary_tripped:
+        # Funding held the effective R above the minimum past the deadline.
+        return {"position_key": position_key, "status": "time_stop_blocked_by_funding"}
     return {"position_key": position_key, "status": "updated" if stop_changed or target_changed or stop_size_changed or target_size_changed else "unchanged"}
 
 
@@ -284,6 +366,135 @@ def _parse_opened_at(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _initial_position_size(task: dict, venue_quantity: float) -> float:
+    """The size the funding accrued on: the bracket's original quantity.
+
+    A scale-out tranche shrinks the venue position while the funding history
+    keeps accruing on the size held before it; dividing by the remainder would
+    inflate the rescue and hold the position longer than it earned. The task
+    quantity is the size the bracket opened with and is never resized by the
+    ladder; a missing value falls back to the venue reading.
+    """
+    try:
+        original = float(task["quantity"])
+    except (KeyError, TypeError, ValueError):
+        return venue_quantity
+    return original if math.isfinite(original) and original > 0 else venue_quantity
+
+
+def _time_stop_funding_inputs(
+    client: Any,
+    symbol: str,
+    opened_at: datetime,
+    entry: float,
+    initial_stop: float,
+    quantity: float,
+    config: dict,
+) -> tuple[float, float, str | None]:
+    """Funding and exit fee in initial-risk units for the time-stop boundary.
+
+    Only consulted once the raw price boundary has tripped. ``quantity`` is
+    the size the bracket opened with, not the venue's possibly shrunken
+    remainder — the funding history accrued on the original size. A failed
+    read contributes zero funding and a note — an unknown funding number must
+    never rescue the position, and the outcome says when the number was a
+    fallback rather than a measurement.
+    """
+    risk_per_unit = abs(entry - initial_stop)
+    if risk_per_unit <= 0 or quantity <= 0:
+        # The policy rejects this geometry on its own; nothing to adjust.
+        return 0.0, 0.0, None
+    fee_r = float(config.get("risk_derivatives_round_trip_fee_rate", 0.001)) * entry / risk_per_unit
+    if not math.isfinite(fee_r):
+        return 0.0, 0.0, None
+    if client is None:
+        # The venue client itself is unavailable: zero funding, and the
+        # outcome must say the number was a fallback, not a measurement.
+        return 0.0, fee_r, "funding_history_unavailable"
+    rows = fetch_funding_income(client, symbol, int(opened_at.timestamp() * 1000))
+    note = None
+    cumulative_usdt = 0.0
+    if rows is None:
+        note = "funding_history_unavailable"
+    else:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            amount = _finite_amount(row.get("amount"))
+            if amount is not None:
+                cumulative_usdt += amount
+    funding_r = cumulative_usdt / (risk_per_unit * quantity)
+    if not math.isfinite(funding_r):
+        # Absurd venue numbers must not wedge the time stop on an error
+        # outcome; zero the adjustment and say so.
+        return 0.0, fee_r, note or "funding_unusable"
+    return funding_r, fee_r, note
+
+
+def _settlement_postpone_verdict(
+    client: Any,
+    symbol: str,
+    side: str,
+    now: datetime,
+    config: dict,
+    postponed_for: datetime | None,
+) -> tuple[bool, str, datetime | None]:
+    """Whether an imminent settlement pays this position inside the window.
+
+    Fail-closed in the risk sense: a missing schedule, a paying position, a
+    disabled window or a window spanning a whole funding cycle all read as
+    "close now". Only a settlement that would PAY the position, inside the
+    postpone window and not already held through, keeps the time stop waiting.
+    One settlement is the most a position ever holds through: once it has been
+    postponed past one settlement, a NEW next settlement still inside the
+    window closes instead of deferring one cycle at a time forever.
+
+    Returns the verdict, a human reason, and the settlement being held
+    through (``None`` when the verdict is "close").
+    """
+    try:
+        postpone_minutes = float(
+            config.get("risk_derivatives_time_stop_postpone_minutes", 90.0)
+        )
+    except (TypeError, ValueError):
+        return False, "postpone window misconfigured", None
+    if not math.isfinite(postpone_minutes) or postpone_minutes <= 0:
+        return False, "postpone window disabled", None
+    schedule = funding_schedule(client, symbol, now)
+    rate = schedule["rate"] if schedule else None
+    next_funding_at = schedule["next_funding_at"] if schedule else None
+    interval_hours = schedule["interval_hours"] if schedule else None
+    verdict = evaluate_time_stop_postpone(
+        side=side,
+        rate=rate,
+        next_funding_at=next_funding_at,
+        now=now,
+        postpone_minutes=postpone_minutes,
+        interval_hours=interval_hours,
+    )
+    if verdict != "postpone":
+        if rate is None or next_funding_at is None:
+            return False, "funding schedule unavailable", None
+        return False, "no paid settlement inside the postpone window", None
+    if postponed_for is not None and next_funding_at > postponed_for:
+        # A settlement was already held through and this is the next one:
+        # holding again would defer the time stop one cycle at a time forever.
+        return False, "a settlement was already collected past the deadline", None
+    minutes = (next_funding_at - now).total_seconds() / 60.0
+    return True, (
+        f"settlement in {minutes:.0f}m pays this {side} "
+        f"(rate {rate:+.6f}, window {postpone_minutes:.0f}m)"
+    ), next_funding_at
+
+
+def _finite_amount(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _positive_or_none(value: Any) -> float | None:

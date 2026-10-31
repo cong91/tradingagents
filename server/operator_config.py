@@ -156,6 +156,19 @@ _ALLOWED: dict[str, dict] = {
             "đúng bằng entry."
         ),
     },
+    "risk_derivatives_time_stop_postpone_minutes": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Hoãn time stop trước settlement (phút)",
+        "hint": (
+            "Khi time stop sắp đóng một vị thế đang NHẬN funding mà settlement "
+            "kế tiếp còn trong khoảng phút này thì hoãn đóng tới sau settlement "
+            "để thu funding (tối đa một kỳ, cửa sổ không được phủ quá chu kỳ "
+            "funding), kỳ sau sẽ đóng lại. Vị thế đang TRẢ phí thì vẫn đóng "
+            "ngay. 0 = tắt hoãn, đóng đúng hạn."
+        ),
+    },
 }
 
 _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}

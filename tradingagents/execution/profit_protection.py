@@ -33,8 +33,18 @@ def evaluate_profit_protection(
     held_hours: float | None = None,
     max_hold_hours: float | None = None,
     time_stop_min_r: float = 1.0,
+    cumulative_funding_r: float | None = None,
+    round_trip_fee_r: float | None = None,
 ) -> ProfitProtectionDecision:
-    """Return monotonic stop/target levels without performing venue actions."""
+    """Return monotonic stop/target levels without performing venue actions.
+
+    The time-stop boundary alone reads funding: ``cumulative_funding_r``
+    carries the venue's sign (positive = the position is being paid) and
+    ``round_trip_fee_r`` the exit fee in initial-risk units, so the deadline
+    verdict uses ``effective_r = favorable_r + funding - fee``. Break-even,
+    lock and trailing stops stay purely price-based because the venue trigger
+    is a price, not an account figure.
+    """
     if mark is None or not _positive_finite(mark):
         return ProfitProtectionDecision(current_stop, current_target, "unchanged")
     if side not in {"long", "short"}:
@@ -59,6 +69,10 @@ def evaluate_profit_protection(
         raise ValueError("held duration must be finite and non-negative")
     if not _positive_finite(time_stop_min_r):
         raise ValueError("time-stop minimum R must be finite and positive")
+    if cumulative_funding_r is not None and not _finite(cumulative_funding_r):
+        raise ValueError("cumulative funding R must be finite")
+    if round_trip_fee_r is not None and not _finite(round_trip_fee_r):
+        raise ValueError("round-trip fee R must be finite")
     if not break_even_r < lock_profit_r < trail_start_r:
         raise ValueError("profit-protection thresholds must be strictly increasing")
 
@@ -70,12 +84,15 @@ def evaluate_profit_protection(
 
     favorable = mark - entry if long else entry - mark
     favorable_r = favorable / risk
-    if (
+    funding_r = 0.0 if cumulative_funding_r is None else float(cumulative_funding_r)
+    fee_r = 0.0 if round_trip_fee_r is None else float(round_trip_fee_r)
+    effective_r = favorable_r + funding_r - fee_r
+    past_deadline = (
         max_hold_hours is not None
         and held_hours is not None
         and held_hours >= max_hold_hours
-        and favorable_r < time_stop_min_r
-    ):
+    )
+    if past_deadline and effective_r < time_stop_min_r:
         return ProfitProtectionDecision(current_stop, current_target, "time_stop", "time_stop")
     candidate = current_stop
     phase = "unchanged"
@@ -109,7 +126,20 @@ def evaluate_profit_protection(
         if phase == "unchanged":
             phase = "target_extended"
 
+    if past_deadline and favorable_r < time_stop_min_r and effective_r >= time_stop_min_r:
+        # The price boundary tripped, yet funding and fees kept the effective R
+        # above the minimum: the position stays, and the phase says why.
+        phase = "time_stop_blocked_by_funding"
+
     return ProfitProtectionDecision(stop, target, phase)
+
+
+def _finite(value: float) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number)
 
 
 def _positive_finite(value: float) -> bool:

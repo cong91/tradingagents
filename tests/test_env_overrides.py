@@ -164,6 +164,7 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert config["risk_derivatives_max_hold_hours"] == 72.0
     assert config["risk_derivatives_time_stop_min_r"] == 1.0
     assert config["risk_derivatives_round_trip_fee_rate"] == 0.001
+    assert config["risk_derivatives_time_stop_postpone_minutes"] == 90.0
     assert config["risk_derivatives_min_stop_move_r"] == 0.1
     assert config["risk_derivatives_mark_max_age_seconds"] == 120.0
     assert config["risk_derivatives_scale_out_enabled"] is False
@@ -190,6 +191,7 @@ def test_risk_float_and_int_coercion(monkeypatch):
         TRADINGAGENTS_RISK_DERIVATIVES_MAX_HOLD_HOURS="24.5",
         TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_MIN_R="0.5",
         TRADINGAGENTS_RISK_DERIVATIVES_ROUND_TRIP_FEE_RATE="0.0004",
+        TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_POSTPONE_MINUTES="45",
         TRADINGAGENTS_EXEC_EXCHANGE_ID="okx",
     )
     assert config["risk_max_daily_loss_pct"] == 2.5
@@ -204,6 +206,7 @@ def test_risk_float_and_int_coercion(monkeypatch):
     assert config["risk_derivatives_time_stop_min_r"] == 0.5
     assert config["risk_derivatives_round_trip_fee_rate"] == 0.0004
     assert isinstance(config["risk_derivatives_round_trip_fee_rate"], float)
+    assert config["risk_derivatives_time_stop_postpone_minutes"] == 45.0
     assert config["exec_exchange_id"] == "okx"
 
 
