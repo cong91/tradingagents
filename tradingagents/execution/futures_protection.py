@@ -155,7 +155,7 @@ def _manage_one_with_lease(
     if not allow_mutation:
         return {"position_key": position_key, "status": "mutation_gated"}
 
-    observed_at = datetime.now(timezone.utc)
+    observed_at = datetime.now(UTC)
     opened_at = _parse_opened_at(snapshot.get("opened_at"))
     if opened_at is None:
         # The age is unknowable, so a time stop must not fire this round: the
@@ -282,8 +282,8 @@ def _parse_opened_at(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _positive_or_none(value: Any) -> float | None:

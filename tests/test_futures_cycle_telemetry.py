@@ -6,7 +6,7 @@ and the durable futures_cycles row: these tests pin the redaction contract
 and the timestamp/terminal behavior of the persistence helpers.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -192,8 +192,8 @@ def test_decision_telemetry_without_state_falls_back_to_parser():
 
 @pytest.mark.unit
 def test_cycle_identity_uses_normalized_candle_opens():
-    one_hour = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
-    four_hour = datetime(2026, 10, 27, 8, tzinfo=timezone.utc)
+    one_hour = datetime(2026, 10, 27, 12, tzinfo=UTC)
+    four_hour = datetime(2026, 10, 27, 8, tzinfo=UTC)
     context = {
         "unified_symbol": "BTC/USDT:USDT",
         "one_hour_open": int(one_hour.timestamp() * 1000),

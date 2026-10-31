@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from twscrape import NoAccountError
 
@@ -30,7 +30,7 @@ def _created_at(tweet: dict) -> datetime | None:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def fetch_x_posts(
@@ -98,7 +98,7 @@ def fetch_x_posts(
     lines = [f"{len(windowed)} recent X posts mentioning {term}:"]
     for tweet in windowed[:limit]:
         created = _created_at(tweet)
-        stamp = created.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if created else "?"
+        stamp = created.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC") if created else "?"
         text = (tweet.get("text") or "").replace("\n", " ").strip()
         if len(text) > 1000:
             text = text[:1000] + "…"

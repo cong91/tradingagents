@@ -6,7 +6,7 @@ The last three tests check the wiring: a funding read that fails nulls only that
 figure and adds a warning, never the snapshot.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +18,7 @@ from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
 
-NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 
 
 def _income(amount: float, when: datetime) -> dict:
@@ -138,7 +138,7 @@ def _install_bridge(monkeypatch, client) -> None:
         portfolio_mod, "read_futures_account",
         lambda bridge: SimpleNamespace(as_dict=_futures_payload),
     )
-    opened = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    opened = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
     state = {"position_key": "BTC/USDT:USDT:sell:42",
              "snapshot": {"side": "short", "opened_at": opened}}
     monkeypatch.setattr(
@@ -160,7 +160,7 @@ def test_portfolio_fills_cost_fields_from_state_and_income(monkeypatch, tmp_path
         def fetch_funding_history(self, symbol, since, limit, params):
             assert symbol == "BTC/USDT:USDT"
             assert params == {}
-            return [{"timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            return [{"timestamp": int(datetime.now(UTC).timestamp() * 1000),
                      "amount": 0.54}]
 
     _install_bridge(monkeypatch, _Client())

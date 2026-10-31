@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -91,12 +91,12 @@ def _candle_open(context: dict, timeframe: str) -> datetime:
     elif isinstance(value, str):
         opened = datetime.fromisoformat(value.replace("Z", "+00:00"))
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        opened = datetime.fromtimestamp(value / 1000, timezone.utc)
+        opened = datetime.fromtimestamp(value / 1000, UTC)
     else:
         raise ValueError(f"futures context is missing the {timeframe} candle open time")
     if opened.tzinfo is None:
-        opened = opened.replace(tzinfo=timezone.utc)
-    return opened.astimezone(timezone.utc)
+        opened = opened.replace(tzinfo=UTC)
+    return opened.astimezone(UTC)
 
 
 def cycle_identity(context: dict) -> tuple[str, str, str]:

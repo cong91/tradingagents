@@ -85,7 +85,6 @@ def test_load_then_render_survives_a_null_quantity(tmp_path):
     )
     text = load_portfolio(path).render("AAPL")
     assert "quantity unknown" in text
->>>>>>> 084076f (fix: fail-closed RiskGuard account state and nullable portfolio quantities)
 
 
 @pytest.mark.unit

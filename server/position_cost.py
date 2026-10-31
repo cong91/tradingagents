@@ -15,7 +15,7 @@ the rest of the portfolio snapshot intact.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from server import job_store
 
@@ -55,8 +55,8 @@ def parse_timestamp(value) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def position_cost(notional, rate, income_rows, opened_at, now) -> dict:
@@ -73,11 +73,11 @@ def position_cost(notional, rate, income_rows, opened_at, now) -> dict:
 
     held_hours = None
     if opened is not None and isinstance(now, datetime):
-        reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
         # Clamped like the monitor's own age (futures_protection.py:170): a clock
         # skew must not render as a negative holding time.
         held_hours = max(
-            0.0, (reference.astimezone(timezone.utc) - opened).total_seconds() / 3600.0
+            0.0, (reference.astimezone(UTC) - opened).total_seconds() / 3600.0
         )
 
     round_trip_fee = None
@@ -182,7 +182,7 @@ def attach_position_costs(
     positions = futures.get("positions")
     if not isinstance(positions, list) or not positions:
         return
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     rate = config.get("risk_derivatives_round_trip_fee_rate", 0.001)
     states = _active_states()
     for position in positions:

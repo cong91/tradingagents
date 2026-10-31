@@ -3,7 +3,7 @@
 import asyncio
 import socket
 import weakref
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -62,7 +62,7 @@ def test_real_scraper_receives_cookie_account_without_a_database(monkeypatch):
     async def search(self, query, limit=-1, kv=None):
         account = await self.pool.get_for_queue_or_wait("SearchTimeline")
         seen.update(query=query, limit=limit, account=account, cookies=dict(account.cookies))
-        yield SimpleNamespace(rawContent="Bitcoin discussion", date=datetime(2026, 10, 26, tzinfo=timezone.utc),
+        yield SimpleNamespace(rawContent="Bitcoin discussion", date=datetime(2026, 10, 26, tzinfo=UTC),
                               likeCount=4, retweetCount=2, url="https://x.com/user/status/1")
         await self.pool.unlock(account.username, "SearchTimeline", 1)
 
@@ -123,7 +123,7 @@ def test_total_search_timeout_cancels_and_closes_the_generator(monkeypatch):
 @pytest.mark.unit
 def test_sync_fetch_is_safe_when_called_from_an_async_context(monkeypatch):
     async def search(self, query, **kwargs):
-        yield SimpleNamespace(rawContent="post", date=datetime.now(timezone.utc), likeCount=0,
+        yield SimpleNamespace(rawContent="post", date=datetime.now(UTC), likeCount=0,
                               retweetCount=0, url="https://x.com/u/status/2")
 
     monkeypatch.setattr(API, "search", search)
@@ -141,7 +141,7 @@ def test_search_limit_stops_a_generator_that_keeps_yielding(monkeypatch):
     async def search(self, query, **kwargs):
         try:
             for number in range(20):
-                yield SimpleNamespace(rawContent=str(number), date=datetime.now(timezone.utc),
+                yield SimpleNamespace(rawContent=str(number), date=datetime.now(UTC),
                                       likeCount=0, retweetCount=0, url=f"https://x.com/u/status/{number}")
         finally:
             closed.append(True)
@@ -179,7 +179,7 @@ def test_upstream_telemetry_and_secret_logs_are_disabled(monkeypatch, capsys):
     async def search(self, query, **kwargs):
         telemetry.capture("gql_request", {"operation": "SearchTimeline"})
         logger.warning("upstream cookie: {}", COOKIES["auth_token"])
-        yield SimpleNamespace(rawContent="post", date=datetime.now(timezone.utc), likeCount=0,
+        yield SimpleNamespace(rawContent="post", date=datetime.now(UTC), likeCount=0,
                               retweetCount=0, url="https://x.com/u/status/2")
 
     monkeypatch.setattr(API, "search", search)

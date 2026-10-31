@@ -6,7 +6,7 @@ import asyncio
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing
-from datetime import timezone
+from datetime import UTC
 from uuid import uuid4
 
 from twscrape import API, AccountsPool, NoAccountError
@@ -51,10 +51,10 @@ async def _search(cookies: dict[str, str], query: str, limit: int) -> list[dict]
             async for tweet in results:
                 created = tweet.date
                 if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
+                    created = created.replace(tzinfo=UTC)
                 tweets.append({
                     "text": tweet.rawContent,
-                    "created_at": created.astimezone(timezone.utc).isoformat(),
+                    "created_at": created.astimezone(UTC).isoformat(),
                     "likes": tweet.likeCount,
                     "reposts": tweet.retweetCount,
                     "url": tweet.url,

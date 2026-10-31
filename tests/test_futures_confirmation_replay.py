@@ -34,7 +34,7 @@ No network: the conftest socket guard holds and no fixture reaches a venue.
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,7 +54,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "futures_confirmation_replay.json
 
 # A fixed UTC instant, far in the past: every replay decision below is a pure
 # function of these candles, never of wall-clock or venue state.
-AS_OF = datetime(2026, 10, 7, 17, 0, tzinfo=timezone.utc)
+AS_OF = datetime(2026, 10, 7, 17, 0, tzinfo=UTC)
 _MARK = 50_000.0
 _CONFIG = {
     "risk_derivatives_max_risk_fraction": 0.02,
@@ -90,8 +90,8 @@ def _candle(timeframe: str, open_at: datetime, direction: str,
 
 # The production alignment at AS_OF: latest closed 1h is [16:00, 17:00), latest
 # closed 4h is [12:00, 16:00) — the 1h hour sits AFTER the 4h block it closes.
-_ONE_HOUR_OPEN = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
-_FOUR_HOUR_OPEN = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+_ONE_HOUR_OPEN = datetime(2026, 10, 7, 16, 0, tzinfo=UTC)
+_FOUR_HOUR_OPEN = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 
 
 def _aligned_pair(direction: str) -> tuple[Candle, Candle]:
@@ -232,7 +232,7 @@ def test_closed_context_is_fail_closed_when_the_pair_drifts(monkeypatch, which):
         four_h = [[four.open_time, four.open, four.high, four.low, four.close, four.volume]]
     else:
         one_h = [[one.open_time, one.open, one.high, one.low, one.close, one.volume]]
-        four_h = [[_open_ms(datetime(2026, 10, 7, 8, 0, tzinfo=timezone.utc)),
+        four_h = [[_open_ms(datetime(2026, 10, 7, 8, 0, tzinfo=UTC)),
                    100.0, 102.0, 99.0, 100.5, 1.0]]  # one 4h block stale
     venue = _CandleVenue(one_h=one_h, four_h=four_h)
     derivatives = SimpleNamespace(
@@ -818,9 +818,9 @@ def test_replay_cycle_identity_drift_is_documented_not_scored():
             r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00):"
             r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00):1$", cycle.cycle_id)
         assert match, cycle.cycle_id
-        identity_one = datetime.fromisoformat(match.group(2)).astimezone(timezone.utc)
+        identity_one = datetime.fromisoformat(match.group(2)).astimezone(UTC)
         snapshot_one = datetime.fromtimestamp(
-            cycle.context["one_hour"].open_time / 1000, tz=timezone.utc)
+            cycle.context["one_hour"].open_time / 1000, tz=UTC)
         if identity_one != snapshot_one:
             drifted += 1
             # The drift is always exactly one 1h candle newer, never older —

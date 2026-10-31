@@ -37,7 +37,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -1250,7 +1250,7 @@ def _process_candidate(
 
 
 def _closed_futures_context(derivatives: Any, ticker: str) -> dict | None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     one_hour, four_hour = closed_candle_pair(now)
     symbol = derivatives.resolve_market(ticker) if hasattr(derivatives, "resolve_market") else derivatives.symbol_for(ticker)
     exchange = derivatives._bridge.client()
@@ -1393,7 +1393,7 @@ def _record_futures_cycle_rejection(
     telemetry: dict | None = None,
     phase_timestamps: dict | None = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     one_hour, four_hour = closed_candle_pair(now)
     symbol = unified_symbol or ticker
     cycle_id = cycle_id or f"futures:{symbol}:{four_hour[0].isoformat()}:{one_hour[0].isoformat()}:1"
@@ -1425,12 +1425,12 @@ def _record_futures_cycle_rejection(
         cycle_id,
         symbol=symbol,
         four_hour_open=(
-            datetime.fromtimestamp(snapshot["four_hour_open"] / 1000, timezone.utc).isoformat()
+            datetime.fromtimestamp(snapshot["four_hour_open"] / 1000, UTC).isoformat()
             if snapshot and isinstance(snapshot.get("four_hour_open"), (int, float))
             else four_hour[0].isoformat()
         ),
         one_hour_open=(
-            datetime.fromtimestamp(snapshot["one_hour_open"] / 1000, timezone.utc).isoformat()
+            datetime.fromtimestamp(snapshot["one_hour_open"] / 1000, UTC).isoformat()
             if snapshot and isinstance(snapshot.get("one_hour_open"), (int, float))
             else one_hour[0].isoformat()
         ),
@@ -1602,7 +1602,7 @@ def _process_futures_candidate(
     margin mode, leverage, or budgets.
     """
     telemetry = telemetry or CycleTelemetry()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     def persist_progress(cycle: str, /, **kwargs: Any) -> None:
         if _cycle_writes_allowed(deadline, cancelled):
@@ -1794,8 +1794,8 @@ def _process_futures_candidate(
         )
         return
     expires_at = now + (
-        datetime.fromtimestamp(candle_4h.close_time / 1000, timezone.utc)
-        - datetime.fromtimestamp(candle_4h.open_time / 1000, timezone.utc)
+        datetime.fromtimestamp(candle_4h.close_time / 1000, UTC)
+        - datetime.fromtimestamp(candle_4h.open_time / 1000, UTC)
     )
     cycle_payload.update({
         **decision_data,
@@ -1831,11 +1831,11 @@ def _process_futures_candidate(
     )
     FuturesSignalEnvelope.create(
         symbol=symbol,
-        candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, timezone.utc),
-        candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, timezone.utc),
+        candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, UTC),
+        candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, UTC),
         direction=direction, entry=mark, stop=stop, targets=(take,),
         created_at=now, expires_at=expires_at,
-        confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, timezone.utc),
+        confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, UTC),
         strategy="autoloop", strategy_version="1",
     )
     try:
@@ -2065,7 +2065,7 @@ def _result_summary(result: DailyResult) -> dict:
 
 
 def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 # --- endpoints ----------------------------------------------------------------
@@ -2201,7 +2201,7 @@ async def halt_now(request: Request):
     # halt line without one would be ignored by _halted_today.
     append_event(get_config()["exec_log_path"], {
         "event": "halt",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "reason": "manual halt from the control panel",
     })
     audit_log.record("autoloop_halt")
@@ -2215,7 +2215,7 @@ async def reset_halt(request: Request):
     await json_body(request)  # CSRF §0: application/json required, body may be {}
     append_event(get_config()["exec_log_path"], {
         "event": "halt_reset",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     })
     audit_log.record("autoloop_halt_reset")
     return {"generated_at": utc_now_iso(), "halted": False}

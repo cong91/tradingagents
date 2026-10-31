@@ -17,7 +17,7 @@ derived in :mod:`server.position_cost`, which owns the entry timestamp, held
 hours, funding and estimated round-trip fee.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
@@ -104,7 +104,7 @@ def _audit_position(ticker: str, lots) -> dict:
 def get_portfolio():
     config = get_config()
     events, skipped = audit_log.read_events()  # 503 when the log exists but cannot be read
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     # This response's top-level portfolio is Spot-only. Futures positions and
     # account P&L come from the venue snapshot below, not the Spot FIFO replay.
     spot_events = [event for event in events if event.get("market", "spot") != "derivatives"]
