@@ -20,7 +20,7 @@ TradingAgents — a multi-agent LLM financial trading framework (research tool):
 
 ## Stack Snapshot
 
-- **Language:** Python ≥ 3.10 (CI matrix: 3.10–3.13; local venv runs 3.13)
+- **Language:** Python ≥ 3.11 (upstream 0.7.1 floor; local venv runs 3.13)
 - **Framework:** LangGraph + LangChain provider clients; Typer/Rich CLI
 - **Package Manager:** pip, setuptools backend, no lockfile (`pip install -e ".[dev]"`)
 - **Detected Shape:** Python library + CLI (`tradingagents = cli.main:app`), Docker optional
@@ -101,7 +101,7 @@ Before finalizing any coding pass, scan the structure of every file the diff tou
 - Always pass `encoding="utf-8"` when opening text files (Windows default is cp1252; this project fixed UTF-8 bugs before).
 - New env-overridable config keys go in `_ENV_OVERRIDES` in `tradingagents/default_config.py` — coercion follows the default's type; no entry-point changes needed.
 - Never introduce look-ahead in dated data paths: a run dated in the past must read data as it stood that day (point-in-time integrity is a core v0.5 contract).
-- Check Python version compat: code must run on 3.10–3.13, so no 3.11+-only syntax in `tradingagents/`.
+- Check Python version compat: the floor is 3.11 (pyproject `requires-python`); avoid 3.12+-only syntax in `tradingagents/`.
 
 ## Repo-Specific Rules
 
@@ -123,7 +123,7 @@ Before finalizing any coding pass, scan the structure of every file the diff tou
 ```bash
 .venv\Scripts\python.exe -m pip install -e ".[dev]"   # fresh env setup
 .venv\Scripts\python.exe -m ruff check .               # lint (strict select, full repo)
-.venv\Scripts\python.exe -m pytest -q                  # full suite (1001 passed, 5 skipped on Windows 2026-09-28)
+.venv\Scripts\python.exe -m pytest -q                  # full suite (1782 passed, 267 skipped on Windows 2026-10-31, post-0.7.1 rebase)
 .venv\Scripts\python.exe -c "import tradingagents, cli.main"   # clean-import smoke (mirrors CI)
 tradingagents --help                                   # CLI (installed entry point)
 ```
