@@ -117,7 +117,7 @@ export type AuditPayload = {
 
 export type PortfolioPosition = {
   ticker: string;
-  quantity: number;
+  quantity: number | null;
   /** Trung bình có trọng số lot FIFO còn mở; null = basis không xác định. */
   average_price: number | null;
   /** "fifo" khi log có lot khớp; null khi không. */
@@ -145,6 +145,14 @@ export type FuturesPosition = {
   notional_currency: string | null;
   margin_currency: string | null;
   unrealized_pnl_currency: string | null;
+  /** Thời điểm mở vị thế (ISO-8601); null = không tìm thấy trong position state. */
+  opened_at?: string | null;
+  /** Số giờ đã giữ vị thế; null = không biết opened_at (không suy đoán). */
+  held_hours?: number | null;
+  /** Tổng funding đã trả/nhận từ lúc mở (USDT; dương = nhận); null = sàn không đọc được. */
+  funding_usdt?: number | null;
+  /** Phí khứ hồi ước tính = |notional| × rate × 2; null = thiếu notional/rate. */
+  round_trip_fee_usdt?: number | null;
 };
 
 export type FuturesPortfolio = {

@@ -156,11 +156,14 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert config["risk_derivatives_risk_fraction"] == 0.01
     assert config["risk_derivatives_margin_fraction"] == 0.25
     assert config["risk_derivatives_profit_protection_enabled"] is True
-    assert config["risk_derivatives_break_even_r"] == 1.0
-    assert config["risk_derivatives_lock_profit_r"] == 2.0
-    assert config["risk_derivatives_trail_start_r"] == 3.0
-    assert config["risk_derivatives_trail_distance_r"] == 1.0
+    assert config["risk_derivatives_break_even_r"] == 0.5
+    assert config["risk_derivatives_lock_profit_r"] == 1.0
+    assert config["risk_derivatives_trail_start_r"] == 1.5
+    assert config["risk_derivatives_trail_distance_r"] == 0.75
     assert config["risk_derivatives_target_extension_r"] == 1.0
+    assert config["risk_derivatives_max_hold_hours"] == 72.0
+    assert config["risk_derivatives_time_stop_min_r"] == 1.0
+    assert config["risk_derivatives_round_trip_fee_rate"] == 0.001
     assert config["risk_derivatives_min_stop_move_r"] == 0.1
     assert config["risk_derivatives_mark_max_age_seconds"] == 120.0
     assert config["risk_derivatives_scale_out_enabled"] is False
@@ -184,6 +187,9 @@ def test_risk_float_and_int_coercion(monkeypatch):
         TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT="5",
         TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE="3",
         TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT="40.0",
+        TRADINGAGENTS_RISK_DERIVATIVES_MAX_HOLD_HOURS="24.5",
+        TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_MIN_R="0.5",
+        TRADINGAGENTS_RISK_DERIVATIVES_ROUND_TRIP_FEE_RATE="0.0004",
         TRADINGAGENTS_EXEC_EXCHANGE_ID="okx",
     )
     assert config["risk_max_daily_loss_pct"] == 2.5
@@ -194,6 +200,10 @@ def test_risk_float_and_int_coercion(monkeypatch):
     assert isinstance(config["risk_max_consecutive_loss_count"], int)
     assert config["risk_max_derivatives_leverage"] == 3.0
     assert config["risk_max_derivatives_exposure_pct"] == 40.0
+    assert config["risk_derivatives_max_hold_hours"] == 24.5
+    assert config["risk_derivatives_time_stop_min_r"] == 0.5
+    assert config["risk_derivatives_round_trip_fee_rate"] == 0.0004
+    assert isinstance(config["risk_derivatives_round_trip_fee_rate"], float)
     assert config["exec_exchange_id"] == "okx"
 
 
@@ -209,6 +219,19 @@ def test_invalid_risk_value_raises(monkeypatch, env_var):
     monkeypatch.setenv(env_var, "not-a-number")
     with pytest.raises(ValueError, match=env_var):
         default_config_module.build_default_config()
+
+
+@pytest.mark.parametrize("env_var", [
+    "TRADINGAGENTS_RISK_MAX_DAILY_LOSS_PCT",
+    "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT",
+])
+def test_non_finite_risk_value_raises(monkeypatch, env_var):
+    monkeypatch.setenv(env_var, "nan")
+    with pytest.raises(ValueError, match=env_var):
+        default_config_module.build_default_config()
+    monkeypatch.delenv(env_var, raising=False)
 
 
 def test_exchange_id_accepts_any_string(monkeypatch):

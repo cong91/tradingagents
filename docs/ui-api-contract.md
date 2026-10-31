@@ -774,8 +774,8 @@ Response 200:
 
 Định nghĩa từng field:
 
-- `cash`, `currency`, `positions[]`, `equity_est` — chỉ Spot, từ `sync_portfolio`: `quantity` thực từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. `equity_est = cash + Σ quantity × marked_price`; Futures wallet/equity/notional không được cộng vào đây.
-- Spot `marked_price` = `bridge.fetch_price(ticker)`; null khi venue không mark được. Position không mark được tính 0 trong `equity_est` và sinh warning.
+- `cash`, `currency`, `positions[]`, `equity_est` — chỉ Spot, từ `sync_portfolio`: `quantity` thực từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. `equity_est = cash + Σ quantity × marked_price`; Futures wallet/equity/notional không được cộng vào đây. Khi một position có `quantity: null`, số lượng chưa xác định được giữ nguyên; `market_value`, `unrealized_pnl` của position và `equity_est` đều null, kèm warning. Không coi số lượng chưa biết là 0.
+- Spot `marked_price` = `bridge.fetch_price(ticker)`; null khi venue không mark được. Position có quantity đã biết nhưng không mark được tính 0 trong `equity_est` và sinh warning; position có `quantity: null` khiến `market_value`, `unrealized_pnl` và `equity_est` là null vì không thể tính an toàn.
 - `average_price` + `basis_source` lấy từ open FIFO lots của Spot audit fills chỉ; `unrealized_pnl` chỉ tính khi có basis + mark, ngược lại null. Futures fills không ảnh hưởng `realized_pnl`, `by_ticker`, `closed_trades` hay `consecutive_losses` của Spot section.
 - `realized_pnl.total` là Spot P&L đã chốt có basis; `today` chỉ gồm lệnh đóng theo UTC hôm nay, khác con số RiskGuard (có thể cộng thêm unrealized của lot mở trong ngày). `by_ticker`, `closed_trades`, `unknown_basis_closes` và `consecutive_losses` đều tính trên Spot-only FIFO replay.
 - `futures.status`: `ok` khi cả balance và positions được đọc, `error` khi một lần đọc futures thất bại, `unavailable` khi chưa vào effective live mode (không có request tới futures private endpoints). Khi `error`, các account fields vẫn null/positions rỗng nhưng phải hiển thị message lỗi, không phải trạng thái tài khoản rỗng.
@@ -792,7 +792,7 @@ Errors:
 
 Trạng thái: loading · **empty** (`cash: null`, `positions: []`, `realized_pnl.total: 0` — chưa có dữ liệu venue/log; hiển thị empty-state riêng, không coi là lỗi) · error 503 (retry) · stale 30s + auto-poll.
 
-Thiếu sót trung thực (ghi trên UI): position mở trước khi audit log bắt đầu có basis không xác định (`average_price: null`, `unrealized_pnl: null`) — replay chỉ thấy những gì log đã ghi; `equity_est` hạ thấp khi có position không mark được (`risk.py:381-403`).
+Thiếu sót trung thực (ghi trên UI): position mở trước khi audit log bắt đầu có basis không xác định (`average_price: null`, `unrealized_pnl: null`) — replay chỉ thấy những gì log đã ghi; position không mark được làm `equity_est` thấp hơn và sinh warning; quantity không rõ làm `equity_est` không xác định (`null`) thay vì tính vị thế là 0.
 
 ## 7. Audit — `GET /api/audit`
 

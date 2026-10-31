@@ -1,0 +1,103 @@
+{
+  "loaded": 551,
+  "baseline": {
+    "total": 77,
+    "confirmed": 24,
+    "rejected": 53,
+    "by_signal": {
+      "Hold": 1,
+      "Sell": 21,
+      "Underweight": 55
+    },
+    "by_1h": {
+      "bearish": 42,
+      "bullish": 35
+    },
+    "by_4h": {
+      "bearish": 40,
+      "bullish": 37
+    },
+    "rule_reasons": {
+      "aligned_direction": 23,
+      "direction_mismatch": 53,
+      "not_required_for_non_tradeable_signal": 1
+    },
+    "recorded_reasons": {
+      "aligned_direction": 23,
+      "direction_mismatch": 53,
+      "not_required_for_non_tradeable_signal": 1
+    },
+    "flips_to_confirm": [],
+    "flips_to_reject": []
+  },
+  "htf_dominance_bounded_pullback": {
+    "total": 77,
+    "confirmed": 27,
+    "rejected": 50,
+    "by_signal": {
+      "Hold": 1,
+      "Sell": 21,
+      "Underweight": 55
+    },
+    "by_1h": {
+      "bearish": 42,
+      "bullish": 35
+    },
+    "by_4h": {
+      "bearish": 40,
+      "bullish": 37
+    },
+    "rule_reasons": {
+      "bounded_pullback": 3,
+      "htf_direction_mismatch": 37,
+      "ltf_aligned": 23,
+      "ltf_pullback_too_deep": 10,
+      "ltf_pullback_wick_dominant": 3,
+      "not_required_for_non_tradeable_signal": 1
+    },
+    "recorded_reasons": {
+      "aligned_direction": 23,
+      "direction_mismatch": 53,
+      "not_required_for_non_tradeable_signal": 1
+    },
+    "flips_to_confirm": [
+      {
+        "cycle_id": "futures:QNT-USD:2026-10-26T16:00:00+00:00:2026-10-26T21:00:00+00:00:1",
+        "symbol": "QNT/USDT:USDT",
+        "phase": "proposal",
+        "status": "rejected",
+        "signal": "Underweight",
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bearish",
+        "recorded_confirmation_reason": "direction_mismatch",
+        "rule_result": true,
+        "rule_reason": "bounded_pullback"
+      },
+      {
+        "cycle_id": "futures:QNT-USD:2026-10-27T00:00:00+00:00:2026-10-27T06:00:00+00:00:1",
+        "symbol": "QNT/USDT:USDT",
+        "phase": "proposal",
+        "status": "rejected",
+        "signal": "Underweight",
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bearish",
+        "recorded_confirmation_reason": "direction_mismatch",
+        "rule_result": true,
+        "rule_reason": "bounded_pullback"
+      },
+      {
+        "cycle_id": "futures:QNT-USD:2026-10-27T04:00:00+00:00:2026-10-27T07:00:00+00:00:1",
+        "symbol": "QNT/USDT:USDT",
+        "phase": "proposal",
+        "status": "rejected",
+        "signal": "Underweight",
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bearish",
+        "recorded_confirmation_reason": "direction_mismatch",
+        "rule_result": true,
+        "rule_reason": "bounded_pullback"
+      }
+    ],
+    "flips_to_reject": []
+  }
+}

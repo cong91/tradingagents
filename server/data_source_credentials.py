@@ -22,16 +22,6 @@ from tradingagents.dataflows.credentials import (
 
 logger = logging.getLogger(__name__)
 
-# Option keys a provider accepts beside its cookies. X needs a search mode;
-# Reddit only needs the cookies themselves.
-_OPTION_KEYS = {
-    "reddit": (),
-    "x": ("bearer_token", "graphql_query_id"),
-}
-
-# Option names that carry a secret and must never be echoed back.
-_SECRET_OPTION_KEYS = {"bearer_token"}
-
 
 def _check_provider(provider: str) -> str:
     key = str(provider).strip().lower()
@@ -42,21 +32,19 @@ def _check_provider(provider: str) -> str:
     return key
 
 
-def _clean_options(provider: str, options: dict | None) -> dict[str, Any]:
-    """Keep only the allowlisted option keys, dropping blanks."""
-    if not options:
-        return {}
+def _check_options(provider: str, options: dict | None) -> None:
+    if options is None:
+        return
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
-    allowed = _OPTION_KEYS.get(provider, ())
-    cleaned: dict[str, Any] = {}
-    for key, value in options.items():
-        if key not in allowed:
-            raise ValueError(f"option {key!r} is not supported for {provider}")
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        cleaned[key] = value.strip() if isinstance(value, str) else value
-    return cleaned
+    for key in options:
+        raise ValueError(f"option {key!r} is not supported for {provider}")
+
+
+def _cookies_valid(provider: str, cookies: dict[str, str]) -> bool:
+    if provider == "x":
+        return all(cookies.get(name, "").strip() for name in ("auth_token", "ct0"))
+    return bool(cookies)
 
 
 def save_credentials(
@@ -69,11 +57,13 @@ def save_credentials(
     """Validate, encrypt and store one provider's credentials; return its summary."""
     key = _check_provider(provider)
     normalized = normalize_cookie_payload(cookies) if cookies else {}
-    cleaned_options = _clean_options(key, options)
-    if not normalized and not cleaned_options:
-        raise ValueError("no cookies or options were supplied")
+    _check_options(key, options)
+    if key == "x" and not _cookies_valid(key, normalized):
+        raise ValueError("X cookies must include non-empty auth_token and ct0")
+    if not normalized:
+        raise ValueError("no cookies were supplied")
 
-    payload = {"cookies": normalized, "options": cleaned_options}
+    payload = {"cookies": normalized, "options": {}}
     secret = credential_vault.encrypt_json(payload)
     with db.session() as conn:
         conn.execute(
@@ -87,7 +77,7 @@ def save_credentials(
         )
     # The engine must serve the new cookies on the next analysis without a
     # restart: the operator expects "save" to take effect immediately.
-    set_provider_credentials(key, normalized, cleaned_options)
+    set_provider_credentials(key, normalized)
     return summary_for(key) or {"provider": key, "configured": True}
 
 
@@ -123,18 +113,15 @@ def _summarize_row(provider: str, secret: str, updated_at: str, updated_by: str 
     except ValueError:
         payload, decryptable = {}, False
     cookies = payload.get("cookies") or {}
-    options = payload.get("options") or {}
     return {
         "provider": provider,
         "configured": True,
         "decryptable": decryptable,
+        "valid": decryptable and _cookies_valid(provider, cookies),
         "cookie_count": len(cookies),
         "cookie_names": sorted(cookies),
-        "option_keys": sorted(options),
-        "secret_options": sorted(key for key in options if key in _SECRET_OPTION_KEYS),
         "updated_at": updated_at,
         "updated_by": updated_by,
-        "supported_options": list(_OPTION_KEYS.get(provider, ())),
     }
 
 
@@ -154,13 +141,11 @@ def _unconfigured(provider: str) -> dict:
         "provider": provider,
         "configured": False,
         "decryptable": False,
+        "valid": False,
         "cookie_count": 0,
         "cookie_names": [],
-        "option_keys": [],
-        "secret_options": [],
         "updated_at": None,
         "updated_by": None,
-        "supported_options": list(_OPTION_KEYS.get(provider, ())),
     }
 
 
@@ -215,9 +200,7 @@ def push_to_engine() -> list[str]:
             failures.append(row["provider"])
             continue
         try:
-            set_provider_credentials(
-                row["provider"], payload.get("cookies"), payload.get("options"),
-            )
+            set_provider_credentials(row["provider"], payload.get("cookies"))
         except ValueError:
             failures.append(row["provider"])
     return failures

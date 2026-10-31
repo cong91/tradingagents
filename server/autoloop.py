@@ -1,6 +1,6 @@
 """Autoloop: the scheduled trading cycle + the kill-switch halt endpoints.
 
-# ai-note: split deferred because the current pass focused on deadline and scheduler safety; revisit when scheduler/state, cycle execution, and futures orchestration need independent changes.
+# ai-note: split declined again — this pass stayed inside the futures discovery/refill block (AUTO_FUTURES_*, _screen_with_timeout, _preflight_candidates*, _select_cycle_candidates, _futures_discovery_limit, _refill_futures_candidates). That block is now self-contained and is the seam to extract into its own module once futures orchestration needs independent changes; the cycle/scheduler/endpoint concerns above and below it do not interact with it.
 
 One concern: run the engine's own once-a-day cycle on a timer (plus run-now)
 and stop everything on demand. The cycle mirrors server/daily.py's auto scan
@@ -51,7 +51,22 @@ from server import (
 )
 from server.autoloop_telemetry import CycleTelemetry
 from server.contract import ApiError, json_body, utc_now_iso
-from tradingagents.agents.rating import RATINGS_5_TIER
+from server.futures_cycle_telemetry import (
+    claim_cycle as claim_futures_cycle,
+    cycle_identity as futures_cycle_identity,
+    decision_telemetry as futures_decision_telemetry,
+    effective_caps as futures_effective_caps,
+    persist_progress as persist_futures_cycle_progress,
+    persist_rejection as persist_futures_cycle_rejection,
+    redact_payload as redact_futures_payload,
+    redact_proposal as redact_futures_proposal,
+    snapshot_payload as futures_snapshot_payload,
+)
+from server.futures_decision_context import (
+    build_futures_portfolio,
+    render_futures_decision_context,
+)
+from tradingagents.agents.rating import RATINGS_5_TIER, parse_rating
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.market_data import fetch_closed_candles
 from tradingagents.default_config import _BOOL_TRUE
@@ -60,7 +75,6 @@ from tradingagents.execution.daily import DailyResult, _handle_plan
 from tradingagents.execution.futures_account import read_futures_account
 from tradingagents.execution.futures_scheduler import closed_candle_pair
 from tradingagents.execution.futures_signals import FuturesSignalEnvelope
-from tradingagents.portfolio import PortfolioContext
 
 router = APIRouter(prefix="/api", tags=["autoloop"])
 
@@ -76,11 +90,27 @@ AUTO_TOP_N = 3
 # futures execution) and symbols with no live contract, and a pool equal to
 # AUTO_TOP_N would leave nothing to run after those drops.
 AUTO_SCREEN_POOL = AUTO_TOP_N * 4
+# Futures must inspect the full discovery pool before selecting the executable
+# subset. Otherwise high-scoring stocks or spot-only crypto can consume the
+# screen's top-N slots and hide lower-ranked contracts.
+AUTO_FUTURES_SCREEN_POOL = AUTO_UNIVERSE_PER_ASSET * 2
+# When the broad pool still cannot fill the cycle after preflight drops
+# contractless pairs, widen discovery instead of running short. Each refill
+# round doubles the inspected universe; the cap keeps one cycle from turning
+# into a full-market sweep, and the round cap bounds vendor cost.
+AUTO_FUTURES_REFILL_ROUNDS = 2
+AUTO_FUTURES_MAX_UNIVERSE = AUTO_UNIVERSE_PER_ASSET * 8
 SCREENING_TIMEOUT_SECONDS = 180.0
 # 3 candidates × ~10 min sequential LLM work through a slow relay fits inside
 # one hour; the scheduler skips interval ticks while the lock is held, so a
 # generous budget only delays the next cycle, it never overlaps one.
 CYCLE_TIMEOUT_SECONDS = 3600.0
+# A refill round is optional work, so it may spend at most this share of the
+# cycle budget that remains. The rest is kept for running the candidates the
+# earlier rounds already vetted; without the cap a widening round could eat the
+# remainder and the previous post-refill deadline check would then discard a
+# full selection instead of running it.
+AUTO_REFILL_BUDGET_SHARE = 0.5
 
 MIN_INTERVAL_MINUTES = 15
 MAX_INTERVAL_MINUTES = 1440
@@ -108,6 +138,7 @@ _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 # spawn (scheduler tick + run-now) loses the acquire and is a silent no-op.
 _cycle_lock = threading.Lock()
 _execution_lock = threading.Lock()
+_screening_worker_lock = threading.Lock()
 _cycle_thread: threading.Thread | None = None  # last spawned cycle worker
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop = threading.Event()
@@ -127,6 +158,21 @@ def _execution_allowed(deadline: float | None, cancelled: threading.Event | None
         (deadline is None or time.monotonic() < deadline)
         and (cancelled is None or not cancelled.is_set())
     )
+
+
+def _cycle_writes_allowed(
+    deadline: float | None, cancelled: threading.Event | None
+) -> bool:
+    """Whether a candidate may still persist rows for its cycle.
+
+    ``_run_candidate_with_timeout`` abandons the worker on timeout: it sets
+    ``cancelled`` and returns, but the thread keeps running until its blocking
+    call (an LLM graph, a venue read) finishes. Every write after that point
+    would land in a cycle that already closed -- a stale funnel row, and in
+    tests a row for a schema that has since been dropped or replaced. Writes
+    are therefore gated by the same predicate as order submission.
+    """
+    return _execution_allowed(deadline, cancelled)
 
 
 def _raise_if_execution_closed(
@@ -150,6 +196,31 @@ def _execute_with_deadline(
         return execute()
 
 
+def _call_crypto_universe(
+    crypto_universe: Callable, config: dict, limit: int, futures_mode: bool,
+) -> list[str]:
+    """Call the universe seam, opting into the futures-only filter when armed.
+
+    ``crypto_universe`` is injected by tests and by the daily spot path; only
+    the autoloop's futures mode wants contract-bearing bases, so the flag is
+    passed only when the callable declares it. A seam that predates the flag
+    keeps its two-argument shape (same pattern as ``cancel_event`` below).
+    """
+    if not futures_mode:
+        return crypto_universe(config, limit)
+    try:
+        parameters = inspect.signature(crypto_universe).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_flag = "futures_only" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_flag:
+        return crypto_universe(config, limit, futures_only=True)
+    return crypto_universe(config, limit)
+
+
 def _screen_with_timeout(
     crypto_universe: Callable,
     stock_universe: Callable,
@@ -158,32 +229,89 @@ def _screen_with_timeout(
     trade_date: str,
     *,
     telemetry: CycleTelemetry | None = None,
+    universe_limit: int | None = None,
+    screen_pool: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[list[str], list[str], list[dict]]:
-    """Run external screening off-cycle so a vendor stall cannot block forever."""
+    """Run external screening off-cycle so a vendor stall cannot block forever.
+
+    ``universe_limit``/``screen_pool`` widen the inspected pool for a discovery
+    refill round; ``None`` keeps the mode default (the full futures pool in
+    futures mode, ``AUTO_SCREEN_POOL`` in spot mode). ``timeout_seconds`` caps
+    this call so a refill round can never outlive the cycle's own budget.
+    """
     result_queue: queue.Queue = queue.Queue(maxsize=1)
     telemetry = telemetry or CycleTelemetry()
+    cancel_screening = threading.Event()
+    if not _screening_worker_lock.acquire(blocking=False):
+        raise TimeoutError("screening worker from a timed-out cycle is still stopping")
 
     def worker() -> None:
         try:
+            futures_mode = config.get("exec_derivatives") is True
+            crypto_limit = (
+                universe_limit
+                if universe_limit is not None
+                else (AUTO_FUTURES_SCREEN_POOL if futures_mode else AUTO_UNIVERSE_PER_ASSET)
+            )
             with telemetry.span("screening:crypto_universe"):
-                crypto = crypto_universe(config, AUTO_UNIVERSE_PER_ASSET)
-            with telemetry.span("screening:stock_universe"):
-                stocks = stock_universe(config, AUTO_UNIVERSE_PER_ASSET)
+                crypto = _call_crypto_universe(crypto_universe, config, crypto_limit, futures_mode)
+            if cancel_screening.is_set():
+                return
+            if futures_mode:
+                # Futures candidates must come from the crypto universe only.
+                stocks = []
+            else:
+                with telemetry.span("screening:stock_universe"):
+                    stocks = stock_universe(config, AUTO_UNIVERSE_PER_ASSET)
+            if cancel_screening.is_set():
+                return
             with telemetry.span("screening:metrics"):
-                candidates = screen_universe(crypto, stocks, trade_date, AUTO_SCREEN_POOL)
-            result_queue.put((crypto, stocks, candidates))
+                pool_limit = (
+                    screen_pool
+                    if screen_pool is not None
+                    else (
+                        AUTO_FUTURES_SCREEN_POOL
+                        if futures_mode
+                        else AUTO_SCREEN_POOL
+                    )
+                )
+                try:
+                    screen_parameters = inspect.signature(screen_universe).parameters
+                except (TypeError, ValueError):
+                    screen_parameters = {}
+                accepts_cancel_event = "cancel_event" in screen_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in screen_parameters.values()
+                )
+                if accepts_cancel_event:
+                    candidates = screen_universe(
+                        crypto, stocks, trade_date, pool_limit,
+                        cancel_event=cancel_screening,
+                    )
+                else:
+                    candidates = screen_universe(crypto, stocks, trade_date, pool_limit)
+            if not cancel_screening.is_set():
+                result_queue.put((crypto, stocks, candidates))
         except BaseException as exc:  # hand exception back to cycle thread
-            result_queue.put(exc)
+            if not cancel_screening.is_set():
+                result_queue.put(exc)
+        finally:
+            _screening_worker_lock.release()
 
     threading.Thread(target=worker, name="server-autoloop-screen", daemon=True).start()
+    budget = SCREENING_TIMEOUT_SECONDS if timeout_seconds is None else min(
+        SCREENING_TIMEOUT_SECONDS, max(0.01, timeout_seconds)
+    )
     try:
-        outcome = result_queue.get(timeout=SCREENING_TIMEOUT_SECONDS)
+        outcome = result_queue.get(timeout=budget)
     except queue.Empty as exc:
+        cancel_screening.set()
         telemetry.close()
         snapshot = telemetry.snapshot()
         stage = snapshot["active_stage"] or snapshot["last_stage"] or "screening"
         raise TimeoutError(
-            f"screening timed out during {stage} after {SCREENING_TIMEOUT_SECONDS:.0f}s"
+            f"screening timed out during {stage} after {budget:.0f}s"
         ) from exc
     if isinstance(outcome, BaseException):
         raise outcome
@@ -358,6 +486,19 @@ def _preflight_candidates(
     *,
     telemetry: CycleTelemetry | None = None,
 ) -> tuple[list[dict], list[dict]]:
+    runnable, skipped, _metadata_available = _preflight_candidates_with_metadata(
+        candidates, derivatives, telemetry=telemetry
+    )
+    return runnable, skipped
+
+
+def _preflight_candidates_with_metadata(
+    candidates: list[dict],
+    derivatives: Any | None,
+    *,
+    telemetry: CycleTelemetry | None = None,
+    rejections_recorded: set[str] | None = None,
+) -> tuple[list[dict], list[dict], bool | None]:
     """Drop candidates that can never become an order, before the LLM pipeline.
 
     In futures mode two kinds of screened candidate are guaranteed to end with
@@ -366,46 +507,262 @@ def _preflight_candidates(
     pipeline, which is how a cycle used to time out with its executable
     candidates never analysed.
 
-    Returns ``(runnable, skipped)``. ``skipped`` entries are
-    ``{"ticker", "reason"}`` for the cycle summary and audit. A market-metadata
-    failure fails open: the per-candidate path re-checks and rejects on its own,
-    so an unreachable venue must not empty the cycle.
+    Returns ``(runnable, skipped, market_metadata_available)``. ``skipped``
+    entries are ``{"ticker", "reason"}`` for the cycle summary and audit. A
+    metadata failure fails open for crypto only: the per-candidate path
+    re-checks and rejects it on its own, while stocks never enter the futures
+    path.
+
+    ``rejections_recorded`` carries tickers a previous discovery round already
+    persisted a rejection for. A refill round re-screens the same pool, so it
+    must report them in ``skipped`` without writing the same cycle row again;
+    the set is extended with the tickers this call records.
     """
     if derivatives is None:
-        return candidates, []  # spot mode: stocks still carry advisory value
+        return candidates, [], None  # spot mode: stocks still carry advisory value
 
     bridge = getattr(derivatives, "_bridge", None)
     if bridge is None:
-        return candidates, []
+        skipped = []
+        for candidate in candidates:
+            asset_type = candidate.get("asset_type")
+            if asset_type == "crypto":
+                continue
+            reason = (
+                "advisory only in futures mode — the venue bridge cannot plan a stock order"
+                if asset_type == "stock"
+                else f"unsupported asset_type in futures mode: {asset_type!r}"
+            )
+            skipped.append({"ticker": str(candidate.get("ticker")), "reason": reason})
+        return [candidate for candidate in candidates if candidate.get("asset_type") == "crypto"], skipped, None
 
     telemetry = telemetry or CycleTelemetry()
+    markets: dict[str, Any] | None
     try:
         with telemetry.span("preflight:futures_markets"):
             markets = bridge.client().load_markets()
     except Exception as exc:  # venue unreachable: leave the decision to the candidate path
         logger.warning("autoloop preflight: futures markets unavailable (%s)", exc)
-        return candidates, []
+        markets = None
 
     runnable: list[dict] = []
     skipped: list[dict] = []
     for candidate in candidates:
         ticker = str(candidate.get("ticker"))
-        asset_type = str(candidate.get("asset_type") or "crypto")
+        asset_type = candidate.get("asset_type")
         if asset_type != "crypto":
-            skipped.append({
-                "ticker": ticker,
-                "reason": "advisory only in futures mode — the venue bridge cannot plan a stock order",
-            })
+            reason = (
+                "advisory only in futures mode — the venue bridge cannot plan a stock order"
+                if asset_type == "stock"
+                else f"unsupported asset_type in futures mode: {asset_type!r}"
+            )
+            skipped.append({"ticker": ticker, "reason": reason})
+            continue
+        if markets is None:
+            # Keep crypto candidates for the per-candidate resolver/context path,
+            # but never let an unavailable futures venue route a stock into the
+            # derivatives pipeline.
+            runnable.append(candidate)
             continue
         try:
             bridge.futures_symbol_for(ticker, markets=markets)
         except ValueError as exc:
             reason = f"no active futures contract: {exc}"
             skipped.append({"ticker": ticker, "reason": reason})
-            _record_futures_cycle_rejection(ticker, market_rejection_reason=str(exc))
+            if rejections_recorded is None or ticker not in rejections_recorded:
+                _record_futures_cycle_rejection(
+                    ticker,
+                    market_rejection_reason=str(exc),
+                    phase="market",
+                    telemetry={"execution_status": "not_started"},
+                )
+                if rejections_recorded is not None:
+                    rejections_recorded.add(ticker)
             continue
         runnable.append(candidate)
-    return runnable, skipped
+    return runnable, skipped, markets is not None
+
+
+def _select_cycle_candidates(
+    candidates: list[dict],
+    derivatives: Any | None,
+    *,
+    limit: int,
+    telemetry: CycleTelemetry | None = None,
+    rejections_recorded: set[str] | None = None,
+) -> tuple[list[dict], list[dict], dict | None]:
+    runnable, skipped, metadata_available = _preflight_candidates_with_metadata(
+        candidates, derivatives, telemetry=telemetry,
+        rejections_recorded=rejections_recorded,
+    )
+    runnable.sort(key=lambda entry: str(entry.get("asset_type") or "crypto") != "crypto")
+    selected = runnable[:limit]
+    if derivatives is None:
+        return selected, skipped, None
+    return selected, skipped, {
+        "mode": "futures",
+        "requested": limit,
+        "screened": len(candidates),
+        "executable": len(runnable) if metadata_available else None,
+        "selected": len(selected),
+        "shortfall": max(0, limit - len(runnable)) if metadata_available else None,
+        "pool_exhausted": len(runnable) < limit if metadata_available else None,
+        "market_metadata_available": metadata_available,
+    }
+
+
+def _futures_discovery_limit(round_index: int) -> int:
+    """Universe size inspected on discovery round ``round_index`` (0 = initial).
+
+    Each refill doubles the inspected pool so lower-ranked contracts can
+    surface, capped so one cycle never becomes a full-market sweep.
+    """
+    widened = AUTO_FUTURES_SCREEN_POOL * (2 ** max(0, round_index))
+    return min(widened, AUTO_FUTURES_MAX_UNIVERSE)
+
+
+def _refill_futures_candidates(
+    crypto_universe: Callable,
+    stock_universe: Callable,
+    screen_universe: Callable,
+    config: dict,
+    trade_date: str,
+    derivatives: Any | None,
+    *,
+    limit: int,
+    selected: list[dict],
+    skipped: list[dict],
+    selection: dict | None,
+    crypto: list[str],
+    inspected: int,
+    deadline: float | None = None,
+    telemetry: CycleTelemetry | None = None,
+) -> tuple[list[str], list[str], list[dict], list[dict], dict | None]:
+    """Widen discovery until ``limit`` executable futures exist, or the pool ends.
+
+    The first screen inspects one broad pool, and its top can be all
+    contractless pairs, so preflight leaves the cycle short while the LLM
+    budget goes unspent. Each refill round re-discovers a wider crypto
+    universe and re-screens it, making contracts ranked below the first cut
+    reachable. Screening keeps each ticker's own ``asset_type`` and futures
+    mode never queries the stock universe, so no stock can enter the futures
+    path.
+
+    Rounds MERGE into the already-vetted set and never replace it.
+    ``crypto_universe`` refetches the venue on every call (screening.py:138-167),
+    so a wider round is a fresh snapshot rather than a superset; replacing would
+    drop a contract that already passed preflight and misreport the shortfall.
+
+    Stops when the target is met, when the venue metadata is unavailable (the
+    per-candidate path must then decide), when discovery returned fewer
+    tickers than requested (the pool is genuinely exhausted), at the round
+    cap, or when the remaining cycle budget is spent. The remaining shortfall
+    stays in ``selection`` as ``shortfall``/``pool_exhausted``.
+
+    Returns ``(crypto, stocks, selected, skipped, selection)`` so the caller
+    reports the discovery that actually produced the cycle's candidates.
+
+    The refill is an optimisation layered on top of a working selection: a
+    failed round is reported in ``selection["refill_error"]`` and keeps every
+    candidate the earlier rounds already vetted, and each round is capped by the
+    remaining cycle budget so it can never outlive the run.
+    """
+    if selection is None:
+        return crypto, [], selected, skipped, selection
+
+    rounds = 0
+    requested = inspected
+    discovered = len(crypto)
+    # Distinct tickers discovery returned across every round: the union is what
+    # actually got inspected, so the summary never under-reports it. A ticker can
+    # appear in one round's snapshot and vanish from the next (screening.py:138-167).
+    inspected_tickers: set[str] = set(crypto)
+    stocks: list[str] = []
+    vetted: list[dict] = list(selected)
+    seen_vetted = {str(entry.get("ticker")) for entry in vetted}
+    seen_skipped = {str(entry.get("ticker")) for entry in skipped}
+    # The first round already persisted a rejection for every ticker it
+    # dropped; a refill re-screens the same pool, so those rows must not be
+    # written a second time for the same cycle.
+    rejections_recorded = set(seen_skipped)
+    metadata_available = selection.get("market_metadata_available")
+    screened_total = int(selection.get("screened") or 0)
+    refill_error: str | None = None
+    while len(vetted) < limit:
+        if metadata_available is not True:
+            break  # cannot tell contractless from unreachable: fail open
+        if discovered < requested:
+            break  # discovery offered no wider pool than the one just inspected
+        if rounds >= AUTO_FUTURES_REFILL_ROUNDS:
+            break
+        widened = _futures_discovery_limit(rounds + 1)
+        if widened <= requested:
+            break  # widening cap reached
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None:
+            # A round is optional work: it may spend at most a share of what is
+            # left, so the candidates already vetted keep a budget to run in.
+            # Without this a round could eat the remainder and the post-refill
+            # deadline check would discard a full selection.
+            remaining *= AUTO_REFILL_BUDGET_SHARE
+            if remaining <= 0:
+                break
+        try:
+            round_crypto, stocks, candidates = _screen_with_timeout(
+                crypto_universe,
+                stock_universe,
+                screen_universe,
+                config,
+                trade_date,
+                telemetry=telemetry,
+                universe_limit=widened,
+                screen_pool=widened,
+                timeout_seconds=remaining,
+            )
+            round_vetted, round_skipped, metadata_available = (
+                _preflight_candidates_with_metadata(
+                    candidates, derivatives, telemetry=telemetry,
+                    rejections_recorded=rejections_recorded,
+                )
+            )
+        except Exception as exc:
+            # A refill round is optional: report it and keep what round 1
+            # vetted instead of failing the whole cycle (or discarding it).
+            logger.warning("autoloop refill round %d failed (%s)", rounds + 1, exc)
+            refill_error = f"{type(exc).__name__}: {exc}"
+            break
+        rounds += 1
+        crypto = round_crypto
+        requested = widened
+        discovered = len(crypto)
+        inspected_tickers.update(crypto)
+        screened_total += len(candidates)
+        for entry in round_vetted:
+            ticker = str(entry.get("ticker"))
+            if ticker not in seen_vetted:
+                seen_vetted.add(ticker)
+                vetted.append(entry)
+        for entry in round_skipped:
+            ticker = str(entry.get("ticker"))
+            if ticker not in seen_skipped:
+                seen_skipped.add(ticker)
+                skipped.append(entry)
+    selected = vetted[:limit]
+    selection.update({
+        "screened": screened_total,
+        "executable": len(vetted) if metadata_available else None,
+        "selected": len(selected),
+        "shortfall": max(0, limit - len(vetted)) if metadata_available else None,
+        "pool_exhausted": len(vetted) < limit if metadata_available else None,
+        "market_metadata_available": metadata_available,
+        "refill_rounds": rounds,
+        "discovery_universe": requested,
+        "discovery_pool": discovered,
+        "discovery_inspected": len(inspected_tickers),
+    })
+    if refill_error is not None:
+        selection["refill_error"] = refill_error
+    return crypto, stocks, selected, skipped, selection
 
 
 def _run_cycle_locked(graph_builder: Callable | None = None) -> None:
@@ -514,7 +871,6 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
                 telemetry=telemetry,
             )
             _cycle_timeout(deadline, "screening")
-        summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
         _cycle_timeout(deadline, "venue setup")
         with telemetry.span("venue_setup"):
             bridge = _build_bridge(config)
@@ -523,19 +879,51 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
         # Drop candidates that cannot end in an order before spending LLM time
         # on them (futures mode: stocks and symbols without a live contract).
         _cycle_timeout(deadline, "candidate preflight")
-        candidates, skipped = _preflight_candidates(candidates, derivatives, telemetry=telemetry)
+        candidates, skipped, candidate_selection = _select_cycle_candidates(
+            candidates,
+            derivatives,
+            limit=AUTO_TOP_N,
+            telemetry=telemetry,
+        )
+        if derivatives is not None:
+            # The broad pool's top can be all contractless pairs. Widen
+            # discovery until the cycle is full so lower-ranked contracts are
+            # reachable, and report whatever remains short instead of silently
+            # running fewer candidates. Spot/daily selection is untouched.
+            # A failed round is reported inside ``candidate_selection`` and
+            # keeps the vetted candidates, so no timeout is re-raised here: the
+            # refill reserves the candidates' budget itself.
+            with telemetry.span("screening:refill"):
+                crypto, stocks, candidates, skipped, candidate_selection = (
+                    _refill_futures_candidates(
+                        crypto_universe,
+                        stock_universe,
+                        screen_universe,
+                        config,
+                        _today_iso(),
+                        derivatives,
+                        limit=AUTO_TOP_N,
+                        selected=candidates,
+                        skipped=skipped,
+                        selection=candidate_selection,
+                        crypto=crypto,
+                        inspected=AUTO_FUTURES_SCREEN_POOL,
+                        deadline=deadline,
+                        telemetry=telemetry,
+                    )
+                )
+        summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
+        if candidate_selection is not None and candidate_selection.get("discovery_inspected"):
+            # The cycle inspected the union of every round, not just the last
+            # snapshot (screening.py:138-167 refetches the venue per call), so
+            # reporting the last round's count would under-state the discovery.
+            summary["universe"]["crypto"] = int(candidate_selection["discovery_inspected"])
         if skipped:
             summary["skipped"] = skipped
             audit_log.record("autoloop_candidates_skipped", skipped=skipped)
+        if candidate_selection is not None:
+            summary["candidate_selection"] = candidate_selection
 
-        # Crypto candidates first: the venue bridge only executes crypto, so a
-        # cycle that runs out of time must have already seen its executable
-        # candidates rather than spending the budget on advisory-only stocks.
-        # Stable sort — score order is preserved inside each group.
-        candidates.sort(key=lambda entry: str(entry.get("asset_type") or "crypto") != "crypto")
-        # Cap after the drops: the screen returns a wider pool so filtering
-        # cannot leave the cycle with nothing to run.
-        candidates = candidates[:AUTO_TOP_N]
         summary["candidates"] = [str(entry["ticker"]) for entry in candidates]
         for candidate in candidates:
             _cycle_timeout(deadline, f"candidate {candidate.get('ticker')}")
@@ -591,6 +979,15 @@ def _process_candidate(
     asset_type = str(candidate.get("asset_type") or "crypto")
     result = DailyResult(ticker=ticker)
     telemetry = telemetry or CycleTelemetry()
+    futures_cycle_id: str | None = None
+    futures_cycle_payload: dict = {}
+    futures_cycle_timestamps: dict[str, str] = {}
+    futures_caps: dict[str, float] = {}
+    agent_note: str | None = None
+    # The executor's risk_guard_decisions list is shared by every candidate in
+    # the cycle, so mark where it stands before this candidate can append to
+    # it: a row must only ever carry the decisions made FOR this candidate.
+    guard_baseline = len(getattr(derivatives, "risk_guard_decisions", None) or [])
     try:
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} start")
@@ -606,10 +1003,16 @@ def _process_candidate(
                     futures_context = _closed_futures_context(derivatives, ticker)
             except PermissionError as exc:
                 result.reason = f"{type(exc).__name__}: {exc}"
+                _record_futures_cycle_rejection(
+                    ticker, market_rejection_reason=result.reason,
+                    phase="market", telemetry={"execution_status": "not_started"},
+                )
                 return result
             except ValueError as exc:
                 result.reason = f"market_rejected: {exc}"
-                _record_futures_cycle_rejection(ticker, market_rejection_reason=str(exc))
+                _record_futures_cycle_rejection(
+                    ticker, market_rejection_reason=str(exc), phase="market",
+                )
                 return result
             if futures_context is None:
                 result.reason = "confirmation_missing: closed 1h/4h candle pair unavailable"
@@ -617,15 +1020,41 @@ def _process_candidate(
                     ticker,
                     confirmation_reason="closed 1h/4h candle pair unavailable",
                     phase="confirmation",
+                    telemetry={"requested_ticker": ticker, "unified_symbol": None},
                 )
                 return result
+            futures_cycle_id, four_hour_open, one_hour_open = futures_cycle_identity(futures_context)
+            futures_cycle_timestamps = {"market_context_finished_at": utc_now_iso()}
+            futures_caps = futures_effective_caps(
+                derivatives, auto_cap=MAX_AUTO_LEVERAGE, config=config,
+            )
+            futures_cycle_payload = {
+                "requested_ticker": ticker,
+                "unified_symbol": futures_context["unified_symbol"],
+                "snapshot": futures_snapshot_payload(futures_context),
+                "effective_caps": futures_caps,
+                "confirmation_result": None,
+                "confirmation_reason": "pending_agent_signal",
+                "confirmation": {"result": None, "reason": "pending_agent_signal"},
+                "execution_status": "in_progress",
+                "phase_timestamps": dict(futures_cycle_timestamps),
+            }
+            if not claim_futures_cycle(
+                futures_cycle_id,
+                symbol=futures_context["unified_symbol"],
+                four_hour_open=four_hour_open,
+                one_hour_open=one_hour_open,
+                payload=futures_cycle_payload,
+            ):
+                result.reason = "duplicate futures signal skipped"
+                return result
+            persist_futures_cycle_progress(
+                futures_cycle_id, phase="market", payload=futures_cycle_payload,
+                timestamp=futures_cycle_timestamps["market_context_finished_at"],
+            )
             with telemetry.span("futures_account", ticker):
-                try:
-                    futures_account = read_futures_account(derivatives._bridge)
-                except (PermissionError, ValueError) as exc:
-                    result.reason = f"futures_account_unavailable: {exc}"
-                    return result
-                futures_portfolio = _futures_portfolio(futures_account)
+                futures_account = read_futures_account(derivatives._bridge)
+            futures_portfolio = build_futures_portfolio(futures_account)
             with telemetry.span("protective_bracket", ticker):
                 # Both directions: the agents need the engine's reference levels
                 # before they decide, and the entry path must reuse these reads
@@ -635,9 +1064,27 @@ def _process_candidate(
                     "short": _bracket_prices(ticker, direction="short"),
                 }
             with telemetry.span("futures_decision_context", ticker):
-                execution_context = _futures_decision_context(
-                    futures_context, futures_account, ticker, config, brackets,
+                execution_context = render_futures_decision_context(
+                    futures_context,
+                    futures_account,
+                    ticker,
+                    config,
+                    brackets,
+                    max_leverage=futures_caps["effective_leverage"],
                 )
+            futures_cycle_timestamps["decision_context_finished_at"] = utc_now_iso()
+            futures_cycle_payload["phase_timestamps"] = dict(futures_cycle_timestamps)
+            futures_cycle_payload["futures_account"] = {
+                "equity": futures_account.equity,
+                "available_balance": futures_account.available_balance,
+                "equity_currency": futures_account.equity_currency,
+                "available_balance_currency": futures_account.available_balance_currency,
+                "position_count": len(futures_account.positions),
+            }
+            persist_futures_cycle_progress(
+                futures_cycle_id, phase="context", payload=futures_cycle_payload,
+                timestamp=futures_cycle_timestamps["decision_context_finished_at"],
+            )
         with telemetry.span("graph_build", ticker):
             graph = build_graph(config, _ANALYSTS_CRYPTO if asset_type == "crypto" else _ANALYSTS_STOCK)
         with telemetry.span("graph_analysis", ticker):
@@ -654,6 +1101,40 @@ def _process_candidate(
         result.signal = signal
         pm_decision = state.get("final_trade_decision") if isinstance(state, dict) else None
         agent_note = (str(pm_decision).strip() or None) if pm_decision else None
+        if derivatives is not None and asset_type == "crypto":
+            decision_data = futures_decision_telemetry(
+                state if isinstance(state, dict) else {}, signal, parse_rating,
+            )
+            confirmation_ok, confirmation_reason = _confirmation_state(
+                futures_context, signal,
+            )
+            decision_data["confirmation_result"] = confirmation_ok
+            decision_data["confirmation_reason"] = confirmation_reason
+            decision_data["confirmation"] = {
+                "result": confirmation_ok,
+                "reason": confirmation_reason,
+            }
+            futures_cycle_payload.update(decision_data)
+            # The PM's verbatim decision travels with every later phase write
+            # (success, rejection and failure), so a completed entry keeps the
+            # rationale the UI renders (futures-cycle-funnel.tsx AgentDecisionNote).
+            if agent_note:
+                futures_cycle_payload["agent_decision_note"] = redact_futures_payload(
+                    agent_note[:6000]
+                )
+            futures_cycle_payload["signal_reason"] = (
+                "tradeable_signal" if signal in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT)
+                else "signal_not_tradeable"
+            )
+            futures_cycle_payload["phase_timestamps"] = {
+                **futures_cycle_timestamps,
+                "analysis_finished_at": utc_now_iso(),
+            }
+            futures_cycle_timestamps = dict(futures_cycle_payload["phase_timestamps"])
+            persist_futures_cycle_progress(
+                futures_cycle_id, phase="analysis", payload=futures_cycle_payload,
+                timestamp=futures_cycle_timestamps["analysis_finished_at"],
+            )
         if asset_type != "crypto":
             result.reason = (
                 "advisory only — signal from the stock pipeline; the venue "
@@ -685,6 +1166,14 @@ def _process_candidate(
                     phase="proposal",
                     snapshot=futures_context,
                     agent_note=agent_note,
+                    cycle_id=futures_cycle_id,
+                    telemetry={
+                        **decision_data,
+                        "effective_caps": futures_caps,
+                        "proposal_validation": {"valid": False, "reason": result.reason},
+                        "execution_status": "not_started",
+                    },
+                    phase_timestamps=futures_cycle_timestamps,
                 )
                 return result
             with telemetry.span("futures_planning", ticker):
@@ -695,6 +1184,11 @@ def _process_candidate(
                     deadline=deadline, cancelled=cancelled,
                     execution_lock=execution_lock, telemetry=telemetry,
                     agent_note=agent_note,
+                    cycle_id=futures_cycle_id,
+                    decision_data=decision_data,
+                    cycle_payload=futures_cycle_payload,
+                    phase_timestamps=futures_cycle_timestamps,
+                    guard_baseline=guard_baseline,
                 )
             return result
         if deadline is not None:
@@ -721,6 +1215,37 @@ def _process_candidate(
         raise
     except Exception as exc:  # one candidate's failure never stops the cycle
         result.reason = f"{type(exc).__name__}: {exc}"
+        if futures_cycle_id is not None:
+            current_phase = (
+                "context" if not futures_cycle_timestamps.get("decision_context_finished_at")
+                else "analysis" if "decision_data" not in locals()
+                else "execution"
+            )
+            phase_finished = utc_now_iso()
+            risk_decisions = _candidate_guard_decisions(derivatives, guard_baseline)
+            payload = {
+                **futures_cycle_payload,
+                "failure_reason": result.reason,
+                "execution_status": "failed" if current_phase == "execution" else "not_started",
+                "risk_guard_decisions": risk_decisions,
+                "risk_guard": risk_decisions[-1] if risk_decisions else {
+                    "allowed": None, "halted": None, "reason": "not_called",
+                },
+                "order_id": result.order_id,
+                "phase_timestamps": {
+                    **futures_cycle_timestamps,
+                    f"{current_phase}_failed_at": phase_finished,
+                },
+            }
+            if agent_note and "agent_decision_note" not in payload:
+                payload["agent_decision_note"] = redact_futures_payload(agent_note[:6000])
+            persist_futures_cycle_progress(
+                futures_cycle_id,
+                status="failed",
+                phase=current_phase,
+                payload=payload,
+                terminal=True,
+            )
     return result
 
 
@@ -797,25 +1322,6 @@ def _candle_direction(candle: Any) -> str:
     return "doji"
 
 
-def _futures_portfolio(snapshot: Any) -> PortfolioContext:
-    """Sizing book backed by the FUTURES wallet, not the spot balance.
-
-    ``ExchangeBridge.sync_portfolio`` reads the spot account, so sizing a
-    futures entry against it would risk money the derivatives wallet does not
-    hold. ``cash`` is the futures equity (wallet balance plus unrealized PnL);
-    open positions are deliberately not added again, because that equity
-    already contains their PnL and re-adding their notional would overstate
-    the denominator every percentage cap divides by. Open exposure is instead
-    reported to the decision agents in their context.
-    """
-    equity = snapshot.equity if snapshot.equity is not None else snapshot.available_balance
-    currency = snapshot.equity_currency or snapshot.available_balance_currency
-    return PortfolioContext(
-        cash=float(equity) if equity is not None else None,
-        currency=currency,
-    )
-
-
 def _direction_brackets(
     ticker: str, brackets: dict | None = None,
 ) -> tuple[tuple[float | None, float | None], tuple[float | None, float | None]]:
@@ -825,83 +1331,27 @@ def _direction_brackets(
     return _bracket_prices(ticker, direction="long"), _bracket_prices(ticker, direction="short")
 
 
-def _futures_decision_context(
-    market: dict, account: Any, ticker: str, config: dict,
-    brackets: dict | None = None,
-) -> str:
-    """Account, market, and hard-limit facts the futures agents decide against.
-
-    The agents own margin mode, leverage, and the risk/margin budgets, so they
-    need the real wallet and the venue's caps; the executor enforces the same
-    caps afterwards and refuses rather than substituting its own numbers.
-    """
-    def number(value: Any, suffix: str = "") -> str:
-        return f"{float(value):,.4f}{suffix}" if value is not None else "unavailable"
-
-    def percent(value: Any) -> str:
-        return f"{float(value) * 100:.4f}%" if value is not None else "unavailable"
-
-    currency = account.equity_currency or account.available_balance_currency or ""
-    lines = [
-        f"Venue profile: {account.venue_profile or 'unreported'}",
-        f"Account scope: {account.account_scope}",
-        f"Futures equity: {number(account.equity, ' ' + currency if currency else '')}",
-        f"Available margin: {number(account.available_balance, ' ' + currency if currency else '')}",
-        f"Wallet balance: {number(account.wallet_balance, ' ' + currency if currency else '')}",
-        f"Unrealized PnL: {number(account.unrealized_pnl, ' ' + currency if currency else '')}",
-    ]
-    if account.positions:
-        lines.append("Open futures positions:")
-        for position in account.positions:
-            lines.append(
-                f"- {position.symbol} {position.side} contracts={position.contracts} "
-                f"entry={position.entry_price} mark={position.mark_price} "
-                f"leverage={position.leverage} margin_mode={position.margin_mode} "
-                f"uPnL={position.unrealized_pnl}"
-            )
-    else:
-        lines.append("Open futures positions: none")
-    lines.extend([
-        "",
-        f"Instrument: {market.get('unified_symbol')} (requested as {ticker})",
-        f"Closed 1h candle: open={market['one_hour'].open} high={market['one_hour'].high} "
-        f"low={market['one_hour'].low} close={market['one_hour'].close} "
-        f"direction={market.get('one_hour_direction')}",
-        f"Closed 4h candle: open={market['four_hour'].open} high={market['four_hour'].high} "
-        f"low={market['four_hour'].low} close={market['four_hour'].close} "
-        f"direction={market.get('four_hour_direction')}",
-        f"Funding rate: {percent(market.get('funding_rate'))} "
-        f"(next funding {market.get('funding_datetime') or 'unavailable'})",
-        f"Mark price: {number(market.get('mark_price'))}",
-        f"Open interest: {number(market.get('open_interest'))} "
-        f"contracts (notional {number(market.get('open_interest_value'))})",
-    ])
-    long_bracket, short_bracket = _direction_brackets(ticker, brackets)
-    if long_bracket[0] is not None:
-        lines.append(f"Engine ATR bracket (long): stop={long_bracket[0]} target={long_bracket[1]}")
-    if short_bracket[0] is not None:
-        lines.append(f"Engine ATR bracket (short): stop={short_bracket[0]} target={short_bracket[1]}")
-    lines.extend([
-        "",
-        "Hard limits the execution layer enforces (a proposal outside them is refused, "
-        "not resized):",
-        f"- Maximum leverage: {MAX_AUTO_LEVERAGE:g}x",
-        f"- Maximum risk_fraction: {float(config.get('risk_derivatives_max_risk_fraction', 0.02)):g}",
-        f"- Maximum margin_fraction: {float(config.get('risk_derivatives_max_margin_fraction', 0.5)):g}",
-        f"- Maximum derivatives notional: "
-        f"{float(config.get('risk_max_derivatives_exposure_pct', 0.0)):g}% of equity",
-        f"- Maximum position per asset: "
-        f"{float(config.get('risk_max_position_pct_per_asset', 25.0)):g}% of equity",
-        f"- Maximum total exposure: "
-        f"{float(config.get('risk_max_total_exposure_pct', 80.0)):g}% of equity",
-        "A FuturesExecutionProposal is required for any entry: margin mode, leverage, "
-        "risk_fraction, margin_fraction, and an evidence-based rationale. Without one "
-        "no order is placed.",
-    ])
-    return "\n".join(lines)
-
-
 def _confirmation_state(context: dict, signal: str) -> tuple[bool, str]:
+    # Kept strict on replay evidence (2026-10-29, tests/test_futures_confirmation_replay.py):
+    # the archived funnel records 86 confirmation rejects, all direction_mismatch,
+    # and of the 58 rejects in the newer export only 1 carries the closed 1h/4h
+    # pair — so a counterfactual is scored on 77 snapshot rows total
+    # (server/futures_replay.py + tests/fixtures/futures_cycles_replay.json).
+    # What that replay shows: "4h dominance + bounded 1h pullback" would
+    # confirm 3 additional candidate candles (all QNT-USD shorts), but every
+    # one of those cycles was refused UPSTREAM at the intent gate (abstain /
+    # manage-only / no structured terms, phase=proposal before this check
+    # runs) — loosening this gate creates ZERO new entries in the sample. Two
+    # of the 3 confirmations are even negative-retrace range-breaks (1h close
+    # below the 4h low) that the harness's bound passes and labels a pullback.
+    # The 1:1 agreement between recorded reasons and this rule is
+    # mirror-consistency, not out-of-sample validation: snapshot rows' payload
+    # reasons were derived at persist time by this very function
+    # (_record_futures_cycle_rejection). No forward-return data exists for any
+    # flip, so nothing here is evidence to loosen a futures entry gate; the
+    # conservative side is refusing entry. This rule stays until reject rows
+    # routinely carry their candle pair (current code persists the snapshot;
+    # the archive predates it) and the sample can be judged on outcomes.
     if signal not in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT):
         return True, "not_required_for_non_tradeable_signal"
     expected = "bearish" if _direction(signal) == "short" else "bullish"
@@ -911,6 +1361,20 @@ def _confirmation_state(context: dict, signal: str) -> tuple[bool, str]:
     if directions != (expected, expected):
         return False, "direction_mismatch"
     return True, "aligned_direction"
+
+
+# Persistence and redaction live in server.futures_cycle_telemetry.
+def _candidate_guard_decisions(derivatives: Any, baseline: int) -> list[dict]:
+    """Only the RiskGuard decisions appended FOR this candidate.
+
+    ``DerivativesExecutor.risk_guard_decisions`` accumulates across the whole
+    cycle (derivatives.py builds one executor per cycle), so copying the list
+    verbatim would let one candidate's row claim the guard verdicts of its
+    predecessors — including an ``allowed=True`` for a candidate the guard
+    never even evaluated.
+    """
+    decisions = getattr(derivatives, "risk_guard_decisions", None) or []
+    return list(decisions[baseline:])
 
 
 def _record_futures_cycle_rejection(
@@ -923,59 +1387,62 @@ def _record_futures_cycle_rejection(
     signal: str | None = None,
     signal_reason: str | None = None,
     phase: str = "market",
+    status: str = "rejected",
     agent_note: str | None = None,
+    cycle_id: str | None = None,
+    telemetry: dict | None = None,
+    phase_timestamps: dict | None = None,
 ) -> None:
     now = datetime.now(UTC)
     one_hour, four_hour = closed_candle_pair(now)
-    cycle_id = f"futures:{ticker}:{four_hour[0].isoformat()}:{one_hour[0].isoformat()}:1"
     symbol = unified_symbol or ticker
+    cycle_id = cycle_id or f"futures:{symbol}:{four_hour[0].isoformat()}:{one_hour[0].isoformat()}:1"
     payload = {
         "requested_ticker": ticker,
         "unified_symbol": unified_symbol,
         "market_rejection_reason": market_rejection_reason,
+        "confirmation_result": None,
         "confirmation_reason": confirmation_reason,
+        "confirmation": {"result": None, "reason": confirmation_reason},
         "signal": signal,
         "signal_reason": signal_reason,
     }
-    # A cycle that stops before entry still observed the closed candle pair, so
-    # record the same verdict the entry path would have reached. Without it the
-    # UI can only say "no data" for a cycle that did read the candles.
+    if telemetry:
+        payload.update(telemetry)
+    if phase_timestamps:
+        payload["phase_timestamps"] = dict(phase_timestamps)
     if snapshot and signal:
         confirmed, derived_reason = _confirmation_state(snapshot, signal)
         payload["confirmation_result"] = confirmed
-        if not confirmation_reason:
-            payload["confirmation_reason"] = derived_reason
-    # The Portfolio Manager's verbatim decision (rating, thesis, execution
-    # intent) is the only human-legible record of WHY a cycle was refused.
+        payload["confirmation_reason"] = confirmation_reason or derived_reason
+        payload["confirmation"] = {"result": confirmed, "reason": payload["confirmation_reason"]}
     if agent_note:
-        payload["agent_decision_note"] = agent_note[:6000]
+        payload["agent_decision_note"] = redact_futures_payload(agent_note[:6000])
+
     if snapshot:
-        payload["snapshot"] = _snapshot_payload(snapshot)
-    # Create the row when absent, then always converge it to the terminal
-    # rejected state; update_futures_cycle merges, so a prior snapshot survives.
-    job_store.claim_futures_cycle(
+        payload["snapshot"] = futures_snapshot_payload(snapshot)
+    persist_futures_cycle_rejection(
         cycle_id,
         symbol=symbol,
-        four_hour_open=four_hour[0].isoformat(),
-        one_hour_open=one_hour[0].isoformat(),
-        strategy_version="1",
+        four_hour_open=(
+            datetime.fromtimestamp(snapshot["four_hour_open"] / 1000, UTC).isoformat()
+            if snapshot and isinstance(snapshot.get("four_hour_open"), (int, float))
+            else four_hour[0].isoformat()
+        ),
+        one_hour_open=(
+            datetime.fromtimestamp(snapshot["one_hour_open"] / 1000, UTC).isoformat()
+            if snapshot and isinstance(snapshot.get("one_hour_open"), (int, float))
+            else one_hour[0].isoformat()
+        ),
+        phase=phase,
         payload=payload,
-    )
-    job_store.update_futures_cycle(
-        cycle_id, status="rejected", phase=phase, payload=payload, terminal=True,
+        status=status,
     )
 
 
 def _snapshot_payload(context: dict) -> dict:
-    def encode(value: Any) -> Any:
-        if hasattr(value, "__dataclass_fields__"):
-            return {key: encode(getattr(value, key)) for key in value.__dataclass_fields__}
-        if isinstance(value, dict):
-            return {str(key): encode(item) for key, item in value.items()}
-        if isinstance(value, (tuple, list)):
-            return [encode(item) for item in value]
-        return value
-    return encode(context)
+    return futures_snapshot_payload(context)
+
 
 
 def _unified_mark_price(bridge: Any, symbol: str) -> float | None:
@@ -1014,6 +1481,7 @@ def _accepts_execution_context(propagate: Callable) -> bool:
 
 def _proposal_terms(
     proposal: Any, *, mark: float, direction: str, config: dict,
+    reference_mark: float | None = None,
 ) -> tuple[dict | None, str | None]:
     """Validate the agents' futures terms; refuse instead of substituting.
 
@@ -1022,6 +1490,12 @@ def _proposal_terms(
     stays inside the system ceilings -- a proposal outside them is refused,
     never silently clamped, because a clamped size would no longer be the
     decision anyone made.
+
+    ``reference_mark`` is the mark the agents were shown. It is a second
+    accepted anchor for ``entry_price``: analysis takes minutes on a moving
+    pair, so a live mark can drift past the 1e-3 tolerance from the number the
+    agent was told to be consistent with. The bracket and the plan still use
+    the live ``mark``.
     """
     if not isinstance(proposal, dict) or not proposal:
         return None, "agent_proposal_missing: no futures entry without agent execution terms"
@@ -1067,7 +1541,13 @@ def _proposal_terms(
             return None, "agent_proposal_rejected: entry_price is not a number"
         if not math.isfinite(entry_value) or entry_value <= 0:
             return None, "agent_proposal_rejected: entry_price must be positive and finite"
-        if abs(entry_value - mark) > max(mark * 0.001, 1e-12):
+
+        def on_mark(anchor: float | None) -> bool:
+            if anchor is None or not math.isfinite(anchor) or anchor <= 0:
+                return False
+            return abs(entry_value - anchor) <= max(anchor * 0.001, 1e-12)
+
+        if not on_mark(mark) and not on_mark(reference_mark):
             return None, "agent_proposal_rejected: non-market entry_price is unsupported by autoloop"
     stop = proposal.get("stop_loss")
     take = proposal.get("take_profit")
@@ -1108,6 +1588,11 @@ def _process_futures_candidate(
     execution_lock: threading.Lock | None = None,
     telemetry: CycleTelemetry | None = None,
     agent_note: str | None = None,
+    cycle_id: str | None = None,
+    decision_data: dict | None = None,
+    cycle_payload: dict | None = None,
+    phase_timestamps: dict | None = None,
+    guard_baseline: int | None = None,
 ) -> None:
     """Run futures candidates through a prevalidated closed candle pair.
 
@@ -1118,10 +1603,52 @@ def _process_futures_candidate(
     """
     telemetry = telemetry or CycleTelemetry()
     now = datetime.now(UTC)
+
+    def persist_progress(cycle: str, /, **kwargs: Any) -> None:
+        if _cycle_writes_allowed(deadline, cancelled):
+            persist_futures_cycle_progress(cycle, **kwargs)
+
+    def record_rejection(*args: Any, **kwargs: Any) -> None:
+        if _cycle_writes_allowed(deadline, cancelled):
+            _record_futures_cycle_rejection(*args, **kwargs)
+
+    # Guard decisions appended before this function belongs to earlier
+    # candidates (or none); planning and execution for THIS candidate append
+    # from here on, so the row's risk_guard fields slice from this mark.
+    if guard_baseline is None:
+        guard_baseline = len(getattr(derivatives, "risk_guard_decisions", None) or [])
     context = context or _closed_futures_context(derivatives, ticker)
     if context is None:
         result.reason = "confirmation_missing: closed 1h/4h candle pair unavailable"
+        record_rejection(
+            ticker, confirmation_reason="closed 1h/4h candle pair unavailable",
+            phase="confirmation", signal=signal, cycle_id=cycle_id,
+            telemetry=decision_data, agent_note=agent_note,
+        )
         return
+    cycle_payload = dict(cycle_payload or {})
+    decision_data = dict(decision_data or {})
+    phase_timestamps = dict(phase_timestamps or {})
+    if not cycle_payload:
+        cycle_id, four_hour_open, one_hour_open = futures_cycle_identity(context)
+        cycle_payload = {
+            "requested_ticker": ticker,
+            "unified_symbol": context["unified_symbol"],
+            "snapshot": futures_snapshot_payload(context),
+            "execution_status": "in_progress",
+        }
+        if not _cycle_writes_allowed(deadline, cancelled):
+            result.reason = "cycle closed before the candidate could claim its signal"
+            return
+        if not claim_futures_cycle(
+            cycle_id,
+            symbol=context["unified_symbol"],
+            four_hour_open=four_hour_open,
+            one_hour_open=one_hour_open,
+            payload=cycle_payload,
+        ):
+            result.reason = "duplicate futures signal skipped"
+            return
     candle_1h = context["one_hour"]
     candle_4h = context["four_hour"]
     if intent is None:
@@ -1132,7 +1659,7 @@ def _process_futures_candidate(
             "manage_existing": "position_management_only",
             "structured_terms_unavailable": "structured_terms_unavailable",
         }.get(str(intent), f"invalid_futures_intent: {intent}")
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=context.get("unified_symbol"),
             signal=signal,
@@ -1140,13 +1667,21 @@ def _process_futures_candidate(
             phase="proposal",
             snapshot=context,
             agent_note=agent_note,
+            cycle_id=cycle_id,
+            telemetry={
+                **decision_data,
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "execution_status": "not_started",
+                "proposal_validation": {"valid": False, "reason": result.reason},
+            },
+            phase_timestamps=phase_timestamps,
         )
         return
     direction = _direction(signal)
     confirmation_ok, confirmation_reason = _confirmation_state(context, signal)
     if not confirmation_ok:
         result.reason = "confirmation_missing"
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=context.get("unified_symbol"),
             confirmation_reason=confirmation_reason,
@@ -1154,26 +1689,56 @@ def _process_futures_candidate(
             snapshot=context,
             signal=signal,
             agent_note=agent_note,
+            cycle_id=cycle_id,
+            telemetry={
+                **decision_data,
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "execution_status": "not_started",
+                "proposal_validation": {"valid": False, "reason": confirmation_reason},
+            },
+            phase_timestamps=phase_timestamps,
         )
         return
     symbol = context["unified_symbol"]
     if signal not in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT):
-        # No entry to decide, so no proposal is required and no cycle is
-        # claimed: burning the candle's cycle id on a Hold would block a later
-        # tradeable signal for the same closed pair.
         result.reason = f"signal_not_tradeable: {signal}"
+        record_rejection(
+            ticker, unified_symbol=symbol, signal=signal,
+            signal_reason=result.reason, phase="proposal", snapshot=context,
+            cycle_id=cycle_id, agent_note=agent_note,
+            telemetry={
+                **decision_data,
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "execution_status": "not_started",
+                "proposal_validation": {"valid": True, "reason": "not_required_for_non_tradeable_signal"},
+            },
+            phase_timestamps=phase_timestamps,
+        )
         return
     with telemetry.span("futures_mark_price", ticker):
         mark = _unified_mark_price(derivatives._bridge, symbol)
     if mark is None:
         result.reason = "derivatives entry requires a price"
+        record_rejection(
+            ticker, unified_symbol=symbol, signal=signal,
+            signal_reason=result.reason, phase="proposal", snapshot=context,
+            cycle_id=cycle_id, agent_note=agent_note,
+            telemetry={
+                **decision_data,
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "proposal_validation": {"valid": False, "reason": result.reason},
+                "execution_status": "not_started",
+            },
+            phase_timestamps=phase_timestamps,
+        )
         return
     terms, proposal_error = _proposal_terms(
-        proposal, mark=mark, direction=direction, config=config,
+        proposal, mark=mark, reference_mark=context.get("mark_price"),
+        direction=direction, config=config,
     )
     if terms is None:
         result.reason = proposal_error
-        _record_futures_cycle_rejection(
+        record_rejection(
             ticker,
             unified_symbol=symbol,
             signal=signal,
@@ -1181,8 +1746,18 @@ def _process_futures_candidate(
             phase="proposal",
             snapshot=context,
             agent_note=agent_note,
+            cycle_id=cycle_id,
+            telemetry={
+                **decision_data,
+                "agent_proposal": redact_futures_proposal(proposal),
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "proposal_validation": {"valid": False, "reason": proposal_error},
+                "execution_status": "not_started",
+            },
+            phase_timestamps=phase_timestamps,
         )
         return
+    proposal_validation = {"valid": True, "reason": None}
     stop, take = terms["stop_loss"], terms["take_profit"]
     if stop is None or take is None:
         with telemetry.span("protective_bracket", ticker):
@@ -1190,15 +1765,71 @@ def _process_futures_candidate(
             stop, take = long_bracket if direction == "long" else short_bracket
     if stop is None or take is None:
         result.reason = "derivatives entry requires price and protective bracket"
+        proposal_validation = {"valid": False, "reason": result.reason}
+        record_rejection(
+            ticker, unified_symbol=symbol, signal=signal,
+            signal_reason=result.reason, phase="proposal", snapshot=context,
+            cycle_id=cycle_id, agent_note=agent_note,
+            telemetry={
+                **decision_data, "agent_proposal": redact_futures_proposal(proposal),
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "proposal_validation": proposal_validation, "execution_status": "not_started",
+            },
+            phase_timestamps=phase_timestamps,
+        )
         return
     if not (stop < mark < take if direction == "long" else stop > mark > take):
         result.reason = "invalid protective bracket"
+        proposal_validation = {"valid": False, "reason": result.reason}
+        record_rejection(
+            ticker, unified_symbol=symbol, signal=signal,
+            signal_reason=result.reason, phase="proposal", snapshot=context,
+            cycle_id=cycle_id, agent_note=agent_note,
+            telemetry={
+                **decision_data, "agent_proposal": redact_futures_proposal(proposal),
+                "effective_caps": cycle_payload.get("effective_caps", {}),
+                "proposal_validation": proposal_validation, "execution_status": "not_started",
+            },
+            phase_timestamps=phase_timestamps,
+        )
         return
     expires_at = now + (
         datetime.fromtimestamp(candle_4h.close_time / 1000, UTC)
         - datetime.fromtimestamp(candle_4h.open_time / 1000, UTC)
     )
-    envelope = FuturesSignalEnvelope.create(
+    cycle_payload.update({
+        **decision_data,
+        "requested_ticker": ticker,
+        "unified_symbol": symbol,
+        "signal": signal,
+        "signal_reason": "tradeable_signal",
+        "confirmation_result": confirmation_ok,
+        "confirmation_reason": confirmation_reason,
+        "snapshot": _snapshot_payload(context),
+        "agent_proposal": redact_futures_proposal(proposal),
+        "proposal_validation": proposal_validation,
+        "mark_price": mark,
+        # HEAD carried the PM's verbatim decision onto the terminal success row;
+        # staging it here keeps it on the proposal, planning, execution AND
+        # failure writes that all build from cycle_payload.
+        "agent_decision_note": (
+            redact_futures_payload(agent_note[:6000]) if agent_note else None
+        ),
+        "plan": {
+            "stop_loss": stop,
+            "take_profit": take,
+            "leverage": terms["leverage"],
+            "risk_fraction": terms["risk_fraction"],
+            "margin_fraction": terms["margin_fraction"],
+            "margin_mode": terms["margin_mode"],
+        },
+    })
+    phase_timestamps["proposal_validated_at"] = utc_now_iso()
+    persist_progress(
+        cycle_id, phase="proposal", payload={**cycle_payload, "phase_timestamps": phase_timestamps},
+        timestamp=phase_timestamps["proposal_validated_at"],
+    )
+    FuturesSignalEnvelope.create(
         symbol=symbol,
         candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, UTC),
         candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, UTC),
@@ -1207,27 +1838,15 @@ def _process_futures_candidate(
         confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, UTC),
         strategy="autoloop", strategy_version="1",
     )
-    if not job_store.claim_futures_cycle(
-        envelope.cycle_id, symbol=symbol,
-        four_hour_open=envelope.confirmation_candle_open,
-        one_hour_open=envelope.candle_open,
-        strategy_version=envelope.strategy_version,
-        payload={
-            "requested_ticker": ticker,
-            "unified_symbol": symbol,
-            "signal": signal,
-            "signal_reason": "tradeable_signal" if signal in RATINGS_5_TIER else "signal_not_tradeable",
-            "confirmation_result": True,
-            "confirmation_reason": "aligned_direction" if signal in (_BUY, _OVERWEIGHT, _SELL, _UNDERWEIGHT) else "not_required_for_non_tradeable_signal",
-            "snapshot": _snapshot_payload(context),
-            "agent_proposal": _snapshot_payload(proposal) if isinstance(proposal, dict) else {},
-        },
-    ):
-        result.reason = "duplicate futures signal skipped"
-        return
     try:
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} futures planning")
+        phase_timestamps["planning_started_at"] = utc_now_iso()
+        persist_progress(
+            cycle_id, phase="planning",
+            payload={**cycle_payload, "phase_timestamps": phase_timestamps},
+            timestamp=phase_timestamps["planning_started_at"],
+        )
         with telemetry.span("portfolio_sync", ticker):
             book = portfolio if portfolio is not None else derivatives._bridge.sync_portfolio()
         with telemetry.span("planning", ticker):
@@ -1240,8 +1859,37 @@ def _process_futures_candidate(
                 futures_execution_intent=intent,
             )
         result.plan = plan
+        phase_timestamps["planning_finished_at"] = utc_now_iso()
+        cycle_payload["plan"] = {
+            **cycle_payload.get("plan", {}),
+            "side": getattr(plan, "side", None),
+            "quantity": getattr(plan, "quantity", None),
+            "estimated_price": getattr(plan, "estimated_price", None),
+            "cost": getattr(plan, "cost", None),
+            "leverage": getattr(plan, "leverage", terms["leverage"]),
+            "margin_mode": getattr(plan, "margin_mode", terms["margin_mode"]),
+            "stop_loss": getattr(plan, "stop_loss", stop),
+            "take_profit": getattr(plan, "take_profit", take),
+            "reason": getattr(plan, "reason", None),
+        }
+        risk_decisions = _candidate_guard_decisions(derivatives, guard_baseline)
+        cycle_payload["risk_guard"] = risk_decisions[-1] if risk_decisions else {
+            "allowed": None, "halted": None, "reason": "not_called",
+        }
+        persist_progress(
+            cycle_id, phase="planning",
+            payload={**cycle_payload, "phase_timestamps": phase_timestamps},
+            timestamp=phase_timestamps["planning_finished_at"],
+        )
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} execution")
+        phase_timestamps["execution_started_at"] = utc_now_iso()
+        persist_progress(
+            cycle_id, phase="execution",
+            payload={**cycle_payload, "phase_timestamps": phase_timestamps,
+                     "execution_status": "in_progress"},
+            timestamp=phase_timestamps["execution_started_at"],
+        )
         with telemetry.span("execution_policy", ticker):
             _handle_plan(
                 derivatives,
@@ -1252,41 +1900,102 @@ def _process_futures_candidate(
                     execute, deadline, cancelled, execution_lock
                 ),
             )
-        execution_status = (
-            "executed" if result.executed else "awaiting_approval" if result.reason and "approval" in result.reason
-            else "not_executed"
-        )
+        # Terminal outcome vocabulary (audit truth): only a venue-confirmed
+        # order is "executed"; a refused/pending/no-order plan keeps its own
+        # execution_status so the funnel never counts it as an entry.
+        # risk_rejected keys off the guard's actual decision, never a reason
+        # substring; awaiting_approval keys off the executor's own literal
+        # "awaiting approval" reasons (daily.py), a vocabulary no guard
+        # refusal shares, so an entry can never be counted from it either.
+        risk_decisions = _candidate_guard_decisions(derivatives, guard_baseline)
+        last_decision = risk_decisions[-1] if risk_decisions else None
+        if result.executed:
+            execution_status = "executed"
+        elif result.reason and "approval" in result.reason:
+            execution_status = "awaiting_approval"
+        elif (
+            plan.side is None
+            and last_decision is not None
+            and last_decision.get("allowed") is False
+        ):
+            execution_status = "risk_rejected"
+        else:
+            execution_status = "not_executed"
         protection_state = "configured" if plan.stop_loss is not None and plan.take_profit is not None else "missing"
+        phase_timestamps["execution_finished_at"] = utc_now_iso()
+        cycle_payload.update({
+            "execution_status": execution_status,
+            "executed": result.executed,
+            "order_id": result.order_id,
+            "plan_reason": plan.reason,
+            "protection_state": protection_state,
+            "risk_guard_decisions": risk_decisions,
+            "risk_guard": last_decision or {"allowed": None, "halted": None, "reason": "not_called"},
+            "phase_timestamps": phase_timestamps,
+        })
+        if result.reason:
+            cycle_payload["execution_reason"] = result.reason
+        terminal_phase = "entry" if execution_status == "executed" else "execution"
+        terminal_status = "completed" if execution_status == "executed" else "rejected"
         job_store.update_futures_cycle(
-            envelope.cycle_id, status="completed", phase="entry",
-            payload={
-                "signal": signal,
-                "signal_reason": "tradeable_signal" if signal in RATINGS_5_TIER else "signal_not_tradeable",
-                "confirmation_result": confirmation_ok,
-                "confirmation_reason": confirmation_reason,
-                "market_rejection_reason": None,
-                "plan_reason": plan.reason,
-                "execution_status": execution_status,
-                "executed": result.executed,
-                "order_id": result.order_id,
-                "protection_state": protection_state,
-                "agent_proposal": _snapshot_payload(proposal),
-                "agent_decision_note": agent_note,
-                "plan": getattr(plan, "__dict__", {}),
-            },
+            cycle_id, status=terminal_status, phase=terminal_phase,
+            payload=redact_futures_payload(cycle_payload),
             terminal=True,
         )
     except Exception as exc:
-        job_store.update_futures_cycle(
-            envelope.cycle_id,
+        # This terminal write must carry the complete audit trail: the row is
+        # locked once it lands terminal (job_store._FUTURES_TERMINAL_STATUSES),
+        # so the outer handler in _process_candidate cannot add risk_guard
+        # afterwards.
+        risk_decisions = _candidate_guard_decisions(derivatives, guard_baseline)
+        # A guard refusal (plan-stage halt or execute-stage refusal) is a
+        # deliberate "no", not a malfunction: it keeps its own terminal shape
+        # (rejected / risk_rejected) so the funnel never mixes refusals into
+        # execution failures.
+        if isinstance(exc, PermissionError) and str(exc).startswith("risk guard"):
+            persist_progress(
+                cycle_id,
+                status="rejected",
+                phase="execution" if phase_timestamps.get("execution_started_at") else "planning",
+                payload={
+                    **cycle_payload,
+                    "signal": signal,
+                    "signal_reason": "tradeable_signal",
+                    "plan_reason": getattr(result.plan, "reason", None),
+                    "execution_status": "risk_rejected",
+                    "executed": False,
+                    "order_id": result.order_id,
+                    "risk_guard_decisions": risk_decisions,
+                    "risk_guard": risk_decisions[-1] if risk_decisions else {
+                        "allowed": None, "halted": None, "reason": "not_called",
+                    },
+                    "execution_reason": str(exc),
+                    "phase_timestamps": phase_timestamps,
+                },
+                terminal=True,
+            )
+            raise
+        persist_progress(
+            cycle_id,
             status="failed",
-            phase="entry",
+            phase="execution",
             payload={
+                **cycle_payload,
                 "signal": signal,
-                "signal_reason": "tradeable_signal" if signal in RATINGS_5_TIER else "signal_not_tradeable",
+                "signal_reason": "tradeable_signal",
                 "plan_reason": getattr(result.plan, "reason", None),
                 "execution_status": "failed",
-                "error": str(exc),
+                "executed": bool(result.executed),
+                "order_id": result.order_id,
+                "risk_guard_decisions": risk_decisions,
+                "risk_guard": risk_decisions[-1] if risk_decisions else {
+                    "allowed": None, "halted": None, "reason": "not_called",
+                },
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+                "phase_timestamps": {
+                    **phase_timestamps,
+                    "execution_failed_at": utc_now_iso(),
+                },
             },
             terminal=True,
         )
@@ -1362,8 +2071,12 @@ def _today_iso() -> str:
 # --- endpoints ----------------------------------------------------------------
 
 # Zero-filled bucket order for the /autoloop/cycles funnel summary.
+# entered requires the executed confirmation; awaiting approval, plan risk
+# refusal, no-order and execute failure each keep their own bucket and are
+# never counted as entered.
 _CYCLE_SUMMARY_BUCKETS = (
     "market_rejected", "confirmation_rejected", "proposal_rejected", "entered",
+    "awaiting_approval", "risk_rejected", "not_executed", "execution_failed",
     "in_flight", "interrupted", "other",
 )
 

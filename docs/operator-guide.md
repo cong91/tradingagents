@@ -409,11 +409,38 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     do bot đã mở và đã lưu `position_states` cùng bracket task. Mặc định bật, nhưng không tự mở
     `exec_derivatives` hay `exec_live`; mọi mutation trên venue vẫn cần đủ cả hai nửa config/env của
     cả hai gate.
-  - Chính sách dùng `R = khoảng cách entry thực tế đến stop ban đầu`: `break_even_r` mặc định 1R
-    dời SL về entry; `lock_profit_r` 2R khóa tối thiểu 1R; từ `trail_start_r` 3R, SL bám mark cách
-    `trail_distance_r` 1R; TP vượt qua được gia hạn từng `target_extension_r` 1R. Stop chỉ đi theo
-    hướng giảm rủi ro, không bao giờ bị nới ngược. `min_stop_move_r` (mặc định 0.1R) bỏ qua các
-    bước dời SL quá nhỏ để không huỷ/tạo conditional order mỗi vòng poll.
+  - Chính sách dùng `R = khoảng cách entry thực tế đến stop ban đầu`: bộ mặc định mới là
+    `break_even_r` **0.5R** dời SL về mốc hòa vốn (đã cộng phí, xem dưới); `lock_profit_r`
+    **1R** khóa tối thiểu 1R; từ `trail_start_r` **1.5R**, SL bám mark cách
+    `trail_distance_r` **0.75R**; TP vượt qua được gia hạn từng `target_extension_r` 1R.
+    Stop chỉ đi theo hướng giảm rủi ro, không bao giờ bị nới ngược. `min_stop_move_r`
+    (mặc định 0.1R) bỏ qua các bước dời SL quá nhỏ để không huỷ/tạo conditional order mỗi
+    vòng poll. Ba ngưỡng đầu **phải tăng dần** (`break_even_r` < `lock_profit_r` <
+    `trail_start_r`); policy từ chối cấu hình vi phạm.
+  - *Time stop* (`risk_derivatives_max_hold_hours`, mặc định 72 giờ; `0` = tắt): vị thế giữ
+    quá số giờ này mà lợi nhuận **chưa đạt** `risk_derivatives_time_stop_min_r` (mặc định
+    1R) sẽ bị đóng và bracket của nó bị huỷ. Mục đích là cắt vùng chết 0–1R: vốn không được
+    để nằm hàng tuần ở một vị thế chưa từng tiến gần mức khóa lợi nhuận. Vị thế đã đạt mốc R
+    tối thiểu thì time stop không can thiệp — nó tiếp tục do break-even/trailing quản lý.
+    Thiếu `held_hours` (không xác định được thời điểm mở) thì time stop không kích hoạt.
+  - *Hòa vốn dịch theo phí khứ hồi* (`risk_derivatives_round_trip_fee_rate`, mặc định
+    0.001 = 0.1%): mỗi vị thế trả phí vào **và** ra, nên dời SL đúng về `entry` vẫn lỗ ròng
+    đúng bằng phần phí đó. Vì vậy khi chạm `break_even_r`, policy đặt SL cao hơn entry một
+    khoảng `round_trip_fee_rate` (long) hoặc thấp hơn tương ứng (short). `0` = không bù phí,
+    SL hòa vốn đúng bằng entry như trước.
+  - Bốn khoá điều chỉnh ngưỡng và ba khoá chi phí/thời gian ở trên cũng sửa được qua
+    `/api/operator-config` (nhóm **risk**, không phải cổng thực thi — không cần `confirm`):
+
+    | Khoá | Mặc định | Ý nghĩa |
+    |---|---|---|
+    | `risk_derivatives_break_even_r` | 0.5 | Đạt mốc R này thì dời SL về hòa vốn đã cộng phí |
+    | `risk_derivatives_lock_profit_r` | 1.0 | Đạt mốc R này thì SL khóa tối thiểu 1R |
+    | `risk_derivatives_trail_start_r` | 1.5 | Từ mốc R này SL bắt đầu bám mark |
+    | `risk_derivatives_trail_distance_r` | 0.75 | SL cách mark bao nhiêu R khi đang trailing |
+    | `risk_derivatives_max_hold_hours` | 72.0 | Quá số giờ này mà chưa đạt mốc R tối thiểu thì đóng vị thế; `0` = tắt |
+    | `risk_derivatives_time_stop_min_r` | 1.0 | Mốc R tối thiểu phải đạt trước hạn giữ tối đa |
+    | `risk_derivatives_round_trip_fee_rate` | 0.001 | Phí khứ hồi dùng để nâng SL hòa vốn lên trên entry; `0` = không bù phí |
+
   - Monitor chỉ mutate khi đọc được position mode và account đang **One-way**; Hedge Mode trả
     `hedge_mode_unsupported` vì Binance không nhận `reduceOnly` ở chế độ đó. Mark được đọc riêng
     từ endpoint mark price; mark cũ hơn `mark_max_age_seconds` (mặc định 120s) trả `mark_stale`

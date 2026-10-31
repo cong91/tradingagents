@@ -86,6 +86,15 @@ class DerivativesExecutor:
         self.config = self._bridge.config
         self.rules = self._bridge.rules
         self.risk_guard = self._bridge.risk_guard
+        self.risk_guard_decisions: list[dict[str, Any]] = []
+
+    def _record_risk_decision(self, stage: str, decision: Any) -> None:
+        self.risk_guard_decisions.append({
+            "stage": stage,
+            "allowed": bool(decision.allowed),
+            "halted": bool(decision.halted),
+            "reason": decision.reason,
+        })
 
     # --- symbols ---------------------------------------------------------
 
@@ -227,6 +236,7 @@ class DerivativesExecutor:
         )
         order.mode = mode
         decision = self.risk_guard.check(order, portfolio, self.config["exec_log_path"])
+        self._record_risk_decision("plan", decision)
         if decision.halted:
             self._bridge.audit_plan(
                 order, action="rejected_by_risk", reason=decision.reason, phase="plan"
@@ -331,6 +341,7 @@ class DerivativesExecutor:
         decision = self.risk_guard.check(
             order, portfolio, self.config["exec_log_path"], fail_closed=True
         )
+        self._record_risk_decision("execute", decision)
         if decision.halted or not decision.allowed:
             self._bridge.audit_plan(
                 order, action="rejected_by_risk", reason=decision.reason,

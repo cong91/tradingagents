@@ -10,6 +10,7 @@ from server import job_store
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.futures_account import FuturesPosition, read_futures_positions
 from tradingagents.execution.profit_protection import evaluate_profit_protection
+from tradingagents.execution.sizing import PlannedOrder
 
 
 def manage_active_positions(
@@ -154,6 +155,19 @@ def _manage_one_with_lease(
     if not allow_mutation:
         return {"position_key": position_key, "status": "mutation_gated"}
 
+    observed_at = datetime.now(UTC)
+    opened_at = _parse_opened_at(snapshot.get("opened_at"))
+    if opened_at is None:
+        # The age is unknowable, so a time stop must not fire this round: the
+        # position is stamped as opened now and judged on a later poll.
+        backfilled = {**snapshot, "opened_at": observed_at.isoformat()}
+        if not job_store.save_position_state(
+            position_key, state["revision"], {**state, "snapshot": backfilled},
+        ):
+            return {"position_key": position_key, "status": "revision_conflict"}
+        return {"position_key": position_key, "status": "opened_at_backfilled"}
+    held_hours = max(0.0, (observed_at - opened_at).total_seconds() / 3600.0)
+
     entry = float(venue_position.entry_price)
     contracts = float(venue_position.contracts) if venue_position.contracts is not None else 0.0
     quantity = abs(float(venue_position.quantity)) if venue_position.quantity is not None else 0.0
@@ -171,6 +185,7 @@ def _manage_one_with_lease(
     ladder = len(target_legs) > 1
     current_stop = float(stop_leg["params"]["stopLossPrice"])
     current_target = None if ladder else float(target_legs[0]["params"]["takeProfitPrice"])
+    max_hold_hours = _positive_or_none(config.get("risk_derivatives_max_hold_hours", 72.0))
     decision = evaluate_profit_protection(
         side=side,
         entry=entry,
@@ -184,7 +199,29 @@ def _manage_one_with_lease(
         trail_distance_r=float(config.get("risk_derivatives_trail_distance_r", 1.0)),
         target_extension_r=float(config.get("risk_derivatives_target_extension_r", 1.0)),
         min_stop_move_r=float(config.get("risk_derivatives_min_stop_move_r", 0.1)),
+        round_trip_fee_rate=float(config.get("risk_derivatives_round_trip_fee_rate", 0.001)),
+        held_hours=held_hours,
+        max_hold_hours=max_hold_hours,
+        time_stop_min_r=float(config.get("risk_derivatives_time_stop_min_r", 1.0)),
     )
+    if decision.exit_reason == "time_stop":
+        status = manager.close_position(bracket_task_id, reason="time_stop", allow_mutation=True)
+        if status != "time_stop_closed":
+            return {"position_key": position_key, "status": status}
+        job_store.delete_position_state(position_key, expected_revision=state["revision"])
+        audit = getattr(bridge, "audit_plan", None)
+        if callable(audit):
+            audit(
+                PlannedOrder(
+                    ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
+                    side=task["close_side"], quantity=contracts, estimated_price=mark,
+                    market="derivatives",
+                ),
+                action="time_stop_closed", confirmed=True, order_id=bracket_task_id,
+                reason=f"held {held_hours:.1f}h past {max_hold_hours}h without reaching {config.get('risk_derivatives_time_stop_min_r', 1.0)}R",
+                phase="execute",
+            )
+        return {"position_key": position_key, "status": "time_stop_closed"}
     stop_changed = not _same(decision.stop, current_stop)
     target_changed = decision.target is not None and not _same(decision.target, current_target)
     stop_size_changed = not _same(contracts, stop_leg.get("quantity", task["quantity"]))
@@ -230,6 +267,32 @@ def _manage_one_with_lease(
     ):
         return {"position_key": position_key, "status": "revision_conflict"}
     return {"position_key": position_key, "status": "updated" if stop_changed or target_changed or stop_size_changed or target_size_changed else "unchanged"}
+
+
+def _parse_opened_at(value: Any) -> datetime | None:
+    """Parse a stored ISO-8601 timestamp as UTC; anything malformed is absent."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        # Python 3.10's fromisoformat does not accept the RFC 3339 suffix.
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _positive_or_none(value: Any) -> float | None:
+    """A disabled policy knob (0, None, junk) becomes "no limit"."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _fresh_mark(

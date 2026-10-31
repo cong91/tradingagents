@@ -47,15 +47,14 @@ export const dataSourceApi = {
    */
   saveCookies(
     provider: DataSourceProvider,
-    cookies: unknown,
-    options?: Record<string, string>
+    cookies: unknown
   ): Promise<DataSourcesPayload> {
     return requestJson<DataSourcesPayload>(
       `/api/data-sources/${encodeURIComponent(provider)}`,
       {
         method: "PUT",
         headers: JSON_HEADERS,
-        body: JSON.stringify({ cookies, options: options ?? {} }),
+        body: JSON.stringify({ cookies }),
       }
     );
   },

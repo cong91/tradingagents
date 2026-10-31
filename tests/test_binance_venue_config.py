@@ -80,6 +80,46 @@ def test_production_url_selects_production_credentials_without_demo(monkeypatch)
     assert all("demo-" not in url for url in client.urls["api"].values())
 
 
+def test_binance_client_requests_time_adjustment_for_clock_skew(monkeypatch):
+    """A host clock ~1s fast makes every signed Binance call fail -1021.
+
+    ccxt only measures the offset when adjustForTimeDifference is set, so the
+    factory must request it for Binance (and leave other venues untouched).
+    """
+    captured = {}
+
+    class Fake(_FakeBinance):
+        def __init__(self, options):
+            captured.update(options)
+            super().__init__(options)
+
+    monkeypatch.setattr(ccxt, "binance", Fake)
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
+
+    bridge_module._default_exchange_factory("binance", base_url="https://demo-api.binance.com")
+
+    assert captured["options"] == {"adjustForTimeDifference": True}
+
+
+def test_non_binance_client_does_not_request_time_adjustment(monkeypatch):
+    captured = {}
+
+    class FakeExchange(ccxt.Exchange):
+        def __init__(self, options):
+            captured.update(options)
+
+        def set_sandbox_mode(self, enabled):
+            self.sandbox_enabled = enabled
+
+    monkeypatch.setattr(ccxt, "okx", FakeExchange)
+    monkeypatch.setenv("OKX_API_KEY", "okx-key")
+    monkeypatch.setenv("OKX_SECRET", "okx-secret")
+
+    bridge_module._default_exchange_factory("okx")
+
+    assert captured == {"apiKey": "okx-key", "secret": "okx-secret", "enableRateLimit": True}
+
 def test_binance_profile_rejects_unapproved_url_before_client_creation(monkeypatch):
     monkeypatch.setattr(ccxt, "binance", _FakeBinance)
 

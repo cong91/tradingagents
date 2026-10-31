@@ -29,6 +29,8 @@ class _Exchange:
         self.calls.append(("create", symbol, side, amount, params))
         if params.get("clientOrderId", "").startswith("emergency-"):
             return self.emergency_response
+        if params.get("clientOrderId", "").startswith("timestop-"):
+            return {"id": "time-stop-exit", "status": "closed", "info": {"algoStatus": "FINISHED"}}
         if self.create_error:
             raise self.create_error
         order_id = str(len(self.orders) + 1)
@@ -300,6 +302,54 @@ def test_filled_tranche_keeps_the_rest_of_the_ladder_and_resizes_the_stop():
     cancels = [call[1] for call in exchange.calls[calls_before:] if call[0] == "cancel"]
     assert first_tp["order_id"] not in cancels
     assert second_tp["order_id"] not in cancels
+
+
+def test_close_position_flattens_only_the_remaining_contracts_then_cancels_legs():
+    manager, _bridge, exchange, task_id = _ladder()
+    exchange.contracts = 0.00335  # a tranche already filled; 0.005 is stale
+    task = job_store.load_bracket_recovery(task_id)
+    resting_ids = {leg["order_id"] for leg in task["legs"]}
+    calls_before = len(exchange.calls)
+
+    status = manager.close_position(task_id, reason="time_stop", allow_mutation=True)
+
+    new_calls = exchange.calls[calls_before:]
+    creates = [call for call in new_calls if call[0] == "create"]
+    cancels = [call[1] for call in new_calls if call[0] == "cancel"]
+    assert status == "time_stop_closed"
+    assert len(creates) == 1
+    _kind, _symbol, close_side, amount, params = creates[0]
+    assert close_side == "sell"
+    assert amount == pytest.approx(0.00335)
+    assert params["reduceOnly"] is True
+    assert params["clientOrderId"].startswith("timestop-")
+    assert set(cancels) == resting_ids
+    assert new_calls.index(creates[0]) < new_calls.index(
+        next(call for call in new_calls if call[0] == "cancel")
+    )
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+
+
+def test_close_position_only_cancels_legs_when_the_venue_is_already_flat():
+    manager, _bridge, exchange, task_id = _ladder(contracts=0.0)
+    task = job_store.load_bracket_recovery(task_id)
+    resting_ids = {leg["order_id"] for leg in task["legs"]}
+    calls_before = len(exchange.calls)
+
+    status = manager.close_position(task_id, reason="time_stop", allow_mutation=True)
+
+    new_calls = exchange.calls[calls_before:]
+    assert status == "time_stop_closed"
+    assert not [call for call in new_calls if call[0] == "create"]
+    assert {call[1] for call in new_calls if call[0] == "cancel"} == resting_ids
+
+
+def test_close_position_is_gated_without_mutation_permission():
+    manager, _bridge, exchange, task_id = _ladder()
+    calls_before = len(exchange.calls)
+
+    assert manager.close_position(task_id, reason="time_stop", allow_mutation=False) == "mutation_gated"
+    assert not [call for call in exchange.calls[calls_before:] if call[0] in {"create", "cancel"}]
 
 
 def test_cancel_failure_after_replacement_keeps_old_id_for_later_cleanup():

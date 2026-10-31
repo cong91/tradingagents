@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import tradingagents.execution.risk as risk
 from tradingagents.execution.risk import RiskDecision, RiskGuard, RiskLimits
@@ -49,12 +50,15 @@ def guard(limits=None, prices=None) -> RiskGuard:
     )
 
 
-def plan(side="buy", cost=250.0, ticker="BTC-USD", market="spot", leverage=1.0, quantity=0.005):
-    """A minimal planned-order stand-in (duck-typed like PlannedOrder)."""
+def plan(side="buy", cost=250.0, ticker="BTC-USD", market="spot", leverage=1.0, quantity=None):
+    """A minimal internally consistent planned-order stand-in."""
     from types import SimpleNamespace
 
+    quantity = (cost * leverage / 50_000.0) if quantity is None and cost is not None else quantity
+    price = cost * leverage / quantity if cost is not None and quantity else None
     return SimpleNamespace(
-        side=side, cost=cost, ticker=ticker, market=market, leverage=leverage, quantity=quantity
+        side=side, cost=cost, ticker=ticker, market=market, leverage=leverage,
+        quantity=quantity, estimated_price=price,
     )
 
 
@@ -425,15 +429,229 @@ def test_equity_unknown_skips_pct_checks_but_halt_still_fires(tmp_path, monkeypa
     assert halted.halted is True
 
 
-def test_unmarkable_price_only_makes_checks_stricter(tmp_path, monkeypatch):
+def test_unmarkable_price_refuses_the_order_fail_closed(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     book = PortfolioContext(cash=1_000.0, positions=[Position(ticker="BTC-USD", quantity=1.0)])
-    # BTC cannot be marked: it counts 0 in equity (400 instead of 45400), so a
-    # 250 buy is 62.5% of equity and breaches the 25% per-asset cap
+    # Unmarked existing exposure cannot be safely compared to the proposed
+    # order, so the guard refuses instead of valuing it at zero.
     decision = guard().check(plan(cost=250.0), book, audit)
     assert decision.allowed is False
+    assert "unknown or unconvertible exposure" in decision.reason
+
+
+# --- non-finite account state: fail-closed, never silently disarmed ----------
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_book_schema_rejects_non_finite_account_values(value):
+    # Schema-level gate: the caller's book cannot carry inf/NaN at all --
+    # an infinite cash would drive every percentage cap toward zero.
+    with pytest.raises(ValidationError):
+        PortfolioContext(cash=value)
+    with pytest.raises(ValidationError):
+        Position(ticker="BTC-USD", quantity=value)
+    with pytest.raises(ValidationError):
+        Position(ticker="BTC-USD", quantity=1.0, mark_price=value)
+    with pytest.raises(ValidationError):
+        Position(ticker="BTC-USD", quantity=1.0, notional=value)
+    with pytest.raises(ValidationError):
+        Position(ticker="BTC-USD", quantity=1.0, average_price=value)
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_cash_bypassing_the_schema_refuses_fail_closed(
+    tmp_path, monkeypatch, value, side,
+):
+    # model_copy skips validation, so the guard re-checks the book itself:
+    # a 10 USDT derivatives order previously sailed under a 50% cap on an
+    # infinite equity (0% of an infinite denominator). Both sides are short
+    # exposure and must refuse.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(cash=1_000.0).model_copy(update={"cash": value})
+    limits = RiskLimits(max_derivatives_exposure_pct=50.0)
+    decision = guard(limits).check(
+        plan(side=side, cost=10.0, market="derivatives", leverage=1.0), book, audit,
+    )
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "non-finite account state" in decision.reason
+    assert "cash" in decision.reason
+
+
+@pytest.mark.parametrize("field", ["quantity", "mark_price", "notional"])
+def test_non_finite_position_value_bypassing_the_schema_refuses_fail_closed(
+    tmp_path, monkeypatch, field,
+):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    position = Position(ticker="BTC-USD", quantity=1.0, mark_price=50.0).model_copy(
+        update={field: float("inf")},
+    )
+    book = PortfolioContext(cash=1_000.0).model_copy(update={"positions": [position]})
+    decision = guard().check(plan(cost=10.0), book, audit)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "non-finite account state" in decision.reason
+    assert f"BTC-USD.{field}" in decision.reason
+
+
+def test_overflowing_equity_refuses_fail_closed(tmp_path, monkeypatch):
+    # Every input is finite, but cash + quantity*price overflows to inf: the
+    # denominator must refuse instead of dividing percentages by infinity.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1e308, positions=[Position(ticker="BTC-USD", quantity=1e308)],
+    )
+    decision = guard(prices={"BTC-USD": 1.0}).check(plan(cost=10.0), book, audit)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "not finite" in decision.reason
+
+
+def test_unmarkable_other_asset_spot_position_blocks_the_order(tmp_path, monkeypatch):
+    # An unvalued position is unknown exposure even when it is neither this
+    # order's asset nor derivatives (spot books from sync_portfolio carry no
+    # mark price): silently dropping it understated the total exposure cap.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[Position(ticker="ETH-USD", quantity=1_000_000.0)],
+    )
+    decision = guard().check(plan(cost=10.0, ticker="BTC-USD"), book, audit)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "ETH-USD" in decision.reason
+    assert "unknown or unconvertible exposure" in decision.reason
+
+
+def test_spot_position_in_a_different_currency_blocks_the_order(tmp_path, monkeypatch):
+    # A spot mark quoted in a currency the account cannot convert from is
+    # unknown exposure: counting it at face value silently misstates the cap,
+    # and dropping it understates total exposure. Both are unsafe.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0, currency="USD",
+        positions=[Position(
+            ticker="ETH-USD", quantity=10.0, mark_price=75.0,
+            price_currency="USDT", base_currency="ETH",
+        )],
+    )
+    decision = guard().check(plan(cost=10.0, ticker="BTC-USD"), book, audit)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "ETH-USD" in decision.reason
+    assert "unknown or unconvertible exposure" in decision.reason
+
+
+def test_spot_position_in_the_account_currency_still_counts(tmp_path, monkeypatch):
+    # The fail-closed currency rule must not block a book whose labels agree:
+    # 10 x 75 = 750 of existing exposure still breaches the per-asset cap.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[Position(
+            ticker="ETH-USD", quantity=10.0, mark_price=75.0,
+            price_currency="usdt", base_currency="ETH",
+        )],
+    )
+    decision = guard().check(plan(cost=10.0, ticker="ETH-USD"), book, audit)
+    assert decision.allowed is False
+    assert decision.halted is False
     assert "per-asset" in decision.reason
+
+
+def test_model_copy_limit_bypass_refuses_when_coerced_cap_is_breached(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    the_guard = guard(limits=RiskLimits().model_copy(update={"max_total_exposure_pct": "10"}))
+    decision = the_guard.check(plan(cost=250.0), PortfolioContext(cash=1_000.0), audit)
+
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "total exposure" in decision.reason
+    assert the_guard.limits.max_total_exposure_pct == 10.0
+
+
+@pytest.mark.parametrize("market,side", [
+    ("spot", "buy"),
+    ("spot", "sell"),
+    ("derivatives", "buy"),
+    ("derivatives", "sell"),
+])
+def test_position_with_none_quantity_never_raises(
+    tmp_path, monkeypatch, market, side,
+):
+    # quantity is nullable (derivatives share the Position schema); a
+    # spot position with unknown units must not let any Spot decision continue
+    # as though it were a known or flat position.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0,
+        positions=[Position(ticker="ETH-USD", quantity=None, mark_price=50.0)],
+    )
+    decision = guard(prices={"ETH-USD": 50.0}).check(
+        plan(side=side, cost=10.0, ticker="BTC-USD", market=market), book, audit,
+    )
+    assert isinstance(decision, RiskDecision)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "unknown quantity" in decision.reason.lower()
+
+
+def test_derivatives_position_without_quantity_uses_its_marked_notional(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    book = PortfolioContext(
+        cash=1_000.0,
+        currency="USDT",
+        positions=[Position(
+            ticker="BTC-USD", quantity=None, mark_price=50.0,
+            notional=100.0, notional_currency="USDT", market="derivatives",
+        )],
+    )
+
+    decision = guard(prices={"BTC-USD": 50.0}).check(
+        plan(cost=10.0, ticker="ETH-USD"), book, tmp_path / "audit.jsonl",
+    )
+
+    assert decision.allowed is True
+    assert decision.halted is False
+
+
+# --- limits revalidation at the check boundary -------------------------------
+
+
+@pytest.mark.filterwarnings("error:Pydantic serializer warnings:UserWarning")
+def test_model_copy_limit_bypass_is_revalidated_and_kept(tmp_path, monkeypatch):
+    # model_copy bypasses pydantic validation, so a raw '80' can ride in the
+    # limits. check() must revalidate, KEEP the coerced instance on the guard
+    # and return a decision -- never raise TypeError comparing float to str.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    the_guard = guard(limits=RiskLimits().model_copy(update={"max_total_exposure_pct": "80"}))
+    decision = the_guard.check(plan(cost=250.0), PortfolioContext(cash=1_000.0), audit)
+    assert isinstance(decision, RiskDecision)
+    assert decision.allowed is True  # 25% of equity, inside the coerced 80% cap
+    assert decision.halted is False
+    assert the_guard.limits.max_total_exposure_pct == 80.0
+
+
+@pytest.mark.filterwarnings("error:Pydantic serializer warnings:UserWarning")
+def test_uncoercible_bypassed_limit_refuses_cleanly(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    the_guard = guard(limits=RiskLimits().model_copy(update={"max_daily_loss_pct": "abc"}))
+    decision = the_guard.check(plan(cost=250.0), PortfolioContext(cash=1_000.0), audit)
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "invalid risk limits" in decision.reason
 
 
 # --- per-asset and total exposure caps --------------------------------------
@@ -514,9 +732,7 @@ def test_derivatives_within_raised_caps_passes(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     limits = RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0)
-    # per-asset now sees the NOTIONAL for derivatives (50 x 3 = 150 = 15% of
-    # equity 1000, <= 25); total exposure 15% (<= 80), derivatives notional
-    # 15% (<= 50)
+    # per-asset sees the NOTIONAL (50 x 3 = 150 = 15% of equity).
     decision = guard(limits).check(
         plan(cost=50.0, market="derivatives", leverage=3.0),
         PortfolioContext(cash=1_000.0),
@@ -525,7 +741,112 @@ def test_derivatives_within_raised_caps_passes(tmp_path, monkeypatch):
     assert decision.allowed is True
 
 
-# --- derivatives caps on every side (shorts included) ------------------------
+@pytest.mark.parametrize("cash", [1_000.0, None])
+@pytest.mark.parametrize("fail_closed", [False, True])
+def test_non_finite_order_cost_is_rejected_before_equity_fail_open(tmp_path, cash, fail_closed):
+    from tradingagents.execution.sizing import PlannedOrder
+
+    order = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT", signal="Buy", side="buy",
+        quantity=0.005, cost=float("nan"), estimated_price=50_000.0,
+    )
+    book = PortfolioContext(cash=cash) if cash is not None else None
+    decision = guard().check(order, book, tmp_path / "audit.jsonl", fail_closed=fail_closed)
+
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "cost" in decision.reason
+    assert "finite and positive" in decision.reason
+
+
+@pytest.mark.parametrize("market,side", [("spot", "buy"), ("spot", "sell"), ("derivatives", "buy"), ("derivatives", "sell")])
+@pytest.mark.parametrize("field", ["cost", "quantity", "leverage", "notional"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), 0.0, -1.0, "invalid"])
+def test_non_positive_and_non_finite_order_terms_are_rejected_before_marking(
+    tmp_path, monkeypatch, market, side, field, value,
+):
+    order = plan(market=market, side=side)
+    setattr(order, field, value)
+    risk_guard = guard()
+    monkeypatch.setattr(risk_guard, "_equity", lambda _: pytest.fail("invalid order reached equity"))
+
+    decision = risk_guard.check(order, PortfolioContext(cash=1_000.0), tmp_path / "audit.jsonl")
+
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert field in decision.reason
+    assert "finite and positive" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "cost,leverage,quantity,price,expected_reason",
+    [
+        # every input is finite and positive; the PRODUCT overflows
+        (1e308, 2.0, 1e308, 1.0, "notional must be finite and positive"),
+        # every input is finite and positive; the PRODUCT underflows to zero
+        (1e-200, 1e-200, 1.0, 1.0, "notional must be finite and positive"),
+        # cost*leverage is valid, but quantity*estimated_price underflows
+        (1.0, 1.0, 1e-200, 1e-200, "actual notional must be finite and positive"),
+    ],
+)
+def test_invalid_computed_notional_is_rejected_without_equity(
+    tmp_path, cost, leverage, quantity, price, expected_reason,
+):
+    order = plan(cost=cost, market="derivatives", leverage=leverage, quantity=quantity)
+    order.estimated_price = price
+    decision = guard().check(order, None, tmp_path / "audit.jsonl")
+
+    assert decision.allowed is False
+    assert expected_reason in decision.reason
+
+
+def test_non_finite_risk_caps_fail_closed_even_if_updated_after_construction(tmp_path):
+    invalid_caps = (
+        "max_daily_loss_pct",
+        "max_position_pct_per_asset",
+        "max_total_exposure_pct",
+        "max_derivatives_leverage",
+        "max_derivatives_exposure_pct",
+    )
+    for field in invalid_caps:
+        with pytest.raises(ValidationError):
+            RiskLimits(**{field: float("nan")})
+        limits = RiskLimits().model_copy(update={field: float("nan")})
+        decision = RiskGuard(limits=limits).check(
+            plan(cost=1.0, market="derivatives", leverage=100.0, quantity=0.01),
+            PortfolioContext(cash=1_000.0),
+            tmp_path / f"{field}.jsonl",
+        )
+        assert decision.allowed is False, field
+        assert "invalid risk limits" in decision.reason.lower(), field
+
+
+def test_risk_limit_assignment_rejects_non_finite_value():
+    limits = RiskLimits()
+    with pytest.raises(ValidationError):
+        limits.max_derivatives_leverage = float("nan")
+
+
+def test_quantity_and_cost_notional_must_match_before_risk_caps(tmp_path):
+    from tradingagents.execution.sizing import PlannedOrder
+
+    order = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy",
+        market="derivatives", side="buy", quantity=1_000.0,
+        estimated_price=100.0, cost=1.0, leverage=1.0,
+    )
+    decision = RiskGuard(limits=RiskLimits(
+        max_derivatives_leverage=10.0,
+        max_derivatives_exposure_pct=10_000.0,
+        max_position_pct_per_asset=10_000.0,
+        max_total_exposure_pct=10_000.0,
+    )).check(order, PortfolioContext(cash=1_000.0), tmp_path / "audit.jsonl")
+
+    assert decision.allowed is False
+    assert "quantity" in decision.reason.lower()
+    assert "cost" in decision.reason.lower()
+
+
 
 
 def test_default_guard_refuses_a_derivatives_short(tmp_path, monkeypatch):
@@ -588,24 +909,113 @@ def test_derivatives_short_within_raised_caps_passes(tmp_path, monkeypatch):
 
 
 def test_derivatives_per_asset_cap_uses_notional_not_margin(tmp_path, monkeypatch):
-    # Margin 200 at 10x is only 20% of equity on a cost basis, but it moves
-    # 2000 of the asset (200% of equity): the per-asset cap must read the
-    # notional for derivatives and refuse (spot keeps the cost basis --
-    # deliberate change from the earlier margin reading).
     freeze(monkeypatch, FROZEN_NOW)
-    audit = tmp_path / "audit.jsonl"
     limits = RiskLimits(
         max_derivatives_leverage=10.0,
-        max_derivatives_exposure_pct=1000.0,
-        max_total_exposure_pct=1000.0,
+        max_derivatives_exposure_pct=1_000.0,
+        max_position_pct_per_asset=100.0,
+        max_total_exposure_pct=1_000.0,
     )
+
     decision = guard(limits).check(
         plan(cost=200.0, market="derivatives", leverage=10.0),
         PortfolioContext(cash=1_000.0),
-        audit,
+        tmp_path / "audit.jsonl",
     )
+
     assert decision.allowed is False
     assert "per-asset" in decision.reason
+
+
+def test_derivatives_per_asset_cap_includes_existing_futures_position(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    limits = RiskLimits(
+        max_derivatives_leverage=3.0,
+        max_derivatives_exposure_pct=100.0,
+        max_position_pct_per_asset=30.0,
+        max_total_exposure_pct=100.0,
+    )
+    book = PortfolioContext(
+        cash=1_000.0,
+        positions=[
+            Position(
+                ticker="BTC-USD", quantity=0.5, mark_price=500.0,
+                notional=250.0, notional_currency="USDT", market="derivatives",
+            )
+        ],
+        currency="USDT",
+    )
+
+    decision = guard(limits, prices={"BTC-USD": 500.0}).check(
+        plan(cost=100.0, ticker="BTC-USD", market="derivatives", leverage=1.0),
+        book,
+        tmp_path / "audit.jsonl",
+    )
+
+    assert decision.allowed is False
+    assert "per-asset" in decision.reason
+
+
+def test_derivatives_total_and_derivatives_caps_include_existing_positions(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    book = PortfolioContext(
+        cash=1_000.0,
+        positions=[
+            Position(
+                ticker="ETH-USD", quantity=-0.5, mark_price=500.0,
+                notional=250.0, notional_currency="USDT", market="derivatives",
+            )
+        ],
+        currency="USDT",
+    )
+    total_limited = guard(RiskLimits(
+        max_derivatives_leverage=3.0,
+        max_derivatives_exposure_pct=100.0,
+        max_position_pct_per_asset=100.0,
+        max_total_exposure_pct=30.0,
+    )).check(
+        plan(cost=100.0, market="derivatives", leverage=1.0),
+        book,
+        tmp_path / "total.jsonl",
+    )
+    derivatives_limited = guard(RiskLimits(
+        max_derivatives_leverage=3.0,
+        max_derivatives_exposure_pct=30.0,
+        max_position_pct_per_asset=100.0,
+        max_total_exposure_pct=100.0,
+    )).check(
+        plan(cost=100.0, market="derivatives", leverage=1.0),
+        book,
+        tmp_path / "derivatives.jsonl",
+    )
+
+    assert total_limited.allowed is False
+    assert "total exposure" in total_limited.reason
+    assert derivatives_limited.allowed is False
+    assert "derivatives notional" in derivatives_limited.reason
+
+
+def test_spot_equity_still_marks_spot_positions_and_derivative_positions_do_not_add_equity(
+    tmp_path, monkeypatch,
+):
+    freeze(monkeypatch, FROZEN_NOW)
+    spot_book = PortfolioContext(
+        cash=1_000.0,
+        positions=[Position(ticker="BTC-USD", quantity=1.0)],
+    )
+    futures_book = PortfolioContext(
+        cash=1_000.0,
+        positions=[Position(
+            ticker="BTC-USD", quantity=1.0, mark_price=500.0,
+            notional=500.0, market="derivatives",
+        )],
+    )
+
+    spot_equity = guard(prices={"BTC-USD": 500.0})._equity(spot_book)
+    futures_equity = guard(prices={"BTC-USD": 500.0})._equity(futures_book)
+
+    assert spot_equity == pytest.approx(1_500.0)
+    assert futures_equity == pytest.approx(1_000.0)
 
 
 def test_leverage_cap_enforced_even_without_portfolio(tmp_path, monkeypatch):
@@ -677,6 +1087,48 @@ def test_corrupt_lines_are_skipped(tmp_path, monkeypatch):
     audit.write_text("not json\n{\"event\": \"halt\"}\n", encoding="utf-8")  # no timestamp either
     decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit)
     assert decision.allowed is True  # unparseable/unusable lines cannot fabricate a halt
+
+
+@pytest.mark.parametrize("field", ["qty", "price_est"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_audit_values_cannot_disarm_the_daily_loss_cap(
+    tmp_path, monkeypatch, field, value,
+):
+    # Python's json module accepts NaN/Infinity literals. Carrying one into
+    # the FIFO replay makes every P&L comparison false (NaN) and would skip
+    # the daily-loss halt; an unusable numeric line must be skipped exactly
+    # like corrupt JSON.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    bogus = {
+        "timestamp": ts(FROZEN_NOW, hour=7), "ticker": "BTC-USD",
+        "action": "buy", "qty": 2.0, "price_est": 100.0,
+    }
+    bogus[field] = value
+    write_events(audit, [
+        bogus,
+        event("buy", 2.0, 100.0, hour=8),
+        event("sell", 2.0, 70.0, hour=9),  # -60 = 6% of 1000 > 5%
+    ])
+    decision = guard(prices={"BTC-USD": 70.0}).check(
+        plan(), PortfolioContext(cash=1_000.0), audit,
+    )
+    assert decision.halted is True
+    assert "daily loss" in decision.reason
+
+
+def test_overflowing_daily_pnl_refuses_fail_closed(tmp_path, monkeypatch):
+    # Finite audit inputs can still overflow in the P&L arithmetic; a
+    # non-finite P&L must refuse rather than skip the loss comparisons.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    write_events(audit, [event("buy", 1e308, 1e-308, hour=8)])
+    decision = guard(prices={"BTC-USD": 1e308}).check(
+        plan(), PortfolioContext(cash=1_000.0), audit,
+    )
+    assert decision.allowed is False
+    assert decision.halted is False
+    assert "daily P&L is not finite" in decision.reason
 
 
 def test_price_of_exceptions_are_treated_as_no_price(tmp_path, monkeypatch):

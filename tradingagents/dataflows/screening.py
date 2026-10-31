@@ -26,7 +26,9 @@ with human-readable ``reasons``. Point-in-time integrity holds because
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
@@ -122,7 +124,36 @@ def _public_exchange(config: dict):
     return exchange
 
 
-def crypto_universe(config: dict, top_n: int) -> list[str]:
+def _futures_bases(exchange: Any, quote: str) -> set[str]:
+    """Bases with an active ``quote``-quoted, ``quote``-settled contract.
+
+    Discovery ranks by *spot* volume, but a futures cycle can only trade a
+    base with a real contract. Without this filter the pool fills with live
+    spot pairs that have no perpetual (SOXLB, SNDKB, MCLB...), and every one
+    of them burns a market-phase cycle before being rejected.
+    """
+    markets = exchange.load_markets()
+    if not isinstance(markets, dict):
+        raise VendorError("futures metadata unavailable: exchange returned no market map")
+    bases: set[str] = set()
+    for market in markets.values():
+        if not isinstance(market, dict):
+            continue
+        if market.get("contract") is not True or market.get("active") is False:
+            continue
+        if str(market.get("type") or "").lower() not in {"swap", "future"}:
+            continue
+        if str(market.get("quote") or "").upper() != quote:
+            continue
+        if str(market.get("settle") or "").upper() != quote:
+            continue
+        base = str(market.get("base") or "").upper()
+        if base:
+            bases.add(base)
+    return bases
+
+
+def crypto_universe(config: dict, top_n: int, *, futures_only: bool = False) -> list[str]:
     """Top ``top_n`` liquid crypto as pipeline tickers (``BTC-USD`` form).
 
     Public exchange data only — no credentials are read or sent. The ranking
@@ -131,12 +162,22 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
     set does not know are kept: the OHLCV vendor resolves any Yahoo-listed
     ``BASE-USD`` and the bridge plans through ``exec_symbol_overrides`` if one
     of them ever earns a plan.
+
+    ``futures_only`` keeps only bases the venue actually quotes a contract for
+    (active swap/future, same quote and settle currency). A futures cycle can
+    trade nothing else, so spot-only bases are pure noise there and used to
+    burn a market-phase cycle each. It is opt-in: the spot and stock paths pass
+    the same config with derivatives armed and must keep seeing spot pairs.
     """
     exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
 
     try:
         exchange = _public_exchange(config)
         tickers = exchange.fetch_tickers()
+        quote = str(config.get("exec_quote_currency") or "USDT").strip().upper()
+        tradable = _futures_bases(exchange, quote) if futures_only else None
+    except VendorError:
+        raise
     except Exception as exc:  # noqa: BLE001 — any ccxt/network failure degrades
         raise VendorError(f"crypto universe unavailable via {exchange_id}: {exc}") from exc
 
@@ -151,6 +192,8 @@ def crypto_universe(config: dict, top_n: int) -> list[str]:
         except (TypeError, ValueError):
             continue
         if base in _STABLECOIN_BASES or quote_volume < MIN_CRYPTO_QUOTE_VOLUME_USD:
+            continue
+        if tradable is not None and base.upper() not in tradable:
             continue
         ranked.append((f"{base}-USD", quote_volume))
 
@@ -380,17 +423,23 @@ def screen_universe(
     curr_date: str,
     top_n: int,
     lookback: int = 20,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict]:
     """Rank both universes by screen score; return the top ``top_n`` as dicts.
 
     Tickers keep the asset type of the universe they came from — that type
     decides the LLM analysts and the advisory/plan path downstream. Each
-    universe shares its class benchmark for the relative-strength bonus.
+    universe shares its class benchmark for the relative-strength bonus. When
+    ``cancel_event`` is set, stop before beginning the next asset/ticker.
     """
     candidates: list[Candidate] = []
     for asset_type, tickers in (("crypto", crypto), ("stock", stocks)):
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         benchmark = _benchmark_momentum(asset_type, curr_date, lookback)
         for ticker in tickers:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             candidate = screen_one(
                 ticker, curr_date, asset_type=asset_type,
                 benchmark_momentum=benchmark, lookback=lookback,

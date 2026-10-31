@@ -35,6 +35,7 @@ import {
 
 import type {
   FuturesPortfolio,
+  FuturesPosition,
   PortfolioPayload,
   PortfolioPosition,
 } from "./contract";
@@ -103,6 +104,34 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
       <dd className="truncate text-base font-semibold tabular-nums">{children}</dd>
     </div>
   );
+}
+
+/** Số giờ đã giữ vị thế: "12.3h"; thiếu/không hợp lệ → null. */
+function formatHeldHours(value: number | null | undefined): string | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return `${value.toFixed(1)}h`;
+}
+
+/** Phí khứ hồi ước tính, luôn mang dấu trừ vì đây là chi phí: "-0.27$". */
+function formatRoundTripFee(value: number | null | undefined): string | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return `-${Math.abs(value).toFixed(2)}$`;
+}
+
+/** Funding ròng: "funding +0.54$" / "funding -0.54$" / "funding +0.00$"; null = chưa đọc được. */
+function formatFunding(value: number | null | undefined): string | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return `funding ${value > 0 ? "+" : value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)}$`;
+}
+
+/** Cột "Giữ / phí": thời gian giữ · phí khứ hồi · funding; thiếu hết → "—". */
+function heldAndCostText(position: FuturesPosition): string {
+  const parts = [
+    formatHeldHours(position.held_hours),
+    formatRoundTripFee(position.round_trip_fee_usdt),
+    formatFunding(position.funding_usdt),
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : "—";
 }
 
 function PositionRow({ position, currency }: { position: PortfolioPosition; currency: string }) {
@@ -207,6 +236,7 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
                 <th scope="col" className="py-2 pr-3 text-right font-medium">Notional</th>
                 <th scope="col" className="py-2 pr-3 text-right font-medium">Margin</th>
                 <th scope="col" className="py-2 pr-3 text-right font-medium">Đòn bẩy</th>
+                <th scope="col" className="py-2 pr-3 text-right font-medium">Giữ / phí</th>
                 <th scope="col" className="py-2 text-right font-medium">Lãi/lỗ chưa chốt</th>
               </tr>
             </thead>
@@ -224,6 +254,7 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
                   <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.notional, position.notional_currency)}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.margin, position.margin_currency)}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{position.leverage != null ? `${formatQuantityValue(position.leverage)}x` : "—"}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{heldAndCostText(position)}</td>
                   <td className={`py-2 text-right tabular-nums ${position.unrealized_pnl != null ? pnlTextClass(position.unrealized_pnl) : ""}`}>
                     {position.unrealized_pnl != null ? formatSignedCurrency(position.unrealized_pnl, position.unrealized_pnl_currency ?? "") : "—"}
                   </td>
@@ -237,6 +268,10 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
       )}
       <p className="text-xs text-muted-foreground">
         Notional là giá trị danh nghĩa, margin là tài sản ký quỹ; cả hai không phải tiền lãi hay dòng tiền đã nhận.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        Cột “Giữ / phí” là chi phí ước tính để tham khảo — phí khứ hồi và funding
+        không phải số tiền đã bị trừ khỏi số dư trong snapshot này.
       </p>
     </section>
   );

@@ -46,8 +46,16 @@ RISK_ANALYSIS_PATH_MAP = {
 
 
 def _tools_or_done(state) -> str:
-    """Route an analyst's turn: run its tool calls, or finish with its report."""
-    return "tools" if state["messages"][-1].tool_calls else END
+    """Route an analyst's turn: run its tool calls, or finish with its report.
+
+    ``tool_calls`` is read with ``getattr`` because not every turn has it: a
+    provider answering with ``role="tool"`` becomes a ``ToolMessage``, which
+    carries ``tool_call_id`` but no ``tool_calls``. Reading the attribute
+    directly raised ``AttributeError`` inside a live cycle. A turn that cannot
+    express tool calls is treated as the end of the analyst's turn, so the graph
+    records the report instead of dying.
+    """
+    return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
 
 
 def _analyst_graph(spec, agent, max_tool_rounds: int):

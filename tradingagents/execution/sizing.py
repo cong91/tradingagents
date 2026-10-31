@@ -135,8 +135,15 @@ def compute(
         quantity = cost / price
     elif signal in (_SELL, _UNDERWEIGHT):
         position = book.position_in(ticker)
-        if position is None or position.quantity <= 0:
-            return no_order("no position to close/reduce")
+        # quantity is nullable (derivatives books report notional instead);
+        # a spot close/reduce cannot be sized from an unknown unit count and
+        # must come back as a refused plan, never a TypeError.
+        if position is None or position.quantity is None or position.quantity <= 0:
+            return no_order(
+                "held position has no usable quantity"
+                if position is not None and position.quantity is None
+                else "no position to close/reduce"
+            )
         if price is None or price <= 0:
             return no_order("price unavailable")
         fraction = 1.0 if signal == _SELL else rules.underweight_fraction

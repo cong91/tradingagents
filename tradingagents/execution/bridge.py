@@ -135,11 +135,14 @@ def _default_exchange_factory(
     secret = os.environ.get(secret_env, "")
     if exchange_id == "binance" and (not api_key or not secret):
         raise RuntimeError(f"missing exchange credentials: {key_env} and {secret_env}")
-    client = klass({
-        "apiKey": api_key,
-        "secret": secret,
-        "enableRateLimit": True,
-    })
+    options: dict = {"apiKey": api_key, "secret": secret, "enableRateLimit": True}
+    if exchange_id == "binance":
+        # Binance rejects a signed request whose timestamp is more than its
+        # recvWindow ahead of server time (-1021). A host clock drifting even
+        # ~1s breaks every private call (balance, orders), so let ccxt measure
+        # the offset once per process and sign with the corrected clock.
+        options["options"] = {"adjustForTimeDifference": True}
+    client = klass(options)
     if exchange_id == "binance":
         if profile == "demo":
             enable_demo_trading = getattr(client, "enable_demo_trading", None)

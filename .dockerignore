@@ -18,3 +18,12 @@ docker-compose.yml
 server/data
 # Archived legacy stores kept for reference outside the build context.
 archive
+# Frontend builds ship in their own image; keep their dependencies out of the API.
+**/node_modules
+**/.next
+# Local diagnostics must not be copied into the application image.
+_*.py
+_*.json
+_*.txt
+*.log
+nul

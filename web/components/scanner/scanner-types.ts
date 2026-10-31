@@ -144,10 +144,34 @@ export interface FuturesCyclePayload {
   /** Nguyên văn quyết định của Quản lý danh mục (Rating / Thesis / Execution
    *  Intent) — lý do con người đọc được vì sao chu kỳ bị từ chối hoặc vào lệnh. */
   agent_decision_note?: string | null;
-  /** Lý do no_order từ kế hoạch (Hold, minimum, risk refusal...). */
+  /** Redacted typed Trader output used for audit classification. */
+  trader_decision?: {
+    action?: "Buy" | "Hold" | "Sell" | null;
+    futures_execution_intent?: string | null;
+    futures_execution_proposal_present?: boolean;
+    structured_output?: boolean;
+  };
+  /** Redacted typed Portfolio Manager output used for audit classification. */
+  pm_decision?: {
+    rating?: string | null;
+    futures_execution_intent?: string | null;
+    futures_execution_status?: string | null;
+    futures_execution_proposal_present?: boolean;
+    structured_output?: boolean;
+  };
+  effective_caps?: Record<string, number>;
+  proposal_validation?: { valid?: boolean; reason?: string | null };
+  risk_guard?: { allowed?: boolean | null; halted?: boolean | null; reason?: string | null };
+  risk_guard_decisions?: Array<{ stage?: string; allowed?: boolean; halted?: boolean; reason?: string | null }>;
+  phase_timestamps?: Record<string, string>;
+  failure_reason?: string | null;
+  /** Lý do plan bị từ chối / không sinh lệnh (từ PlannedOrder.reason). */
   plan_reason?: string | null;
-  /** executed | awaiting_approval | not_executed | failed */
+  agent_proposal?: Record<string, string | number | null>;
+  /** executed | awaiting_approval | risk_rejected | not_executed | failed */
   execution_status?: string | null;
+  /** Lý do ở bước thực thi (chờ duyệt / risk từ chối) — rev 8. */
+  execution_reason?: string | null;
   reason?: string | null;
   reason_code?: string | null;
   candidates?: FuturesCycleCandidate[];
@@ -188,12 +212,18 @@ export interface FuturesCyclePayload {
   skipped_reason?: string | null;
 }
 
-/** Phễu kết quả mọi chu kỳ đã ghi nhận (GET /api/autoloop/cycles). */
+/** Phễu kết quả mọi chu kỳ đã ghi nhận (GET /api/autoloop/cycles).
+ *  `entered` chỉ đếm chu kỳ có xác nhận thực thi (execution_status=executed);
+ *  chờ duyệt / risk từ chối / không có lệnh / thực thi lỗi là các bucket riêng. */
 export interface FuturesCycleSummary {
   market_rejected: number;
   confirmation_rejected: number;
   proposal_rejected: number;
   entered: number;
+  awaiting_approval: number;
+  risk_rejected: number;
+  not_executed: number;
+  execution_failed: number;
   in_flight: number;
   interrupted: number;
   other: number;
@@ -205,12 +235,27 @@ export interface FuturesCycleSymbolRollup {
   symbol: string;
   total: number;
   entered: number;
+  awaiting_approval: number;
+  risk_rejected: number;
+  not_executed: number;
+  execution_failed: number;
   proposal_rejected: number;
   confirmation_rejected: number;
   market_rejected: number;
   in_flight: number;
   interrupted: number;
+  /** Chu kỳ không rơi vào bucket nào đã đặt tên (legacy mù, tự mâu thuẫn…). */
+  other: number;
   last_updated: string;
+  /** status/phase/execution_status của chu kỳ mới nhất — để hiển thị đúng
+   *  kết quả thay vì suy ra từ signal_reason. */
+  last_status: string | null;
+  last_phase: string | null;
+  last_execution_status: string | null;
+  /** Chuỗi boolean payload ('true'/'false'/'') của chu kỳ mới nhất — '' khi
+   *  chu kỳ cũ không ghi trường executed; 'false' phủ nhận đã vào lệnh. */
+  last_executed: string | null;
+  last_execution_reason: string | null;
   last_signal: string | null;
   last_signal_reason: string | null;
   last_market_rejection_reason: string | null;

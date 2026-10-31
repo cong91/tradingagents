@@ -136,6 +136,8 @@ def test_portfolio_manager_emits_explicit_abstain_intent_without_terms():
     assert "manage_existing" in result["final_trade_decision"]
 
 
+@pytest.mark.unit
+def test_portfolio_manager_surfaces_explicit_enter_with_complete_terms():
     from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 
     risk = {
@@ -182,6 +184,130 @@ def test_portfolio_manager_emits_explicit_abstain_intent_without_terms():
     assert result["futures_execution_intent"] == "enter"
     assert result["futures_execution_status"] == "structured"
     assert "Futures equity: 1000 USDT" in str(structured.invoke.call_args.args[0])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rating", [PortfolioRating.SELL, PortfolioRating.UNDERWEIGHT])
+def test_portfolio_manager_sell_rating_with_explicit_enter_is_not_suppressed(rating):
+    """Underweight/Sell are investment ratings, never automatic short-entry
+    instructions — but an explicit enter with a complete proposal must surface
+    a short entry (not be silently converted to abstain)."""
+    proposal = FuturesExecutionProposal(
+        margin_mode="isolated",
+        leverage=2,
+        risk_fraction=0.005,
+        margin_fraction=0.2,
+        stop_loss=108,
+        take_profit=96,
+        rationale="Bearish 1h/4h confirmation; stop above the ATR bracket; funding carry favors a short.",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=rating,
+        executive_summary="Short the confirmed breakdown.",
+        investment_thesis="Risk debate supports the short; terms are inside the caps.",
+        futures_execution=proposal,
+        futures_execution_intent="enter",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": {
+            "history": "h", "aggressive_history": "a", "conservative_history": "c",
+            "neutral_history": "n", "current_aggressive_response": "",
+            "current_conservative_response": "", "current_neutral_response": "",
+            "latest_speaker": "Aggressive", "count": 3,
+        },
+        "investment_plan": "Fade the confirmed breakdown.",
+        "trader_investment_plan": "Trader proposes the short.",
+    })
+
+    assert result["futures_execution_intent"] == "enter"
+    assert result["futures_execution_proposal"] == proposal.model_dump()
+    assert result["futures_execution_proposal"]["stop_loss"] == 108
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rating", [PortfolioRating.SELL, PortfolioRating.UNDERWEIGHT])
+def test_portfolio_manager_sell_rating_without_explicit_enter_surfaces_no_proposal(rating):
+    """The mirror guard: an Underweight/Sell rating alone never authorizes an
+    entry — without explicit enter intent no proposal is surfaced, so the
+    autoloop's intent gate (not the rating) decides to short."""
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=rating,
+        executive_summary="Reduce existing exposure only.",
+        investment_thesis="No defensible new futures entry.",
+        futures_execution_intent="abstain",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT; available margin: 700 USDT.",
+        "risk_debate_state": {
+            "history": "h", "aggressive_history": "a", "conservative_history": "c",
+            "neutral_history": "n", "current_aggressive_response": "",
+            "current_conservative_response": "", "current_neutral_response": "",
+            "latest_speaker": "Conservative", "count": 3,
+        },
+        "investment_plan": "Reduce exposure if already held.",
+        "trader_investment_plan": "Do not open a new short.",
+    })
+
+    assert result["futures_execution_intent"] == "abstain"
+    assert result["futures_execution_proposal"] == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("execution_context", [None, "", "   "])
+def test_portfolio_manager_missing_or_insufficient_futures_context_defaults_to_abstain(
+    execution_context,
+):
+    """Missing/blank account context means no decision context was supplied:
+    the node must not forward an enter authorization the agents could not
+    have grounded — it falls back to abstain even when the typed decision
+    asked to enter."""
+    proposal = FuturesExecutionProposal(
+        margin_mode="isolated", leverage=1, risk_fraction=0.005,
+        margin_fraction=0.1, rationale="Only possible with account context.",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = PortfolioDecision(
+        rating=PortfolioRating.BUY,
+        executive_summary="x", investment_thesis="y",
+        futures_execution=proposal,
+        futures_execution_intent="enter",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+
+    state = {
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "risk_debate_state": {
+            "history": "h", "aggressive_history": "a", "conservative_history": "c",
+            "neutral_history": "n", "current_aggressive_response": "",
+            "current_conservative_response": "", "current_neutral_response": "",
+            "latest_speaker": "Neutral", "count": 3,
+        },
+        "investment_plan": "plan",
+        "trader_investment_plan": "trader plan",
+    }
+    if execution_context is not None:
+        state["execution_context"] = execution_context
+
+    result = create_portfolio_manager(llm)(state)
+
+    assert result["futures_execution_intent"] == "abstain"
+    assert result["futures_execution_proposal"] == {}
+    assert result["futures_execution_status"] == "not_applicable"
 
 
 @pytest.mark.unit

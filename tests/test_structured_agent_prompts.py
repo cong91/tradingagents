@@ -107,6 +107,60 @@ def test_portfolio_manager_prompt_states_constraint():
 
 
 @pytest.mark.unit
+def test_portfolio_manager_prompt_states_symmetric_enter_criteria():
+    """The futures paragraph must give the model positive, symmetric enter
+    criteria (direction, executable bracket, reward/risk with funding, caps)
+    instead of a list of reasons to withhold: a qualifying setup should end
+    in an explicit enter, and Underweight/Sell must be a symmetric short
+    authorization — not an automatic one, and not an abstain trigger."""
+    from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
+
+    captured = {}
+    llm = _capturing_llm(
+        captured,
+        PortfolioDecision(rating=PortfolioRating.BUY, executive_summary="x",
+                          investment_thesis="y", futures_execution_intent="enter"),
+    )
+    risk = {
+        "history": "h", "aggressive_history": "a", "conservative_history": "c",
+        "neutral_history": "n", "current_aggressive_response": "",
+        "current_conservative_response": "", "current_neutral_response": "",
+        "latest_speaker": "Neutral", "count": 1,
+    }
+    create_portfolio_manager(llm)({
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "execution_context": "Futures equity: 1000 USDT",
+        "risk_debate_state": risk,
+        "investment_plan": "plan",
+        "trader_investment_plan": "trader plan",
+    })
+    text = _prompt_text(captured["prompt"])
+
+    # Positive enter criteria, symmetric across directions.
+    assert "the bar is symmetric for longs and shorts" in text
+    assert "Buy/Overweight is a fresh long" in text
+    assert "Sell/Underweight is a fresh short" in text
+    assert "neither rating alone is an entry instruction" in text
+    assert "closed 1h and 4h candles" in text
+    assert "mark price and engine ATR brackets" in text
+    # A missing bracket is named, not silently dropped: it shifts the bracket
+    # duty to the agent's own proposal instead of reading as criterion-2 fail.
+    assert "propose your own stop and take-profit together" in text
+    assert "an unavailable bracket is not an automatic abstain" in text
+    assert "funding cost" in text
+    assert "available margin" in text
+    # No default abstain: a qualifying setup must enter; abstain must name
+    # the failed criterion.
+    assert "must not default to abstain" in text
+    assert "say which one" in text
+    # Explicit intents stay named; prose is never parsed into an order.
+    assert "manage_existing" in text
+    assert "abstain" in text
+    assert "Never put execution terms only in prose" in text
+
+
+@pytest.mark.unit
 def test_sentiment_prompt_states_constraint(monkeypatch):
     from tradingagents.agents.schemas import SentimentBand, SentimentReport
 

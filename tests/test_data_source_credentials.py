@@ -101,25 +101,127 @@ class TestStore:
         # The engine must serve the new cookies immediately, without a restart.
         assert credentials.cookie_header("reddit") == "reddit_session=s"
 
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_saving_x_preserves_encrypted_cookies_and_pushes_to_engine(self, monkeypatch, wrapped):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        cookies = {"auth_token": "session-secret", "ct0": "csrf-secret"}
+        payload = {"cookies": cookies} if wrapped else cookies
+
+        summary = data_source_credentials.save_credentials("x", payload, updated_by="operator")
+
+        assert summary["configured"] is True
+        assert summary["valid"] is True
+        assert summary["cookie_count"] == 2
+        assert summary["updated_by"] == "operator"
+        secret = database.rows["x"]["secret"]
+        assert all(value not in secret for value in cookies.values())
+        assert data_source_credentials.load_credentials("x") == {"cookies": cookies, "options": {}}
+        assert credentials.cookies_for("x") == cookies
+        assert credentials.options_for("x") == {}
+
     def test_a_read_never_returns_a_cookie_value(self, monkeypatch):
         monkeypatch.setattr(data_source_credentials, "db", _FakeDb())
         data_source_credentials.save_credentials(
-            "x", [{"name": "auth_token", "value": "secret-value"}],
-            options={"graphql_query_id": "abc123"},
+            "x", [{"name": "auth_token", "value": "secret-value"},
+                  {"name": "ct0", "value": "csrf-value"}],
         )
         summary = data_source_credentials.summary_for("x")
         serialized = json.dumps(summary, ensure_ascii=False)
         assert "secret-value" not in serialized
-        assert "auth_token" in summary["cookie_names"]
-        assert summary["option_keys"] == ["graphql_query_id"]
+        assert "csrf-value" not in serialized
+        assert summary["cookie_names"] == ["auth_token", "ct0"]
+        assert not {"option_keys", "secret_options", "supported_options"}.intersection(summary)
 
-    def test_a_bearer_token_counts_as_a_configured_secret_option(self, monkeypatch):
-        monkeypatch.setattr(data_source_credentials, "db", _FakeDb())
-        summary = data_source_credentials.save_credentials(
-            "x", None, options={"bearer_token": "tok-SECRET-VALUE-123"},
-        )
-        assert summary["secret_options"] == ["bearer_token"]
-        assert "tok-SECRET-VALUE-123" not in json.dumps(summary)
+    @pytest.mark.parametrize("option", ["bearer_token", "graphql_query_id"])
+    def test_obsolete_x_options_are_refused(self, monkeypatch, option):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        with pytest.raises(ValueError, match="not supported"):
+            data_source_credentials.save_credentials(
+                "x", {"auth_token": "session", "ct0": "csrf"},
+                options={option: "obsolete-value"},
+            )
+        assert database.rows == {}
+        assert credentials.is_configured("x") is False
+
+    @pytest.mark.parametrize("cookies", [
+        None,
+        {},
+        [],
+        {"auth_token": "session"},
+        {"ct0": "csrf"},
+        {"auth_token": "", "ct0": "csrf"},
+        {"auth_token": "session", "ct0": ""},
+        {"auth_token": " \t", "ct0": "csrf"},
+        {"auth_token": "session", "ct0": " \n"},
+    ])
+    def test_x_requires_both_session_cookies(self, monkeypatch, cookies):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        with pytest.raises(ValueError, match="auth_token.*ct0"):
+            data_source_credentials.save_credentials("x", cookies)
+        assert database.rows == {}
+        assert credentials.is_configured("x") is False
+
+    def test_an_invalid_x_save_preserves_the_stored_cookies(self, monkeypatch):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        cookies = {"auth_token": "session", "ct0": "csrf"}
+        data_source_credentials.save_credentials("x", cookies)
+        saved = dict(database.rows["x"])
+
+        with pytest.raises(ValueError, match="auth_token.*ct0"):
+            data_source_credentials.save_credentials("x", {"auth_token": "replacement"})
+
+        assert database.rows["x"] == saved
+        assert credentials.cookies_for("x") == cookies
+
+    @pytest.mark.parametrize("cookies", [
+        {},
+        {"auth_token": "session"},
+        {"ct0": "csrf"},
+        {"auth_token": "", "ct0": "csrf"},
+        {"auth_token": "session", "ct0": " \t"},
+    ])
+    def test_incomplete_stored_x_cookies_are_not_reported_valid(self, monkeypatch, cookies):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        secret = credential_vault.encrypt_json({
+            "cookies": cookies, "options": {"bearer_token": "obsolete-secret"},
+        })
+        database.rows["x"] = {
+            "provider": "x", "secret": secret,
+            "updated_at": "2026-10-26T00:00:00+00:00", "updated_by": None,
+        }
+
+        summary = data_source_credentials.summary_for("x")
+
+        assert summary["configured"] is True
+        assert summary["decryptable"] is True
+        assert summary["valid"] is False
+        assert not {"option_keys", "secret_options", "supported_options"}.intersection(summary)
+        assert "obsolete-secret" not in json.dumps(summary)
+        assert database.rows["x"]["secret"] == secret
+
+    def test_startup_push_preserves_stored_x_cookies_without_obsolete_options(self, monkeypatch):
+        database = _FakeDb()
+        monkeypatch.setattr(data_source_credentials, "db", database)
+        cookies = {"auth_token": "session", "ct0": "csrf"}
+        secret = credential_vault.encrypt_json({
+            "cookies": cookies,
+            "options": {"bearer_token": "obsolete-secret", "graphql_query_id": "old-id"},
+        })
+        database.rows["x"] = {
+            "provider": "x", "secret": secret,
+            "updated_at": "2026-10-26T00:00:00+00:00", "updated_by": None,
+        }
+
+        assert data_source_credentials.push_to_engine() == []
+        assert credentials.cookies_for("x") == cookies
+        assert credentials.options_for("x") == {}
+        assert data_source_credentials.summary_for("x")["valid"] is True
+        assert database.rows["x"]["secret"] == secret
 
     def test_empty_credentials_are_refused(self, monkeypatch):
         monkeypatch.setattr(data_source_credentials, "db", _FakeDb())
@@ -143,6 +245,9 @@ class TestStore:
         items = data_source_credentials.summaries()
         assert {item["provider"] for item in items} == set(credentials.PROVIDERS)
         assert all(item["configured"] is False for item in items)
+        assert all(item["valid"] is False for item in items)
+        assert all(not {"option_keys", "secret_options", "supported_options"}.intersection(item)
+                   for item in items)
 
 
 class _FakeDb:
@@ -169,6 +274,11 @@ class _FakeDb:
                         row = rows.get(params[0])
                         return _Cursor(0, [row] if row else [])
                     return _Cursor(0, list(rows.values()))
+                if normalized.startswith("SELECT provider, secret FROM data_source_credentials"):
+                    return _Cursor(0, [
+                        {"provider": row["provider"], "secret": row["secret"]}
+                        for row in rows.values()
+                    ])
                 if normalized.startswith("SELECT secret FROM data_source_credentials"):
                     row = rows.get(params[0])
                     return _Cursor(0, [{"secret": row["secret"]}] if row else [])

@@ -35,7 +35,27 @@ const FUNNEL_STEPS = [
   {
     key: "entered",
     label: "Triển khai được",
-    hint: "Đủ điều kiện vào lệnh và đã thực thi",
+    hint: "Order đã gửi lên sàn và được xác nhận thực thi (executed)",
+  },
+  {
+    key: "awaiting_approval",
+    label: "Chờ duyệt",
+    hint: "Cổng duyệt chưa mở — plan chưa được gửi lên sàn",
+  },
+  {
+    key: "risk_rejected",
+    label: "RiskGuard từ chối",
+    hint: "Guard rủi ro chặn plan trước khi sinh lệnh",
+  },
+  {
+    key: "not_executed",
+    label: "Không có lệnh",
+    hint: "Plan không sinh lệnh (sizing, budget, side rỗng…)",
+  },
+  {
+    key: "execution_failed",
+    label: "Thực thi lỗi",
+    hint: "Gửi lệnh hoặc gọi sàn gặp lỗi — chưa xác nhận khớp",
   },
 ] as const;
 
@@ -109,6 +129,10 @@ function phaseLabel(phase: string): string {
       return "Xác nhận nến";
     case "proposal":
       return "Đề xuất vào lệnh";
+    case "planning":
+      return "Lập kế hoạch";
+    case "execution":
+      return "Thực thi lệnh";
     case "entry":
       return "Vào lệnh";
     case "protection":
@@ -118,10 +142,44 @@ function phaseLabel(phase: string): string {
   }
 }
 
+/** Nhãn cho từng terminal execution outcome — entered chỉ khi payload xác nhận
+ *  order đã gửi (execution_status=executed); mọi outcome khác ghi rõ chưa vào lệnh. */
+function executionStatusLabel(payload: FuturesCyclePayload): string {
+  switch (payload.execution_status) {
+    case "awaiting_approval":
+      return `Chờ duyệt — chưa vào lệnh (${payload.execution_reason ?? "cổng duyệt chưa mở"})`;
+    case "risk_rejected":
+      return `RiskGuard từ chối plan — chưa vào lệnh (${payload.execution_reason ?? payload.plan_reason ?? "vượt trần rủi ro"})`;
+    case "not_executed":
+      return `Không có lệnh (${payload.plan_reason ?? payload.execution_reason ?? "plan không sinh lệnh"})`;
+    case "failed":
+      return `Thực thi lỗi — chưa vào lệnh (${payload.failure_reason ?? payload.error ?? "không rõ"})`;
+    default:
+      return "";
+  }
+}
+
 function cycleOutcome(cycle: FuturesCycle): string {
   const payload: FuturesCyclePayload = cycle.payload ?? {};
   if (cycle.status === "completed" && cycle.phase === "entry") {
-    return "Triển khai được — đã vào lệnh";
+    // entered chỉ khi execution_status=executed và payload không phủ định
+    // (executed=false) — khớp điều kiện DB trong job_store.futures_cycle_summary.
+    if (payload.execution_status === "executed" && payload.executed !== false) {
+      return "Triển khai được — đã vào lệnh";
+    }
+    // Chu kỳ cũ ghi completed/entry trước khi có execution_status: map rõ ràng
+    // theo outcome payload đã ghi, không suy diễn thành "đã vào lệnh".
+    return executionStatusLabel(payload) || "Hoàn tất nhưng không rõ thực thi (chu kỳ cũ)";
+  }
+  if (payload.execution_status) {
+    const outcome = executionStatusLabel(payload);
+    if (outcome) return outcome;
+  }
+  // Lỗi ở lớp ngoài (context/analysis): row failed với execution_status
+  // not_started nhưng payload vẫn ghi failure_reason — hiển thị nó thay vì
+  // rơi xuống reason chung.
+  if (cycle.status === "failed" && payload.failure_reason) {
+    return `Thực thi lỗi — chưa vào lệnh (${payload.failure_reason})`;
   }
   if (cycle.phase === "market") return marketRejectionLabel(payload.market_rejection_reason);
   if (cycle.phase === "confirmation") return confirmationLabel(payload.confirmation_reason);
@@ -133,12 +191,33 @@ function cycleOutcome(cycle: FuturesCycle): string {
   return payload.signal_reason ?? payload.reason ?? "Chưa có dữ liệu";
 }
 
-/** Một chu kỳ chỉ ghi lý do của bước nó dừng lại, nên lý do mới nhất là
- *  trường last_* duy nhất khác null trên dòng rollup. */
+/** Kết quả gần nhất của một mã, suy ra từ status/phase/execution_status của
+ *  chu kỳ mới nhất — không dùng signal_reason làm bằng chứng đã vào lệnh.
+ *  entered chỉ khi payload xác nhận thực thi VÀ không bị executed=false phủ
+ *  nhận; chu kỳ cũ thiếu trường executed ('') vẫn giữ nghĩa executed. */
 function latestOutcome(row: FuturesCycleSymbolRollup): string {
-  if (row.last_market_rejection_reason) return marketRejectionLabel(row.last_market_rejection_reason);
-  if (row.last_confirmation_reason) return confirmationLabel(row.last_confirmation_reason);
-  if (row.last_signal_reason === "tradeable_signal") return "Triển khai được — đã vào lệnh";
+  if (row.last_status === "completed" && row.last_phase === "entry"
+      && row.last_execution_status === "executed"
+      && row.last_executed !== "false") {
+    return "Triển khai được — đã vào lệnh";
+  }
+  switch (row.last_execution_status) {
+    case "awaiting_approval":
+      return "Chờ duyệt — chưa vào lệnh";
+    case "risk_rejected":
+      return `RiskGuard từ chối plan — chưa vào lệnh${row.last_execution_reason ? ` (${row.last_execution_reason})` : ""}`;
+    case "not_executed":
+      return `Không có lệnh${row.last_execution_reason ? ` (${row.last_execution_reason})` : ""}`;
+    case "failed":
+      return `Thực thi lỗi — chưa vào lệnh${row.last_execution_reason ? ` (${row.last_execution_reason})` : ""}`;
+  }
+  if (row.last_status === "failed") {
+    return `Thực thi lỗi — chưa vào lệnh${row.last_execution_reason ? ` (${row.last_execution_reason})` : ""}`;
+  }
+  if (row.last_phase === "market") return marketRejectionLabel(row.last_market_rejection_reason);
+  if (row.last_phase === "confirmation") return confirmationLabel(row.last_confirmation_reason);
+  if (row.last_phase === "proposal") return proposalLabel(row.last_signal_reason);
+  if (row.last_signal_reason === "tradeable_signal") return "Đã phân tích — xem chi tiết từng chu kỳ";
   if (row.last_signal_reason) return proposalLabel(row.last_signal_reason);
   return "Chưa có dữ liệu";
 }
@@ -146,11 +225,16 @@ function latestOutcome(row: FuturesCycleSymbolRollup): string {
 function breakdownParts(row: FuturesCycleSymbolRollup): string[] {
   const parts: string[] = [];
   if (row.entered) parts.push(`${row.entered} vào lệnh`);
+  if (row.awaiting_approval) parts.push(`${row.awaiting_approval} chờ duyệt`);
+  if (row.risk_rejected) parts.push(`${row.risk_rejected} risk từ chối`);
+  if (row.not_executed) parts.push(`${row.not_executed} không có lệnh`);
+  if (row.execution_failed) parts.push(`${row.execution_failed} thực thi lỗi`);
   if (row.proposal_rejected) parts.push(`${row.proposal_rejected} agent từ chối`);
   if (row.confirmation_rejected) parts.push(`${row.confirmation_rejected} nến chưa xác nhận`);
   if (row.market_rejected) parts.push(`${row.market_rejected} loại từ bước quét`);
   if (row.in_flight) parts.push(`${row.in_flight} đang chạy`);
   if (row.interrupted) parts.push(`${row.interrupted} gián đoạn`);
+  if (row.other) parts.push(`${row.other} khác`);
   return parts;
 }
 
@@ -269,11 +353,19 @@ export function FuturesCycleFunnel({
   symbols: FuturesCycleSymbolRollup[];
 }) {
   if (!summary) return null;
-  const extras = summary.in_flight + summary.interrupted + summary.other;
+  const extraParts = [
+    summary.in_flight ? `${summary.in_flight} đang chạy` : "",
+    summary.awaiting_approval ? `${summary.awaiting_approval} chờ duyệt` : "",
+    summary.risk_rejected ? `${summary.risk_rejected} risk từ chối` : "",
+    summary.not_executed ? `${summary.not_executed} không có lệnh` : "",
+    summary.execution_failed ? `${summary.execution_failed} thực thi lỗi` : "",
+    summary.interrupted ? `${summary.interrupted} gián đoạn` : "",
+    summary.other ? `${summary.other} khác` : "",
+  ].filter(Boolean);
 
   return (
     <div className="space-y-3">
-      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-8">
         {FUNNEL_STEPS.map((step) => (
           <div key={step.key} className="rounded-lg border p-3">
             <p className="text-lg font-semibold tabular-nums">{summary[step.key]}</p>
@@ -284,11 +376,7 @@ export function FuturesCycleFunnel({
       </div>
       <p className="text-xs text-muted-foreground">
         Tổng {summary.total} chu kỳ đã ghi nhận
-        {extras > 0
-          ? ` · ${summary.in_flight} đang chạy · ${summary.interrupted} gián đoạn${
-              summary.other ? ` · ${summary.other} khác` : ""
-            }`
-          : ""}
+        {extraParts.length > 0 ? ` · ${extraParts.join(" · ")}` : ""}
         . Click một mã để xem từng chu kỳ và lý do cụ thể.
       </p>
       {symbols.length > 0 ? (

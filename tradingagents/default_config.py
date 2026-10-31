@@ -1,3 +1,4 @@
+import math
 import os
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
@@ -68,6 +69,12 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_FIRST_FRACTION": "risk_derivatives_scale_out_first_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_R": "risk_derivatives_scale_out_second_r",
     "TRADINGAGENTS_RISK_DERIVATIVES_SCALE_OUT_SECOND_FRACTION": "risk_derivatives_scale_out_second_fraction",
+    # Cost-aware exit knobs: a time stop for positions that never reach their
+    # minimum R, and a round-trip fee that shifts the break-even stop above the
+    # raw entry so a "flat" exit does not book a loss after fees.
+    "TRADINGAGENTS_RISK_DERIVATIVES_MAX_HOLD_HOURS": "risk_derivatives_max_hold_hours",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_MIN_R": "risk_derivatives_time_stop_min_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_ROUND_TRIP_FEE_RATE": "risk_derivatives_round_trip_fee_rate",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
     "TRADINGAGENTS_EXEC_BASE_URL":                     "exec_base_url",
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
@@ -99,7 +106,10 @@ def _coerce(value: str, reference):
     if isinstance(reference, int) and not isinstance(reference, bool):
         return int(value)
     if isinstance(reference, float):
-        return float(value)
+        coerced = float(value)
+        if not math.isfinite(coerced):
+            raise ValueError(f"expected a finite number, got {value!r}")
+        return coerced
     return value
 
 
@@ -281,11 +291,17 @@ def build_default_config() -> dict:
         "risk_derivatives_risk_fraction": 0.01,
         "risk_derivatives_margin_fraction": 0.25,
         "risk_derivatives_profit_protection_enabled": True,
-        "risk_derivatives_break_even_r": 1.0,
-        "risk_derivatives_lock_profit_r": 2.0,
-        "risk_derivatives_trail_start_r": 3.0,
-        "risk_derivatives_trail_distance_r": 1.0,
+        "risk_derivatives_break_even_r": 0.5,
+        "risk_derivatives_lock_profit_r": 1.0,
+        "risk_derivatives_trail_start_r": 1.5,
+        "risk_derivatives_trail_distance_r": 0.75,
         "risk_derivatives_target_extension_r": 1.0,
+        # Cost-aware exit knobs: a time stop for positions that never reach
+        # their minimum R, and a round-trip fee that shifts the break-even stop
+        # above the raw entry so a "flat" exit does not book a loss after fees.
+        "risk_derivatives_max_hold_hours": 72.0,
+        "risk_derivatives_time_stop_min_r": 1.0,
+        "risk_derivatives_round_trip_fee_rate": 0.001,
         # Refuse tiny stop nudges that would churn conditional orders every poll,
         # and treat a venue mark older than this as unusable (no mutation).
         "risk_derivatives_min_stop_move_r": 0.1,

@@ -39,7 +39,6 @@ function ProviderCard({
 }) {
   const meta = PROVIDER_META[summary.provider];
   const [raw, setRaw] = useState("");
-  const [options, setOptions] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
 
@@ -57,7 +56,7 @@ function ProviderCard({
     }
     setBusy(true);
     try {
-      const payload = await dataSourceApi.saveCookies(summary.provider, parsed, options);
+      const payload = await dataSourceApi.saveCookies(summary.provider, parsed);
       onSaved(payload);
       setRaw("");
       setFeedback({ role: "status", text: `Đã lưu cookie ${meta.title}.` });
@@ -67,7 +66,7 @@ function ProviderCard({
     } finally {
       setBusy(false);
     }
-  }, [meta.title, onSaved, options, raw, summary.provider]);
+  }, [meta.title, onSaved, raw, summary.provider]);
 
   const remove = useCallback(async () => {
     setBusy(true);
@@ -89,12 +88,14 @@ function ProviderCard({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-medium">{meta.title}</p>
         {summary.configured ? (
-          summary.decryptable ? (
+          !summary.decryptable ? (
+            <Badge variant="destructive">Không giải mã được — import lại</Badge>
+          ) : summary.valid ? (
             <Badge variant="secondary">
               Đã cấu hình · {summary.cookie_count} cookie
             </Badge>
           ) : (
-            <Badge variant="destructive">Không giải mã được — import lại</Badge>
+            <Badge variant="destructive">Thiếu cookie bắt buộc — import lại</Badge>
           )
         ) : (
           <Badge variant="outline">Chưa cấu hình</Badge>
@@ -111,49 +112,12 @@ function ProviderCard({
             </dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">Tuỳ chọn</dt>
-            <dd className="font-mono break-all">
-              {summary.option_keys.length > 0
-                ? summary.option_keys
-                    .map((key) =>
-                      summary.secret_options.includes(key) ? `${key} (đã lưu)` : key
-                    )
-                    .join(", ")
-                : "—"}
-            </dd>
-          </div>
-          <div>
             <dt className="text-muted-foreground">Cập nhật</dt>
             <dd>
               {summary.updated_at ? formatDateTimeVi(summary.updated_at) : "—"}
             </dd>
           </div>
         </dl>
-      ) : null}
-
-      {meta.options.length > 0 ? (
-        <div className="grid gap-2 sm:grid-cols-2">
-          {meta.options.map((option) => (
-            <label key={option.key} className="block text-xs">
-              <span className="text-muted-foreground">{option.label}</span>
-              <input
-                type={option.key === "bearer_token" ? "password" : "text"}
-                value={options[option.key] ?? ""}
-                disabled={busy}
-                onChange={(event) =>
-                  setOptions((prev) => ({ ...prev, [option.key]: event.target.value }))
-                }
-                className="mt-1 h-10 w-full min-w-0 rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
-                autoComplete="off"
-              />
-              {option.hint ? (
-                <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
-                  {option.hint}
-                </span>
-              ) : null}
-            </label>
-          ))}
-        </div>
       ) : null}
 
       <label className="block text-xs">
