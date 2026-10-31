@@ -36,7 +36,7 @@ def test_position_state_can_be_linked_to_bracket_and_listed_as_active():
 
 def test_persisted_entry_state_records_opened_at():
     position_key = "BTC/USDT:USDT:buy:entry-3"
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     assert job_store.persist_futures_entry_state(
         position_key,
         side="long",
@@ -51,7 +51,7 @@ def test_persisted_entry_state_records_opened_at():
     opened_at = job_store.load_position_state(position_key)["snapshot"]["opened_at"]
     parsed = datetime.fromisoformat(opened_at)
     assert parsed.tzinfo is not None
-    assert before <= parsed <= datetime.now(timezone.utc)
+    assert before <= parsed <= datetime.now(UTC)
 
 
 def test_position_state_compare_and_swap_rejects_stale_revision():
@@ -223,7 +223,7 @@ def _resting_leg_orders():
 def _set_opened_hours_ago(position_key: str, hours: float) -> None:
     state = job_store.load_position_state(position_key)
     state["snapshot"]["opened_at"] = (
-        datetime.now(timezone.utc) - timedelta(hours=hours)
+        datetime.now(UTC) - timedelta(hours=hours)
     ).isoformat()
     assert job_store.save_position_state(position_key, state["revision"], state)
 

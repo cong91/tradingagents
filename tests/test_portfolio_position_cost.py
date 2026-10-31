@@ -2,7 +2,7 @@
 
 ``position_cost`` is pure: notional, fee rate, the venue's FUNDING_FEE income
 rows, the stored entry timestamp and "now". No database, no venue, no clock.
-The last two tests check the wiring: a funding read that fails nulls only that
+The last three tests check the wiring: a funding read that fails nulls only that
 figure and adds a warning, never the snapshot.
 """
 
@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import portfolio as portfolio_mod
-from server.portfolio import position_cost
+from server import portfolio as portfolio_mod, position_cost as position_cost_module
+from server.position_cost import position_cost
 from tradingagents.dataflows.config import set_config
 from tradingagents.portfolio import PortfolioContext
 
@@ -141,8 +141,12 @@ def _install_bridge(monkeypatch, client) -> None:
     opened = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
     state = {"position_key": "BTC/USDT:USDT:sell:42",
              "snapshot": {"side": "short", "opened_at": opened}}
-    monkeypatch.setattr(portfolio_mod.job_store, "active_position_states", lambda: [state])
-    monkeypatch.setattr(portfolio_mod.job_store, "load_position_state", lambda key: state)
+    monkeypatch.setattr(
+        position_cost_module.job_store, "active_position_states", lambda: [state]
+    )
+    monkeypatch.setattr(
+        position_cost_module.job_store, "load_position_state", lambda key: state
+    )
 
 
 def test_portfolio_fills_cost_fields_from_state_and_income(monkeypatch, tmp_path):
@@ -193,7 +197,9 @@ def test_portfolio_funding_read_failure_nulls_only_funding(monkeypatch, tmp_path
 def test_portfolio_without_a_recorded_state_leaves_cost_unknown(monkeypatch, tmp_path):
     set_config({"exec_live": True, "exec_log_path": str(tmp_path / "absent.jsonl")})
     _install_bridge(monkeypatch, object())
-    monkeypatch.setattr(portfolio_mod.job_store, "active_position_states", lambda: [])
+    monkeypatch.setattr(
+        position_cost_module.job_store, "active_position_states", lambda: []
+    )
 
     body = portfolio_mod.get_portfolio()
 
