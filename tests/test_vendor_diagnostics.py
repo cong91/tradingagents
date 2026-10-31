@@ -36,13 +36,13 @@ def test_diagnostic_scope_resets_after_span_error():
 def test_router_spans_each_attempt_with_static_stages_and_preserves_fallback(monkeypatch):
     from tradingagents.dataflows import router
     from tradingagents.dataflows.config import set_config
-    from tradingagents.dataflows.errors import VendorRateLimitError
+    from tradingagents.dataflows.errors import VendorUnavailableError
 
     observer = _Observer()
     set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
 
     def throttled(*args, **kwargs):
-        raise VendorRateLimitError("limited")
+        raise VendorUnavailableError("limited")
 
     def fallback(*args, **kwargs):
         return "fallback data"

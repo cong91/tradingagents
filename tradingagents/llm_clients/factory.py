@@ -125,8 +125,9 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
         from .openai_client import is_openai_compatible
 
         # Only the OpenAI-compatible family can speak /responses; a Google,
-        # Azure, or Bedrock tier must never receive the unknown kwarg.
-        if is_openai_compatible(provider):
+        # Azure, or Bedrock tier must never receive the unknown kwarg. An
+        # unset provider (bare config) keeps the flag application.
+        if not provider or is_openai_compatible(provider):
             kwargs["use_responses_api"] = True
 
     if provider == "google":

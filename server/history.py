@@ -11,11 +11,11 @@ from collections import Counter
 from pathlib import Path
 
 from fastapi import APIRouter, Query
-from tradingagents.decision_log import TradingMemoryLog
 
 from server.contract import ApiError, utc_now_iso
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.symbols import safe_ticker_component
+from tradingagents.memory import TradingMemoryLog
 
 router = APIRouter(prefix="/api", tags=["history"])
 

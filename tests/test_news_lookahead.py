@@ -135,8 +135,7 @@ def _ticker_with(articles, monkeypatch, search_news=(), search_quotes=("AAPL",))
 def test_empty_ticker_stream_falls_back_to_the_search_feed(monkeypatch):
     # yfinance 1.7 answers 200 with an empty ticker stream for every symbol
     # (AAPL included), so an empty stream must not be read as "no news".
-    found = [{"title": "FOUND", "publisher": "P", "link": "l",
-              "providerPublishTime": _epoch("2026-09-10")}]
+    found = [_tagged("FOUND", "2026-09-10", "AAPL")]
     _ticker_with([], monkeypatch, search_news=found)
     out = ynews.get_news_yfinance("AAPL", "2026-09-01", "2026-09-14")
     assert "FOUND" in out

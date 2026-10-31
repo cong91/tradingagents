@@ -479,7 +479,7 @@ class TradingAgentsGraph:
                     company_name, trade_date, asset_type, portfolio, execution_context,
                 )
             return final_state, run_rating(final_state)
-        elif self.debug:
+        elif getattr(self, "debug", False):
             # A state repeats the messages before it, so each prints once (#1027).
             final_state, printed = {}, set()
             for messages, state in self.stream_run(graph_input, **args):
