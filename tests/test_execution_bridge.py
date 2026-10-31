@@ -818,6 +818,8 @@ def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
                 for key, value in self.urls["api"].items()
             }
 
+    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
+    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
     monkeypatch.setattr(ccxt, "binance", FakeBinance)
     bridge = ExchangeBridge(
         config={
