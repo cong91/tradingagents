@@ -65,9 +65,9 @@ def position_cost(notional, rate, income_rows, opened_at, now) -> dict:
     ``income_rows`` are the venue's FUNDING_FEE entries already scoped to this
     position by the caller (``None`` when the read failed or the window is
     unknown), ``opened_at`` the raw stored timestamp and ``rate`` the
-    configured per-side fee rate. Anything missing or malformed stays ``None``
-    instead of becoming a guessed number: a null says "unknown", a zero would
-    claim "free".
+    configured round-trip fee rate (not per-side; see default_config.py).
+    Anything missing or malformed stays ``None`` instead of becoming a guessed
+    number: a null says "unknown", a zero would claim "free".
     """
     opened = parse_timestamp(opened_at)
 
@@ -84,7 +84,10 @@ def position_cost(notional, rate, income_rows, opened_at, now) -> dict:
     size = _finite_number(notional)
     fee_rate = _finite_number(rate)
     if size is not None and fee_rate is not None and fee_rate >= 0:
-        round_trip_fee = abs(size) * fee_rate * 2  # one side at entry, one at exit
+        # The configured rate is the round-trip total, the same number
+        # profit_protection.py places the break-even stop at entry +/-;
+        # doubling it here would report twice the fees actually charged.
+        round_trip_fee = abs(size) * fee_rate
 
     funding = None
     if income_rows is not None:

@@ -622,12 +622,17 @@ class BracketManager:
 
     def _repair(self, exchange: Any, task: dict) -> str:
         task["attempts"] += 1
+        # Legs submit at their own recorded size, capped to the contracts the
+        # venue still reports: a tranche that already filled makes the original
+        # bracket size a reduce-only over-close the venue rejects (-2022).
+        remaining = self._remaining_contracts(task)
         try:
             for leg in task["legs"]:
                 if leg["status"] != "pending":
                     continue
+                quantity = min(float(leg.get("quantity", task["quantity"])), float(remaining))
                 response = exchange.create_order(
-                    task["symbol"], "market", task["close_side"], task["quantity"],
+                    task["symbol"], "market", task["close_side"], quantity,
                     None, self._conditional_params({**leg["params"], "reduceOnly": True}),
                 )
                 leg_id = _order_id(response)
@@ -677,10 +682,26 @@ class BracketManager:
         return self._save(task, terminal_status)
 
     def _emergency_close(self, exchange: Any, task: dict, error: Exception) -> str:
+        """Flatten with a reduce-only market order sized to the venue's remaining contracts.
+
+        Like ``close_position``, the order size is what the venue still
+        reports, never the bracket's opening size: after a filled tranche the
+        original size is a reduce-only over-close the venue rejects (-2022),
+        which would leave the position without any protection.
+        """
+        remaining = self._remaining_contracts(task, fallback_to_task=False)
+        if remaining is None:
+            self._save(
+                task, "emergency_close_failed",
+                f"protective recovery failed: {error!r}; venue position read failed, no close submitted",
+            )
+            return "emergency_close_failed"
+        if remaining <= 0:
+            return self._cancel_resting_legs(exchange, task, allow_cancel=True)
         client_order_id = "emergency-" + hashlib.sha256(task["task_id"].encode()).hexdigest()[:20]
         try:
             response = exchange.create_order(
-                task["symbol"], "market", task["close_side"], task["quantity"],
+                task["symbol"], "market", task["close_side"], remaining,
                 None, {"reduceOnly": True, "clientOrderId": client_order_id},
             )
             if not isinstance(response, dict) or _state(response) != "filled":

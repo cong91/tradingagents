@@ -376,7 +376,7 @@ def test_cancel_failure_after_replacement_keeps_old_id_for_later_cleanup():
 
 @pytest.mark.parametrize("response", [{"id": "exit"}, {"id": "exit", "status": "open"}, None])
 def test_emergency_acknowledgement_is_not_a_confirmed_close(response):
-    exchange = _Exchange()
+    exchange = _LadderExchange(0.005)
     exchange.create_error = ccxt.ExchangeError("protection refused")
     manager, bridge, exchange, task_id = _bracket(exchange)
     exchange.emergency_response = response
@@ -386,6 +386,41 @@ def test_emergency_acknowledgement_is_not_a_confirmed_close(response):
     calls_before = len(exchange.calls)
     assert manager.reconcile(task_id, repair_missing=True, allow_sibling_cancel=True) == "emergency_close_failed"
     assert len(exchange.calls) > calls_before
+
+
+def test_emergency_close_scales_to_the_venue_remaining_contracts():
+    exchange = _LadderExchange(0.00335)  # one tranche already filled; 0.005 is stale
+    exchange.create_error = ccxt.ExchangeError("protection refused")
+    manager, _bridge, exchange, task_id = _bracket(exchange)
+    calls_before = len(exchange.calls)
+
+    status = manager.reconcile(task_id, repair_missing=True, allow_sibling_cancel=True)
+
+    new_calls = exchange.calls[calls_before:]
+    creates = [call for call in new_calls if call[0] == "create"]
+    # Both the stop repair and the emergency close submit only what remains.
+    assert [call[3] for call in creates] == [pytest.approx(0.00335), pytest.approx(0.00335)]
+    emergency = next(call for call in creates if str(call[4].get("clientOrderId", "")).startswith("emergency-"))
+    assert emergency[4]["reduceOnly"] is True
+    assert status == "emergency_closed"
+    assert job_store.load_bracket_recovery(task_id)["status"] == "emergency_closed"
+
+
+def test_emergency_close_without_a_venue_position_read_submits_nothing():
+    exchange = _Exchange()  # no fetch_positions: the remaining size is unknowable
+    exchange.create_error = ccxt.ExchangeError("protection refused")
+    manager, _bridge, exchange, task_id = _bracket(exchange)
+    calls_before = len(exchange.calls)
+
+    status = manager.reconcile(task_id, repair_missing=True, allow_sibling_cancel=True)
+
+    new_calls = exchange.calls[calls_before:]
+    assert status == "emergency_close_failed"
+    assert not [
+        call for call in new_calls
+        if call[0] == "create" and str(call[4].get("clientOrderId", "")).startswith("emergency-")
+    ]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "emergency_close_failed"
 
 
 def test_timed_out_initial_submit_is_monitored_without_retry():

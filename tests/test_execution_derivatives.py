@@ -49,6 +49,8 @@ class FakeDerivExchange:
         self.emergency_error = None
         self.fetch_open_orders_error = None
         self._markets_loaded = False
+        # Venue position report for _remaining_contracts; None = read fails.
+        self.contracts = None
 
     def fetch_ticker(self, symbol):
         self.calls.append(("fetch_ticker", symbol))
@@ -82,6 +84,18 @@ class FakeDerivExchange:
     def fetch_position_mode(self, symbol=None, params=None):
         self.calls.append(("fetch_position_mode", symbol, params))
         return {"hedged": self.hedged, "info": {"dualSidePosition": self.hedged}}
+
+    def fetch_positions(self, symbols=None, params=None):
+        self.calls.append(("fetch_positions", symbols, params))
+        if self.contracts is None:
+            raise ccxt.ExchangeError("position data unavailable")
+        return [{
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": self.contracts,
+            "entryPrice": self.price, "markPrice": self.price,
+        }]
+
+    def market(self, symbol):
+        return {"quote": "USDT", "settle": "USDT", "inverse": False}
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         self.calls.append(("create_order", symbol, order_type, side, amount, params))
@@ -1273,9 +1287,10 @@ def test_completed_bracket_recovery_is_idempotent(tmp_path, monkeypatch):
 
 def test_recovery_does_not_report_emergency_close_when_order_fails(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
-    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
     exchange.bracket_error = ccxt.ExchangeError("protective leg still unavailable")
     exchange.emergency_error = ccxt.ExchangeError("emergency close refused")
+    exchange.contracts = order.quantity  # the venue still holds the full entry
 
     assert executor.recover_bracket(task_id) == "emergency_close_failed"
     task = store.load_bracket_recovery(task_id)
@@ -1286,8 +1301,9 @@ def test_recovery_does_not_report_emergency_close_when_order_fails(tmp_path, mon
 
 def test_repeated_recovery_failure_emergency_closes_reduce_only(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(fail_bracket_calls=1)
-    executor, _, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
+    executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
     exchange.bracket_error = ccxt.ExchangeError("protective leg still unavailable")
+    exchange.contracts = order.quantity  # the venue still holds the full entry
 
     assert executor.recover_bracket(task_id) == "emergency_closed"
     task = store.load_bracket_recovery(task_id)

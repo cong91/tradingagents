@@ -26,7 +26,7 @@ def _income(amount: float, when: datetime) -> dict:
             "timestamp": int(when.timestamp() * 1000)}
 
 
-def test_cost_of_a_held_position_sums_funding_and_charges_both_fee_sides():
+def test_cost_of_a_held_position_sums_funding_and_charges_the_round_trip_fee():
     opened = NOW - timedelta(hours=12.5)
     rows = [_income(-0.20, opened + timedelta(hours=8)), _income(-0.07, opened + timedelta(hours=10))]
 
@@ -35,7 +35,9 @@ def test_cost_of_a_held_position_sums_funding_and_charges_both_fee_sides():
     assert cost["opened_at"] == opened.isoformat()
     assert cost["held_hours"] == pytest.approx(12.5)
     assert cost["funding_usdt"] == pytest.approx(-0.27)
-    assert cost["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.001 * 2)
+    # The rate is the round-trip total (matching profit_protection's
+    # break-even stop); it must not be doubled again here.
+    assert cost["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.001)
 
 
 def test_notional_null_leaves_the_fee_unknown_but_keeps_the_rest():
@@ -62,7 +64,7 @@ def test_failed_funding_read_is_null_not_zero():
     cost = position_cost(100.0, 0.001, None, None, NOW)
 
     assert cost["funding_usdt"] is None
-    assert cost["round_trip_fee_usdt"] == pytest.approx(0.2)
+    assert cost["round_trip_fee_usdt"] == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize("opened_at", ["not-a-date", "2026-13-01T00:00:00+00:00", "", None])
@@ -103,7 +105,7 @@ def test_funding_rows_are_summed_as_returned():
 def test_short_notional_uses_absolute_size():
     cost = position_cost(-990.0, 0.001, [], None, NOW)
 
-    assert cost["round_trip_fee_usdt"] == pytest.approx(1.98)
+    assert cost["round_trip_fee_usdt"] == pytest.approx(0.99)
 
 
 def test_malformed_income_rows_are_skipped_not_guessed():
@@ -171,7 +173,7 @@ def test_portfolio_fills_cost_fields_from_state_and_income(monkeypatch, tmp_path
     assert position["opened_at"].endswith("+00:00")
     assert position["held_hours"] == pytest.approx(6.0, abs=0.05)
     assert position["funding_usdt"] == pytest.approx(0.54)
-    assert position["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.002 * 2)
+    assert position["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.002)
     assert body["futures"]["status"] == "ok"
 
 
@@ -208,5 +210,5 @@ def test_portfolio_without_a_recorded_state_leaves_cost_unknown(monkeypatch, tmp
     assert position["held_hours"] is None
     assert position["funding_usdt"] is None
     # The fee needs only notional × rate, so it survives an unknown entry time.
-    assert position["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.001 * 2)
+    assert position["round_trip_fee_usdt"] == pytest.approx(990.0 * 0.001)
     assert body["futures"]["status"] == "ok"
