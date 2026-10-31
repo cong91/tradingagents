@@ -12,6 +12,7 @@ class ProfitProtectionDecision:
     stop: float
     target: float | None
     phase: str
+    exit_reason: str | None = None
 
 
 def evaluate_profit_protection(
@@ -28,6 +29,10 @@ def evaluate_profit_protection(
     trail_distance_r: float = 1.0,
     target_extension_r: float = 1.0,
     min_stop_move_r: float = 0.1,
+    round_trip_fee_rate: float = 0.0,
+    held_hours: float | None = None,
+    max_hold_hours: float | None = None,
+    time_stop_min_r: float = 1.0,
 ) -> ProfitProtectionDecision:
     """Return monotonic stop/target levels without performing venue actions."""
     if mark is None or not _positive_finite(mark):
@@ -45,6 +50,15 @@ def evaluate_profit_protection(
         raise ValueError("profit-protection thresholds must be finite and positive")
     if not _non_negative_finite(min_stop_move_r):
         raise ValueError("minimum stop movement must be finite and non-negative")
+    if not (_non_negative_finite(round_trip_fee_rate) and float(round_trip_fee_rate) < 1):
+        raise ValueError("round-trip fee rate must be finite and within [0, 1)")
+    fee_rate = float(round_trip_fee_rate)
+    if max_hold_hours is not None and not _positive_finite(max_hold_hours):
+        raise ValueError("maximum hold duration must be finite and positive")
+    if held_hours is not None and not _non_negative_finite(held_hours):
+        raise ValueError("held duration must be finite and non-negative")
+    if not _positive_finite(time_stop_min_r):
+        raise ValueError("time-stop minimum R must be finite and positive")
     if not break_even_r < lock_profit_r < trail_start_r:
         raise ValueError("profit-protection thresholds must be strictly increasing")
 
@@ -56,6 +70,13 @@ def evaluate_profit_protection(
 
     favorable = mark - entry if long else entry - mark
     favorable_r = favorable / risk
+    if (
+        max_hold_hours is not None
+        and held_hours is not None
+        and held_hours >= max_hold_hours
+        and favorable_r < time_stop_min_r
+    ):
+        return ProfitProtectionDecision(current_stop, current_target, "time_stop", "time_stop")
     candidate = current_stop
     phase = "unchanged"
     if favorable_r >= trail_start_r:
@@ -65,7 +86,7 @@ def evaluate_profit_protection(
         candidate = entry + risk if long else entry - risk
         phase = "profit_lock"
     elif favorable_r >= break_even_r:
-        candidate = entry
+        candidate = entry * (1 + fee_rate) if long else entry * (1 - fee_rate)
         phase = "break_even"
 
     stop = max(current_stop, candidate) if long else min(current_stop, candidate)

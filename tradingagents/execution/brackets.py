@@ -16,7 +16,7 @@ from tradingagents.execution.sizing import PlannedOrder
 _TASK_LOCK = threading.RLock()
 _TERMINAL_STATUSES = {
     "emergency_closed", "reconciled_take_profit",
-    "reconciled_stop_loss", "cancelled", "completed",
+    "reconciled_stop_loss", "cancelled", "completed", "time_stop_closed",
 }
 
 
@@ -432,6 +432,52 @@ class BracketManager:
                 return self._save(task, "position_cleanup_pending", "; ".join(errors))
             return self._save(task, "completed")
 
+    def close_position(self, task_id: str, *, reason: str, allow_mutation: bool) -> str:
+        """Flatten the venue position with a reduce-only market order, then cancel the legs.
+
+        The order size is the contracts the venue still reports, never the
+        bracket's opening size: a partially closed position must not be closed
+        twice for the original amount.
+        """
+        if not allow_mutation:
+            return "mutation_gated"
+        with _TASK_LOCK:
+            task = job_store.load_bracket_recovery(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.get("venue_key") and task["venue_key"] != _venue_key(self.bridge):
+                self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
+                return "venue_mismatch"
+            exchange = self.bridge.client()
+            remaining = self._remaining_contracts(task, fallback_to_task=False)
+            if remaining is None:
+                self._save(task, task["status"], "venue position read failed; no close submitted")
+                return "time_stop_unknown_position"
+            if remaining <= 0:
+                return self._cancel_resting_legs(
+                    exchange, task, allow_cancel=True, terminal_status="time_stop_closed",
+                )
+            client_order_id = "timestop-" + hashlib.sha256(
+                f"{task_id}:{reason}".encode()
+            ).hexdigest()[:20]
+            try:
+                response = exchange.create_order(
+                    task["symbol"], "market", task["close_side"], remaining,
+                    None, {"reduceOnly": True, "clientOrderId": client_order_id},
+                )
+            except ccxt.NetworkError as exc:
+                self._save(task, "time_stop_submission_uncertain", f"close submission uncertain; inspect before retry: {exc!r}")
+                return "time_stop_submission_uncertain"
+            except Exception as exc:
+                self._save(task, "time_stop_failed", f"close order failed: {exc!r}")
+                return "time_stop_failed"
+            if not isinstance(response, dict) or _state(response) != "filled":
+                self._save(task, "time_stop_submission_uncertain", "close order was not confirmed filled; inspect before retry")
+                return "time_stop_submission_uncertain"
+            return self._cancel_resting_legs(
+                exchange, task, allow_cancel=True, terminal_status="time_stop_closed",
+            )
+
     def _cleanup_retired(self, exchange: Any, task: dict, allow_cancel: bool) -> list[str]:
         errors = []
         for leg in task["legs"]:
@@ -537,7 +583,8 @@ class BracketManager:
         # would write the old order id and quantity back over it.
         return "monitoring"
 
-    def _remaining_contracts(self, task: dict) -> float:
+    def _remaining_contracts(self, task: dict, *, fallback_to_task: bool = True) -> float | None:
+        """Contracts still open on the venue; ``None`` when the read fails and no fallback is allowed."""
         try:
             from tradingagents.execution.futures_account import read_futures_positions
 
@@ -546,7 +593,7 @@ class BracketManager:
                 if position.symbol == task["symbol"] and position.side == side:
                     return abs(float(position.contracts or 0.0))
         except Exception:
-            return float(task["quantity"])
+            return float(task["quantity"]) if fallback_to_task else None
         return 0.0
 
     def _cleanup(self, exchange: Any, task: dict, winner: dict, allow_cancel: bool) -> str:
@@ -598,7 +645,10 @@ class BracketManager:
             return self._emergency_close(exchange, task, exc)
         return self._save(task, "monitoring")
 
-    def _cancel_resting_legs(self, exchange: Any, task: dict, allow_cancel: bool) -> str:
+    def _cancel_resting_legs(
+        self, exchange: Any, task: dict, allow_cancel: bool, *,
+        terminal_status: str = "emergency_closed",
+    ) -> str:
         errors = []
         for leg in task["legs"]:
             if leg["status"] in {"filled", "cancelled"}:
@@ -624,7 +674,7 @@ class BracketManager:
                 errors.append(f"cancel {order_id}: {exc!r}")
         if errors:
             return self._save(task, "emergency_cleanup_pending", "; ".join(errors))
-        return self._save(task, "emergency_closed")
+        return self._save(task, terminal_status)
 
     def _emergency_close(self, exchange: Any, task: dict, error: Exception) -> str:
         client_order_id = "emergency-" + hashlib.sha256(task["task_id"].encode()).hexdigest()[:20]

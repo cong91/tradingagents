@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -32,6 +32,26 @@ def test_position_state_can_be_linked_to_bracket_and_listed_as_active():
         "position_key": position_key,
         **job_store.load_position_state(position_key),
     }]
+
+
+def test_persisted_entry_state_records_opened_at():
+    position_key = "BTC/USDT:USDT:buy:entry-3"
+    before = datetime.now(timezone.utc)
+    assert job_store.persist_futures_entry_state(
+        position_key,
+        side="long",
+        entry=100.0,
+        quantity=1.0,
+        stop=90.0,
+        targets=[130.0],
+        mark=100.0,
+        order_id="entry-3",
+    )
+
+    opened_at = job_store.load_position_state(position_key)["snapshot"]["opened_at"]
+    parsed = datetime.fromisoformat(opened_at)
+    assert parsed.tzinfo is not None
+    assert before <= parsed <= datetime.now(timezone.utc)
 
 
 def test_position_state_compare_and_swap_rejects_stale_revision():
@@ -86,6 +106,9 @@ class _ProtectionExchange:
 
     def create_order(self, symbol, kind, side, amount, price=None, params=None):
         self.calls.append(("create", symbol, side, amount, params))
+        if "stopLossPrice" not in params and "takeProfitPrice" not in params:
+            # A plain reduce-only market close: the venue answers filled.
+            return {"id": "close-1", "status": "closed", "info": {"algoStatus": "FINISHED"}}
         order_id = str(len(self.orders) + 1)
         key = "stopLossPrice" if "stopLossPrice" in params else "takeProfitPrice"
         order_type = "STOP_MARKET" if key == "stopLossPrice" else "TAKE_PROFIT_MARKET"
@@ -175,6 +198,34 @@ def _linked_position(*, side="long", entry=100.0, stop=90.0, target=130.0):
         venue_key="binance|https://demo-api.binance.com|True",
     )
     return position_key, task_id
+
+
+def _resting_leg_orders():
+    """The two conditional legs a bracket places, as the venue lists them."""
+    return {
+        "old-stop": {
+            "id": "old-stop", "symbol": "TIA/USDT:USDT", "side": "sell",
+            "amount": 1.0, "type": "market", "status": "open",
+            "info": {"algoId": "old-stop", "symbol": "TIAUSDT", "side": "SELL",
+                     "algoStatus": "NEW", "orderType": "STOP_MARKET",
+                     "triggerPrice": "90.0", "quantity": "1.0", "reduceOnly": True},
+        },
+        "old-target": {
+            "id": "old-target", "symbol": "TIA/USDT:USDT", "side": "sell",
+            "amount": 1.0, "type": "market", "status": "open",
+            "info": {"algoId": "old-target", "symbol": "TIAUSDT", "side": "SELL",
+                     "algoStatus": "NEW", "orderType": "TAKE_PROFIT_MARKET",
+                     "triggerPrice": "130.0", "quantity": "1.0", "reduceOnly": True},
+        },
+    }
+
+
+def _set_opened_hours_ago(position_key: str, hours: float) -> None:
+    state = job_store.load_position_state(position_key)
+    state["snapshot"]["opened_at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=hours)
+    ).isoformat()
+    assert job_store.save_position_state(position_key, state["revision"], state)
 
 
 def test_live_position_management_uses_venue_entry_quantity_and_mark():
@@ -450,3 +501,84 @@ def test_stale_mark_price_blocks_position_mutations():
 
     assert result == [{"position_key": position_key, "status": "mark_stale"}]
     assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_missing_opened_at_is_backfilled_without_closing():
+    position_key, _task_id = _linked_position()
+    state = job_store.load_position_state(position_key)
+    state["snapshot"].pop("opened_at")
+    assert job_store.save_position_state(position_key, state["revision"], state)
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 105.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={
+            "risk_derivatives_profit_protection_enabled": True,
+            "risk_derivatives_max_hold_hours": 0.0001,
+        },
+    )
+
+    assert result == [{"position_key": position_key, "status": "opened_at_backfilled"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert datetime.fromisoformat(snapshot["opened_at"]).tzinfo is not None
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_time_stop_past_the_deadline_below_minimum_r_closes_and_deletes_state():
+    position_key, task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 105.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True,
+        config={
+            "risk_derivatives_profit_protection_enabled": True,
+            "risk_derivatives_max_hold_hours": 72.0,
+            "risk_derivatives_time_stop_min_r": 1.0,
+        },
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    closes = [call for call in exchange.calls if call[0] == "create"]
+    assert len(closes) == 1
+    _kind, _symbol, close_side, amount, params = closes[0]
+    assert close_side == "sell"
+    assert amount == pytest.approx(1.0)
+    assert params == {"reduceOnly": True, "clientOrderId": params["clientOrderId"]}
+    assert params["clientOrderId"].startswith("timestop-")
+    assert {call[1] for call in exchange.calls if call[0] == "cancel"} == {"old-stop", "old-target"}
+    assert job_store.load_position_state(position_key) is None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+
+
+def test_time_stop_past_the_deadline_after_minimum_r_keeps_the_position():
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 115.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={
+            "risk_derivatives_profit_protection_enabled": True,
+            "risk_derivatives_max_hold_hours": 72.0,
+            "risk_derivatives_time_stop_min_r": 1.0,
+        },
+    )
+
+    assert result == [{"position_key": position_key, "status": "updated"}]
+    assert not [call for call in exchange.calls if call[0] == "create" and "clientOrderId" in call[4]]
+    assert job_store.load_position_state(position_key) is not None

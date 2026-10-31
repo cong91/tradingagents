@@ -84,6 +84,78 @@ _ALLOWED: dict[str, dict] = {
         "label": "Chốt lời nhiều tầng (scale-out)",
         "hint": "Bật: hai tầng chốt theo R + phần còn lại chạy trailing. Tắt: một TP duy nhất.",
     },
+    "risk_derivatives_break_even_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Mốc hòa vốn (R)",
+        "hint": (
+            "Đạt mốc R này thì dời SL về hòa vốn. Mốc hòa vốn đặt cao hơn "
+            "entry đúng bằng phí khứ hồi, nên thoát ở SL vẫn không lỗ sau phí. "
+            "0 không hợp lệ: phải > 0 và nhỏ hơn mốc khóa lợi nhuận."
+        ),
+    },
+    "risk_derivatives_lock_profit_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Mốc khóa lợi nhuận (R)",
+        "hint": (
+            "Đạt mốc R này thì SL khóa tối thiểu 1R. Phải lớn hơn mốc hòa vốn "
+            "và nhỏ hơn mốc bắt đầu trailing; 0 không hợp lệ."
+        ),
+    },
+    "risk_derivatives_trail_start_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Bắt đầu trailing (R)",
+        "hint": (
+            "Từ mốc R này SL bám theo mark, cách mark đúng khoảng trailing. "
+            "Phải lớn hơn mốc khóa lợi nhuận; 0 không hợp lệ."
+        ),
+    },
+    "risk_derivatives_trail_distance_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Khoảng trailing (R)",
+        "hint": (
+            "SL bám mark cách bao nhiêu R khi đã trailing. Càng nhỏ càng bám "
+            "sát, dễ bị wick quét; 0 không hợp lệ, phải > 0."
+        ),
+    },
+    "risk_derivatives_max_hold_hours": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Thời gian giữ tối đa (giờ)",
+        "hint": (
+            "Giữ quá số giờ này mà lợi nhuận chưa đạt mốc R tối thiểu thì "
+            "time stop đóng vị thế và huỷ bracket. 0 = tắt time stop."
+        ),
+    },
+    "risk_derivatives_time_stop_min_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Mốc R tối thiểu trước time stop (R)",
+        "hint": (
+            "Vị thế phải đạt ít nhất mốc R này trước hạn giữ tối đa, nếu không "
+            "sẽ bị đóng khi hết hạn. 0 không hợp lệ: phải > 0."
+        ),
+    },
+    "risk_derivatives_round_trip_fee_rate": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Phí khứ hồi (tỷ lệ)",
+        "hint": (
+            "Tổng phí vào + ra theo tỷ lệ giá trị danh nghĩa (0.001 = 0.1%). "
+            "Dùng để nâng SL hòa vốn lên trên entry. 0 = không bù phí, hòa vốn "
+            "đúng bằng entry."
+        ),
+    },
 }
 
 _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}

@@ -586,6 +586,7 @@ def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
         targets=tuple(targets),
         mark=mark,
     )
+    now = _now()
     return save_position_state(position_key, 0, {
         "snapshot": {
             **dataclasses.asdict(snapshot),
@@ -594,7 +595,8 @@ def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
             "initial_stop": stop,
             "current_target": targets[0] if targets else None,
             "phase": "initial",
-            "observed_at": _now(),
+            "opened_at": now,
+            "observed_at": now,
         },
         "orders": [],
         "entry_order_id": order_id,
