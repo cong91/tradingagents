@@ -50,6 +50,12 @@ def _is_connection_error(exc: Exception) -> bool:
                 "upstream_http2_stream_error",
                 "upstream_stream_read_error",
                 "upstream response stream was interrupted",
+                # Relay-side infrastructure failures observed live as
+                # ResponseError(code='upstream_error', ...): "Upstream HTTP/2
+                # stream failed", "Unable to forward upstream stream",
+                # "Upstream service temporarily unavailable", "Upstream access
+                # forbidden". All are the relay's own upstream classification.
+                "upstream_error",
                 # Relay-side overload answers (HTTP 5xx equivalents): bounded
                 # retry applies the same as a dropped connection.
                 "server_error",

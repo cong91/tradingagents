@@ -131,6 +131,9 @@ def render_futures_decision_context(
         f"{float(config.get('risk_max_position_pct_per_asset', 25.0)):g}% of equity",
         f"- Maximum total exposure: "
         f"{float(config.get('risk_max_total_exposure_pct', 80.0)):g}% of equity",
+        "- One open position per symbol: a symbol that already holds a futures "
+        "position (see the list above) is managed by the exit layer; a new entry "
+        "on it is refused",
         "A FuturesExecutionProposal is required for any entry: margin mode, leverage, "
         "risk_fraction, margin_fraction, and an evidence-based rationale. Without one "
         "no order is placed. If a proposal omits its stop and take-profit (they are "

@@ -741,6 +741,72 @@ def test_derivatives_within_raised_caps_passes(tmp_path, monkeypatch):
     assert decision.allowed is True
 
 
+def _held_derivatives_position(ticker="SOL-USD") -> Position:
+    return Position(
+        ticker=ticker, quantity=None, notional=90.0, notional_currency="USDT",
+        market="derivatives", market_symbol=ticker,
+    )
+
+
+def test_derivatives_entry_on_held_symbol_is_rejected(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    limits = RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0)
+    # Notional caps would pass (28 = 2.8% of equity); only the held-symbol
+    # rule refuses: the venue cannot reconfigure margin/leverage for an add.
+    decision = guard(limits).check(
+        plan(side="sell", cost=28.0, ticker="SOL-USD", market="derivatives", leverage=1.0),
+        PortfolioContext(cash=1_000.0, positions=[_held_derivatives_position()]),
+        audit,
+    )
+    assert decision.allowed is False
+    assert "already has an open derivatives position" in decision.reason
+
+
+def test_derivatives_entry_on_held_symbol_via_market_symbol_is_rejected(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    limits = RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0)
+    held = _held_derivatives_position()
+    held.ticker = "SOLUSDT"  # venue spelling; market_symbol is the normalized pair
+    decision = guard(limits).check(
+        plan(side="sell", cost=28.0, ticker="SOL-USD", market="derivatives", leverage=1.0),
+        PortfolioContext(cash=1_000.0, positions=[held]),
+        audit,
+    )
+    assert decision.allowed is False
+    assert "already has an open derivatives position" in decision.reason
+
+
+def test_derivatives_entry_on_flat_symbol_with_other_held_positions_passes(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    limits = RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0)
+    decision = guard(limits).check(
+        plan(side="sell", cost=50.0, ticker="XPL-USD", market="derivatives", leverage=3.0),
+        PortfolioContext(cash=1_000.0, currency="USDT", positions=[_held_derivatives_position("SOL-USD")]),
+        audit,
+    )
+    assert decision.allowed is True
+
+
+def test_spot_buy_on_held_symbol_is_still_allowed(tmp_path, monkeypatch):
+    # The one-position-per-symbol rule is derivatives-only: the daily spot
+    # pipeline keeps its existing rebalance/add semantics.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(cash=10_000.0, currency="USDT", positions=[Position(
+        ticker="BTC-USD", quantity=0.01, mark_price=50_000.0, price_currency="USDT",
+        market="spot",
+    )])
+    decision = guard().check(
+        plan(side="buy", cost=250.0, ticker="BTC-USD", market="spot", leverage=1.0),
+        book,
+        audit,
+    )
+    assert decision.allowed is True
+
+
 @pytest.mark.parametrize("cash", [1_000.0, None])
 @pytest.mark.parametrize("fail_closed", [False, True])
 def test_non_finite_order_cost_is_rejected_before_equity_fail_open(tmp_path, cash, fail_closed):

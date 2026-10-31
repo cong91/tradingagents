@@ -765,6 +765,36 @@ class RiskGuard:
                     reason=f"existing spot position {ticker} has unknown quantity; failing closed",
                 )
 
+        # One open derivatives position per symbol: the entry path must
+        # reconfigure margin mode and leverage before sending, and the venue
+        # refuses both while a position (or its protective legs) is open
+        # (Binance demo answers -4067/-4161 there). An entry on a held symbol
+        # is a deliberate "no" at plan and execute stage, not a venue crash.
+        if is_derivatives and side is not None and portfolio is not None:
+            entry_ticker = str(getattr(order_plan, "ticker", "") or "").strip().upper()
+            held_symbol = next(
+                (
+                    position
+                    for position in portfolio.positions
+                    if getattr(position, "market", "spot") == "derivatives"
+                    and (
+                        str(getattr(position, "ticker", "") or "").strip().upper() == entry_ticker
+                        or (
+                            getattr(position, "market_symbol", None) is not None
+                            and str(getattr(position, "market_symbol", "")).strip().upper() == entry_ticker
+                        )
+                    )
+                ),
+                None,
+            )
+            if held_symbol is not None:
+                reasons.append(
+                    f"symbol {entry_ticker or '?'} already has an open derivatives "
+                    "position; a new entry on a non-flat symbol is refused "
+                    "(margin mode and leverage cannot be reconfigured while the "
+                    "venue holds a position)"
+                )
+
         equity = self._equity(portfolio)
         if equity is not None and not math.isfinite(equity):
             return RiskDecision(

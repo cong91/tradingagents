@@ -70,6 +70,22 @@ def test_connection_retry_budget_is_bounded():
         TimeoutError("request timed out"),
         ValueError("upstream_http2_stream_error: upstream failed"),
         ValueError("upstream_stream_read_error: response interrupted"),
+        # Live relay answers (token.v-claw.org, 2026-10-30/31): the relay's
+        # own upstream classification, raised as ValueError(ResponseError
+        # (code='upstream_error', ...)) — must retry like a dropped stream.
+        ValueError(
+            "ResponseError(code='upstream_error', message='Upstream HTTP/2 "
+            "stream failed', misalignment=None, param=None, type=None)"
+        ),
+        ValueError(
+            "ResponseError(code=None, message='Unable to forward upstream "
+            "stream', misalignment=None, param=None, type='upstream_error')"
+        ),
+        ValueError(
+            "ResponseError(code='upstream_error', message='Upstream service "
+            "temporarily unavailable, please retry later', misalignment=None, "
+            "param=None, type='upstream_error')"
+        ),
     ],
 )
 def test_stream_transport_errors_are_retryable(error):

@@ -284,8 +284,12 @@ def test_long_and_short_positions_share_per_asset_exposure_even_with_alias_ticke
 
 
 def test_futures_exposure_at_caps_is_allowed_without_multiplying_existing_leverage(tmp_path):
+    # The held position sits on a DIFFERENT symbol on purpose: a new entry on
+    # a held symbol is refused outright (one open position per symbol), while
+    # this test pins the exposure arithmetic -- the held 250 notional counts
+    # ONCE toward the totals, never margin x its own leverage again.
     book = build_futures_portfolio(_account(positions=(FuturesPosition(
-        symbol="BTC/USDT:USDT", quantity=-2.5, mark_price=100.0,
+        symbol="ETH/USDT:USDT", quantity=-2.5, mark_price=100.0,
         notional=250.0, leverage=3.0,
     ),)))
     guard = RiskGuard(limits=RiskLimits(
