@@ -47,6 +47,7 @@ def test_dry_run_loads_files_without_opening_database(monkeypatch):
         "0002_control_plane.sql",
         "0003_operator_settings.sql",
         "0004_data_source_credentials.sql",
+        "0005_futures_account_identity.sql",
     ]
 
 

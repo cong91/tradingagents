@@ -31,7 +31,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     >
       <body className="flex min-h-full flex-col">
         <ModeBar />
-        <div className="flex flex-1">
+        <div className="flex flex-1 flex-col md:flex-row">
           <Sidebar />
           <main className="min-w-0 flex-1 p-4 md:p-6">{children}</main>
         </div>

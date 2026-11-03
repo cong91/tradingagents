@@ -37,6 +37,7 @@ def poll_active_brackets() -> list[dict]:
         and executor.effective_mode() == "live"
     )
     outcomes = []
+    deferred_counts: dict[str, int] = {}
     for task in tasks:
         try:
             if task["status"] == "pending" and can_recover:
@@ -47,6 +48,16 @@ def poll_active_brackets() -> list[dict]:
             status = f"error:{type(exc).__name__}:{exc}"
             logger.warning("bracket reconciliation failed for %s: %s", task["task_id"], exc)
         outcomes.append({"task_id": task["task_id"], "status": status})
+        if status in {
+            "account_identity_unknown", "account_identity_mismatch",
+            "entry_reconciliation_required", "venue_mismatch",
+        }:
+            deferred_counts[status] = deferred_counts.get(status, 0) + 1
+    for status, count in deferred_counts.items():
+        logger.error(
+            "Bracket reconciliation deferred (%s: %d); verify venue protection manually",
+            status, count,
+        )
     return outcomes
 
 

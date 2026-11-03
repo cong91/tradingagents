@@ -1197,7 +1197,7 @@ def test_overflowing_daily_pnl_refuses_fail_closed(tmp_path, monkeypatch):
     assert "daily P&L is not finite" in decision.reason
 
 
-def test_price_of_exceptions_are_treated_as_no_price(tmp_path, monkeypatch):
+def test_price_of_exceptions_are_treated_as_no_price(tmp_path, monkeypatch, caplog):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
     write_events(audit, [event("buy", 2.0, 100.0, hour=8)])  # open lot needs a mark
@@ -1210,6 +1210,38 @@ def test_price_of_exceptions_are_treated_as_no_price(tmp_path, monkeypatch):
     # the open lot is excluded from daily P&L and from equity; the trade plan
     # itself still passes the (weaker) checks
     assert decision.allowed is True
+    assert "price_of" in caplog.text
+
+
+def test_price_of_returning_none_is_not_a_failure(tmp_path, monkeypatch, caplog):
+    # The price_of contract is `float | None`: a None return is the
+    # documented "unpriceable" outcome and must stay silent -- float(None)
+    # used to surface as a misleading "price_of failed: TypeError" warning.
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    write_events(audit, [event("buy", 2.0, 100.0, hour=8)])  # open lot, unmarkable
+    decision = guard().check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.allowed is True
+    assert "price_of" not in caplog.text
+
+
+def test_lots_outside_today_are_not_marked_at_all(tmp_path, monkeypatch):
+    # Marking hits the venue; a queue holding only pre-today lots must not
+    # trigger a single price_of call (their mark cannot change the figure).
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    yesterday = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    write_events(audit, [event("buy", 2.0, 100.0, day=yesterday, hour=8)])
+    marked: list[str] = []
+
+    def recording(ticker):
+        marked.append(ticker)
+        return 10.0
+
+    g = RiskGuard(price_of=recording)
+    decision = g.check(plan(), PortfolioContext(cash=1_000.0), audit)
+    assert decision.allowed is True
+    assert "BTC-USD" not in marked
 
 
 # --- unreadable audit log: fail-closed at execute time only -------------------

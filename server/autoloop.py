@@ -1023,6 +1023,10 @@ def _process_candidate(
                     telemetry={"requested_ticker": ticker, "unified_symbol": None},
                 )
                 return result
+            with telemetry.span("futures_account", ticker):
+                futures_account = read_futures_account(derivatives._bridge)
+            if not futures_account.positions_scope_complete:
+                raise ValueError("futures position scope is unverified; analysis deferred")
             futures_cycle_id, four_hour_open, one_hour_open = futures_cycle_identity(futures_context)
             futures_cycle_timestamps = {"market_context_finished_at": utc_now_iso()}
             futures_caps = futures_effective_caps(
@@ -1052,8 +1056,6 @@ def _process_candidate(
                 futures_cycle_id, phase="market", payload=futures_cycle_payload,
                 timestamp=futures_cycle_timestamps["market_context_finished_at"],
             )
-            with telemetry.span("futures_account", ticker):
-                futures_account = read_futures_account(derivatives._bridge)
             futures_portfolio = build_futures_portfolio(futures_account)
             with telemetry.span("protective_bracket", ticker):
                 # Both directions: the agents need the engine's reference levels

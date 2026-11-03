@@ -43,13 +43,18 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
 
+from server import snapshot_observer
 from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.symbols import crypto_base, futures_base
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
+from tradingagents.execution.exchange_client import (
+    _default_exchange_factory,
+    credential_env_names,
+    venue_key,
+)
 from tradingagents.execution.risk import RiskGuard, RiskLimits
 from tradingagents.execution.sizing import PlannedOrder, SizingRules, compute
 from tradingagents.portfolio import PortfolioContext, Position
@@ -57,106 +62,6 @@ from tradingagents.portfolio import PortfolioContext, Position
 logger = logging.getLogger(__name__)
 
 _UNIFIED_FUTURES_SYMBOL = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+:[A-Z0-9]+$")
-
-_BINANCE_DEMO_HOSTS = frozenset({"demo-api.binance.com", "demo-fapi.binance.com"})
-_BINANCE_PRODUCTION_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
-
-
-def _binance_profile(base_url: str | None) -> str:
-    """Validate the configured Binance base URL and return its profile."""
-    raw = str(base_url or "").strip()
-    parsed = urlparse(raw)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or parsed.path not in ("", "/"):
-        raise ValueError("exec_base_url must be an HTTPS Binance API host without a path")
-    if host in _BINANCE_DEMO_HOSTS:
-        return "demo"
-    if host in _BINANCE_PRODUCTION_HOSTS:
-        return "production"
-    raise ValueError(
-        "exec_base_url must be https://demo-api.binance.com or https://api.binance.com"
-    )
-
-
-def credential_env_names(exchange_id: str, base_url: str | None = None) -> tuple[str, str]:
-    """Return credential env vars coupled to the selected venue profile."""
-    upper = exchange_id.strip().upper()
-    if upper == "BINANCE" and _binance_profile(base_url or "https://api.binance.com") == "demo":
-        return "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_SECRET"
-    return f"{upper}_API_KEY", f"{upper}_SECRET"
-
-
-def _assert_binance_urls(client: Any, profile: str) -> None:
-    expected = _BINANCE_DEMO_HOSTS if profile == "demo" else _BINANCE_PRODUCTION_HOSTS
-    api = client.urls.get("api", {}) if isinstance(getattr(client, "urls", None), dict) else {}
-    if isinstance(api, str):
-        watched = [api]
-    elif isinstance(api, dict):
-        watched = [
-            value for key, value in api.items()
-            if key in {"public", "private", "fapiPublic", "fapiPrivate"}
-        ]
-    else:
-        watched = []
-    hosts = {urlparse(str(url)).hostname for url in watched}
-    if not watched or not hosts.issubset(expected):
-        raise RuntimeError(
-            f"Binance {profile} profile resolved unexpected API hosts: {sorted(hosts)}"
-        )
-
-
-def _default_exchange_factory(
-    exchange_id: str, sandbox: bool = False, *, base_url: str | None = None
-) -> Any:
-    """Build the configured ccxt client lazily; credentials from env only.
-
-    ``exchange_id`` must name a ``ccxt.Exchange`` subclass (e.g. "binance",
-    "okx"); anything else raises before any network call. ccxt is imported
-    here, not at module level, so importing tradingagents.execution stays
-    cheap and tests can inject fakes. For Binance, the safe mode is its Demo
-    Trading API (``demo-api.binance.com``), not Spot Testnet. Other exchanges
-    use ccxt's sandbox mode when available.
-    """
-    import ccxt
-
-    klass = getattr(ccxt, exchange_id, None)
-    if not (isinstance(klass, type) and issubclass(klass, ccxt.Exchange)):
-        raise ValueError(
-            f"exec_exchange_id {exchange_id!r} does not name a ccxt exchange class"
-        )
-    profile = None
-    if exchange_id == "binance":
-        profile = _binance_profile(base_url or "https://demo-api.binance.com")
-    credential_url = base_url or (
-        "https://demo-api.binance.com" if profile == "demo" else "https://api.binance.com"
-    ) if exchange_id == "binance" else None
-    key_env, secret_env = credential_env_names(exchange_id, credential_url)
-    api_key = os.environ.get(key_env, "")
-    secret = os.environ.get(secret_env, "")
-    if exchange_id == "binance" and (not api_key or not secret):
-        raise RuntimeError(f"missing exchange credentials: {key_env} and {secret_env}")
-    options: dict = {"apiKey": api_key, "secret": secret, "enableRateLimit": True}
-    if exchange_id == "binance":
-        # Binance rejects a signed request whose timestamp is more than its
-        # recvWindow ahead of server time (-1021). A host clock drifting even
-        # ~1s breaks every private call (balance, orders), so let ccxt measure
-        # the offset once per process and sign with the corrected clock.
-        options["options"] = {"adjustForTimeDifference": True}
-    client = klass(options)
-    if exchange_id == "binance":
-        if profile == "demo":
-            enable_demo_trading = getattr(client, "enable_demo_trading", None)
-            if not callable(enable_demo_trading):
-                raise RuntimeError(
-                    "ccxt Binance client does not support Demo Trading mode; "
-                    "refusing to fall back to Spot Testnet"
-                )
-            enable_demo_trading(True)
-        _assert_binance_urls(client, profile)
-    elif sandbox:
-        client.set_sandbox_mode(True)
-    return client
-
 
 class PreTradeRejection(RuntimeError):
     """A live order was refused before reaching the exchange; already audited.
@@ -581,7 +486,11 @@ class ExchangeBridge:
                     f"{order.ccxt_symbol} cost {sent_cost:.8g} is below the exchange "
                     f"minimum {min_cost:.8g} after precision truncation; nothing was sent"
                 )
-            response = exchange.create_order(order.ccxt_symbol, "market", order.side, amount)
+            response = snapshot_observer.run(
+                self, exchange,
+                operation="create_spot_order", symbol=order.ccxt_symbol,
+                call=lambda: exchange.create_order(order.ccxt_symbol, "market", order.side, amount),
+            )
             order_id = response.get("id") if isinstance(response, dict) else None
         except PreTradeRejection:
             raise  # business rejections above are already audited
@@ -673,7 +582,11 @@ class ExchangeBridge:
             place = getattr(exchange, "privatePostOrderListOco", None)
             if place is None:
                 raise RuntimeError("exchange client does not expose orderList/oco")
-            response = place(request)
+            response = snapshot_observer.run(
+                self, exchange,
+                operation="place_spot_oco", symbol=order.ccxt_symbol,
+                call=lambda: place(request),
+            )
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
             self._audit(
                 action="bracket_failed",
@@ -833,6 +746,7 @@ class ExchangeBridge:
             "confirmed": confirmed,
             "order_id": order_id,
             "phase": phase,
+            "venue_key": venue_key(self),
             # The risk guard's FIFO replay needs the market to recognize a
             # derivatives sell as a short opener; leverage documents the
             # notional multiplier alongside price_est.

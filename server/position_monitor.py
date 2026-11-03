@@ -48,9 +48,24 @@ def poll_active_positions() -> list[dict]:
         ]
     executor = _build_executor(config)
     try:
-        return manage_active_positions(
+        outcomes = manage_active_positions(
             executor._bridge, allow_mutation=True, config=config,
         )
+        deferred_counts: dict[str, int] = {}
+        for outcome in outcomes:
+            status = outcome.get("status")
+            if status in {
+                "account_identity_unknown", "account_identity_mismatch",
+                "missing_bracket_link", "missing_bracket_task",
+                "venue_mismatch", "bracket_identity_mismatch", "position_unknown",
+            }:
+                deferred_counts[status] = deferred_counts.get(status, 0) + 1
+        for status, count in deferred_counts.items():
+            logger.error(
+                "Futures protection deferred (%s: %d); verify venue protection manually",
+                status, count,
+            )
+        return outcomes
     except Exception as exc:
         logger.exception("futures position protection poll failed")
         return [

@@ -30,10 +30,27 @@ def test_portfolio_unknown_quantity_preserves_unknown_value_and_equity(
         fetch_price=lambda ticker: marked_price if ticker == "BTC-USD" else 10.0,
     )
     monkeypatch.setattr(portfolio_mod, "_build_bridge", lambda config: bridge)
-    monkeypatch.setattr(
-        portfolio_mod, "read_futures_account",
-        lambda bridge: SimpleNamespace(as_dict=lambda: {"status": "unavailable"}),
-    )
+    futures = {
+        "equity": None,
+        "wallet_balance": None,
+        "available_balance": None,
+        "unrealized_pnl": None,
+        "venue_profile": None,
+        "equity_currency": None,
+        "wallet_balance_currency": None,
+        "available_balance_currency": None,
+        "unrealized_pnl_currency": None,
+        "account_scope": "derivatives",
+        "positions": [],
+        "positions_read": {
+            "status": "partial", "skipped": 0,
+            "issues": [{"symbol": None, "reason": "scope_unverified"}],
+            "observed_at": "2026-11-02T12:00:00+00:00",
+        },
+        "status": "ok",
+        "error": None,
+    }
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: futures)
     monkeypatch.setattr(portfolio_mod, "_fifo_basis", lambda lots: (40.0, "fifo"))
 
     body = portfolio_mod.get_portfolio()
@@ -46,4 +63,11 @@ def test_portfolio_unknown_quantity_preserves_unknown_value_and_equity(
     assert known["market_value"] == 20.0
     assert body["cash"] == 1_000.0
     assert body["equity_est"] is None
+    assert body["futures"]["status"] == "ok"
+    assert body["futures"]["positions_read"] == {
+        "status": "partial", "skipped": 0,
+        "issues": [{"symbol": None, "reason": "scope_unverified"}],
+        "observed_at": "2026-11-02T12:00:00+00:00",
+    }
+    assert body["futures"]["positions"] == []
     assert any("quantity" in warning and "BTC-USD" in warning for warning in body["warnings"])

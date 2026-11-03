@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import UTC, datetime
 from typing import Any
 
 from server import job_store
-from tradingagents.execution.brackets import BracketManager
-from tradingagents.execution.futures_account import FuturesPosition, read_futures_positions
+from tradingagents.execution import futures_identity
+from tradingagents.execution.brackets import BracketManager, stored_account_identity
+from tradingagents.execution.exchange_client import venue_key
+from tradingagents.execution.futures_account import FuturesPosition, observe_futures_positions
 from tradingagents.execution.futures_funding import (
     evaluate_time_stop_postpone,
     fetch_funding_income,
@@ -16,6 +19,8 @@ from tradingagents.execution.futures_funding import (
 )
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 from tradingagents.execution.sizing import PlannedOrder
+
+logger = logging.getLogger(__name__)
 
 
 def manage_active_positions(
@@ -35,7 +40,7 @@ def manage_active_positions(
     except (TypeError, ValueError):
         return [{"position_key": state["position_key"], "status": "invalid_policy_config"} for state in states]
     try:
-        positions = read_futures_positions(bridge)
+        observation = observe_futures_positions(bridge)
     except Exception as exc:
         return [
             {"position_key": state["position_key"], "status": f"positions_unavailable:{type(exc).__name__}"}
@@ -43,7 +48,17 @@ def manage_active_positions(
         ]
     if bridge.exchange_id != "binance":
         return [{"position_key": state["position_key"], "status": "venue_unsupported"} for state in states]
-    position_map = _position_map(positions)
+    position_map = _position_map(tuple(
+        position for position in observation.positions
+        if position.symbol not in observation.unknown_symbols
+    ))
+    identities = {}
+    for state in states:
+        try:
+            snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+            identities[state["position_key"]] = _position_identity(state["position_key"], snapshot)
+        except (KeyError, TypeError, ValueError):
+            continue
     mark_status: dict[str, str] = {}
     if allow_mutation:
         try:
@@ -57,8 +72,9 @@ def manage_active_positions(
         max_mark_age = float(config.get("risk_derivatives_mark_max_age_seconds", 120.0))
         marks: dict[str, tuple[float | None, str | None]] = {}
         for state in states:
-            snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
-            key = _position_identity(state["position_key"], snapshot)
+            key = identities.get(state.get("position_key"))
+            if key is None:
+                continue
             if key not in position_map:
                 continue
             symbol = key[0]
@@ -72,9 +88,9 @@ def manage_active_positions(
             # must fail closed, never be completed from another endpoint.
     grouped_states: dict[tuple[str, str], list[dict]] = {}
     for state in states:
-        snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
-        symbol, side = _position_identity(state["position_key"], snapshot)
-        grouped_states.setdefault((symbol, side), []).append(state)
+        key = identities.get(state.get("position_key"))
+        if key is not None:
+            grouped_states.setdefault(key, []).append(state)
     ambiguous_keys = {
         key for key, grouped in grouped_states.items()
         if len(grouped) > 1 and key in position_map
@@ -84,6 +100,9 @@ def manage_active_positions(
         try:
             snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
             key = _position_identity(state["position_key"], snapshot)
+            if observation.unknown_scope or key[0] in observation.unknown_symbols:
+                outcomes.append({"position_key": state["position_key"], "status": "position_unknown"})
+                continue
             if key in ambiguous_keys:
                 outcomes.append({"position_key": state["position_key"], "status": "ambiguous_net_position"})
                 continue
@@ -107,22 +126,8 @@ def _manage_one(
     config: dict,
 ) -> dict:
     position_key = state["position_key"]
-    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
     if not state.get("bracket_task_id"):
-        entry_order_id = state.get("entry_order_id")
-        if not entry_order_id:
-            return {"position_key": position_key, "status": "missing_bracket_link"}
-        symbol, _side = _position_identity(position_key, snapshot)
-        candidates = job_store.find_bracket_recoveries(symbol, str(entry_order_id))
-        if len(candidates) != 1:
-            return {"position_key": position_key, "status": "missing_bracket_link"}
-        candidate = candidates[0]
-        if candidate.get("venue_key") and candidate["venue_key"] != _venue_key(bridge):
-            return {"position_key": position_key, "status": "venue_mismatch"}
-        state = {**state, "bracket_task_id": candidate["task_id"], "venue_key": candidate.get("venue_key")}
-        if not job_store.save_position_state(position_key, state["revision"], state):
-            return {"position_key": position_key, "status": "revision_conflict"}
-        state["revision"] += 1
+        return {"position_key": position_key, "status": "missing_bracket_link"}
     owner = job_store.acquire_position_monitor_lease(position_key)
     if owner is None:
         return {"position_key": position_key, "status": "lease_busy"}
@@ -146,15 +151,72 @@ def _manage_one_with_lease(
         return {"position_key": position_key, "status": "missing_bracket_link"}
     side = str(snapshot.get("side") or "")
     symbol, side = _position_identity(position_key, snapshot)
+    task = job_store.load_bracket_recovery(bracket_task_id)
+    if task is None:
+        return {"position_key": position_key, "status": "missing_bracket_task"}
+    if task.get("venue_key") != venue_key(bridge):
+        return {"position_key": position_key, "status": "venue_mismatch"}
+    if side not in {"long", "short"}:
+        return {"position_key": position_key, "status": "position_unknown"}
+    if task.get("symbol") != symbol or task.get("close_side") != ("sell" if side == "long" else "buy"):
+        return {"position_key": position_key, "status": "bracket_identity_mismatch"}
     venue_position = position_map.get((symbol, side))
-    manager = BracketManager(bridge)
     if venue_position is None:
-        cleanup = manager.cancel_all(bracket_task_id, allow_mutation=allow_mutation)
-        if cleanup == "completed":
-            job_store.delete_position_state(position_key, expected_revision=state["revision"])
-            return {"position_key": position_key, "status": "closed"}
-        return {"position_key": position_key, "status": f"closed_{cleanup}"}
+        return {"position_key": position_key, "status": "position_unknown"}
+    deferred = None
+    if allow_mutation:
+        deferred = _identity_deferred_status(bridge, state)
+        if deferred is not None:
+            if deferred == "account_identity_mismatch":
+                logger.warning(
+                    "Futures protection deferred: stored account identity does not match the venue client",
+                )
+            else:
+                logger.warning("Futures protection deferred: bracket account identity is unverified")
+    if not _valid_position(venue_position):
+        return {"position_key": position_key, "status": "invalid_position_snapshot"}
+    if not allow_mutation:
+        return {"position_key": position_key, "status": "mutation_gated"}
+    if _parse_opened_at(snapshot.get("opened_at")) is None:
+        return {"position_key": position_key, "status": "opened_at_unknown"}
+    if deferred is not None:
+        return {"position_key": position_key, "status": deferred}
+    return _advance_for_verified_account(bridge, state, task, position_map, allow_mutation, config)
 
+
+def _identity_deferred_status(bridge: Any, state: dict) -> str | None:
+    """The deferred protection status for this position's stored binding.
+
+    A legacy row (no stored binding) can never be verified against current
+    evidence, and unknown evidence is never treated as a match. None means the
+    stored binding matches the signed client and policy work may proceed.
+    """
+    stored = stored_account_identity(state)
+    if stored is None:
+        return "account_identity_unknown"
+    comparison = futures_identity.compare_futures_account_identity(bridge, stored)
+    if comparison is futures_identity.IdentityComparison.MISMATCH:
+        return "account_identity_mismatch"
+    if comparison is not futures_identity.IdentityComparison.MATCH:
+        return "account_identity_unknown"
+    return None
+
+
+def _advance_for_verified_account(
+    bridge: Any,
+    state: dict,
+    task: dict,
+    position_map: dict[tuple[str, str], FuturesPosition],
+    allow_mutation: bool,
+    config: dict,
+) -> dict:
+    """Policy logic; not reachable until account ownership is proven."""
+    position_key = state["position_key"]
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    bracket_task_id = state["bracket_task_id"]
+    symbol, side = _position_identity(position_key, snapshot)
+    venue_position = position_map[(symbol, side)]
+    manager = BracketManager(bridge)
     if not _valid_position(venue_position):
         return {"position_key": position_key, "status": "invalid_position_snapshot"}
     if not allow_mutation:
@@ -163,14 +225,7 @@ def _manage_one_with_lease(
     observed_at = datetime.now(UTC)
     opened_at = _parse_opened_at(snapshot.get("opened_at"))
     if opened_at is None:
-        # The age is unknowable, so a time stop must not fire this round: the
-        # position is stamped as opened now and judged on a later poll.
-        backfilled = {**snapshot, "opened_at": observed_at.isoformat()}
-        if not job_store.save_position_state(
-            position_key, state["revision"], {**state, "snapshot": backfilled},
-        ):
-            return {"position_key": position_key, "status": "revision_conflict"}
-        return {"position_key": position_key, "status": "opened_at_backfilled"}
+        return {"position_key": position_key, "status": "opened_at_unknown"}
     held_hours = max(0.0, (observed_at - opened_at).total_seconds() / 3600.0)
 
     entry = float(venue_position.entry_price)
@@ -178,11 +233,6 @@ def _manage_one_with_lease(
     quantity = abs(float(venue_position.quantity)) if venue_position.quantity is not None else 0.0
     mark = float(venue_position.mark_price)
     initial_stop = float(snapshot.get("initial_stop", snapshot.get("stop")))
-    task = job_store.load_bracket_recovery(bracket_task_id)
-    if task is None:
-        return {"position_key": position_key, "status": "missing_bracket_task"}
-    if task.get("venue_key") and task["venue_key"] != _venue_key(bridge):
-        return {"position_key": position_key, "status": "venue_mismatch"}
     stop_leg = next((leg for leg in task["legs"] if leg["name"] == "stop-loss"), None)
     target_legs = [leg for leg in task["legs"] if leg["name"].startswith("take-profit")]
     if stop_leg is None or not target_legs:
@@ -540,6 +590,9 @@ def _position_identity(position_key: str, snapshot: dict) -> tuple[str, str]:
         raise ValueError(f"invalid futures position key: {position_key!r}")
     symbol, side_token, _entry_id = parts
     side = str(snapshot.get("side") or ("long" if side_token == "buy" else "short" if side_token == "sell" else ""))
+    expected_side = "long" if side_token == "buy" else "short" if side_token == "sell" else None
+    if not symbol or expected_side is None or side != expected_side:
+        raise ValueError("position key and snapshot side do not agree")
     return symbol, side
 
 
@@ -561,15 +614,6 @@ def _validate_policy_config(config: dict) -> None:
     max_mark_age = float(config.get("risk_derivatives_mark_max_age_seconds", 120.0))
     if not math.isfinite(max_mark_age) or max_mark_age <= 0:
         raise ValueError("mark maximum age must be finite and positive")
-
-
-def _venue_key(bridge: Any) -> str:
-    config = bridge.config
-    return "|".join((
-        str(bridge.exchange_id).lower(),
-        str(config.get("exec_base_url") or "").rstrip("/").lower(),
-        str(config.get("exec_sandbox") is True),
-    ))
 
 
 def _position_map(positions: tuple[FuturesPosition, ...]) -> dict[tuple[str, str], FuturesPosition]:

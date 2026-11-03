@@ -21,11 +21,11 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
-from server import audit as audit_log
+from server import audit as audit_log, performance_history_cache, portfolio_snapshot
 from server.contract import ApiError, utc_now_iso
+from server.futures_snapshot import read_futures_snapshot
 from server.position_cost import attach_position_costs
 from tradingagents.dataflows.config import get_config
-from tradingagents.execution.futures_account import read_futures_account
 from tradingagents.execution.risk import _consecutive_losses, _halted_today, _replay
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -59,9 +59,8 @@ def _fifo_basis(lots) -> tuple[float | None, str | None]:
 def _venue_position(bridge, position, open_lots, warnings) -> dict:
     try:
         marked = bridge.fetch_price(position.ticker)
-    except Exception as exc:  # the venue served the balance but cannot mark: §6 wants 503
-        raise ApiError(503, "exchange_unreachable",
-                       f"venue cannot mark {position.ticker}: {exc}") from exc
+    except Exception as exc:  # the caller reports a sanitized Spot error
+        raise ApiError(503, "exchange_unreachable", "venue cannot mark position") from exc
     average, basis = _fifo_basis(open_lots.get(position.ticker))
     quantity = position.quantity
     if quantity is None:
@@ -102,15 +101,42 @@ def _audit_position(ticker: str, lots) -> dict:
 
 @router.get("/portfolio")
 def get_portfolio():
-    config = get_config()
-    events, skipped = audit_log.read_events()  # 503 when the log exists but cannot be read
+    return portfolio_snapshot.read_portfolio(
+        get_config(),
+        build_bridge=_build_bridge,
+        get_config=get_config,
+        load_portfolio=_get_portfolio,
+        stale_after=STALE_AFTER,
+    )
+
+
+def _mark_rate_limit(exc: Exception, bridge) -> bool:
+    if not performance_history_cache.is_rate_limit_error(exc):
+        return False
+    try:
+        client = bridge.client()
+    except Exception:
+        client = None
+    retry_after = performance_history_cache.retry_after_from_exception(exc, client)
+    performance_history_cache.start_cooldown({"retry_after_seconds": retry_after})
+    return True
+
+
+def _get_portfolio(config: dict, bridge=None):
+    warnings: list[str] = []
+    try:
+        events, skipped = audit_log.read_events()
+    except Exception:
+        if config.get("exec_live") is not True:
+            raise
+        events, skipped = None, 0
+        warnings.append("audit data unavailable")
     today = datetime.now(UTC).date()
-    # This response's top-level portfolio is Spot-only. Futures positions and
-    # account P&L come from the venue snapshot below, not the Spot FIFO replay.
-    spot_events = [event for event in events if event.get("market", "spot") != "derivatives"]
+    spot_events = [
+        event for event in events if event.get("market", "spot") != "derivatives"
+    ] if events is not None else []
     closed, open_lots = _replay(spot_events)
 
-    warnings: list[str] = []
     if skipped:
         warnings.append(f"{skipped} unparseable audit lines were skipped")
 
@@ -118,27 +144,36 @@ def get_portfolio():
     currency = str(config.get("exec_quote_currency") or "USDT").strip().upper() or None
     positions: list[dict] = []
 
-    bridge = None
     live = False
+    spot_available = False
     if config.get("exec_live") is True:  # only then can the env flag open the venue
         try:
-            bridge = _build_bridge(config)
+            if bridge is None:
+                bridge = _build_bridge(config)
         except Exception as exc:
             raise ApiError(503, "exchange_unreachable", f"venue not available: {exc}") from exc
         live = bridge.effective_mode() == "live"
 
-    if live:
+    if not live and events is None:
+        raise ApiError(503, "audit_log_unreadable", "audit log cannot be read")
+    if live and not performance_history_cache.is_rate_limited():
         try:
             portfolio = bridge.sync_portfolio()
+            cash = portfolio.cash
+            if portfolio.currency:
+                currency = portfolio.currency
+            for position in portfolio.positions:
+                positions.append(_venue_position(bridge, position, open_lots, warnings))
+            spot_available = True
         except Exception as exc:
-            raise ApiError(503, "exchange_unreachable",
-                           f"venue cannot serve a balance: {exc}") from exc
-        cash = portfolio.cash
-        if portfolio.currency:
-            currency = portfolio.currency
-        for position in portfolio.positions:
-            positions.append(_venue_position(bridge, position, open_lots, warnings))
-    else:
+            cause = exc.__cause__ if exc.__cause__ is not None else exc
+            _mark_rate_limit(cause, bridge)
+            cash, positions = None, []
+            warnings.append(f"spot account read failed ({type(cause).__name__})")
+    elif live:
+        warnings.append("spot and futures reads deferred during rate limit cooldown")
+
+    if not live:
         for ticker in sorted(open_lots):
             lots = open_lots[ticker]
             if abs(sum(lot.quantity for lot in lots)) <= _QTY_EPSILON:
@@ -183,21 +218,27 @@ def get_portfolio():
         "unrealized_pnl_currency": None,
         "account_scope": "derivatives",
         "positions": [],
+        "positions_read": {
+            "status": "unavailable", "skipped": None, "issues": [], "observed_at": None,
+        },
         "status": "unavailable",
         "error": None,
     }
-    if live:
+    if live and not performance_history_cache.is_rate_limited():
         try:
-            futures = read_futures_account(bridge).as_dict()
+            futures = read_futures_snapshot(bridge)
         except Exception as exc:
+            _mark_rate_limit(exc, bridge)
             futures["status"] = "error"
             futures["error"] = f"futures account read failed ({type(exc).__name__})"
             warnings.append(futures["error"])
         else:
             try:
-                attach_position_costs(futures, bridge, config, warnings)
+                attach_position_costs(futures, config)
             except Exception as exc:
                 warnings.append(f"futures position cost unavailable ({type(exc).__name__})")
+    elif live:
+        warnings.append("futures account read deferred during rate limit cooldown")
 
     return {
         "generated_at": utc_now_iso(),
@@ -205,6 +246,7 @@ def get_portfolio():
         "cash": cash,
         "equity_est": equity,
         "positions": positions,
+        "positions_source": ("venue" if spot_available else "unavailable") if live else "audit",
         "realized_pnl": {
             "total": total,
             "today": today_total,
@@ -214,8 +256,8 @@ def get_portfolio():
             "consecutive_losses": _consecutive_losses(
                 closed, int(config.get("risk_max_consecutive_loss_count") or 3)
             ),
-        },
-        "halted_today": _halted_today(events, today),
+        } if events is not None else None,
+        "halted_today": _halted_today(events, today) if events is not None else None,
         "warnings": warnings,
         "stale_after": STALE_AFTER,
         "futures": futures,

@@ -703,18 +703,18 @@ Errors: 404 (job không tồn tại ở cả live set lẫn database). Trạng t
 
 ## 6. Portfolio — `GET /api/portfolio` (màn Tổng quan)
 
-Nguồn: `bridge.sync_portfolio()` (`bridge.py:330-356`) cho **Spot cash/equity/positions**; riêng section **Futures** đọc read-only futures balance và positions qua `fetch_balance`/`fetch_positions` với tham số loại futures của venue. Cả hai được giữ tách biệt. **Spot realized P&L** lấy từ replay FIFO `risk.py` trên audit log chỉ sau khi bỏ các event `market="derivatives"`; Futures unrealized P&L lấy từ venue snapshot, không cộng vào Spot cash, equity hoặc realized P&L. Nếu bridge/Spot venue khởi tạo hoặc Spot balance/mark thất bại, endpoint trả 503 `exchange_unreachable`; nếu chỉ Futures read lỗi, endpoint vẫn 200 và trả `futures.status="error"`, `futures.error` chỉ nêu loại exception, kèm warning — không diễn giải lỗi đó thành vị thế rỗng.
+Nguồn: **Spot cash/equity/positions** lấy từ `bridge.sync_portfolio()` khi effective live, còn dry tái dựng positions từ audit; section **Futures** đọc độc lập từ cùng bridge/client. Snapshot Futures không chứng minh đầy đủ scope; `observed_at` chỉ ghi thời điểm lời đọc vị thế trả về. Spot realized P&L replay FIFO từ audit không gồm derivatives; Futures P&L không cộng vào Spot. Lỗi Spot hoặc audit trong live mode không che dữ liệu Futures khả dụng; P&L và halt không xác định được trả null. Lỗi Futures báo riêng trong section Futures. Khi bị giới hạn, các lượt đọc hiển thị tiếp theo có thể bị hoãn theo cooldown.
 
 Request: `GET /api/portfolio` (không tham số bắt buộc).
 
-Response 200:
+Response 200 (số liệu giả định, không phải dữ liệu tài khoản):
 
 ```json
 {
   "generated_at": "2026-09-30T08:00:00Z",
   "currency": "USDT",
   "cash": 9500.0,
-  "equity_est": 10225.0,
+  "equity_est": 9915.5,
   "positions": [
     {
       "ticker": "BTC-USD",
@@ -726,6 +726,7 @@ Response 200:
       "unrealized_pnl": 5.5
     }
   ],
+  "positions_source": "venue",
   "realized_pnl": {
     "total": 12.34,
     "today": -1.2,
@@ -763,6 +764,7 @@ Response 200:
       "margin_currency": "USDT",
       "unrealized_pnl_currency": "USDT"
     }],
+    "positions_read": { "status": "partial", "skipped": 0, "issues": [{ "symbol": null, "reason": "scope_unverified" }], "observed_at": "2026-09-30T08:00:00.123Z" },
     "status": "ok",
     "error": null
   },
@@ -774,21 +776,26 @@ Response 200:
 
 Định nghĩa từng field:
 
-- `cash`, `currency`, `positions[]`, `equity_est` — chỉ Spot, từ `sync_portfolio`: `quantity` thực từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. `equity_est = cash + Σ quantity × marked_price`; Futures wallet/equity/notional không được cộng vào đây. Khi một position có `quantity: null`, số lượng chưa xác định được giữ nguyên; `market_value`, `unrealized_pnl` của position và `equity_est` đều null, kèm warning. Không coi số lượng chưa biết là 0.
+- `cash`, `currency`, `positions[]`, `equity_est` — chỉ Spot; khi effective live, `sync_portfolio` lấy `quantity` từ `balance.total`, `cash` từ `balance.free` của quote; `cash: null` khi balance không trả quote. `equity_est = cash + Σ quantity × marked_price`; Futures wallet/equity/notional không được cộng vào đây. Khi một position có `quantity: null`, số lượng chưa xác định được giữ nguyên; `market_value`, `unrealized_pnl` của position và `equity_est` đều null, kèm warning. Không coi số lượng chưa biết là 0.
+- `positions_source`: `"venue"` khi đọc Spot live thành công, `"unavailable"` khi lỗi hoặc snapshot không khả dụng, `"audit"` khi dry. `realized_pnl` và `halted_today` là null khi audit không đọc được; không suy ra P&L bằng 0 hoặc trạng thái không halt. Ở dry, Spot positions được tái dựng từ open FIFO lots trong audit, có thể gồm giao dịch mô phỏng; không phải snapshot vị thế live. `cash`, `marked_price`, `market_value` và `unrealized_pnl` không khả dụng; không suy ra equity thực từ `equity_est` (có thể là 0 khi có lots không được mark).
 - Spot `marked_price` = `bridge.fetch_price(ticker)`; null khi venue không mark được. Position có quantity đã biết nhưng không mark được tính 0 trong `equity_est` và sinh warning; position có `quantity: null` khiến `market_value`, `unrealized_pnl` và `equity_est` là null vì không thể tính an toàn.
-- `average_price` + `basis_source` lấy từ open FIFO lots của Spot audit fills chỉ; `unrealized_pnl` chỉ tính khi có basis + mark, ngược lại null. Futures fills không ảnh hưởng `realized_pnl`, `by_ticker`, `closed_trades` hay `consecutive_losses` của Spot section.
-- `realized_pnl.total` là Spot P&L đã chốt có basis; `today` chỉ gồm lệnh đóng theo UTC hôm nay, khác con số RiskGuard (có thể cộng thêm unrealized của lot mở trong ngày). `by_ticker`, `closed_trades`, `unknown_basis_closes` và `consecutive_losses` đều tính trên Spot-only FIFO replay.
-- `futures.status`: `ok` khi cả balance và positions được đọc, `error` khi một lần đọc futures thất bại, `unavailable` khi chưa vào effective live mode (không có request tới futures private endpoints). Khi `error`, các account fields vẫn null/positions rỗng nhưng phải hiển thị message lỗi, không phải trạng thái tài khoản rỗng.
-- `futures.positions[]`: `side` là hướng venue; `quantity` có dấu (long dương, short âm), `contracts` là độ lớn không dấu. `notional` luôn là magnitude tuyệt đối, không phải cash inflow hay P&L; `margin` là collateral/initial margin nếu venue trả, không suy ra từ notional khi thiếu; `unrealized_pnl` là số liệu venue báo, chưa chốt. Các trường `price_currency`, `notional_currency`, `margin_currency`, `unrealized_pnl_currency` gắn đơn vị riêng cho từng đại lượng; null nghĩa là venue/CCXT không xác định chắc chắn và UI không được suy ra từ Spot quote. OKX có thể trả notional USD trong khi margin/P&L theo settlement coin. `entry_price`, `mark_price`, `liquidation_price`, `leverage`, `margin_mode` cũng có thể null nếu venue không cung cấp.
+- `average_price` + `basis_source` lấy từ open FIFO lots trong Spot audit; `unrealized_pnl` chỉ tính khi có basis + mark, ngược lại null. Futures fills không ảnh hưởng `realized_pnl`, `by_ticker`, `closed_trades` hay `consecutive_losses` của Spot section.
+- `realized_pnl.total` là Spot P&L đã chốt có basis theo replay audit; `today` chỉ gồm lệnh đóng theo UTC hôm nay, khác con số RiskGuard (có thể cộng thêm unrealized của lot mở trong ngày). `by_ticker`, `closed_trades`, `unknown_basis_closes` và `consecutive_losses` đều tính trên Spot-only FIFO replay. Giá vốn và P&L này là số liệu suy ra từ audit, có thể chứa mô phỏng hoặc ước tính, không phải kết quả đã đối soát với sàn.
+- `futures.status`: `ok` khi account/balance đã đọc hợp lệ, kể cả khi đọc positions bị lỗi thông thường hoặc chỉ được một phần; `error` khi account/balance thất bại, venue không hỗ trợ, hoặc vị thế trả 418/429; `unavailable` khi chưa vào effective live mode hoặc read bị hoãn trong cooldown (không gọi futures private endpoints). Trong các trường hợp `error`/`unavailable`, account fields null, `positions: []` và `positions_read` unavailable; không coi đây là tài khoản không có vị thế (`server/portfolio.py`).
+- `futures.positions_read` có shape `{ "status": "partial" | "unavailable", "skipped": number | null, "issues": [{ "symbol": null, "reason": string }], "observed_at": string | null }`. Binance USD-M dùng `fapiPrivateV3GetPositionRisk({})` sau khi kiểm tra profile, routes và account mode; Bybit/OKX dùng `fetch_positions`. Khi endpoint trả list, trạng thái luôn `partial` và issues luôn có `{ "symbol": null, "reason": "scope_unverified" }`: chưa chứng minh được đầy đủ account scope, kể cả khi không có lỗi dòng hay list rỗng. `skipped` đếm riêng các dòng lỗi (0 nếu không có); issue dùng mã lý do đã làm sạch và không để lộ symbol thô. `observed_at` là UTC sau khi lời gọi vị thế trả về, trước normalization; nếu venue trả non-list thì timestamp vẫn có vì đã nhận response. Nếu lời gọi ném lỗi thông thường, trạng thái `partial`, `skipped: null`, issue `read_failed`, `observed_at: null`; lỗi 418/429 được truyền tới portfolio để bật cooldown chung và phần Futures có status `error`. Binance Portfolio Margin chưa được hỗ trợ: balance có envelope list không gửi request USD-M V3 và position issue là `account_type_unverified`. `invalid_response` được dùng khi lời gọi không ném lỗi nhưng trả non-list. `unavailable` với `skipped: null`, `issues: []`, `observed_at: null` dùng khi chưa đọc snapshot hoặc account lỗi (`server/futures_snapshot.py`, `server/portfolio.py`). `positions: []` không xác nhận tài khoản không có vị thế, kể cả khi `skipped: 0`.
+- `futures.positions[]`: `side` là hướng venue; `quantity` có dấu khi xác định được (long dương, short âm), `contracts` là độ lớn không dấu. Thiếu metadata hợp đồng đáng tin cậy hoặc thiếu entry hợp lệ của inverse có thể khiến `quantity: null`. `notional` luôn là magnitude tuyệt đối, không phải cash inflow hay P&L; `margin` là collateral/initial margin nếu venue trả, không suy ra từ notional khi thiếu; `unrealized_pnl` là số liệu venue báo, chưa chốt. Các trường `price_currency`, `notional_currency`, `margin_currency`, `unrealized_pnl_currency` gắn đơn vị riêng cho từng đại lượng; null nghĩa là venue/CCXT không xác định chắc chắn và UI không được suy ra từ Spot quote. OKX có thể trả notional USD trong khi margin/P&L theo settlement coin. `entry_price`, `mark_price`, `liquidation_price`, `leverage`, `margin_mode` cũng có thể null nếu venue không cung cấp.
 - `futures.equity_currency`, `wallet_balance_currency`, `available_balance_currency`, `unrealized_pnl_currency` lần lượt mô tả đơn vị của từng tổng account; không dùng chung một currency khi nguồn khác nhau. Bybit Unified `totalEquity`, `totalWalletBalance`, `totalAvailableBalance` và `totalPerpUPL` là giá trị quy đổi USD; OKX `totalEq`/`upl` là USD, còn wallet detail chỉ có currency khi một coin duy nhất rõ ràng (`ccy`). Những tổng này không trộn vào Spot metrics. Bybit positions được yêu cầu theo `settleCoin=exec_quote_currency`; các sàn khác ngoài Binance/Bybit/OKX trả section Futures error rõ ràng vì chưa có routing đã xác minh. `venue_profile` là `demo`/`production` khi xác định được từ Binance URL, nếu không thì null.
-- `stale_after: 30` — màn Tổng quan poll snapshot mỗi 30 giây; mọi số dư/mark phản ánh venue tại `generated_at`.
+- Chi phí giữ vị thế (display-only): `round_trip_fee` = `|notional| × risk_derivatives_round_trip_fee_rate`, kèm `round_trip_fee_currency` là currency của notional đã xác minh trong snapshot; thiếu notional/rate/currency → null. `opened_at`, `held_hours`, `funding`, `funding_currency` hiện luôn null: position state không có ràng buộc account bền vững (venue_key chỉ định danh venue/profile, không phải account) nên UI không được ghép vị thế venue với `opened_at` hoặc cửa sổ funding lưu trong state; funding cũng không được cộng thành 0 khi coverage/cửa sổ/currency chưa được chứng minh. Khôi phục các số này cần lượt account-binding được phê duyệt riêng.
+- `stale_after: 30` — màn Tổng quan poll snapshot mỗi 30 giây. `generated_at` chỉ là thời điểm tạo HTTP response, không phải thời điểm dữ liệu tại sàn; `futures.positions_read.observed_at` là thời điểm client nhận xong lời đọc vị thế, không chứng minh snapshot nguyên tử với balance hay tuổi dữ liệu nguồn. UI giữ bản cũ kèm cảnh báo khi poll lỗi; danh sách `partial` không bao giờ được trình bày như danh sách đầy đủ hay tài khoản phẳng.
+- Khi bật đồng bộ hiển thị (mặc định TẮT, cần cả `TRADINGAGENTS_UI_SNAPSHOT_SYNC=true` và `TRADINGAGENTS_UI_SNAPSHOT_SINGLE_PROCESS=true`), response thêm `snapshot` với context HMAC theo credential của client, epoch, generation, pending, dirty, cache, các timestamp request/response gốc và `freshness: "unknown"`, `atomic: false`. Dockerfile mặc định một worker nhưng cấu hình không chứng minh chỉ một replica; operator phải xác nhận topology trước khi bật. Mỗi process gộp read đồng thời, giới hạn tối đa 4 read đang bay, khoảng cách 5 giây giữa hai lần bắt đầu cùng key xuyên generation và tối đa 12 lần bắt đầu/phút/context; TTL 25 giây, retention 300 giây, timeout 8 giây. Đây là giới hạn **bắt đầu loader UI**, không phải tổng HTTP, request weight, các đường giao dịch/monitor, process khác hay tổng lưu lượng IP Binance. Khi bị chặn có thể trả cache cũ với `cache: "stale"`, dirty/error và timestamp gốc; không có cache thì unavailable. Read đang bay bị event chen ngang bị từ chối; read không bị chen ngang sau mutation có thể xóa dirty nhưng không chứng minh read-after-write hay tuổi dữ liệu nguồn. Các mutation chỉ là hint, không chứng minh fill; TP/SL thực thi tại sàn chỉ được phát hiện qua monitor hint có bằng chứng hoặc polling định kỳ. Cooldown dùng chung với lịch sử hiển thị khi thấy 418/429; không áp dụng lên đường giao dịch.
+- `GET /api/snapshot/events` (SSE, GET-only, miễn CSRF) phát hint invalidation `{id, epoch, type: "dirty" | "reset", context_id, generation, resource, symbol, operation, phase, outcome, occurred_at}`. Mỗi kết nối bắt đầu bằng reset rồi theo dõi hint mới, không hứa replay xuyên restart; UI debounce GET portfolio, đóng listener khi rời màn và vẫn poll định kỳ. `pending`/`outcome` mô tả lời gọi mutation, không phải bằng chứng fill.
 
 Errors:
 
 | HTTP | code | ý nghĩa |
 |------|------|---------|
-| 503 | `exchange_unreachable` | Spot venue không đọc được balance/mark trong `/api/portfolio`; Futures read lỗi riêng được biểu diễn trong section `futures` và không làm hỏng Spot snapshot |
-| 503 | `audit_log_unreadable` | `exec_log_path` không đọc được — nhất quán với execute-time fail-closed (`risk.py:122-147`) |
+| 503 | `exchange_unreachable` | Không tạo được bridge khi cần live; lỗi Spot read đã khởi tạo bridge được báo trong response 200 |
+| 503 | `audit_log_unreadable` | Audit không đọc được trong dry mode; live mode trả audit unknown để vẫn giữ Futures |
 
 Trạng thái: loading · **empty** (`cash: null`, `positions: []`, `realized_pnl.total: 0` — chưa có dữ liệu venue/log; hiển thị empty-state riêng, không coi là lỗi) · error 503 (retry) · stale 30s + auto-poll.
 
@@ -989,7 +996,8 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 16| GET   | `/api/history`                   | decision log + run tree |
 | 17| GET   | `/api/backtest`                  | `results_dir/backtest/*` + summarize |
 | 18| GET   | `/api/health`                    | mode/halt/key status |
-| 19| GET   | `/api/performance`               | đọc `exec_log_path` FIFO Spot + Futures long/short (§12) |
+| 19| GET   | `/api/performance`               | đọc execution audit: brackets, sự kiện execute gần đây, skipped_lines (§12) |
+| 19a| GET  | `/api/performance/fills`          | đọc một trang/mã Binance USD-M Futures trong phạm vi audit-selected (§12) |
 | 20| GET   | `/api/autoloop`                  | gates (thêm 2 nửa futures — chỉ quan sát) + state file `autoloop.json` (§13, §15) |
 | 21| POST  | `/api/autoloop`                  | fail-closed 409 gate_closed (§13) |
 | 22| POST  | `/api/autoloop/run-now`          | 1 chu kỳ screen→propagate→plan→`_handle_plan`; crypto qua `DerivativesExecutor` khi `exec_derivatives` bật — futures long/short, đòn bẩy ≤3× (§15) |
@@ -997,7 +1005,7 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
 | 25| GET   | `/api/runs`                      | lịch sử run (database) + `active_run_id` (§3 rev 7) |
 
-**endpointCount = 26.**
+**endpointCount = 28.**
 
 ---
 
@@ -1024,59 +1032,35 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 
 - §4: approve fail-closed được giữ đúng như đã code (hiện `approvals.py:245-250`) và bổ sung pipeline 4 bước (rebuild → double-check → `execute_order` → audit hai tầng) khi `exec_live=True`; **bỏ** policy `dry_fill_on_gate_closed`; thêm lỗi `mock_not_executable`/502 `execute_failed`; item + `daily_job_id`/`expires_at`/`mock`; trạng thái `approved` rõ nghĩa claim. *Rev 3.1: pipeline đã implement, refusals trước claim.*
 - §5: worker server tự chạy vòng lặp per-coin trên seam engine (không gọi `run_daily`); `mode: "mock"` tái dùng machinery `runs.py`; enqueue per-coin (risk 13 cũ về enqueue-at-completion được giải quyết — xoá); job không bao giờ tự execute.
-- `performance.py` hỗ trợ FIFO Spot và Futures long/short theo market, không chỉ long-only; Futures mark dùng unified futures symbol.
 - §7–§11: renumber từ §6–§10; thêm mã lỗi 403 `forbidden_key`, 410 `expired`, 502 `execute_failed`, 503 `exchange_unreachable` vào §0.1; Base URL/origin §0 khớp code thật (`server/main.py:5,26-33`, `web/next.config.ts:7-9`).
 
 ---
 
-## 12. Performance — `GET /api/performance` (rev 8, màn Tổng quan)
+## 12. Performance — `GET /api/performance`, `GET /api/performance/fills` (màn Tổng quan)
 
-Nguồn: replay fill từ engine audit log (`exec_log_path`) qua `audit.read_events()` — không đụng venue, trừ mark giá cho position mở.
-
-Định nghĩa **fill**: dòng audit có `action ∈ {buy, sell}`, `phase == "execute"`, ticker khác rỗng và `qty > 0`, `price_est > 0` — dòng plan, risk rejection, awaiting-approval không bao giờ dịch chuyển position.
-
-- FIFO tách theo `(ticker, market)`: Spot và derivatives không khớp chéo; derivatives hỗ trợ short. Futures mark dùng unified futures contract symbol; Spot mark tiếp tục dùng spot resolver. Không có mark → `current_price` và `unrealized_pct` là `null`.
+Performance tách ba nguồn: sự kiện audit từ `/api/performance`, vị thế Futures từ snapshot venue và vị thế Spot theo `positions_source` của `/api/portfolio` (§6), và khớp lệnh Futures do sàn báo cáo từ `/api/performance/fills`. Không dùng audit replay để xác nhận vị thế hiện tại, thống kê thắng/thua hay lịch sử P&L; audit có thể thiếu giao dịch, chứa ước tính hoặc giao dịch mô phỏng.
 
 ### GET /api/performance
 
-
-Response 200:
+Đọc `exec_log_path` qua `audit.read_events()`, không gọi venue (`server/performance.py:37-70`). Không có tham số bắt buộc. Response 200 ví dụ giả định:
 
 ```json
 {
-  "generated_at": "2026-10-02T08:00:00Z",
-  "summary": {
-    "closed_trades": 2,
-    "wins": 1,
-    "losses": 1,
-    "win_rate_pct": 50.0,
-    "avg_win_pct": 10.0,
-    "avg_loss_pct": -5.0,
-    "expectancy_pct": 2.5
-  },
-  "open_positions": [
-    {
-      "ticker": "BTC-USD",
-      "qty": 0.002,
-      "entry_price": 50000.0,
-      "current_price": 52500.0,
-      "unrealized_pct": 5.0,
-      "market": "spot",
-      "leverage": null,
-      "mode": "dry",
-      "entry_at": "2026-10-01T03:00:00Z"
-    }
-  ],
-  "brackets": { "placed": 1, "failed": 1 },
+  "generated_at": "2026-11-02T12:00:00Z",
+  "skipped_lines": 1,
+  "summary": null,
+  "open_positions": null,
+  "brackets": { "placed": 0, "failed": 0 },
   "recent_orders": [
     {
-      "timestamp": "2026-10-01T07:00:00Z",
-      "ticker": "BTC-USD",
+      "timestamp": "2026-11-02T11:00:00Z",
+      "ticker": "ASSET-USD",
+      "ccxt_symbol": null,
       "action": "rejected_by_risk",
       "qty": null,
-      "price_est": 50000.0,
+      "price_est": null,
       "market": "spot",
-      "leverage": 1.0,
+      "leverage": null,
       "cost": null,
       "mode": "dry",
       "order_id": null
@@ -1085,13 +1069,60 @@ Response 200:
 }
 ```
 
-- `summary` — win/loss trên round-trip đóng: `wins` = pnl > 0, `losses` = pnl ≤ 0 (loss giữ dấu âm), `expectancy_pct` = trung bình toàn bộ round-trip ⇒ `win_rate × avg_win + loss_rate × avg_loss == expectancy` (`performance.py:116-130`).
-- `open_positions[]` — mỗi lot chưa khớp có `qty` có dấu: long dương, Futures short âm; `market` là `spot` hoặc `derivatives`, `leverage` lấy từ fill nếu có. `current_price` mark qua seam theo market (Spot resolver hoặc unified futures symbol); không mark được → `null`, không biến thành giá 0. Với short, `unrealized_pct` dương khi mark thấp hơn entry.
-- `recent_orders[]` — tối đa 50 dòng `phase == "execute"` mới nhất, mới nhất trước; gồm `market`, `leverage`, `cost` cùng qty/price/order id. `cost` của derivatives là margin/cost kế hoạch hoặc fill do venue trả; UI hiển thị nó cùng notional theo nhãn trung tính, không phải cash inflow hay realized P&L. qty/price/cost thiếu phải hiển thị `—`.
+- `summary` và `open_positions` luôn là `null`: chưa đủ dữ liệu đối soát để xác nhận thống kê giao dịch đóng hoặc vị thế mở. Hiển thị chưa xác định, không thay bằng số 0 hay danh sách rỗng. Vị thế venue và chất lượng đọc nằm ở `/api/portfolio`, bao gồm `positions_source` và `futures.positions_read` (§6).
+- `recent_orders` là tối đa 50 sự kiện audit có `phase="execute"` và `action` khác rỗng, theo thứ tự dòng mới nhất trước, không sắp xếp theo timestamp. Bao gồm cả dry/live, từ chối, thất bại và bracket; **không phải danh sách fill đã xác nhận**. `qty`, `price_est`, `leverage`, `cost` chỉ giữ số hữu hạn, các giá trị sai/thiếu là `null`; các trường text sai kiểu là `null`, riêng `market` mặc định `"spot"` khi thiếu, rỗng hoặc sai kiểu. `price_est` và `cost` không chứng minh giá khớp hay P&L.
+- `brackets.placed`/`failed` đếm các sự kiện `bracket_placed`/`bracket_failed` trong toàn audit, không phân biệt phase/mode; đây là số lần ghi nhận trong lịch sử, không xác nhận bảo vệ hiện tại trên sàn.
+- `skipped_lines` là số dòng JSON không hợp lệ hoặc không phải object bị bỏ qua; dòng trống không được tính (`server/audit.py:34-64`). Hiển thị cảnh báo nếu lớn hơn 0.
 
-Errors: `503 audit_log_unreadable` (log tồn tại nhưng không đọc được — nhất quán `/api/audit`); **log thiếu hoặc rỗng là empty state 200 toàn số 0, không phải lỗi** (`performance.py:202-205`).
+Log thiếu hoặc rỗng trả 200 với `summary`/`open_positions` null, `recent_orders: []`, số đếm bracket và `skipped_lines` bằng 0; điều này không chứng minh tài khoản không có giao dịch. Log tồn tại nhưng không đọc được trả `503 audit_log_unreadable`. UI xử lý loading, danh sách audit rỗng, lỗi/retry và dữ liệu cũ; Overview poll audit performance mỗi 30 giây (`web/components/overview/dashboard.tsx:45`).
 
-Trạng thái: loading · **empty** (chưa có fill nào — `summary` toàn 0, danh sách rỗng) · error 503 (retry) · stale 60s (badge "cũ" — `web/components/overview/performance-card.tsx:45`).
+### GET /api/performance/fills
+
+Endpoint **read-only**, không tham số bắt buộc, chỉ đọc khớp lệnh Binance USD-M Futures từ venue; không đặt/hủy lệnh, đổi cấu hình hay ghi audit. Đây không phải lịch sử Spot hoặc toàn bộ tài khoản (`server/performance_history.py:276-391`, `server/futures_trade_history.py:267-416`).
+
+Điều kiện và phạm vi:
+
+- Gate effective live phải mở: `exec_live` là boolean `true` trong config **và** `TRADINGAGENTS_EXEC_LIVE` được đọc là true (`true`, `1`, `yes`, `on`, không phân biệt hoa thường). Với cấu hình Binance, khi dry/gate đóng trả 200 `status="unavailable"`, `source="unavailable"`, `fills=[]`, kèm warning và không gọi venue; đây không phải xác nhận không có fill (`bridge.py:714-728`, `bridge.py:769-780`). Khi `exec_live` là `true` nhưng cấu hình sàn khác Binance, endpoint trả `unsupported` trước khi kiểm tra nửa env.
+- Chỉ chọn tối đa 12 `ccxt_symbol` Futures chính xác, duy nhất từ event `phase="execute"`, `mode="live"`, `market="derivatives"` và action `buy`, `sell`, `bracket_placed`, `bracket_failed` hoặc `time_stop_closed`; ưu tiên event audit có `venue_key` khớp venue hiện tại, mới nhất theo timestamp trong mỗi nhóm. Legacy event thiếu `venue_key` vẫn có thể gợi ý mã để hỏi sàn, nhưng luôn kèm warning và đứng sau mọi mã đã xác minh; không dùng chúng làm bằng chứng fill hay bot ownership. Event có venue key khác bị loại. `time_stop_closed` chỉ giúp chọn mã cần hỏi sàn; chính nó không được trình bày như fill. Chọn mã từ toàn audit, không chỉ sự kiện trong cửa sổ 7 ngày; timestamp không hợp lệ được xếp cuối và có warning. Không đoán mã từ ticker. Dòng hỏng, mã thiếu/sai hoặc vượt giới hạn cũng được cảnh báo. Không có mã đủ điều kiện trả `unavailable`, không gọi lịch sử sàn (`server/performance_history.py:97-137,211-255`).
+- Cửa sổ UTC cố định 7 ngày `[start_at, end_at)`: tính cả đầu, không tính cuối; `end_at` là thời điểm bắt đầu xử lý request, chính xác đến mili giây. Chỉ giữ fill trong cửa sổ và các mã đã chọn. Reader chỉ đọc **một trang/mã**, tối đa 1000 fill; trang đầy có thể đã bỏ sót fill cũ hơn, kể cả cùng timestamp, và được đánh dấu partial. Deadline phối hợp 15 giây kiểm tra giữa các lời gọi, không bảo đảm ngắt I/O/retry đang chạy; timeout client 5 giây (`server/performance_history.py:349-352`, `server/futures_trade_history.py:219-285`).
+- Cache response: sau khi qua effective live gate và chọn được mã, route tra cache trước khi kiểm tra rate-limit và trước khi gọi venue. Chỉ cache payload có `source="venue_fills"` và `status` `ok`/`partial`; cache giữ tối đa 240 giây, lưu **một payload duy nhất** trong process và xóa payload cũ khi ghi payload mới. Khóa cache gồm profile venue (exchange id + base URL), HMAC của cặp credential môi trường hiện tại và đúng thứ tự danh sách symbol đã chọn; nếu thiếu credential đầy đủ thì không cache. Khi cache hit, `generated_at`, `start_at`, `end_at` và `observed_at` giữ timestamp của lần đọc venue đã lưu; warning và phạm vi từ audit được cập nhật theo lần gọi hiện tại, không tạo lần đọc venue mới.
+- Phạm vi chọn từ audit luôn chưa đầy đủ: không biết toàn bộ mã/giao dịch tài khoản, basis vị thế trước cửa sổ hoặc thời gian lưu trữ của sàn. Reader đọc thành công luôn gắn warning `normalized_history_unverified`, kể cả trang chuẩn hóa rỗng; endpoint cũng ép `status="partial"` với mọi kết quả venue `status="ok"`. Chỉ khi không có lần đọc chuẩn hóa thành công nào mới trả `unavailable`, không phải lịch sử đầy đủ với 0 giao dịch. `fills: []` khi partial/unavailable không chứng minh không có giao dịch khác.
+
+Response 200 ví dụ giả định, mọi mã và số liệu đều là dữ liệu minh họa:
+
+```json
+{
+  "generated_at": "2026-11-02T12:00:00.000Z",
+  "status": "partial",
+  "source": "venue_fills",
+  "venue_profile": "demo",
+  "start_at": "2026-10-26T12:00:00.000Z",
+  "end_at": "2026-11-02T12:00:00.000Z",
+  "observed_at": "2026-11-02T12:00:00.000Z",
+  "coverage": "Chỉ các mã trong nhật ký được chọn; chưa xác minh đầy đủ tài khoản và lịch sử trước khoảng này. Các giao dịch là của tài khoản sàn đang chọn, có thể do người dùng hoặc hệ thống khác thực hiện. Không xác minh được giao dịch nào do bot thực hiện. Chưa xác định cơ sở vị thế ban đầu và thời gian lưu trữ của sàn. Mã đã chọn: ASSET/USDT:USDT.",
+  "warnings": ["Lịch sử chuẩn hóa chưa được xác minh đầy đủ."],
+  "fills": [{
+    "trade_id": "101",
+    "order_id": "201",
+    "symbol": "ASSET/USDT:USDT",
+    "side": "buy",
+    "timestamp": "2026-11-01T12:00:00.000Z",
+    "contracts": "0.12500000",
+    "price": "100.00000001",
+    "fee": "0.01000000",
+    "fee_currency": "USDT",
+    "realized_pnl": null,
+    "realized_pnl_currency": null
+  }]
+}
+```
+
+- `status`: `partial` cho kết quả normalized từ venue; reader luôn cảnh báo `normalized_history_unverified`, kể cả khi không có fill. `unavailable` khi gate đóng, không có mã, reader/client/markets không khả dụng hoặc đang trong cooldown rate-limit; `unsupported` khi sàn/tài khoản không hỗ trợ; `error` khi profile/endpoint không khớp hoặc có lỗi xử lý. Các trạng thái `unavailable`, `unsupported`, `error` có `source="unavailable"` và `fills=[]`; giữ warning thay vì trình bày như số dư hay lịch sử bằng 0. Concurrent request khi history đang được đọc trả **HTTP 503 `history_busy`** theo error envelope §0.1, không response history 200. Khi rate limit, route đặt cooldown tối thiểu 900 giây; nếu venue cung cấp `Retry-After` dạng số giây/HTTP-date hoặc thời gian ban, cooldown dùng thời lượng dài hơn. Reader không có lần đọc chuẩn hóa thành công trả `unavailable`; lỗi theo từng mã khác khi còn ít nhất một lần đọc chuẩn hóa thành công có thể trả `partial`.
+- `source="venue_fills"` xác định nguồn là reader lịch sử sàn, không tự chứng minh mọi mã đã đọc thành công. `venue_profile` là `"demo"`, `"production"` hoặc `null`; reader nhận diện profile từ cấu hình Binance và kiểm tra endpoint tương ứng trước khi lấy dữ liệu. `observed_at` là thời điểm reader hoàn tất phần đọc venue thành công; có thể `null` nếu chưa có lần đọc chuẩn hóa thành công. Khi cache hit, các timestamp giữ nguyên từ lần đọc đã lưu, còn warning audit được cập nhật. `coverage` và `warnings` mô tả giới hạn/lỗi và phải được hiển thị cùng dữ liệu.
+- Mỗi fill có `trade_id`, `order_id` nullable, `symbol`, `side` (`buy`/`sell`), `timestamp`, `contracts`, `price`, `fee`, `fee_currency`, `realized_pnl`, `realized_pnl_currency`. `contracts` và `price` là chuỗi thập phân dương; `fee` và `realized_pnl` là chuỗi thập phân chính xác từ giá trị nguồn hoặc `null`, không ép về float để hiển thị. Ưu tiên chuỗi gốc của venue; nếu CCXT chỉ cung cấp số thì việc chuyển thành chuỗi không khôi phục độ chính xác đã mất. Currency có thể null; không tự suy ra đơn vị hoặc biến `null` thành 0 (`server/futures_trade_history.py:96-166`).
+- `realized_pnl` chỉ là giá trị sàn báo cho từng fill khi có, không phải P&L tổng hay thống kê lịch sử hoàn chỉnh. Endpoint không trả funding, không tự tạo historical P&L/funding từ audit hoặc ước tính; không tính win rate hay expectancy từ phạm vi từng phần.
+
+Audit log tồn tại nhưng không đọc được trả HTTP `503 audit_log_unreadable` với message đã làm sạch; các lỗi đọc lịch sử khác thường trả HTTP 200 với `status` và `warnings` ở trên. UI phân biệt loading, partial, unavailable, unsupported, error và stale; Overview poll lịch sử mỗi 5 phút (`web/components/overview/dashboard.tsx:46`), không xem dữ liệu cũ là quan sát mới.
 
 ---
 

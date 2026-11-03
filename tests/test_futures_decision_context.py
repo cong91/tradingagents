@@ -394,7 +394,7 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
 ):
     from server import autoloop
 
-    account = _account(positions=(FuturesPosition(
+    account = _account(positions_scope_complete=True, positions=(FuturesPosition(
         symbol="BTC/USDT:USDT", quantity=-2.0, mark_price=100.0, notional=200.0,
     ),))
     seen = {}

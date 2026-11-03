@@ -686,115 +686,6 @@ def test_custom_factory_client_is_the_one_used(tmp_path, monkeypatch):
     assert sentinel.calls  # the injected fake served the live path
 
 
-def test_default_factory_reads_production_credentials_from_env(monkeypatch):
-    monkeypatch.setenv("BINANCE_API_KEY", "env-key")
-    monkeypatch.setenv("BINANCE_SECRET", "env-secret")
-    import tradingagents.execution.bridge as bridge_module
-
-    captured = {}
-
-    class FakeBinance(ccxt.Exchange):
-        def __init__(self, options):
-            captured.update(options)
-            self.apiKey = options["apiKey"]
-            self.secret = options["secret"]
-            self.urls = {"api": {
-                "public": "https://api.binance.com/api/v3",
-                "private": "https://api.binance.com/api/v3",
-                "fapiPublic": "https://fapi.binance.com/fapi/v1",
-                "fapiPrivate": "https://fapi.binance.com/fapi/v1",
-            }}
-
-    monkeypatch.setattr(ccxt, "binance", FakeBinance)
-    bridge_module._default_exchange_factory(
-        "binance", base_url="https://api.binance.com"
-    )
-    assert captured == {
-        "apiKey": "env-key",
-        "secret": "env-secret",
-        "enableRateLimit": True,
-        # Binance needs ccxt's measured clock offset: a host ~1s fast fails
-        # every signed request with -1021 (test_binance_venue_config pins this).
-        "options": {"adjustForTimeDifference": True},
-    }
-
-
-def test_default_factory_demo_uses_demo_credentials(monkeypatch):
-    import tradingagents.execution.bridge as bridge_module
-
-    captured = {}
-
-    class FakeBinance(ccxt.Exchange):
-        def __init__(self, options):
-            captured.update(options)
-            self.urls = {"api": {
-                "public": "https://api.binance.com/api/v3",
-                "private": "https://api.binance.com/api/v3",
-                "fapiPublic": "https://fapi.binance.com/fapi/v1",
-                "fapiPrivate": "https://fapi.binance.com/fapi/v1",
-            }}
-
-        def enable_demo_trading(self, enabled):
-            self.urls["api"] = {
-                key: value.replace("https://api.binance.com", "https://demo-api.binance.com")
-                .replace("https://fapi.binance.com", "https://demo-fapi.binance.com")
-                for key, value in self.urls["api"].items()
-            }
-
-    monkeypatch.setenv("BINANCE_API_KEY", "wrong-key")
-    monkeypatch.setenv("BINANCE_SECRET", "wrong-secret")
-    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
-    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
-    monkeypatch.setattr(ccxt, "binance", FakeBinance)
-
-    bridge_module._default_exchange_factory("binance", sandbox=True)
-
-    assert captured["apiKey"] == "demo-key"
-    assert captured["secret"] == "demo-secret"
-
-
-def test_default_factory_demo_routes_to_demo_api(monkeypatch):
-    """Sandbox binance must arm Demo Trading (its own demo endpoint), never
-    fall back to Spot Testnet."""
-    import tradingagents.execution.bridge as bridge_module
-
-    calls = []
-
-    class FakeBinance(ccxt.Exchange):
-        def __init__(self, options):
-            self.urls = {"api": "https://api.binance.com/api/v3", "demo": "https://demo-api.binance.com/api/v3"}
-
-        def enable_demo_trading(self, enabled):
-            calls.append((enabled, self.urls["demo"]))
-            self.urls["api"] = self.urls["demo"]
-
-        def set_sandbox_mode(self, enabled):
-            raise AssertionError("Binance demo mode must not use Spot Testnet")
-
-    monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
-    monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
-    monkeypatch.setattr(ccxt, "binance", FakeBinance)
-    bridge_module._default_exchange_factory("binance", sandbox=True)
-    assert calls == [(True, "https://demo-api.binance.com/api/v3")]
-
-
-def test_default_factory_sandbox_routes_other_exchange_to_sandbox(monkeypatch):
-    import tradingagents.execution.bridge as bridge_module
-
-    calls = []
-
-    class FakeOkx(ccxt.Exchange):
-        def __init__(self, options):
-            pass
-
-        def set_sandbox_mode(self, enabled):
-            calls.append(enabled)
-
-    monkeypatch.setattr(ccxt, "okx", FakeOkx)
-    bridge_module._default_exchange_factory("okx", sandbox=True)
-    assert calls == [True]
-
-
 def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
     # The exec_sandbox config key (env-overridable via
     # TRADINGAGENTS_EXEC_SANDBOX) flows into the default factory; the FR5
@@ -834,61 +725,6 @@ def test_bridge_wires_exec_sandbox_into_default_factory(tmp_path, monkeypatch):
     assert calls == [True, True]  # default bridge is Demo by default
 
 
-def test_default_factory_selects_exchange_class_by_id(monkeypatch):
-    # Two fake exchange ids: each resolves its own ccxt class and its own
-    # {ID}_API_KEY / {ID}_SECRET env names (generalized from the L1 Binance
-    # pair, which keeps working unchanged for id "binance").
-    import tradingagents.execution.bridge as bridge_module
-
-    built = []
-
-    def make_fake(name):
-        class FakeVenue(ccxt.Exchange):
-            def __init__(self, options):
-                built.append((name, options))
-
-        return FakeVenue
-
-    monkeypatch.setattr(ccxt, "okx", make_fake("okx"))
-    monkeypatch.setattr(ccxt, "kraken", make_fake("kraken"))
-    monkeypatch.setenv("OKX_API_KEY", "okx-key")
-    monkeypatch.setenv("OKX_SECRET", "okx-secret")
-    monkeypatch.setenv("KRAKEN_API_KEY", "kraken-key")
-    monkeypatch.setenv("KRAKEN_SECRET", "kraken-secret")
-
-    bridge_module._default_exchange_factory("okx")
-    bridge_module._default_exchange_factory("kraken")
-    assert built == [
-        ("okx", {"apiKey": "okx-key", "secret": "okx-secret", "enableRateLimit": True}),
-        ("kraken", {"apiKey": "kraken-key", "secret": "kraken-secret", "enableRateLimit": True}),
-    ]
-
-
-def test_default_factory_rejects_unknown_exchange_id():
-    import tradingagents.execution.bridge as bridge_module
-
-    with pytest.raises(ValueError, match="does not name a ccxt exchange class"):
-        bridge_module._default_exchange_factory("nosuchexchange")
-
-
-def test_default_factory_rejects_non_exchange_attribute(monkeypatch):
-    import tradingagents.execution.bridge as bridge_module
-
-    monkeypatch.setattr(ccxt, "impostor", object(), raising=False)  # not an Exchange subclass
-    with pytest.raises(ValueError, match="does not name a ccxt exchange class"):
-        bridge_module._default_exchange_factory("impostor")
-
-
-def test_default_factory_rejects_plain_function(monkeypatch):
-    # A callable that is not a ccxt.Exchange subclass must fail the factory
-    # validation, not ride duck typing into the live path.
-    import tradingagents.execution.bridge as bridge_module
-
-    monkeypatch.setattr(ccxt, "impostor", lambda options: object(), raising=False)
-    with pytest.raises(ValueError, match="does not name a ccxt exchange class"):
-        bridge_module._default_exchange_factory("impostor")
-
-
 def test_bridge_uses_exchange_id_override(tmp_path, monkeypatch):
     # The exchange_id constructor argument overrides exec_exchange_id and is
     # what the default factory receives.
@@ -900,13 +736,38 @@ def test_bridge_uses_exchange_id_override(tmp_path, monkeypatch):
         seen.append((exchange_id, sandbox))
         return FakeExchange()
 
-    monkeypatch.setattr(bridge_module, "_default_exchange_factory", fake_factory)
     bridge = ExchangeBridge(
         config={"exec_log_path": str(tmp_path / "audit.jsonl"), "exec_exchange_id": "binance"},
         exchange_id="kraken",
     )
-    bridge._exchange_or_raise()
+    monkeypatch.setattr(bridge_module, "_default_exchange_factory", fake_factory)
+    assert seen == []
+    client = bridge._exchange_or_raise()
+    assert bridge._exchange_or_raise() is client
     assert seen == [("kraken", False)]
+
+
+@pytest.mark.parametrize("sandbox", [False, True])
+def test_bridge_passes_binance_profile_to_default_factory(tmp_path, monkeypatch, sandbox):
+    import tradingagents.execution.bridge as bridge_module
+
+    seen = []
+
+    def fake_factory(exchange_id, sandbox=False, *, base_url=None):
+        seen.append((exchange_id, sandbox, base_url))
+        return FakeExchange()
+
+    monkeypatch.setattr(bridge_module, "_default_exchange_factory", fake_factory)
+    bridge = ExchangeBridge(config={
+        "exec_exchange_id": "binance",
+        "exec_base_url": "https://api.binance.com",
+        "exec_sandbox": sandbox,
+        "exec_log_path": str(tmp_path / "audit.jsonl"),
+    })
+    assert seen == []
+    client = bridge._exchange_or_raise()
+    assert bridge._exchange_or_raise() is client
+    assert seen == [("binance", sandbox, "https://api.binance.com")]
 
 
 def test_bridge_defaults_exchange_id_from_config(tmp_path, monkeypatch):

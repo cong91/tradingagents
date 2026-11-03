@@ -37,11 +37,13 @@ from server import (
     job_store,
     operator_config,
     performance,
+    performance_history,
     portfolio,
     position_monitor,
     postgres,
     runs,
     settings,
+    snapshot_events,
     watchlist,
 )
 from server.contract import error_response, install_error_handlers
@@ -156,6 +158,7 @@ async def csrf_guard(request: Request, call_next):
 
 for _router in (
     settings.router,
+    snapshot_events.router,
     operator_config.router,
     watchlist.router,
     runs.router,
@@ -166,6 +169,7 @@ for _router in (
     history.router,
     health.router,
     performance.router,
+    performance_history.router,
     autoloop.router,
     data_sources.router,
 ):
