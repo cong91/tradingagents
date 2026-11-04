@@ -155,3 +155,55 @@ def test_momentum_with_zero_start_price_is_undefined():
 
     assert _momentum(pd.Series([0.0, 1.0, 2.0]), 2) is None
     assert _momentum(pd.Series([1.0, 1.5, 2.0]), 2) == 100.0
+
+
+def test_pinning_screen_pins_picks_and_drops_price_mismatches():
+    """Every discovery round (initial and refill) pins through the same wrapper."""
+    from types import SimpleNamespace
+
+    from server.autoloop import _pinning_screen
+    from tradingagents.dataflows.screening import MAX_PRICE_MISMATCH, price_mismatch
+
+    bridge = _bridge()
+    contracts = {
+        "SOL-USD": {"futures_symbol": "SOL/USDC:USDC", "settle": "USDC", "last_price": 100.0},
+        "MU-USD": {"futures_symbol": "MU/USDT:USDT", "settle": "USDT", "last_price": 100.0},
+    }
+    seen_cancel = []
+
+    def screen_universe(crypto, stocks, trade_date, pool_limit, cancel_event=None):
+        seen_cancel.append(cancel_event)
+        closes = {"SOL-USD": 101.0, "MU-USD": 4.0, "XYZ-USD": 1.0}
+        return [{"ticker": ticker, "last_close": closes[ticker]} for ticker in crypto]
+
+    mismatched: dict = {}
+    screen = _pinning_screen(
+        screen_universe, SimpleNamespace(_bridge=bridge), contracts, mismatched,
+        max_mismatch=MAX_PRICE_MISMATCH, price_mismatch=price_mismatch,
+    )
+    marker = object()
+    kept = screen(["SOL-USD", "MU-USD", "XYZ-USD"], [], "2026-11-04", 3, cancel_event=marker)
+
+    assert seen_cancel == [marker]
+    assert [entry["ticker"] for entry in kept] == ["SOL-USD", "XYZ-USD"]
+    assert kept[0]["futures_symbol"] == "SOL/USDC:USDC" and kept[0]["settle"] == "USDC"
+    assert bridge.pinned_futures_symbol("SOL-USD") == "SOL/USDC:USDC"
+    assert bridge.pinned_futures_symbol("MU-USD") is None
+    assert set(mismatched) == {"MU-USD"}
+    assert "MU/USDT:USDT" in mismatched["MU-USD"]["reason"]
+
+
+def test_pinning_screen_keeps_a_two_argument_seam_working():
+    from types import SimpleNamespace
+
+    from server.autoloop import _pinning_screen
+    from tradingagents.dataflows.screening import MAX_PRICE_MISMATCH, price_mismatch
+
+    def screen_universe(crypto, stocks, trade_date, pool_limit):
+        return [{"ticker": ticker} for ticker in crypto]
+
+    screen = _pinning_screen(
+        screen_universe, SimpleNamespace(_bridge=_bridge()), {}, {},
+        max_mismatch=MAX_PRICE_MISMATCH, price_mismatch=price_mismatch,
+    )
+    assert screen(["BTC-USD"], [], "2026-11-04", 1, cancel_event=object()) == [{"ticker": "BTC-USD"}]

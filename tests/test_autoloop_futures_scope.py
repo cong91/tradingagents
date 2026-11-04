@@ -26,7 +26,7 @@ def test_candidate_defers_before_analysis_when_scope_is_unverified(monkeypatch, 
     )
     writes = []
     monkeypatch.setattr(autoloop, "_closed_futures_context", lambda *_: market)
-    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_: account)
+    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_args, **_kwargs: account)
     monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         autoloop, "persist_futures_cycle_progress", lambda *args, **kwargs: writes.append(kwargs),
@@ -57,7 +57,7 @@ def test_unverified_scope_can_be_retried_without_claiming_candle_pair(monkeypatc
     )
     claims, reads = [], []
 
-    def read(_bridge):
+    def read(_bridge, **_kwargs):
         reads.append(1)
         return FuturesAccountSnapshot(equity=100)
 

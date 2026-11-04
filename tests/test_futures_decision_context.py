@@ -403,7 +403,7 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=risk_cap)),
     )
     monkeypatch.setattr(autoloop, "_closed_futures_context", lambda *_: _market_context())
-    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_: account)
+    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_args, **_kwargs: account)
     monkeypatch.setattr(autoloop, "_bracket_prices", lambda _, direction: BRACKETS[direction])
     monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
