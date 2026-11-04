@@ -187,3 +187,62 @@ def test_active_position_states_carry_the_identity_columns():
 
     assert active[0]["account_identity_hash"] == identity.identity_hash
     assert active[0]["account_identity_profile"] == "demo"
+
+
+# --- late binding of legacy (previously unbound) bracket rows ------------------
+
+
+def test_bind_bracket_recovery_identity_binds_a_previously_null_row():
+    identity = _identity()
+    job_store.create_bracket_recovery("task-bind", **_task_kwargs())
+
+    assert job_store.bind_bracket_recovery_identity("task-bind", identity=identity) == "bound"
+
+    assert _stored_task_identity("task-bind") == (
+        identity.exchange, identity.profile, identity.account_type, identity.identity_hash,
+    )
+
+
+def test_bind_bracket_recovery_identity_reports_unknown_task():
+    assert job_store.bind_bracket_recovery_identity(
+        "task-missing", identity=_identity(),
+    ) == "not_found"
+
+
+def test_bind_bracket_recovery_identity_is_idempotent_for_the_same_identity():
+    identity = _identity()
+    job_store.create_bracket_recovery("task-same", identity=identity, **_task_kwargs())
+
+    assert job_store.bind_bracket_recovery_identity(
+        "task-same", identity=identity,
+    ) == "already_bound_same"
+    assert _stored_task_identity("task-same") == (
+        identity.exchange, identity.profile, identity.account_type, identity.identity_hash,
+    )
+
+
+def test_bind_bracket_recovery_identity_never_overwrites_a_different_identity():
+    from tests.execution_derivatives_support import identity_for_api_key
+
+    identity = _identity()
+    other = identity_for_api_key("different-account")
+    job_store.create_bracket_recovery("task-other", identity=identity, **_task_kwargs())
+
+    assert job_store.bind_bracket_recovery_identity(
+        "task-other", identity=other,
+    ) == "already_bound_other"
+    assert _stored_task_identity("task-other") == (
+        identity.exchange, identity.profile, identity.account_type, identity.identity_hash,
+    )
+
+
+def test_bind_bracket_recovery_identity_rejects_a_malformed_identity():
+    job_store.create_bracket_recovery("task-malformed", **_task_kwargs())
+
+    with pytest.raises(ValueError, match="identity"):
+        job_store.bind_bracket_recovery_identity(
+            "task-malformed",
+            identity=("binance", "demo", "usds_futures", "NOT-A-HASH"),
+        )
+
+    assert _stored_task_identity("task-malformed") == (None, None, None, None)

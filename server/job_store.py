@@ -487,6 +487,41 @@ def load_bracket_recovery(task_id: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def bind_bracket_recovery_identity(task_id: str, *, identity) -> str:
+    """Bind identity to a legacy (previously unbound) bracket task.
+
+    One of "bound" (row accepted the binding), "not_found",
+    "already_bound_same" (same four values already stored), or
+    "already_bound_other" (a different binding exists; never overwritten).
+    """
+    columns = _identity_columns(identity)
+    if columns is None:
+        raise ValueError("account identity is required to bind a bracket recovery task")
+    with db.session() as conn:
+        cursor = conn.execute(
+            """UPDATE bracket_recovery_tasks
+               SET account_identity_exchange = %s, account_identity_profile = %s,
+                   account_identity_type = %s, account_identity_hash = %s
+               WHERE task_id = %s AND account_identity_hash IS NULL""",
+            (*columns, task_id),
+        )
+        if cursor.rowcount == 1:
+            return "bound"
+        row = conn.execute(
+            "SELECT account_identity_exchange, account_identity_profile, "
+            "account_identity_type, account_identity_hash "
+            "FROM bracket_recovery_tasks WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        stored = (
+            row["account_identity_exchange"], row["account_identity_profile"],
+            row["account_identity_type"], row["account_identity_hash"],
+        )
+        return "already_bound_same" if stored == columns else "already_bound_other"
+
+
 def update_bracket_recovery(task_id: str, *, status: str, placed_ids: list[str], attempts: int,
                             last_error: str | None, now: str, legs: list[dict] | None = None) -> None:
     with db.session() as conn:
