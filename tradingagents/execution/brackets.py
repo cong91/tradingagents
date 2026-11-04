@@ -40,7 +40,7 @@ TIME_STOP_RETRY_STATUSES = frozenset({
 })
 
 
-def _reconcile_leg_rounding(exchange: Any, task: dict, leg: dict, item: Any, matches_leg) -> bool:
+def reconcile_leg_rounding(exchange: Any, task: dict, leg: dict, item: Any, matches_leg) -> bool:
     """Accept a leg when ccxt's own precision functions explain the difference.
 
     ``matches_leg`` compares persisted planned values verbatim, but the venue
@@ -133,7 +133,7 @@ class BracketManager:
         """The leg contract, with venue tick/step rounding reconciled first."""
         if self._matches_leg(item, task, leg):
             return True
-        return _reconcile_leg_rounding(exchange, task, leg, item, self._matches_leg)
+        return reconcile_leg_rounding(exchange, task, leg, item, self._matches_leg)
 
 
     def _save(self, task: dict, status: str, error: str | None = None) -> str:
