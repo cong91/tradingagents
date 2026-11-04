@@ -575,6 +575,105 @@ class _LadderExchange(_RawV3Exchange):
         self.contracts = contracts
 
 
+class _RoundingExchange(_Exchange):
+    """Venue that acknowledges tick/step-rounded triggers and quantities."""
+
+    def price_to_precision(self, symbol, price):
+        return f"{float(price):.1f}"
+
+    def amount_to_precision(self, symbol, amount):
+        return f"{float(amount):.4f}"
+
+    def create_order(self, symbol, kind, side, amount, price=None, params=None):
+        rounded_params = dict(params)
+        for key in ("stopLossPrice", "takeProfitPrice"):
+            if rounded_params.get(key) is not None:
+                rounded_params[key] = float(
+                    self.price_to_precision(symbol, rounded_params[key])
+                )
+        rounded_amount = float(self.amount_to_precision(symbol, amount))
+        return super().create_order(symbol, kind, side, rounded_amount, price, rounded_params)
+
+
+class _RoundingV3Exchange(_RawV3Exchange, _RoundingExchange):
+    """Raw-V3 position surface plus the venue's precision layer."""
+
+
+def _rounded_bracket(exchange):
+    """A bracket whose planned trigger/size need venue tick/step rounding."""
+    bridge = _Bridge(exchange)
+    order = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", market="derivatives",
+        signal="Buy", side="buy", quantity=0.51234, estimated_price=50000,
+        cost=250, stop_loss=48000.123456, take_profit=55000.654321,
+    )
+    manager = BracketManager(bridge)
+    manager.place(order, True, "entry-rounded")
+    return manager, bridge, exchange, f"bracket:{order.ccxt_symbol}:entry-rounded"
+
+
+def test_tick_rounded_legs_are_reconciled_to_venue_values_by_inspect():
+    """The venue acknowledges triggers and sizes rounded to its tick/step: the
+    monitor must reconcile the leg records to those values and converge, not
+    loop on an identity mismatch forever."""
+    exchange = _RoundingExchange()
+    manager, _bridge, _exchange, task_id = _rounded_bracket(exchange)
+    assert job_store.load_bracket_recovery(task_id)["legs"][0]["params"] == {
+        "stopLossPrice": 48000.123456
+    }
+
+    status = manager.reconcile(task_id, repair_missing=False, allow_sibling_cancel=True)
+
+    stored = job_store.load_bracket_recovery(task_id)
+    assert status == "monitoring"
+    assert stored["legs"][0]["params"] == {"stopLossPrice": 48000.1}
+    assert stored["legs"][1]["params"] == {"takeProfitPrice": 55000.7}
+    assert stored["legs"][0]["quantity"] == pytest.approx(0.5123)
+    assert stored["legs"][1]["quantity"] == pytest.approx(0.5123)
+    assert stored["last_error"] is None
+
+
+def test_repair_ack_rounding_is_reconciled_to_venue_values():
+    """A repaired leg is acknowledged at the venue's rounded values; the ACK
+    must both verify and persist those values instead of leaving the leg in a
+    permanent verify-fail loop."""
+    exchange = _RoundingV3Exchange()
+    exchange.contracts = 0.51234
+    manager, _bridge, _exchange, task_id = _rounded_bracket(exchange)
+    task = job_store.load_bracket_recovery(task_id)
+    lost_id = task["legs"][1]["order_id"]
+    task["legs"][1].update(status="pending", order_id=None)
+    exchange.orders.pop(lost_id)
+    job_store.update_bracket_recovery(
+        task_id, status="pending", placed_ids=[task["legs"][0]["order_id"]], attempts=0,
+        last_error=None, now=datetime.now(UTC).isoformat(), legs=task["legs"],
+    )
+
+    status = manager.reconcile(task_id, repair_missing=True, allow_sibling_cancel=True)
+
+    stored = job_store.load_bracket_recovery(task_id)
+    assert status == "monitoring", stored["last_error"]
+    assert stored["legs"][1]["params"] == {"takeProfitPrice": 55000.7}
+    assert stored["legs"][1]["quantity"] == pytest.approx(0.5123)
+    assert stored["last_error"] is None
+
+
+def test_a_difference_the_precision_layer_cannot_explain_stays_refused():
+    """Rounding reconciliation never invents a tolerance: a venue trigger that
+    is not the planned value as the exchange represents it must keep failing."""
+    exchange = _RoundingExchange()
+    manager, _bridge, exchange, task_id = _rounded_bracket(exchange)
+    exchange.orders["1"]["info"]["triggerPrice"] = "48000.4"
+
+    status = manager.reconcile(task_id, repair_missing=False, allow_sibling_cancel=True)
+
+    assert status == "reconcile_incomplete"
+    stored = job_store.load_bracket_recovery(task_id)
+    assert stored["legs"][0]["params"] == {"stopLossPrice": 48000.123456}
+    assert "unconfirmed identity" in (stored["last_error"] or "")
+
+
+
 def _ladder(contracts=0.005):
     exchange = _LadderExchange(contracts)
     bridge = _Bridge(exchange)

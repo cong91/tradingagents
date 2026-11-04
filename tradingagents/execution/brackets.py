@@ -40,6 +40,61 @@ TIME_STOP_RETRY_STATUSES = frozenset({
 })
 
 
+def _reconcile_leg_rounding(exchange: Any, task: dict, leg: dict, item: Any, matches_leg) -> bool:
+    """Accept a leg when ccxt's own precision functions explain the difference.
+
+    ``matches_leg`` compares persisted planned values verbatim, but the venue
+    acknowledges tick-rounded triggers and step-rounded quantities. The rounded
+    values are recomputed by ccxt itself — nothing here invents a tolerance —
+    then the leg record is aligned to them and the FULL contract is re-verified
+    against the same venue item, so an unexplained field anywhere still fails.
+    Aligned values stay on the record; any failure restores the original.
+    """
+    if not isinstance(item, dict):
+        return False
+    raw_info = _info(item)
+    if not isinstance(raw_info, dict):
+        return False
+    param = "stopLossPrice" if leg["name"] == "stop-loss" else "takeProfitPrice"
+    planned_trigger = leg.get("params", {}).get(param)
+    planned_quantity = leg.get(
+        "replacement_quantity", leg.get("repair_quantity", leg.get("quantity", task["quantity"])),
+    )
+    if planned_trigger is None or planned_quantity is None:
+        return False
+    venue_trigger = raw_info.get("triggerPrice")
+    venue_quantity = raw_info.get("quantity")
+    try:
+        if not _same_number(venue_trigger, exchange.price_to_precision(task["symbol"], planned_trigger)):
+            return False
+        if not _same_number(venue_quantity, exchange.amount_to_precision(task["symbol"], planned_quantity)):
+            return False
+    except Exception:
+        return False
+    had_quantity = "quantity" in leg
+    saved = {"trigger": planned_trigger, "quantity": leg.get("quantity")}
+    for key in ("replacement_quantity", "repair_quantity"):
+        if key in leg:
+            saved[key] = leg[key]
+    leg["params"][param] = float(venue_trigger)
+    leg["quantity"] = float(venue_quantity)
+    for key in ("replacement_quantity", "repair_quantity"):
+        if key in leg:
+            leg[key] = float(venue_quantity)
+    if matches_leg(item, task, leg):
+        return True
+    leg["params"][param] = saved["trigger"]
+    if had_quantity:
+        leg["quantity"] = saved["quantity"]
+    else:
+        leg.pop("quantity", None)
+    for key in ("replacement_quantity", "repair_quantity"):
+        if key in saved:
+            leg[key] = saved[key]
+    return False
+
+
+
 def stored_account_identity(record: dict) -> futures_identity.FuturesAccountIdentity | None:
     """The binding stored on a task or position row, or None for a legacy row.
 
@@ -73,6 +128,13 @@ class BracketManager:
 
     def _matches_leg(self, item: dict, task: dict, leg: dict) -> bool:
         return _matches(item, task, leg, require_mark_price=self.bridge.exchange_id == "binance")
+
+    def _matches_leg_or_rounded(self, exchange: Any, item: dict, task: dict, leg: dict) -> bool:
+        """The leg contract, with venue tick/step rounding reconciled first."""
+        if self._matches_leg(item, task, leg):
+            return True
+        return _reconcile_leg_rounding(exchange, task, leg, item, self._matches_leg)
+
 
     def _save(self, task: dict, status: str, error: str | None = None) -> str:
         ids = [str(leg["order_id"]) for leg in task["legs"] if leg.get("order_id")]
@@ -431,7 +493,7 @@ class BracketManager:
             if (
                 confirmed_state == "cancelled"
                 and isinstance(confirmed, dict)
-                and self._matches_leg(confirmed, task, leg)
+                and self._matches_leg_or_rounded(exchange, confirmed, task, leg)
             ):
                 for key in ("replacement_price", "replacement_quantity", "price_key",
                             "replacement_order_id", "replacement_client_id"):
@@ -442,7 +504,7 @@ class BracketManager:
                     f"replacement {new_id} not resting on the venue; existing leg retained",
                 )
                 return "replacement_failed"
-            if confirmed_state != "placed" or not self._matches_leg(confirmed, task, leg):
+            if confirmed_state != "placed" or not self._matches_leg_or_rounded(exchange, confirmed, task, leg):
                 # filled or an unmapped status: claim neither resting nor dead;
                 # keep the old leg and let reconcile plus the flat-position
                 # monitor settle the outcome before anything is retired.
@@ -701,7 +763,7 @@ class BracketManager:
                 try:
                     item = exchange.fetch_order(order_id, task["symbol"], params=self._trigger_params)
                     if (
-                        not isinstance(item, dict) or not self._matches_leg(item, task, leg)
+                        not isinstance(item, dict) or not self._matches_leg_or_rounded(exchange, item, task, leg)
                         or self._leg_state(exchange, item, task, leg) != "filled"
                     ):
                         raise ValueError("filled conditional order is unconfirmed")
@@ -740,7 +802,7 @@ class BracketManager:
                         except Exception as exc:
                             errors.append(f"repair {repair_id}: {exc!r}")
                             continue
-                    if not isinstance(candidate, dict) or not self._matches_leg(candidate, task, leg):
+                    if not isinstance(candidate, dict) or not self._matches_leg_or_rounded(exchange, candidate, task, leg):
                         errors.append(f"repair {repair_id} identity mismatch")
                         continue
                     repair_state = self._leg_state(exchange, candidate, task, leg)
@@ -793,7 +855,7 @@ class BracketManager:
                         except Exception as exc:
                             errors.append(f"replacement {replacement_id}: {exc!r}")
                             continue
-                    if not isinstance(candidate, dict) or not self._matches_leg(candidate, task, leg):
+                    if not isinstance(candidate, dict) or not self._matches_leg_or_rounded(exchange, candidate, task, leg):
                         errors.append(f"replacement {replacement_id} identity mismatch")
                         continue
                     candidate_state = _state(candidate)
@@ -831,7 +893,7 @@ class BracketManager:
                         fetched = exchange.fetch_order(
                             leg["order_id"], task["symbol"], params=self._trigger_params,
                         )
-                        if not isinstance(fetched, dict) or not self._matches_leg(fetched, task, leg):
+                        if not isinstance(fetched, dict) or not self._matches_leg_or_rounded(exchange, fetched, task, leg):
                             raise ValueError("conditional order identity is unconfirmed")
                         fetched_state = self._leg_state(exchange, fetched, task, leg)
                         if fetched_state not in {"placed", "filled"}:
@@ -846,7 +908,7 @@ class BracketManager:
                         fetched = exchange.fetch_order(
                             leg["order_id"], task["symbol"], params=self._trigger_params,
                         )
-                        if not isinstance(fetched, dict) or not self._matches_leg(fetched, task, leg):
+                        if not isinstance(fetched, dict) or not self._matches_leg_or_rounded(exchange, fetched, task, leg):
                             raise ValueError("conditional order identity is unconfirmed")
                         fetched_state = self._leg_state(exchange, fetched, task, leg)
                         if fetched_state not in {"placed", "filled"}:
@@ -870,7 +932,7 @@ class BracketManager:
                 item = observed.get(order_id)
                 if item is None:
                     item = exchange.fetch_order(order_id, task["symbol"], params=self._trigger_params)
-                if not isinstance(item, dict) or not self._matches_leg(item, task, leg):
+                if not isinstance(item, dict) or not self._matches_leg_or_rounded(exchange, item, task, leg):
                     raise ValueError(f"unconfirmed identity for conditional order {order_id}")
                 item_state = self._leg_state(exchange, item, task, leg)
                 if item_state in {None, "transitioning"}:
@@ -1022,12 +1084,16 @@ class BracketManager:
                         f"{leg['name']} repair resting state unverified; inspect before retry: {exc!r}",
                     )
                     return "reconcile_incomplete"
-                if not self._matches_leg(confirmed, task, leg):
+                if not self._matches_leg_or_rounded(exchange, confirmed, task, leg):
                     self._save(
                         task, "submission_uncertain",
                         f"{leg['name']} repair read does not match its persisted intent",
                     )
                     return "reconcile_incomplete"
+                # The venue acknowledges rounded values; the journal keeps what
+                # the exchange itself reports so later polls match directly.
+                if leg.get("quantity") is not None:
+                    quantity = float(leg["quantity"])
                 confirmed_state = self._leg_state(exchange, confirmed, task, leg)
                 if confirmed_state == "cancelled":
                     leg.update(status="pending", order_id=None)
