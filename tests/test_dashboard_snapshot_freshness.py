@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.node_renderer import require_web_renderer
+
 ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT / "web"
 
@@ -49,6 +51,7 @@ process.stdout.write(JSON.stringify(cases.map(({ state, portfolioStale, clock })
 
 @pytest.mark.unit
 def test_dashboard_keeps_spot_and_futures_timestamp_status_separate():
+    require_web_renderer()
     clock = 1_700_000_000_000
     generated_at = "2023-11-14T22:13:20.000Z"
 

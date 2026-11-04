@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.node_renderer import require_web_renderer
+
 ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT / "web"
 
@@ -350,6 +352,7 @@ def _cases():
 
 @pytest.fixture(scope="module")
 def rendered():
+    require_web_renderer()
     env = os.environ.copy()
     env.update({"TZ": "UTC", "NODE_ENV": "production"})
     result = subprocess.run(
