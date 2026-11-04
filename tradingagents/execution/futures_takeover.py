@@ -158,12 +158,16 @@ def _verify_legs(bridge: Any, task: dict) -> tuple[int | None, str | None]:
 
     A leg that matches but is no longer ``placed`` (triggered, finished or
     cancelled between read and check) refuses the bind: the monitor would
-    manage a ghost order.
+    manage a ghost order. A leg whose persisted trigger/quantity differ from
+    the venue ONLY by the exchange's own tick/step rounding is reconciled to
+    the venue values before binding: the persisted plan stays bookkeeping,
+    the signed venue read is the truth.
     """
     exchange = bridge.client()
     is_binance = bridge.exchange_id == "binance"
     params = {"trigger": True} if is_binance else {}
     verified = 0
+    reconciled = False
     for leg in task["legs"]:
         if not leg.get("order_id") or leg.get("status") not in _LIVE_LEG_STATUSES:
             continue
@@ -172,12 +176,62 @@ def _verify_legs(bridge: Any, task: dict) -> tuple[int | None, str | None]:
         except Exception:
             return None, None
         if not bracket_legs.matches(item, task, leg, require_mark_price=is_binance):
-            return None, None
+            if not _reconcile_leg_to_venue(exchange, task, leg, item):
+                return None, None
+            reconciled = True
         state_name = bracket_legs.state(item)
         if state_name != "placed":
             return None, state_name
         verified += 1
+    if reconciled and verified:
+        job_store.update_bracket_recovery(
+            task["task_id"], status=task["status"], placed_ids=[
+                str(leg["order_id"]) for leg in task["legs"] if leg.get("order_id")
+            ], attempts=task.get("attempts", 0), last_error=None,
+            now=datetime.now(UTC).isoformat(), legs=task["legs"],
+        )
     return verified, None
+
+
+def _reconcile_leg_to_venue(exchange: Any, task: dict, leg: dict, item: Any) -> bool:
+    """Accept a leg when ccxt's own precision functions explain the difference.
+
+    ``bracket_legs.matches`` compares the persisted planned values verbatim,
+    but the venue acknowledges tick-rounded triggers and step-rounded
+    quantities. The rounded values are computed by ccxt itself — nothing here
+    invents a tolerance — and the leg record is rewritten to the venue's
+    acknowledged values so the monitor can match it afterwards.
+    """
+    raw_info = item.get("info") if isinstance(item, dict) else {}
+    if not isinstance(raw_info, dict):
+        return False
+    param = "stopLossPrice" if leg["name"] == "stop-loss" else "takeProfitPrice"
+    planned_trigger = leg.get("params", {}).get(param)
+    planned_quantity = leg.get("quantity", task.get("quantity"))
+    if planned_trigger is None or planned_quantity is None:
+        return False
+    venue_trigger = bracket_legs.info(item).get("triggerPrice")
+    venue_quantity = bracket_legs.info(item).get("quantity")
+    try:
+        if not _same_number(venue_trigger, exchange.price_to_precision(task["symbol"], planned_trigger)):
+            return False
+        if not _same_number(venue_quantity, exchange.amount_to_precision(task["symbol"], planned_quantity)):
+            return False
+    except Exception:
+        return False
+    leg["params"][param] = float(venue_trigger)
+    leg["quantity"] = float(venue_quantity)
+    return True
+
+
+def _same_number(left: Any, right: Any) -> bool:
+    try:
+        number_left, number_right = float(left), float(right)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number_left) and math.isfinite(number_right) and math.isclose(
+        number_left, number_right, rel_tol=1e-9, abs_tol=1e-12,
+    )
 
 
 def _without_identity_keys(state: dict) -> dict:

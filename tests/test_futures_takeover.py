@@ -118,6 +118,72 @@ def _bound_identity():
             VERIFIED_IDENTITY.account_type, VERIFIED_IDENTITY.identity_hash)
 
 
+# --- rounding reconciliation ---------------------------------------------------
+
+
+class _RoundingExchange(FakeDerivExchange):
+    """Venue whose precision layer rounds the planned trigger to one decimal."""
+
+    def price_to_precision(self, symbol, price):
+        return f"{float(price):.1f}"
+
+    def amount_to_precision(self, symbol, amount):
+        return f"{float(amount):.4f}"
+
+
+def test_tick_rounded_leg_is_reconciled_to_venue_values_and_bound(tmp_path, monkeypatch):
+    exchange = _RoundingExchange()
+    exchange.contracts = 0.005
+    exchange.orders_by_id["leg-1"] = _algo_order(
+        "leg-1", name="stop-loss", trigger=48000.1, quantity=0.005,
+    )
+    bridge = _TakeoverBridge(exchange)
+    _seed_state(POSITION_KEY, task_id=TASK_ID)
+    _seed_task(TASK_ID, legs=[
+        _leg("stop-loss", "leg-1", trigger=48000.123456789),
+    ], venue_key_value=venue_key(bridge))
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+
+    reports = futures_takeover.take_over_legacy_positions(
+        bridge, allow_mutation=True, config={"exec_log_path": str(tmp_path / "audit.jsonl")},
+    )
+
+    assert reports == [{
+        "position_key": POSITION_KEY, "status": "bound", "symbol": SYMBOL,
+        "side": "long", "contracts": 0.005, "entry": 50000.0,
+        "legs_verified": 1, "task_id": TASK_ID,
+    }]
+    stored = job_store.load_bracket_recovery(TASK_ID)
+    assert stored["legs"][0]["params"] == {"stopLossPrice": 48000.1}
+    assert stored["legs"][0]["quantity"] == 0.005
+    assert _task_identity(TASK_ID) == _bound_identity()
+    assert _state_identity(POSITION_KEY) == _bound_identity()
+
+
+def test_unexplainable_trigger_difference_refuses_the_bind(tmp_path, monkeypatch):
+    exchange = _RoundingExchange()
+    exchange.contracts = 0.005
+    exchange.orders_by_id["leg-1"] = _algo_order(
+        "leg-1", name="stop-loss", trigger=48000.9, quantity=0.005,
+    )
+    bridge = _TakeoverBridge(exchange)
+    _seed_state(POSITION_KEY, task_id=TASK_ID)
+    _seed_task(TASK_ID, legs=[
+        _leg("stop-loss", "leg-1", trigger=48000.123456789),
+    ], venue_key_value=venue_key(bridge))
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+
+    reports = futures_takeover.take_over_legacy_positions(
+        bridge, allow_mutation=True, config={"exec_log_path": str(tmp_path / "audit.jsonl")},
+    )
+
+    assert reports == [{"position_key": POSITION_KEY, "status": "leg_unverified"}]
+    stored = job_store.load_bracket_recovery(TASK_ID)
+    assert stored["legs"][0]["params"] == {"stopLossPrice": 48000.123456789}
+    assert _task_identity(TASK_ID) == (None, None, None, None)
+    assert _state_identity(POSITION_KEY) == (None, None, None, None)
+
+
 # --- happy path ---------------------------------------------------------------
 
 
