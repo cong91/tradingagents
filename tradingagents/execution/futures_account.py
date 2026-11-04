@@ -312,6 +312,10 @@ def _binance_position_rows(bridge, client) -> tuple[list, bool]:
     base_url = bridge.config.get("exec_base_url") or "https://demo-api.binance.com"
     binance_futures_positions.validate_client(client, profile, base_url)
     reader = binance_futures_positions.isolated_client(client)
+    # prepare_rows maps venue ids through the client's market metadata; a
+    # client that has not loaded markets yet would fail every row closed.
+    if not isinstance(getattr(reader, "markets_by_id", None), dict) or not reader.markets_by_id:
+        reader.load_markets()
     raw = reader.fapiPrivateV3GetPositionRisk({})
     if not isinstance(raw, list):
         raise ValueError("exchange returned an invalid futures positions response")

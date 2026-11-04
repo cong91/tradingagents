@@ -80,6 +80,32 @@ def test_empty_raw_list_certifies_account_wide_scope(monkeypatch):
     assert calls == [("risk", {})]
 
 
+def test_unloaded_markets_are_loaded_before_row_mapping(monkeypatch):
+    """A fresh runtime client has no market metadata: without loading it every
+    row would be refused as unknown_market and scope would never certify."""
+    client, calls = _client(monkeypatch, [_row()])
+    markets_loaded = []
+
+    def load_markets(*args, **kwargs):
+        markets_loaded.append(1)
+        # The cloned reader shares this dict (shallow copy), so an in-place
+        # mutation models a real load_markets filling the caller's metadata.
+        client.markets_by_id.clear()
+        client.markets_by_id["BTCUSDT"] = [_market()]
+
+    monkeypatch.setattr(client, "markets_by_id", {})
+    monkeypatch.setattr(client, "load_markets", load_markets)
+
+    observation = observe_futures_positions(_Bridge(client))
+
+    assert markets_loaded == [1]
+    assert observation.unknown_symbols == frozenset()
+    assert [
+        (p.symbol, p.side, p.contracts) for p in observation.positions
+    ] == [("BTC/USDT:USDT", "long", 1.0)]
+    assert observation.scope_complete is True
+
+
 def test_clean_read_flows_complete_scope_through_read_futures_account(monkeypatch):
     client, _ = _client(monkeypatch, [])
     monkeypatch.setattr(
