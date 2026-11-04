@@ -59,6 +59,11 @@ export function formatDateWith(
 // Dấu trừ toán học (U+2212), phân biệt với gạch nối.
 export const MINUS_SIGN = "\u2212";
 
+/** Decimal separator of the active locale ("." en-US, "," vi-VN). */
+export function decimalSeparator(): string {
+  return numberFormat({ minimumFractionDigits: 1 }).format(1.5).charAt(1);
+}
+
 export type PnlTone = "profit" | "loss" | "neutral";
 
 export function pnlTone(value: number): PnlTone {
