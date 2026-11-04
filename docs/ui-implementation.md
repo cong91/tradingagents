@@ -211,17 +211,14 @@ khi thêm token — chính sách chi tiết ở §6.
 
 ```bash
 .venv\Scripts\python.exe -m pytest -q            # toàn suite repo
-.venv\Scripts\python.exe -m pytest -q tests/test_server_api.py
+.venv\Scripts\python.exe -m pytest -q tests/test_server_api.py tests/test_settings_api.py tests/test_csrf_api.py tests/test_watchlist_api.py tests/test_runs_api.py tests/test_approvals_api.py tests/test_audit_api.py tests/test_history_api.py tests/test_daily_api.py tests/test_portfolio_api.py
 ```
 
-`tests/test_server_api.py` có **28 unit test** dùng FastAPI `TestClient`,
-không mở socket: fixture `_no_network` (`tests/test_server_api.py:35-58`,
-docstring mô tả hành vi ở :37-44) chặn mọi `connect` thật nhưng whitelist
-đúng cặp socket self-pipe mà event loop Windows tự dựng; không gọi LLM
-(fake graph); mọi dữ liệu mock vào tmp. Phủ đủ các luồng: health
-dry-mode, settings mask/persist/cấm key gate/coercion 422, 3 nhánh CSRF
-(415 content-type, 403 origin lạ, 403 cross-site + 1 case origin hợp lệ),
-watchlist roundtrip, run mock hoàn thành với synthetic events, v.v.
+Các test API dùng FastAPI `TestClient`, được chia theo từng chức năng.
+Fixture trong `tests/server_api_fixtures.py` chặn kết nối mạng thật nhưng cho
+phép cặp socket self-pipe của event loop Windows; dữ liệu và graph đều được
+cô lập. Các test lưu trữ cần `TRADINGAGENTS_TEST_DATABASE_URL` trỏ tới
+PostgreSQL thử nghiệm riêng, không dùng cơ sở dữ liệu đang chạy của ứng dụng.
 
 **Lint backend:**
 
@@ -229,11 +226,10 @@ watchlist roundtrip, run mock hoàn thành với synthetic events, v.v.
 .venv\Scripts\python.exe -m ruff check .
 ```
 
-**Frontend — giới hạn đã biết: `web/` hiện KHÔNG có test tự động nào.**
-`web/package.json` chỉ có 4 script `dev / build / start / lint`
-(`web/package.json:5-9`), devDependencies không có vitest / jest /
-playwright — ngoài lint + typecheck + build, frontend chưa được kiểm tra
-bằng gì khác. Thêm harness test frontend là mục còn mở (§8).
+**Frontend:** `web/package.json` có các lệnh `dev / build / start / lint`.
+`tests/test_performance_ui_render.py` kiểm tra render các component hiệu suất
+bằng React server rendering; test này không thay thế kiểm thử tương tác bằng
+trình duyệt. Chưa có test runner JavaScript riêng trong `web/`.
 
 ```bash
 cd web

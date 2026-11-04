@@ -8,6 +8,7 @@ Covers two systematic fixes:
 """
 
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,7 +16,7 @@ import pandas as pd
 import pytest
 
 from tradingagents.dataflows import router
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import run_config
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.vendors.yahoo import common, ohlcv
@@ -24,14 +25,8 @@ from tradingagents.dataflows.vendors.yahoo import common, ohlcv
 @pytest.mark.unit
 class TestLoadOhlcvNoPoison(unittest.TestCase):
     def setUp(self):
-        self._tmp = os.path.join(os.path.dirname(__file__), "_tmp_cache")
-        os.makedirs(self._tmp, exist_ok=True)
-        set_config({"data_cache_dir": self._tmp})
-
-    def tearDown(self):
-        for f in os.listdir(self._tmp):
-            os.remove(os.path.join(self._tmp, f))
-        os.rmdir(self._tmp)
+        self._tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(run_config({"data_cache_dir": self._tmp}))
 
     def test_empty_download_raises_and_does_not_cache(self):
         empty = mock.Mock(history=mock.Mock(return_value=pd.DataFrame()))

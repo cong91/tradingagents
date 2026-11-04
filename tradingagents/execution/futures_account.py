@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
 
@@ -50,6 +51,7 @@ class FuturesAccountSnapshot:
     positions: tuple[FuturesPosition, ...] = ()
     status: str = "ok"
     error: str | None = None
+    positions_scope_complete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -277,17 +279,250 @@ def _futures_params(exchange_id: str, config: dict) -> tuple[dict[str, str], dic
     raise ValueError(f"futures account reads are not configured for {exchange_id!r}")
 
 
-def read_futures_positions(bridge) -> tuple[FuturesPosition, ...]:
-    """Read and normalize only the configured derivatives positions."""
-    client = bridge.client()
+@dataclass(frozen=True)
+class FuturesPositionsObservation:
+    """Positions plus the symbols whose rows could not be interpreted safely."""
+
+    positions: tuple[FuturesPosition, ...]
+    unknown_symbols: frozenset[str]
+    unknown_scope: bool
+    scope_complete: bool = False
+
+
+def _position_rows(bridge, client) -> list:
     exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
     _, position_params = _futures_params(exchange_id, bridge.config)
     positions = client.fetch_positions(None, params=position_params)
     if not isinstance(positions, list):
         raise ValueError("exchange returned an invalid futures positions response")
-    return tuple(
-        position for raw in positions if (position := _normalize_position(raw, client)) is not None
+    return positions
+
+
+def _binance_position_rows(bridge, client) -> tuple[list, bool]:
+    """Read raw V3 position-risk rows for Binance; errors propagate.
+
+    The V3 endpoint returns every symbol that has an open position or open
+    orders, so a response whose rows are all interpretable certifies the
+    account-wide book. Returns one (mapped_row, raw_row, reason) entry per
+    response row plus whether the bridge still serves the validated client.
+    """
+    from server import binance_futures_positions
+
+    profile = _venue_profile(bridge)
+    base_url = bridge.config.get("exec_base_url") or "https://demo-api.binance.com"
+    binance_futures_positions.validate_client(client, profile, base_url)
+    reader = binance_futures_positions.isolated_client(client)
+    # prepare_rows maps venue ids through the client's market metadata; a
+    # client that has not loaded markets yet would fail every row closed.
+    if not isinstance(getattr(reader, "markets_by_id", None), dict) or not reader.markets_by_id:
+        reader.load_markets()
+    raw = reader.fapiPrivateV3GetPositionRisk({})
+    if not isinstance(raw, list):
+        raise ValueError("exchange returned an invalid futures positions response")
+    if bridge.client() is not client:
+        return [], False
+    prepared = binance_futures_positions.prepare_rows(raw, reader)
+    return [
+        (mapped, raw_row, reason)
+        for raw_row, (mapped, _, reason) in zip(raw, prepared, strict=True)
+    ], True
+
+
+def _observed_size(raw: dict, info: dict) -> float | None:
+    values = []
+    for source, keys in (
+        (raw, ("contracts", "positionAmt", "position_amount", "amount", "size")),
+        (info, ("positionAmt", "position_amount", "pos", "size")),
+    ):
+        for key in keys:
+            value = source.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, str) and "_" in value:
+                return None
+            if isinstance(value, bool):
+                return None
+            try:
+                exact = Decimal(str(value))
+                number = float(exact)
+            except (ValueError, TypeError, OverflowError, InvalidOperation):
+                return None
+            if not math.isfinite(number) or (number == 0 and exact != 0):
+                return None
+            values.append(number)
+    if not values or any(
+        not math.isclose(abs(value), abs(values[0]), rel_tol=1e-12, abs_tol=0.0)
+        for value in values[1:]
+    ):
+        return None
+    return values[0]
+
+
+def _flat_notional_conflicts(raw: dict, info: dict) -> bool:
+    for source in (raw, info):
+        for key in ("notional", "notionalUsd", "notionalValue", "positionValue"):
+            value = source.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool) or isinstance(value, str) and "_" in value:
+                return True
+            try:
+                number = Decimal(str(value))
+            except (ValueError, TypeError, InvalidOperation):
+                return True
+            if not number.is_finite() or number != 0:
+                return True
+    return False
+
+
+def observe_futures_positions(bridge) -> FuturesPositionsObservation:
+    """Read position evidence without treating absent or malformed rows as flat."""
+    client = bridge.client()
+    exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
+    unknown_symbols: set[str] = set()
+    unknown_scope = False
+    scope_complete = False
+    if exchange_id == "binance":
+        entries, scope_complete = _binance_position_rows(bridge, client)
+        if not scope_complete:
+            # The bridge rebound its client during the read; the validated
+            # route no longer describes the client the rest of the run uses.
+            unknown_scope = True
+    else:
+        rows = _position_rows(bridge, client)
+        entries = [(row, row, None) for row in rows]
+    positions = []
+    seen: set[tuple[str, str]] = set()
+    for raw, raw_row, reason in entries:
+        if reason is not None:
+            symbol = raw_row.get("symbol") if isinstance(raw_row, dict) else None
+            if isinstance(symbol, str) and symbol.strip():
+                unknown_symbols.add(symbol)
+            else:
+                unknown_scope = True
+            continue
+        symbol = raw.get("symbol") if isinstance(raw, dict) else None
+        if not isinstance(symbol, str) or not symbol.strip():
+            unknown_scope = True
+            continue
+        if raw.get("info") is not None and not isinstance(raw.get("info"), dict):
+            unknown_symbols.add(symbol)
+            continue
+        raw_info = raw.get("info") or {}
+        contracts = _observed_size(raw, raw_info)
+        raw_sides = [str(raw[key]).lower() for key in ("side", "positionSide", "position_side")
+                     if raw.get(key) not in (None, "")]
+        if contracts is None or any(side not in {"long", "short", "both"} for side in raw_sides):
+            unknown_symbols.add(symbol)
+            continue
+        directions = {side for side in raw_sides if side in {"long", "short"}}
+        if len(directions) > 1:
+            unknown_symbols.add(symbol)
+            continue
+        side = next(iter(directions), "")
+        info_symbol = raw_info.get("symbol")
+        if (
+            str(getattr(bridge, "exchange_id", "")).lower() == "binance"
+            and info_symbol and str(info_symbol).upper() != symbol.split(":", 1)[0].replace("/", "").upper()
+        ):
+            # Either symbol could be the row's real identity.
+            unknown_scope = True
+            continue
+        info_side = str(raw_info.get("positionSide") or "").lower()
+        if info_side not in {"", "both", "long", "short"}:
+            unknown_symbols.add(symbol)
+            continue
+        if info_side in {"long", "short"} and side in {"long", "short"} and info_side != side:
+            unknown_symbols.add(symbol)
+            continue
+        resolved_side = side if side in {"long", "short"} else info_side
+        if resolved_side == "long" and contracts < 0:
+            unknown_symbols.add(symbol)
+            continue
+        signed_values = [
+            _number(source[key])
+            for source, keys in (
+                (raw, ("positionAmt", "position_amount")),
+                (raw_info, ("positionAmt", "position_amount", "pos")),
+            )
+            for key in keys if source.get(key) not in (None, "")
+        ]
+        negative_size = any(
+            _number(source[key]) < 0
+            for source, keys in (
+                (raw, ("contracts", "amount", "size")),
+                (raw_info, ("size",)),
+            )
+            for key in keys if source.get(key) not in (None, "")
+        )
+        if any(
+            signed is None
+            or (resolved_side == "long" and signed < 0)
+            or (resolved_side == "short" and signed > 0)
+            for signed in signed_values
+        ) or (
+            any(signed is not None and signed > 0 for signed in signed_values)
+            and any(signed is not None and signed < 0 for signed in signed_values)
+        ) or (
+            negative_size and (
+                resolved_side == "long"
+                or any(signed is not None and signed > 0 for signed in signed_values)
+            )
+        ):
+            unknown_symbols.add(symbol)
+            continue
+        if resolved_side not in {"long", "short"}:
+            signed = next((value for value in signed_values if value), 0)
+            if not signed and negative_size:
+                signed = -abs(contracts)
+            resolved_side = "long" if signed > 0 else "short" if signed < 0 else ""
+            if not resolved_side and contracts != 0:
+                unknown_symbols.add(symbol)
+                continue
+        if contracts == 0:
+            if _flat_notional_conflicts(raw, raw_info):
+                unknown_symbols.add(symbol)
+            # A flat row contributes no position; a contradictory notional
+            # above keeps the row and the account scope unknown.
+            continue
+        values = [
+            value for key in ("contracts", "positionAmt", "position_amount", "amount", "size")
+            if (value := _number(raw.get(key))) is not None
+        ]
+        if not values:
+            raw = {**raw, "contracts": contracts}
+        position = _normalize_position({**raw, "side": resolved_side}, client)
+        if position is None or position.side not in {"long", "short"}:
+            unknown_symbols.add(symbol)
+            continue
+        key = (symbol, position.side)
+        if key in seen:
+            unknown_symbols.add(symbol)
+        seen.add(key)
+        positions.append(position)
+    return FuturesPositionsObservation(
+        tuple(positions), frozenset(unknown_symbols), unknown_scope,
+        scope_complete and not unknown_symbols and not unknown_scope,
     )
+
+
+def read_futures_balance(bridge) -> FuturesAccountSnapshot:
+    """Read account totals without making a second, potentially inconsistent position read."""
+    client = bridge.client()
+    exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
+    balance_params, _ = _futures_params(exchange_id, bridge.config)
+    balance = client.fetch_balance(params=balance_params)
+    if not isinstance(balance, dict):
+        raise ValueError("exchange returned an invalid futures account response")
+    return FuturesAccountSnapshot(**_account_values(balance, exchange_id), venue_profile=_venue_profile(bridge))
+
+
+def read_futures_positions(bridge) -> tuple[FuturesPosition, ...]:
+    """Read positions only when every returned row is interpretable."""
+    observation = observe_futures_positions(bridge)
+    if observation.unknown_scope or observation.unknown_symbols:
+        raise ValueError("exchange returned malformed futures position rows")
+    return observation.positions
 
 
 def read_futures_account(bridge) -> FuturesAccountSnapshot:
@@ -296,26 +531,11 @@ def read_futures_account(bridge) -> FuturesAccountSnapshot:
     Venue-specific params keep CCXT on derivatives endpoints while preserving
     the venue's current client configuration.
     """
-    client = bridge.client()
-    exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
-    profile = _venue_profile(bridge)
-    balance_params, _ = _futures_params(exchange_id, bridge.config)
-
-    balance = client.fetch_balance(params=balance_params)
-    if not isinstance(balance, dict):
-        raise ValueError("exchange returned an invalid futures account response")
-    normalized = read_futures_positions(bridge)
-    values = _account_values(balance, exchange_id)
-    return FuturesAccountSnapshot(
-        equity=values["equity"],
-        wallet_balance=values["wallet_balance"],
-        available_balance=values["available_balance"],
-        unrealized_pnl=values["unrealized_pnl"],
-        venue_profile=profile,
-        equity_currency=values["equity_currency"],
-        wallet_balance_currency=values["wallet_balance_currency"],
-        available_balance_currency=values["available_balance_currency"],
-        unrealized_pnl_currency=values["unrealized_pnl_currency"],
-        account_scope=values["account_scope"],
-        positions=normalized,
+    snapshot = read_futures_balance(bridge)
+    observation = observe_futures_positions(bridge)
+    if observation.unknown_scope or observation.unknown_symbols:
+        raise ValueError("exchange returned malformed futures position rows")
+    return replace(
+        snapshot, positions=observation.positions,
+        positions_scope_complete=observation.scope_complete,
     )

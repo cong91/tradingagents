@@ -3,6 +3,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from server import job_store
+from tests.execution_derivatives_support import (
+    VERIFIED_IDENTITY,
+    bind_identity,
+)
 from tradingagents.execution.futures_protection import manage_active_positions
 
 
@@ -81,6 +85,41 @@ class _ProtectionExchange:
         self.calls = []
         self.orders = {}
         self.cancel_error = None
+        # The account-scope surface the raw V3 position read validates.
+        self.urls = {"api": {
+            "fapiPrivate": "https://demo-fapi.binance.com/fapi/v1",
+            "fapiPrivateV2": "https://demo-fapi.binance.com/fapi/v2",
+            "fapiPrivateV3": "https://demo-fapi.binance.com/fapi/v3",
+        }}
+        self.options = {"enableDemoTrading": True, "sandboxMode": False}
+        self.verbose = False
+        self.markets_by_id = {"TIAUSDT": {
+            "id": "TIAUSDT", "symbol": "TIA/USDT:USDT", "contract": True,
+            "linear": True, "inverse": False, "quote": "USDT", "settle": "USDT",
+            "settleId": "USDT",
+        }}
+
+    def fapiPrivateV3GetPositionRisk(self, params=None):
+        self.calls.append(("raw_positions", params))
+        rows = []
+        for position in self.positions:
+            if not isinstance(position, dict):
+                rows.append(position)
+                continue
+            contracts = position.get("contracts")
+            side = str(position.get("side") or "").lower()
+            row = {
+                "symbol": str(position.get("symbol", "")).split(":", 1)[0].replace("/", ""),
+                "positionSide": "BOTH", "marginAsset": "USDT",
+            }
+            if contracts is not None:
+                signed = float(contracts) * (-1.0 if side == "short" else 1.0)
+                row["positionAmt"] = f"{signed:.6f}"
+            for key in ("entryPrice", "markPrice"):
+                if position.get(key) is not None:
+                    row[key] = str(position[key])
+            rows.append(row)
+        return rows
 
     def fetch_positions(self, symbols=None, params=None):
         self.calls.append(("positions", symbols, params))
@@ -101,14 +140,12 @@ class _ProtectionExchange:
             "timestamp": int(datetime.now(UTC).timestamp() * 1000),
         }
 
-    def market(self, symbol):
-        return {"quote": "USDT", "settle": "USDT", "inverse": False}
-
     def create_order(self, symbol, kind, side, amount, price=None, params=None):
         self.calls.append(("create", symbol, side, amount, params))
         if "stopLossPrice" not in params and "takeProfitPrice" not in params:
-            # A plain reduce-only market close: the venue answers filled.
-            return {"id": "close-1", "status": "closed", "info": {"algoStatus": "FINISHED"}}
+            # A plain reduce-only market close (no conditional algo status):
+            # the venue's confirmed "closed" status proves the fill.
+            return {"id": "close-1", "status": "closed"}
         order_id = str(len(self.orders) + 1)
         key = "stopLossPrice" if "stopLossPrice" in params else "takeProfitPrice"
         order_type = "STOP_MARKET" if key == "stopLossPrice" else "TAKE_PROFIT_MARKET"
@@ -128,6 +165,8 @@ class _ProtectionExchange:
                 "triggerPrice": str(params[key]),
                 "quantity": str(amount),
                 "reduceOnly": True,
+                "workingType": params.get("workingType"),
+                "clientAlgoId": params.get("clientOrderId"),
             },
         }
         return {"id": order_id}
@@ -179,6 +218,7 @@ def _linked_position(*, side="long", entry=100.0, stop=90.0, target=130.0):
         targets=[target],
         mark=entry,
         order_id="entry-1",
+        identity=VERIFIED_IDENTITY,
     )
     state = job_store.load_position_state(position_key)
     state["bracket_task_id"] = task_id
@@ -196,6 +236,7 @@ def _linked_position(*, side="long", entry=100.0, stop=90.0, target=130.0):
         ],
         now="2026-10-19T00:00:00+00:00",
         venue_key="binance|https://demo-api.binance.com|True",
+        identity=VERIFIED_IDENTITY,
     )
     return position_key, task_id
 
@@ -208,14 +249,16 @@ def _resting_leg_orders():
             "amount": 1.0, "type": "market", "status": "open",
             "info": {"algoId": "old-stop", "symbol": "TIAUSDT", "side": "SELL",
                      "algoStatus": "NEW", "orderType": "STOP_MARKET",
-                     "triggerPrice": "90.0", "quantity": "1.0", "reduceOnly": True},
+                     "triggerPrice": "90.0", "quantity": "1.0", "reduceOnly": True,
+                     "workingType": "MARK_PRICE"},
         },
         "old-target": {
             "id": "old-target", "symbol": "TIA/USDT:USDT", "side": "sell",
             "amount": 1.0, "type": "market", "status": "open",
             "info": {"algoId": "old-target", "symbol": "TIAUSDT", "side": "SELL",
                      "algoStatus": "NEW", "orderType": "TAKE_PROFIT_MARKET",
-                     "triggerPrice": "130.0", "quantity": "1.0", "reduceOnly": True},
+                     "triggerPrice": "130.0", "quantity": "1.0", "reduceOnly": True,
+                     "workingType": "MARK_PRICE"},
         },
     }
 
@@ -228,7 +271,8 @@ def _set_opened_hours_ago(position_key: str, hours: float) -> None:
     assert job_store.save_position_state(position_key, state["revision"], state)
 
 
-def test_live_position_management_uses_venue_entry_quantity_and_mark():
+def test_live_position_management_uses_venue_entry_quantity_and_mark(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, task_id = _linked_position()
     exchange = _ProtectionExchange(positions=[{
         "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 2.0,
@@ -240,14 +284,16 @@ def test_live_position_management_uses_venue_entry_quantity_and_mark():
             "amount": 1.0, "type": "market", "status": "open",
             "info": {"algoId": "old-stop", "symbol": "TIAUSDT", "side": "SELL",
                      "algoStatus": "NEW", "orderType": "STOP_MARKET",
-                     "triggerPrice": "90.0", "quantity": "1.0", "reduceOnly": True},
+                     "triggerPrice": "90.0", "quantity": "1.0", "reduceOnly": True,
+                     "workingType": "MARK_PRICE"},
         },
         "old-target": {
             "id": "old-target", "symbol": "TIA/USDT:USDT", "side": "sell",
             "amount": 1.0, "type": "market", "status": "open",
             "info": {"algoId": "old-target", "symbol": "TIAUSDT", "side": "SELL",
                      "algoStatus": "NEW", "orderType": "TAKE_PROFIT_MARKET",
-                     "triggerPrice": "130.0", "quantity": "1.0", "reduceOnly": True},
+                     "triggerPrice": "130.0", "quantity": "1.0", "reduceOnly": True,
+                     "workingType": "MARK_PRICE"},
         },
     }
     bridge = _ProtectionBridge(exchange)
@@ -266,15 +312,74 @@ def test_live_position_management_uses_venue_entry_quantity_and_mark():
     created = [call for call in exchange.calls if call[0] == "create"]
     # Binance conditional legs trigger on the mark price, so a wick that never
     # reaches the last-traded price still closes the position.
-    assert created == [
-        ("create", "TIA/USDT:USDT", "sell", 2.0,
-         {"stopLossPrice": 125.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
-        ("create", "TIA/USDT:USDT", "sell", 2.0,
-         {"takeProfitPrice": 141.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
+    assert [(call[0], call[1], call[2], call[3]) for call in created] == [
+        ("create", "TIA/USDT:USDT", "sell", 2.0),
+        ("create", "TIA/USDT:USDT", "sell", 2.0),
     ]
+    assert [call[4].get("stopLossPrice", call[4].get("takeProfitPrice")) for call in created] == [125.0, 141.0]
+    assert all(call[4]["reduceOnly"] and call[4]["workingType"] == "MARK_PRICE" for call in created)
+    assert all(call[4]["clientOrderId"].startswith("br-") for call in created)
     task = job_store.load_bracket_recovery(task_id)
     assert task["legs"][0]["retired_ids"] == []
     assert task["legs"][1]["retired_ids"] == []
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [{"symbol": "TIA/USDT:USDT", "side": "long"}],
+    [{"symbol": "TIA/USDT:USDT", "side": "long", "contracts": "NaN"}],
+    [{"symbol": "TIA/USDT:USDT", "side": "long", "contracts": 0}],
+    [None],
+])
+def test_unproven_flat_never_cancels_or_deletes(rows):
+    position_key, task_id = _linked_position()
+    exchange = _ProtectionExchange(positions=rows)
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+    assert result == [{"position_key": position_key, "status": "position_unknown"}]
+    assert job_store.load_position_state(position_key) is not None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "pending"
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_malformed_position_key_does_not_prevent_other_states():
+    position_key, _task_id = _linked_position()
+    job_store.persist_futures_entry_state(
+        "malformed", side="long", entry=100, quantity=1,
+        stop=90, targets=[130], mark=100, order_id="entry-bad",
+    )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1,
+        "entryPrice": 100, "markPrice": 135,
+    }])
+    results = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+    statuses = {item["position_key"]: item["status"] for item in results}
+    assert statuses[position_key] == "account_identity_unknown"
+    assert statuses["malformed"].startswith("error:ValueError:")
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_unknown_account_does_not_change_open_position_protection():
+    position_key, task_id = _linked_position()
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 135.0,
+    }])
+    state = job_store.load_position_state(position_key)
+    task = job_store.load_bracket_recovery(task_id)
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+    assert result == [{"position_key": position_key, "status": "account_identity_unknown"}]
+    assert job_store.load_position_state(position_key) == state
+    assert job_store.load_bracket_recovery(task_id) == task
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
 
 
 def test_closed_mutation_gate_does_not_create_or_cancel_orders():
@@ -335,9 +440,9 @@ def test_flat_position_cleans_legs_before_deleting_durable_state():
         config={"risk_derivatives_profit_protection_enabled": True},
     )
 
-    assert result == [{"position_key": position_key, "status": "closed"}]
-    assert job_store.load_position_state(position_key) is None
-    assert {call[1] for call in exchange.calls if call[0] == "cancel"} == {"old-stop", "old-target"}
+    assert result == [{"position_key": position_key, "status": "position_unknown"}]
+    assert job_store.load_position_state(position_key) is not None
+    assert not [call for call in exchange.calls if call[0] == "cancel"]
 
 
 def test_flat_position_retains_state_when_conditional_cleanup_is_uncertain():
@@ -368,8 +473,9 @@ def test_flat_position_retains_state_when_conditional_cleanup_is_uncertain():
         config={"risk_derivatives_profit_protection_enabled": True},
     )
 
-    assert result == [{"position_key": position_key, "status": "closed_position_cleanup_pending"}]
+    assert result == [{"position_key": position_key, "status": "position_unknown"}]
     assert job_store.load_position_state(position_key) is not None
+    assert not [call for call in exchange.calls if call[0] == "cancel"]
 
 
 def test_position_monitor_lease_has_one_owner_and_recovers_after_expiry(monkeypatch):
@@ -440,9 +546,8 @@ def test_legacy_position_state_backfills_only_an_exact_bracket_task():
         config={"risk_derivatives_profit_protection_enabled": True},
     )
 
-    assert result == [{"position_key": position_key, "status": "unchanged"}]
-    linked = job_store.load_position_state(position_key)
-    assert linked["bracket_task_id"] == "bracket:TIA/USDT:USDT:legacy-entry"
+    assert result == [{"position_key": position_key, "status": "missing_bracket_link"}]
+    assert not job_store.load_position_state(position_key).get("bracket_task_id")
 
 
     _position_key, _task_id = _linked_position()
@@ -522,13 +627,14 @@ def test_missing_opened_at_is_backfilled_without_closing():
         },
     )
 
-    assert result == [{"position_key": position_key, "status": "opened_at_backfilled"}]
+    assert result == [{"position_key": position_key, "status": "opened_at_unknown"}]
     snapshot = job_store.load_position_state(position_key)["snapshot"]
-    assert datetime.fromisoformat(snapshot["opened_at"]).tzinfo is not None
+    assert "opened_at" not in snapshot
     assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
 
 
-def test_time_stop_past_the_deadline_below_minimum_r_closes_and_deletes_state():
+def test_time_stop_past_the_deadline_below_minimum_r_closes_and_deletes_state(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     exchange = _ProtectionExchange(positions=[{
@@ -561,7 +667,8 @@ def test_time_stop_past_the_deadline_below_minimum_r_closes_and_deletes_state():
     assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
 
 
-def test_time_stop_past_the_deadline_after_minimum_r_keeps_the_position():
+def test_time_stop_past_the_deadline_after_minimum_r_keeps_the_position(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     exchange = _ProtectionExchange(positions=[{
@@ -580,7 +687,7 @@ def test_time_stop_past_the_deadline_after_minimum_r_keeps_the_position():
     )
 
     assert result == [{"position_key": position_key, "status": "updated"}]
-    assert not [call for call in exchange.calls if call[0] == "create" and "clientOrderId" in call[4]]
+    assert not [call for call in exchange.calls if call[0] == "create" and str(call[4].get("clientOrderId", "")).startswith("timestop-")]
     assert job_store.load_position_state(position_key) is not None
 
 
@@ -625,7 +732,8 @@ _TIME_STOP_CONFIG = {
 }
 
 
-def test_strong_funding_blocks_the_time_stop_and_records_the_reason():
+def test_strong_funding_blocks_the_time_stop_and_records_the_reason(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id, exchange = _short_position_state()
     # Mark 105 on entry 100 puts the short at -0.5R; +30 USDT of funding
     # against a 10 USDT initial risk is +3.0R, enough to hold the position.
@@ -646,7 +754,8 @@ def test_strong_funding_blocks_the_time_stop_and_records_the_reason():
     assert bridge.audit == []
 
 
-def test_earning_short_inside_the_settlement_window_postpones_the_time_stop():
+def test_earning_short_inside_the_settlement_window_postpones_the_time_stop(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id, exchange = _short_position_state()
     # +2 USDT of funding lifts the effective R only to -0.31, so the time stop
     # would close — but the next settlement pays this short and is 30m away.
@@ -672,7 +781,8 @@ def test_earning_short_inside_the_settlement_window_postpones_the_time_stop():
     assert [event["action"] for event in bridge.audit] == ["time_stop_postponed"]
 
 
-def test_a_second_settlement_inside_the_window_closes_instead_of_deferring():
+def test_a_second_settlement_inside_the_window_closes_instead_of_deferring(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id, exchange = _short_position_state()
     exchange.funding_rows = [{"amount": 2.0}]
     exchange.funding_rate = {
@@ -699,7 +809,8 @@ def test_a_second_settlement_inside_the_window_closes_instead_of_deferring():
     assert job_store.load_position_state(position_key) is None
 
 
-def test_strong_funding_blocks_the_time_stop_on_the_brackets_original_size():
+def test_strong_funding_blocks_the_time_stop_on_the_brackets_original_size(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id, exchange = _short_position_state()
     # A scale-out tranche already left: the venue reports half the original
     # contracts while the funding history accrued on the full size.
@@ -720,28 +831,35 @@ def test_strong_funding_blocks_the_time_stop_on_the_brackets_original_size():
     assert snapshot["cumulative_funding_r"] == pytest.approx(3.0)
 
 
-class _FlakyClientBridge(_ProtectionBridge):
-    """A bridge whose client read hiccups exactly once, at the funding read.
+class _FundingDeadClient:
+    """A client whose funding endpoints are unreachable (a dropped connection
+    during the funding reads); every other surface proxies the venue."""
 
-    One mutation pass reaches ``client()`` four times: positions read,
-    position mode, mark price, then the funding reads (the close re-reads it
-    afterwards). Letting only the funding call fail — as a single dropped
-    connection would — exercises the fallback without breaking the gates
-    around it or the close that follows.
-    """
+    def __init__(self, exchange):
+        self._exchange = exchange
+
+    def __getattr__(self, name):
+        if name in {"fetch_funding_history", "fetch_funding_rate"}:
+            raise RuntimeError("client unavailable")
+        return getattr(self._exchange, name)
+
+
+class _FlakyClientBridge(_ProtectionBridge):
+    """A bridge whose client read hiccups exactly at the funding reads, as a
+    single dropped connection would: the gates and the close still work, only
+    the funding adjustments fall back. The wrapped client stays the SAME
+    instance for the whole pass, like a real bridge's cached client."""
 
     def __init__(self, exchange):
         super().__init__(exchange)
-        self._client_calls = 0
+        self._wrapped = _FundingDeadClient(exchange)
 
     def client(self):
-        self._client_calls += 1
-        if self._client_calls == 4:
-            raise RuntimeError("client unavailable")
-        return self.exchange
+        return self._wrapped
 
 
-def test_unavailable_venue_client_notes_the_funding_fallback():
+def test_unavailable_venue_client_notes_the_funding_fallback(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     exchange = _ProtectionExchange(positions=[{
@@ -762,7 +880,8 @@ def test_unavailable_venue_client_notes_the_funding_fallback():
     assert job_store.load_position_state(position_key) is None
 
 
-def test_paying_long_closes_at_the_deadline_despite_the_upcoming_settlement():
+def test_paying_long_closes_at_the_deadline_despite_the_upcoming_settlement(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     exchange = _FundingExchange(
@@ -789,7 +908,8 @@ def test_paying_long_closes_at_the_deadline_despite_the_upcoming_settlement():
     assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
 
 
-def test_failed_funding_history_treats_funding_as_zero_and_notes_it():
+def test_failed_funding_history_treats_funding_as_zero_and_notes_it(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     exchange = _FundingExchange(
@@ -813,7 +933,8 @@ def test_failed_funding_history_treats_funding_as_zero_and_notes_it():
     assert job_store.load_position_state(position_key) is None
 
 
-def test_disabled_postpone_window_closes_without_reading_the_schedule():
+def test_disabled_postpone_window_closes_without_reading_the_schedule(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id, exchange = _short_position_state()
     exchange.funding_rows = [{"amount": 2.0}]
     exchange.funding_rate = {
@@ -832,7 +953,8 @@ def test_disabled_postpone_window_closes_without_reading_the_schedule():
     assert job_store.load_position_state(position_key) is None
 
 
-def test_funding_is_only_consulted_once_the_raw_boundary_trips():
+def test_funding_is_only_consulted_once_the_raw_boundary_trips(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
     # Mark 115 on entry 100 is +1.5R: above the time-stop minimum before any

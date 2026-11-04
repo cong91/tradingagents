@@ -6,9 +6,11 @@
 // Tách khỏi dashboard.tsx để từng card (hiệu suất, audit, danh mục) chia sẻ
 // đúng một định nghĩa trạng thái — cùng pattern use-section-data.ts của audit/.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { FetchError } from "./contract";
+
+const MAX_TIMESTAMP_SKEW_MS = 5_000;
 
 export type PanelState<T> =
   | { status: "loading" }
@@ -23,14 +25,45 @@ export function usePoll<T>(
   fetcher: () => Promise<T>,
   intervalMs: number,
   staleAfterMs: number,
-  clock: number
+  clock: number,
+  suppressOverlap = false,
+  getDataTimestamp?: (data: T) => string | number | null | undefined
 ): { state: PanelState<T>; refresh: () => void; stale: boolean } {
   const [state, setState] = useState<PanelState<T>>({ status: "loading" });
+  const requestSequence = useRef(0);
+  const inFlightRequest = useRef<object | null>(null);
+  const refreshQueued = useRef(false);
+  const active = useRef(false);
 
-  const load = useCallback(() => {
-    fetcher().then(
-      (data) => setState({ status: "ready", data, fetchedAt: Date.now() }),
+  const load = useCallback(function load(): void {
+    if (!active.current) return;
+    if (suppressOverlap && inFlightRequest.current !== null) {
+      refreshQueued.current = true;
+      return;
+    }
+
+    const sequence = ++requestSequence.current;
+    const request = {};
+    if (suppressOverlap) inFlightRequest.current = request;
+    const clearInFlight = () => {
+      if (inFlightRequest.current === request) inFlightRequest.current = null;
+    };
+
+    let pending: Promise<T>;
+    try {
+      pending = fetcher();
+    } catch (err) {
+      clearInFlight();
+      throw err;
+    }
+
+    pending.then(
+      (data) => {
+        if (!active.current || sequence !== requestSequence.current) return;
+        setState({ status: "ready", data, fetchedAt: Date.now() });
+      },
       (err: unknown) => {
+        if (!active.current || sequence !== requestSequence.current) return;
         const message = err instanceof Error ? err.message : "Lỗi không xác định";
         const code = err instanceof FetchError ? err.code : "unknown_error";
         setState((prev) => {
@@ -46,18 +79,48 @@ export function usePoll<T>(
           return { status: "error", message, code };
         });
       }
-    );
-  }, [fetcher]);
+    ).finally(() => {
+      clearInFlight();
+      if (active.current && refreshQueued.current) {
+        refreshQueued.current = false;
+        load();
+      }
+    });
+  }, [fetcher, suppressOverlap]);
 
   useEffect(() => {
+    active.current = true;
     load();
     const id = setInterval(load, intervalMs);
-    return () => clearInterval(id);
+    return () => {
+      active.current = false;
+      requestSequence.current += 1;
+      inFlightRequest.current = null;
+      refreshQueued.current = false;
+      clearInterval(id);
+    };
   }, [load, intervalMs]);
 
   const stale =
     (state.status === "ready" || state.status === "stale") &&
-    clock - state.fetchedAt > staleAfterMs;
+    (getDataTimestamp
+      ? isTimestampStale(getDataTimestamp(state.data), clock, staleAfterMs)
+      : clock - state.fetchedAt > staleAfterMs);
 
   return { state, refresh: load, stale };
+}
+
+function isTimestampStale(
+  timestamp: string | number | null | undefined,
+  clock: number,
+  staleAfterMs: number
+): boolean {
+  if (timestamp == null) return true;
+  const timestampMs = typeof timestamp === "number" ? timestamp : Date.parse(timestamp);
+  const ageMs = clock - timestampMs;
+  return (
+    !Number.isFinite(timestampMs) ||
+    ageMs < -MAX_TIMESTAMP_SKEW_MS ||
+    ageMs > staleAfterMs
+  );
 }

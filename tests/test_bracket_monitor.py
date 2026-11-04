@@ -152,6 +152,24 @@ def test_uncertain_and_failed_emergency_tasks_are_polled(monitor_state, monkeypa
     assert calls["recover"] == []
 
 
+def test_time_stop_close_statuses_are_polled(monitor_state, monkeypatch):
+    """A time-stop close that never confirmed is fenced by its persisted
+    status: the background poll must keep enumerating it instead of leaving
+    the retry only to the protection loop."""
+    _create_task("time-uncertain", status="time_stop_submission_uncertain")
+    _create_task("time-unknown", status="time_stop_unknown_position")
+    _create_task("time-failed", status="time_stop_failed")
+    calls = _install_executor(monkeypatch)
+
+    results = bracket_monitor.poll_active_brackets()
+
+    assert {item["task_id"] for item in results} == {
+        "time-uncertain", "time-unknown", "time-failed",
+    }
+    assert set(calls["monitor"]) == {"time-uncertain", "time-unknown", "time-failed"}
+    assert calls["recover"] == []
+
+
 def test_task_failure_is_reported_and_does_not_stop_later_tasks(monitor_state, monkeypatch):
     _create_task("fails", status="monitoring")
     _create_task("continues", status="monitoring")

@@ -26,6 +26,7 @@ from server import (
 )
 from server.contract import install_error_handlers, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.execution.futures_account import FuturesAccountSnapshot
 from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
@@ -1260,6 +1261,20 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     _handle_plan can only ever dry-run, and the executor seam replaced by a
     factory over the stub venue."""
     engine_audit = tmp_path / "engine-audit.jsonl"
+    # Fully stub the account read: the derivatives cycle needs a complete
+    # equity picture, not a venue round-trip, and a real read would now demand
+    # a validate_client-compatible Binance transport the stub venue lacks.
+    monkeypatch.setattr(
+        autoloop_mod, "read_futures_account",
+        lambda bridge: FuturesAccountSnapshot(
+            equity=_STUB_CASH, wallet_balance=_STUB_CASH,
+            available_balance=_STUB_CASH, unrealized_pnl=0.0,
+            venue_profile="demo",
+            equity_currency="USDT", wallet_balance_currency="USDT",
+            available_balance_currency="USDT", unrealized_pnl_currency="USDT",
+            positions=(), positions_scope_complete=True,
+        ),
+    )
     set_config({
         "exec_auto_confirm": True, "exec_live": False,
         "exec_derivatives": True,

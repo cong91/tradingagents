@@ -2,7 +2,7 @@ import ccxt
 import pytest
 
 from tradingagents.default_config import DEFAULT_CONFIG, _apply_env_overrides
-from tradingagents.execution import bridge as bridge_module
+from tradingagents.execution import exchange_client as exchange_client_module
 
 
 class _FakeBinance(ccxt.Exchange):
@@ -46,7 +46,7 @@ def test_demo_url_selects_demo_credentials_and_demo_hosts(monkeypatch):
     monkeypatch.setenv("BINANCE_API_KEY", "production-key")
     monkeypatch.setenv("BINANCE_SECRET", "production-secret")
 
-    client = bridge_module._default_exchange_factory(
+    client = exchange_client_module._default_exchange_factory(
         "binance", base_url="https://demo-api.binance.com"
     )
 
@@ -70,7 +70,7 @@ def test_production_url_selects_production_credentials_without_demo(monkeypatch)
     monkeypatch.setenv("BINANCE_API_KEY", "production-key")
     monkeypatch.setenv("BINANCE_SECRET", "production-secret")
 
-    client = bridge_module._default_exchange_factory(
+    client = exchange_client_module._default_exchange_factory(
         "binance", base_url="https://api.binance.com"
     )
 
@@ -97,7 +97,7 @@ def test_binance_client_requests_time_adjustment_for_clock_skew(monkeypatch):
     monkeypatch.setenv("BINANCE_DEMO_API_KEY", "demo-key")
     monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
 
-    bridge_module._default_exchange_factory("binance", base_url="https://demo-api.binance.com")
+    exchange_client_module._default_exchange_factory("binance", base_url="https://demo-api.binance.com")
 
     assert captured["options"] == {"adjustForTimeDifference": True}
 
@@ -116,7 +116,7 @@ def test_non_binance_client_does_not_request_time_adjustment(monkeypatch):
     monkeypatch.setenv("OKX_API_KEY", "okx-key")
     monkeypatch.setenv("OKX_SECRET", "okx-secret")
 
-    bridge_module._default_exchange_factory("okx")
+    exchange_client_module._default_exchange_factory("okx")
 
     assert captured == {"apiKey": "okx-key", "secret": "okx-secret", "enableRateLimit": True}
 
@@ -124,7 +124,7 @@ def test_binance_profile_rejects_unapproved_url_before_client_creation(monkeypat
     monkeypatch.setattr(ccxt, "binance", _FakeBinance)
 
     with pytest.raises(ValueError, match="exec_base_url"):
-        bridge_module._default_exchange_factory(
+        exchange_client_module._default_exchange_factory(
             "binance", base_url="https://evil.example.invalid"
         )
 
@@ -139,7 +139,7 @@ def test_binance_profile_rejects_client_host_mismatch(monkeypatch):
     monkeypatch.setenv("BINANCE_DEMO_SECRET", "demo-secret")
 
     with pytest.raises(RuntimeError, match="unexpected API hosts"):
-        bridge_module._default_exchange_factory(
+        exchange_client_module._default_exchange_factory(
             "binance", base_url="https://demo-api.binance.com"
         )
 

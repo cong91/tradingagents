@@ -2,14 +2,17 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState } from "react";
 import {
   ClipboardCheckIcon,
   HistoryIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
+  MenuIcon,
   ScanSearchIcon,
   SettingsIcon,
   WorkflowIcon,
+  XIcon,
 } from "lucide-react";
 import { cn } from "cn";
 
@@ -25,10 +28,30 @@ const NAV_ITEMS = [
 
 export function Sidebar() {
   const pathname = usePathname();
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar">
-      <nav aria-label="Điều hướng chính" className="flex-1 p-3">
+    <aside className="flex w-full flex-col border-b bg-sidebar md:w-56 md:shrink-0 md:border-b-0 md:border-r">
+      <button
+        type="button"
+        aria-controls="primary-navigation"
+        aria-expanded={mobileOpen}
+        aria-label={mobileOpen ? "Đóng điều hướng chính" : "Mở điều hướng chính"}
+        className="min-touch flex items-center gap-2 px-4 text-sm font-medium md:hidden"
+        onClick={() => setMobileOpen((open) => !open)}
+      >
+        {mobileOpen ? (
+          <XIcon className="size-4" aria-hidden="true" />
+        ) : (
+          <MenuIcon className="size-4" aria-hidden="true" />
+        )}
+        <span>Điều hướng</span>
+      </button>
+      <nav
+        id="primary-navigation"
+        aria-label="Điều hướng chính"
+        className={cn("flex-1 p-3 md:block", mobileOpen ? "block" : "hidden")}
+      >
         <ul className="space-y-1">
           {NAV_ITEMS.map(({ label, href, icon: Icon }) => {
             const active =
@@ -44,6 +67,7 @@ export function Sidebar() {
                       ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
                       : "text-sidebar-foreground hover:bg-sidebar-accent/60"
                   )}
+                  onClick={() => setMobileOpen(false)}
                 >
                   <Icon className="size-4 shrink-0" aria-hidden="true" />
                   <span>{label}</span>
@@ -52,8 +76,11 @@ export function Sidebar() {
             );
           })}
         </ul>
+        <p className="mt-3 border-t pt-3 text-[11px] leading-snug text-muted-foreground md:hidden">
+          Công cụ nghiên cứu — không phải lời khuyên tài chính.
+        </p>
       </nav>
-      <p className="border-t p-3 text-[11px] leading-snug text-muted-foreground">
+      <p className="hidden border-t p-3 text-[11px] leading-snug text-muted-foreground md:block">
         Công cụ nghiên cứu — không phải lời khuyên tài chính.
       </p>
     </aside>

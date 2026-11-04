@@ -13,6 +13,7 @@ database in lockstep with no drift and no partial write to reason about.
 
 import dataclasses
 import json
+import re
 import secrets
 import time
 from datetime import UTC, datetime
@@ -23,6 +24,40 @@ from server import db
 # still active when a new process starts was orphaned — see reconcile_orphans.
 ACTIVE_STATUSES = ("queued", "running")
 _FUTURES_TERMINAL_STATUSES = ("completed", "rejected", "failed", "interrupted")
+_IDENTITY_HASH = re.compile(r"^[0-9a-f]{64}$")
+_IDENTITY_STATE_KEYS = (
+    "account_identity_exchange", "account_identity_profile",
+    "account_identity_type", "account_identity_hash",
+)
+
+
+def _identity_columns(identity):
+    """The four account-identity column values, or None when unbound.
+
+    Accepts the FuturesAccountIdentity dataclass, a duck-typed equivalent
+    (exchange/profile/account_type/identity_hash attributes), or a 4-tuple.
+    The digest is validated before any write; the database CHECK enforces it
+    again.
+    """
+    if identity is None:
+        return None
+    if isinstance(identity, (tuple, list)):
+        if len(identity) != 4:
+            raise ValueError(
+                "account identity tuple must be (exchange, profile, account_type, identity_hash)"
+            )
+        exchange, profile, account_type, identity_hash = identity
+    else:
+        exchange = getattr(identity, "exchange", None)
+        profile = getattr(identity, "profile", None)
+        account_type = getattr(identity, "account_type", None)
+        identity_hash = getattr(identity, "identity_hash", None)
+    if any(not isinstance(value, str) or not value
+           for value in (exchange, profile, account_type)):
+        raise ValueError("account identity requires string exchange, profile and account_type")
+    if not isinstance(identity_hash, str) or not _IDENTITY_HASH.fullmatch(identity_hash):
+        raise ValueError("account identity hash must be a 64-character lowercase hex digest")
+    return exchange, profile, account_type, identity_hash
 
 
 def _now() -> str:
@@ -428,14 +463,18 @@ def release_futures_signal(signal_id: str, *, status: str = "completed",
 
 def create_bracket_recovery(task_id: str, *, symbol: str, entry_order_id: str, close_side: str,
                             quantity: float, legs: list[dict], now: str,
-                            venue_key: str | None = None) -> bool:
+                            venue_key: str | None = None, identity=None) -> bool:
+    columns = _identity_columns(identity) or (None, None, None, None)
     with db.session() as conn:
         cursor = conn.execute(
             """INSERT INTO bracket_recovery_tasks
-               (task_id, symbol, entry_order_id, close_side, quantity, legs, updated_at, venue_key)
-               VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+               (task_id, symbol, entry_order_id, close_side, quantity, legs, updated_at, venue_key,
+                account_identity_exchange, account_identity_profile,
+                account_identity_type, account_identity_hash)
+               VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (task_id) DO NOTHING""",
-            (task_id, symbol, entry_order_id, close_side, quantity, _json(legs), now, venue_key),
+            (task_id, symbol, entry_order_id, close_side, quantity, _json(legs), now, venue_key,
+             *columns),
         )
         return cursor.rowcount == 1
 
@@ -446,6 +485,41 @@ def load_bracket_recovery(task_id: str) -> dict | None:
             "SELECT * FROM bracket_recovery_tasks WHERE task_id = %s", (task_id,)
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def bind_bracket_recovery_identity(task_id: str, *, identity) -> str:
+    """Bind identity to a legacy (previously unbound) bracket task.
+
+    One of "bound" (row accepted the binding), "not_found",
+    "already_bound_same" (same four values already stored), or
+    "already_bound_other" (a different binding exists; never overwritten).
+    """
+    columns = _identity_columns(identity)
+    if columns is None:
+        raise ValueError("account identity is required to bind a bracket recovery task")
+    with db.session() as conn:
+        cursor = conn.execute(
+            """UPDATE bracket_recovery_tasks
+               SET account_identity_exchange = %s, account_identity_profile = %s,
+                   account_identity_type = %s, account_identity_hash = %s
+               WHERE task_id = %s AND account_identity_hash IS NULL""",
+            (*columns, task_id),
+        )
+        if cursor.rowcount == 1:
+            return "bound"
+        row = conn.execute(
+            "SELECT account_identity_exchange, account_identity_profile, "
+            "account_identity_type, account_identity_hash "
+            "FROM bracket_recovery_tasks WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        stored = (
+            row["account_identity_exchange"], row["account_identity_profile"],
+            row["account_identity_type"], row["account_identity_hash"],
+        )
+        return "already_bound_same" if stored == columns else "already_bound_other"
 
 
 def update_bracket_recovery(task_id: str, *, status: str, placed_ids: list[str], attempts: int,
@@ -480,7 +554,9 @@ def active_bracket_recoveries() -> list[dict]:
             "SELECT * FROM bracket_recovery_tasks "
             "WHERE status IN ('pending', 'monitoring', 'submission_uncertain', "
             "'emergency_close_failed', 'emergency_cleanup_pending', "
-            "'replacement_cleanup_pending', 'position_cleanup_pending')"
+            "'replacement_cleanup_pending', 'position_cleanup_pending', "
+            "'time_stop_submission_uncertain', 'time_stop_unknown_position', "
+            "'time_stop_failed')"
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -515,12 +591,27 @@ def release_position_monitor_lease(position_key: str, owner: str) -> bool:
 def load_position_state(position_key: str) -> dict | None:
     with db.read() as conn:
         row = conn.execute(
-            "SELECT revision, state FROM position_states WHERE position_key = %s",
+            """SELECT revision, state, account_identity_exchange, account_identity_profile,
+                      account_identity_type, account_identity_hash
+               FROM position_states WHERE position_key = %s""",
             (position_key,),
         ).fetchone()
     if row is None:
         return None
-    return {**row["state"], "revision": row["revision"]}
+    return _state_with_identity(row["state"], row["revision"], row)
+
+
+def _state_with_identity(state: dict, revision: int, row) -> dict:
+    """The stored state plus the identity columns when the row is bound.
+
+    Legacy rows (all four columns NULL) carry no identity keys, so callers
+    can distinguish an unbound record from a verified one.
+    """
+    merged = {**state, "revision": revision}
+    if row["account_identity_exchange"] is not None:
+        for key in _IDENTITY_STATE_KEYS:
+            merged[key] = row[key]
+    return merged
 
 
 def find_bracket_recoveries(symbol: str, entry_order_id: str) -> list[dict]:
@@ -535,24 +626,55 @@ def find_bracket_recoveries(symbol: str, entry_order_id: str) -> list[dict]:
 def active_position_states() -> list[dict]:
     with db.read() as conn:
         rows = conn.execute(
-            "SELECT position_key, revision, state FROM position_states ORDER BY updated_at"
+            """SELECT position_key, revision, state, account_identity_exchange,
+                      account_identity_profile, account_identity_type, account_identity_hash
+               FROM position_states ORDER BY updated_at"""
         ).fetchall()
     return [
-        {"position_key": row["position_key"], **row["state"], "revision": row["revision"]}
+        {
+            "position_key": row["position_key"],
+            **_state_with_identity(row["state"], row["revision"], row),
+        }
         for row in rows
     ]
 
 
-def save_position_state(position_key: str, expected_revision: int, state: dict) -> bool:
+def save_position_state(position_key: str, expected_revision: int, state: dict,
+                        identity=None) -> bool:
+    # The identity keys ride on the state dict when it round-trips through the
+    # readers; they belong in the columns, never duplicated inside the jsonb.
+    payload = {key: value for key, value in state.items() if key not in _IDENTITY_STATE_KEYS}
+    if identity is None:
+        candidate = tuple(state.get(key) for key in _IDENTITY_STATE_KEYS)
+        if all(value is not None for value in candidate):
+            identity = candidate
+    columns = _identity_columns(identity)
     with db.session() as conn:
-        cursor = conn.execute(
-            """INSERT INTO position_states(position_key, revision, state, updated_at)
-               VALUES (%s, %s, %s::jsonb, %s)
-               ON CONFLICT (position_key) DO UPDATE SET revision = excluded.revision,
-                 state = excluded.state, updated_at = excluded.updated_at
-               WHERE position_states.revision = %s""",
-            (position_key, expected_revision + 1, _json(state), _now(), expected_revision),
-        )
+        if columns is None:
+            cursor = conn.execute(
+                """INSERT INTO position_states(position_key, revision, state, updated_at)
+                   VALUES (%s, %s, %s::jsonb, %s)
+                   ON CONFLICT (position_key) DO UPDATE SET revision = excluded.revision,
+                     state = excluded.state, updated_at = excluded.updated_at
+                   WHERE position_states.revision = %s""",
+                (position_key, expected_revision + 1, _json(payload), _now(), expected_revision),
+            )
+        else:
+            cursor = conn.execute(
+                """INSERT INTO position_states(position_key, revision, state, updated_at,
+                                               account_identity_exchange, account_identity_profile,
+                                               account_identity_type, account_identity_hash)
+                   VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                   ON CONFLICT (position_key) DO UPDATE SET revision = excluded.revision,
+                     state = excluded.state, updated_at = excluded.updated_at,
+                     account_identity_exchange = excluded.account_identity_exchange,
+                     account_identity_profile = excluded.account_identity_profile,
+                     account_identity_type = excluded.account_identity_type,
+                     account_identity_hash = excluded.account_identity_hash
+                   WHERE position_states.revision = %s""",
+                (position_key, expected_revision + 1, _json(payload), _now(),
+                 *columns, expected_revision),
+            )
         return cursor.rowcount == 1
 
 
@@ -573,7 +695,8 @@ def delete_position_state(position_key: str, expected_revision: int | None = Non
 
 def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
                                 quantity: float, stop: float, targets: list[float],
-                                mark: float, order_id: str | None) -> bool:
+                                mark: float, order_id: str | None,
+                                identity=None) -> bool:
     """Record a live acknowledged entry and its initial protective state."""
     from tradingagents.execution.position_manager import PositionSnapshot
 
@@ -600,7 +723,7 @@ def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
         },
         "orders": [],
         "entry_order_id": order_id,
-    })
+    }, identity=identity)
 
 
 def reconcile_orphans() -> list[str]:

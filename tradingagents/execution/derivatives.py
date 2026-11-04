@@ -30,12 +30,16 @@ from __future__ import annotations
 
 import contextlib
 import math
+import secrets
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
-from server import job_store
+from server import job_store, snapshot_observer
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
 from tradingagents.default_config import _BOOL_TRUE
+from tradingagents.execution import futures_identity
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.futures_safety import (
@@ -335,6 +339,49 @@ class DerivativesExecutor:
                 phase="execute",
             )
         mode = self._bridge.effective_mode()
+        if confirm is not True:
+            self._bridge.audit_plan(
+                order, action="derivatives_denied",
+                reason="derivatives execution requires confirm=True, even in dry-run",
+                confirmed=confirm, phase="execute",
+            )
+            raise PermissionError(
+                "derivatives execution requires confirm=True, even in dry-run; "
+                "nothing was sent"
+            )
+        if mode == "live":
+            try:
+                from server.futures_decision_context import build_futures_portfolio
+                from tradingagents.execution.futures_account import (
+                    observe_futures_positions,
+                    read_futures_balance,
+                )
+
+                client = self._bridge.client()
+                snapshot = read_futures_balance(self._bridge)
+                if self._bridge.client() is not client:
+                    raise ValueError("futures client changed during account read")
+                positions = observe_futures_positions(self._bridge)
+                if self._bridge.client() is not client:
+                    raise ValueError("futures client changed during positions read")
+                if not positions.scope_complete or positions.unknown_scope or positions.unknown_symbols:
+                    raise ValueError("futures position scope is unverified")
+                snapshot = replace(snapshot, positions=positions.positions)
+                if _positive_number(snapshot.equity) is None or not snapshot.equity_currency:
+                    raise ValueError("futures equity or currency is unavailable")
+                portfolio = build_futures_portfolio(snapshot)
+                open_orders = client.fetch_open_orders(order.ccxt_symbol)
+                if self._bridge.client() is not client:
+                    raise ValueError("futures client changed during open order read")
+                if not isinstance(open_orders, list) or any(not isinstance(item, dict) for item in open_orders):
+                    raise ValueError("open order response is invalid")
+                if open_orders:
+                    raise ValueError("existing open orders make a new entry unsafe")
+            except Exception as exc:
+                raise self._refuse(
+                    order, f"fresh futures account or open orders unavailable: {type(exc).__name__}",
+                    phase="execute",
+                ) from exc
         # fail_closed=True: same rule as the spot execute re-check -- an
         # unreadable audit log hides the halt/streak state a send decision
         # needs, so it refuses instead of passing.
@@ -348,16 +395,6 @@ class DerivativesExecutor:
                 confirmed=confirm, phase="execute",
             )
             raise PermissionError(f"risk guard refused execution: {decision.reason}")
-        if confirm is not True:
-            self._bridge.audit_plan(
-                order, action="derivatives_denied",
-                reason="derivatives execution requires confirm=True, even in dry-run",
-                confirmed=confirm, phase="execute",
-            )
-            raise PermissionError(
-                "derivatives execution requires confirm=True, even in dry-run; "
-                "nothing was sent"
-            )
         if mode == "dry":
             self._bridge.audit_plan(
                 order, action=order.side or "no_order",
@@ -365,7 +402,14 @@ class DerivativesExecutor:
                 confirmed=confirm, phase="execute",
             )
             return None
-        return self._execute_live(order, confirm)
+        identity = futures_identity.read_futures_account_identity(self._bridge)
+        if identity is None:
+            raise self._refuse(
+                order,
+                "live entry unavailable: authenticated account identity cannot be bound to protective state",
+                phase="execute",
+            )
+        return self._execute_live(order, confirm, identity)
 
     # --- internals -----------------------------------------------------------
 
@@ -462,7 +506,7 @@ class DerivativesExecutor:
             stop_loss=stop_loss, take_profit=take_profit,
         )
 
-    def _execute_live(self, order: PlannedOrder, confirm: bool) -> str | None:
+    def _execute_live(self, order: PlannedOrder, confirm: bool, identity: Any = None) -> str | None:
         exchange = self._bridge.client()
         api_key = getattr(exchange, "apiKey", "") or ""
         secret = getattr(exchange, "secret", "") or ""
@@ -472,7 +516,7 @@ class DerivativesExecutor:
                 reason="missing exchange API credentials",
                 confirmed=confirm, phase="execute",
             )
-            from tradingagents.execution.bridge import credential_env_names
+            from tradingagents.execution.exchange_client import credential_env_names
 
             key_env, secret_env = credential_env_names(
                 self._bridge.exchange_id, self._bridge.config.get("exec_base_url")
@@ -481,8 +525,37 @@ class DerivativesExecutor:
                 f"live derivatives execution requires {key_env} and {secret_env}; "
                 "nothing was sent"
             )
+        if identity is None:
+            # Direct callers (recovery tooling) read the same seam the public
+            # entry gate uses; nothing is sent without a binding.
+            identity = futures_identity.read_futures_account_identity(self._bridge)
+        if identity is None:
+            raise RuntimeError(
+                "live derivatives entry requires an authenticated account identity; "
+                "nothing was sent"
+            )
         import ccxt
 
+        entry_client_id = "entry-" + secrets.token_hex(12)
+        intent_id = f"entry-intent:{order.ccxt_symbol}:{entry_client_id}"
+        job_store.create_bracket_recovery(
+            intent_id, symbol=order.ccxt_symbol, entry_order_id=entry_client_id,
+            close_side="sell" if order.side == "buy" else "buy",
+            quantity=float(order.quantity),
+            legs=[{"name": "entry-intent", "status": "uncertain", "order_id": None,
+                   "client_order_id": entry_client_id}],
+            now=datetime.now(UTC).isoformat(), identity=identity,
+        )
+        if any(
+            task.get("symbol") == order.ccxt_symbol and task.get("task_id") != intent_id
+            for task in job_store.active_bracket_recoveries()
+        ):
+            job_store.update_bracket_recovery(
+                intent_id, status="cancelled", placed_ids=[], attempts=0,
+                last_error="existing active task blocks entry", now=datetime.now(UTC).isoformat(),
+            )
+            raise self._refuse(order, "existing active task blocks entry", phase="execute")
+        entry_sent = False
         try:
             # load_markets first: ccxt's amount_to_precision requires the
             # markets loaded (same precondition as the spot path).
@@ -512,15 +585,36 @@ class DerivativesExecutor:
             # that is the desired end state, not a failure.
             if order.margin_mode is not None:
                 with contextlib.suppress(ccxt.MarginModeAlreadySet):
-                    exchange.set_margin_mode(order.margin_mode, order.ccxt_symbol)
+                    snapshot_observer.run(
+                        self._bridge, exchange,
+                        operation="set_margin_mode", symbol=order.ccxt_symbol,
+                        call=lambda: exchange.set_margin_mode(order.margin_mode, order.ccxt_symbol),
+                    )
             # Always pin the leverage -- including 1x: skipping the call at
             # 1x would leave the venue's per-symbol preset in charge of the
             # real leverage.
-            exchange.set_leverage(int(order.leverage), order.ccxt_symbol)
+            snapshot_observer.run(
+                self._bridge, exchange,
+                operation="set_leverage", symbol=order.ccxt_symbol,
+                call=lambda: exchange.set_leverage(int(order.leverage), order.ccxt_symbol),
+            )
             amount = exchange.amount_to_precision(order.ccxt_symbol, order.quantity)
-            response = exchange.create_order(order.ccxt_symbol, "market", order.side, amount)
+            entry_sent = True
+            response = snapshot_observer.run(
+                self._bridge, exchange,
+                operation="create_futures_entry", symbol=order.ccxt_symbol,
+                call=lambda: exchange.create_order(
+                    order.ccxt_symbol, "market", order.side, amount,
+                    params={"clientOrderId": entry_client_id},
+                ),
+            )
             order_id = response.get("id") if isinstance(response, dict) else None
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            if not entry_sent:
+                job_store.update_bracket_recovery(
+                    intent_id, status="cancelled", placed_ids=[], attempts=0,
+                    last_error="entry not submitted", now=datetime.now(UTC).isoformat(),
+                )
             self._bridge.audit_plan(
                 order, action="rejected_at_execute",
                 reason=f"exchange error: {exc}", confirmed=confirm, phase="execute",
@@ -529,6 +623,11 @@ class DerivativesExecutor:
                 f"live derivatives order on {order.ccxt_symbol} failed: {exc}"
             ) from exc
         except Exception as exc:  # safety #4: nothing escapes the path unaudited
+            if not entry_sent:
+                job_store.update_bracket_recovery(
+                    intent_id, status="cancelled", placed_ids=[], attempts=0,
+                    last_error="entry not submitted", now=datetime.now(UTC).isoformat(),
+                )
             self._bridge.audit_plan(
                 order, action="rejected_at_execute",
                 reason=f"unexpected error: {exc!r}", confirmed=confirm, phase="execute",
@@ -537,25 +636,64 @@ class DerivativesExecutor:
                 f"live derivatives order on {order.ccxt_symbol} failed: {exc!r}"
             ) from exc
 
+        intent_leg = {"name": "entry-intent", "status": "uncertain", "order_id": order_id,
+                      "client_order_id": entry_client_id}
+        response = response if isinstance(response, dict) else {}
         actual_quantity = _positive_number(response.get("filled"))
         actual_entry = _positive_number(response.get("average")) or _positive_number(response.get("price"))
-        live_position = None
+        response_status = str(response.get("status") or "").lower()
+        complete = (
+            actual_quantity is not None
+            and response_status in {"closed", "filled"}
+            and math.isclose(actual_quantity, float(amount), rel_tol=1e-9, abs_tol=1e-12)
+        )
+        residual_warning = (
+            "entry partial or remaining quantity unknown; residual exposure unresolved; "
+            "account identity unverified, remaining entry not cancelled; "
+            "only confirmed fill can be protected, protection unverified"
+        )
+        post_ack_errors: list[tuple[str, Exception]] = []
+        try:
+            job_store.update_bracket_recovery(
+                intent_id, status="submission_uncertain", placed_ids=[str(order_id)] if order_id else [],
+                attempts=0, last_error="bracket resting status unverified; reconciliation required" if complete else residual_warning,
+                now=datetime.now(UTC).isoformat(), legs=[intent_leg],
+            )
+        except Exception as exc:
+            post_ack_errors.append(("entry intent update", exc))
         if actual_quantity is None or actual_entry is None:
+            if actual_quantity is not None:
+                try:
+                    BracketManager(self._bridge).place(
+                        order.model_copy(update={"quantity": actual_quantity}), confirm, order_id,
+                    )
+                except Exception as exc:
+                    post_ack_errors.append(("bracket attempt failed or unverified", exc))
             try:
-                from tradingagents.execution.futures_account import read_futures_positions
-
-                live_position = next((
-                    item for item in read_futures_positions(self._bridge)
-                    if item.symbol == order.ccxt_symbol
-                    and item.side == ("long" if order.side == "buy" else "short")
-                ), None)
-            except Exception:
-                live_position = None
-        if live_position is not None:
-            actual_quantity = _positive_number(live_position.contracts) or actual_quantity
-            actual_entry = _positive_number(live_position.entry_price) or actual_entry
-        actual_quantity = actual_quantity or float(amount)
-        actual_entry = actual_entry or float(order.estimated_price)
+                self._bridge.audit_plan(
+                    order, action="entry_uncertain", confirmed=confirm, order_id=order_id,
+                    reason="entry fill quantity or price is unknown; manual reconciliation required",
+                    phase="execute",
+                )
+            except Exception as exc:
+                post_ack_errors.append(("entry audit", exc))
+            if not complete:
+                try:
+                    self._bridge.audit_plan(
+                        order, action="entry_partial_or_unknown", confirmed=confirm,
+                        order_id=order_id, reason=residual_warning, phase="execute",
+                    )
+                except Exception as exc:
+                    post_ack_errors.append(("residual audit", exc))
+            details = "; ".join(f"{stage}: {type(exc).__name__}" for stage, exc in post_ack_errors)
+            message = "entry fill is unknown; durable intent retained for reconciliation"
+            if not complete:
+                message += f"; {residual_warning}"
+            if actual_quantity is not None:
+                message += "; bracket attempted for confirmed quantity; protection unverified"
+            if details:
+                message += f"; post-ACK errors: {details}"
+            raise RuntimeError(message) from (post_ack_errors[0][1] if post_ack_errors else None)
         actual_order = order.model_copy(update={
             "quantity": actual_quantity,
             "estimated_price": actual_entry,
@@ -568,38 +706,66 @@ class DerivativesExecutor:
                 order_id=order_id,
                 phase="execute",
             )
-        except OSError as exc:
-            raise RuntimeError(
-                f"order {order_id!r} WAS placed on {order.ccxt_symbol} but writing "
-                f"the audit log failed: {exc}"
-            ) from exc
+        except Exception as exc:
+            post_ack_errors.append(("entry audit", exc))
         if order.stop_loss is not None or order.take_profit is not None:
             position_key = f"{order.ccxt_symbol}:{order.side}:{order_id or 'unknown'}"
-            persisted = job_store.persist_futures_entry_state(
-                position_key,
-                side="long" if order.side == "buy" else "short",
-                entry=actual_entry,
-                quantity=actual_quantity,
-                stop=float(order.stop_loss) if order.stop_loss is not None else actual_entry,
-                targets=[float(order.take_profit)] if order.take_profit is not None else [],
-                mark=actual_entry,
-                order_id=str(order_id) if order_id is not None else None,
-            )
-            if not persisted:
-                self._bridge.audit_plan(
-                    order,
-                    action="position_state_failed",
-                    reason="live entry was placed but durable position state could not be initialized",
-                    confirmed=confirm,
-                    order_id=order_id,
-                    phase="execute",
+            try:
+                persisted = job_store.persist_futures_entry_state(
+                    position_key,
+                    side="long" if order.side == "buy" else "short",
+                    entry=actual_entry,
+                    quantity=actual_quantity,
+                    stop=float(order.stop_loss) if order.stop_loss is not None else actual_entry,
+                    targets=[float(order.take_profit)] if order.take_profit is not None else [],
+                    mark=actual_entry,
+                    order_id=str(order_id) if order_id is not None else None,
+                    identity=identity,
                 )
-            self._place_bracket(actual_order, confirm, order_id)
-        return order_id
+                if not persisted:
+                    raise RuntimeError("durable position state could not be initialized")
+            except Exception as exc:
+                post_ack_errors.append(("position state", exc))
+                try:
+                    self._bridge.audit_plan(
+                        order,
+                        action="position_state_failed",
+                        reason="live entry was placed but durable position state could not be initialized",
+                        confirmed=confirm,
+                        order_id=order_id,
+                        phase="execute",
+                    )
+                except Exception as audit_exc:
+                    post_ack_errors.append(("position state audit", audit_exc))
+            try:
+                self._place_bracket(actual_order, confirm, order_id)
+            except Exception as exc:
+                post_ack_errors.append(("bracket attempt failed or unverified", exc))
+        if post_ack_errors:
+            details = "; ".join(f"{stage}: {type(exc).__name__}" for stage, exc in post_ack_errors)
+            warning = f"; {residual_warning}" if not complete else ""
+            raise RuntimeError(
+                f"post-ACK processing failed for order {order_id!r} on {order.ccxt_symbol}; "
+                f"bracket attempted for confirmed quantity; protection unverified; {details}{warning}"
+            ) from post_ack_errors[0][1]
+        if not complete:
+            self._bridge.audit_plan(
+                actual_order, action="entry_partial_or_unknown", confirmed=confirm,
+                order_id=order_id, reason=residual_warning, phase="execute",
+            )
+            raise RuntimeError(f"{residual_warning}; durable intent retained")
+        raise RuntimeError(
+            f"entry order {order_id!r} filled on {order.ccxt_symbol}, but bracket resting status "
+            "is unverified; durable intent retained for reconciliation"
+        )
 
     def _place_bracket(self, order: PlannedOrder, confirm: bool, entry_order_id: str | None) -> None:
         manager = BracketManager(self._bridge)
-        plan = self._scale_out_plan(order)
+        try:
+            plan = self._scale_out_plan(order)
+        except Exception:
+            manager.place(order, confirm, entry_order_id)
+            raise
         if plan is None:
             manager.place(order, confirm, entry_order_id)
             return

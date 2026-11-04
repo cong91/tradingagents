@@ -113,7 +113,7 @@ def _public_exchange(config: dict):
     exchange = exchange_class({"enableRateLimit": True})
     if exchange_id == "binance":
         base_url = str(config.get("exec_base_url") or "https://demo-api.binance.com")
-        from tradingagents.execution.bridge import _binance_profile
+        from tradingagents.execution.exchange_client import _binance_profile
 
         profile = _binance_profile(base_url)
         if profile == "demo":

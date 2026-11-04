@@ -20,9 +20,11 @@ import {
   fetchHealth,
   fetchHistory,
   fetchPerformance,
+  fetchPerformanceHistory,
   fetchPortfolio,
   type AuditPayload,
   type HistoryPayload,
+  type PortfolioPayload,
 } from "./contract";
 import { summarizeHistory } from "./summary";
 import { usePoll, type ReadyPanel } from "./use-panel";
@@ -35,14 +37,14 @@ import { PerformanceCard } from "./performance-card";
 import { OverviewActivityCard } from "./activity-card";
 
 // Chu kỳ poll theo stale_after của từng endpoint (hợp đồng §0.2/§6/§7/§8/§9):
-// audit 10s, health 15s, history 60s, portfolio 30s (stale_after §6);
-// performance 30s — endpoint chưa trả stale_after, chọn bằng chu kỳ portfolio
-// (cùng đọc audit log + mark giá từ sàn).
+// audit 10s, health 15s, history 60s, portfolio 30s;
+// venue fill history 5 minutes to limit exchange requests.
 const HEALTH_INTERVAL_MS = 15_000;
 const AUDIT_INTERVAL_MS = 10_000;
 const HISTORY_INTERVAL_MS = 60_000;
 const PORTFOLIO_INTERVAL_MS = 30_000;
 const PERFORMANCE_INTERVAL_MS = 30_000;
+const PERFORMANCE_HISTORY_INTERVAL_MS = 300_000;
 const AUDIT_PAGE_SIZE = 200;
 const HISTORY_LIMIT = 200;
 
@@ -51,6 +53,26 @@ const loadHistory = () => fetchHistory(HISTORY_LIMIT);
 const loadAudit = () => fetchAudit(AUDIT_PAGE_SIZE);
 const loadPortfolio = () => fetchPortfolio();
 const loadPerformance = () => fetchPerformance();
+const loadPerformanceHistory = () => fetchPerformanceHistory();
+export const portfolioTimestamp = (data: PortfolioPayload): number | null => {
+  if (data.snapshot?.cache === "stale" || data.snapshot?.dirty || data.snapshot?.pending) return null;
+  const created = Date.parse(data.generated_at);
+  return Number.isFinite(created) ? created : null;
+};
+
+export function isFuturesStale(
+  state: ReadyPanel<PortfolioPayload>,
+  portfolioStale: boolean,
+  clock: number
+): boolean {
+  if (portfolioStale || state.status === "stale") return true;
+  if (state.data.futures?.status !== "ok") return true;
+  const observed = state.data.futures.positions_read?.observed_at;
+  const timestamp = observed ? Date.parse(observed) : NaN;
+  const age = clock - timestamp;
+  return !Number.isFinite(timestamp) || age < -5_000 || age > PORTFOLIO_INTERVAL_MS;
+}
+const generatedTimestamp = (data: { generated_at: string }): string => data.generated_at;
 
 function PanelSkeleton() {
   return (
@@ -176,12 +198,25 @@ export function OverviewDashboard() {
   const health = usePoll(loadHealth, HEALTH_INTERVAL_MS, HEALTH_INTERVAL_MS, clock);
   const history = usePoll(loadHistory, HISTORY_INTERVAL_MS, HISTORY_INTERVAL_MS, clock);
   const audit = usePoll(loadAudit, AUDIT_INTERVAL_MS, AUDIT_INTERVAL_MS, clock);
-  const portfolio = usePoll(loadPortfolio, PORTFOLIO_INTERVAL_MS, PORTFOLIO_INTERVAL_MS, clock);
+  const portfolio = usePoll(loadPortfolio, PORTFOLIO_INTERVAL_MS, PORTFOLIO_INTERVAL_MS, clock, true, portfolioTimestamp);
+  const futuresStale = portfolio.state.status === "ready" || portfolio.state.status === "stale"
+    ? isFuturesStale(portfolio.state, portfolio.stale, clock)
+    : true;
   const performance = usePoll(
     loadPerformance,
     PERFORMANCE_INTERVAL_MS,
     PERFORMANCE_INTERVAL_MS,
-    clock
+    clock,
+    false,
+    generatedTimestamp
+  );
+  const performanceHistory = usePoll(
+    loadPerformanceHistory,
+    PERFORMANCE_HISTORY_INTERVAL_MS,
+    PERFORMANCE_HISTORY_INTERVAL_MS,
+    clock,
+    true,
+    generatedTimestamp
   );
   // refresh của từng hook là callback ổn định — destructure để deps của refreshAll ổn định.
   const { refresh: refreshHealth } = health;
@@ -189,6 +224,37 @@ export function OverviewDashboard() {
   const { refresh: refreshAudit } = audit;
   const { refresh: refreshPortfolio } = portfolio;
   const { refresh: refreshPerformance } = performance;
+  const { refresh: refreshPerformanceHistory } = performanceHistory;
+  const snapshotContext = portfolio.state.status === "ready" || portfolio.state.status === "stale"
+    ? portfolio.state.data.snapshot?.context_id
+    : undefined;
+  const snapshotEpoch = portfolio.state.status === "ready" || portfolio.state.status === "stale"
+    ? portfolio.state.data.snapshot?.epoch
+    : undefined;
+
+  useEffect(() => {
+    if (!snapshotContext || !snapshotEpoch || typeof EventSource === "undefined") return;
+    const stream = new EventSource("/api/snapshot/events");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onHint = (event: MessageEvent) => {
+      try {
+        const hint = JSON.parse(event.data) as { context_id?: string | null; epoch?: string };
+        if (hint.context_id && hint.context_id !== snapshotContext && hint.epoch === snapshotEpoch) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(refreshPortfolio, 1_000);
+      } catch {
+        // Polling remains the fallback for malformed hints.
+      }
+    };
+    stream.addEventListener("dirty", onHint);
+    stream.addEventListener("reset", onHint);
+    return () => {
+      if (timer) clearTimeout(timer);
+      stream.removeEventListener("dirty", onHint);
+      stream.removeEventListener("reset", onHint);
+      stream.close();
+    };
+  }, [refreshPortfolio, snapshotContext, snapshotEpoch]);
 
   const refreshAll = useCallback(() => {
     refreshHealth();
@@ -196,7 +262,8 @@ export function OverviewDashboard() {
     refreshAudit();
     refreshPortfolio();
     refreshPerformance();
-  }, [refreshHealth, refreshHistory, refreshAudit, refreshPortfolio, refreshPerformance]);
+    refreshPerformanceHistory();
+  }, [refreshHealth, refreshHistory, refreshAudit, refreshPortfolio, refreshPerformance, refreshPerformanceHistory]);
 
   const allLoading =
     health.state.status === "loading" &&
@@ -211,7 +278,8 @@ export function OverviewDashboard() {
     .reduce<number | null>((max, t) => (max === null || t > max ? t : max), null);
 
   const anyStale =
-    health.stale || history.stale || audit.stale || portfolio.stale || performance.stale;
+    health.stale || history.stale || audit.stale || portfolio.stale || futuresStale ||
+    performance.stale || performanceHistory.stale;
 
   const halted = health.state.status !== "loading" && health.state.status !== "error"
     ? health.state.data.halted_today === true
@@ -280,6 +348,7 @@ export function OverviewDashboard() {
             <PortfolioCard
               state={portfolio.state}
               stale={portfolio.stale}
+              futuresStale={futuresStale}
               onRetry={portfolio.refresh}
             />
           </div>
@@ -311,7 +380,15 @@ export function OverviewDashboard() {
           <div className="mt-4">
             <PerformanceCard
               state={performance.state}
+              stale={performance.stale}
               onRetry={performance.refresh}
+              portfolioState={portfolio.state}
+              portfolioStale={portfolio.stale}
+              futuresStale={futuresStale}
+              onPortfolioRetry={portfolio.refresh}
+              historyState={performanceHistory.state}
+              historyStale={performanceHistory.stale}
+              onHistoryRetry={performanceHistory.refresh}
             />
           </div>
 

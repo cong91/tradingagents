@@ -12,6 +12,7 @@ from typing import Any
 
 from server import job_store
 from tradingagents.execution.brackets import conditional_params
+from tradingagents.execution.exchange_client import venue_key
 from tradingagents.execution.futures_account import FuturesPosition
 from tradingagents.execution.position_adoption import AdoptionPlan, plan_adoption
 
@@ -119,7 +120,7 @@ def _place_replacement(bridge: Any, plan: AdoptionPlan, task_id: str) -> dict:
     job_store.create_bracket_recovery(
         task_id, symbol=plan.symbol, entry_order_id="adopted",
         close_side=plan.close_side, quantity=plan.contracts, legs=legs,
-        now=_now(), venue_key=_venue_key(bridge),
+        now=_now(), venue_key=venue_key(bridge),
     )
     task = job_store.load_bracket_recovery(task_id)
     order_ids: list[str] = []
@@ -204,21 +205,12 @@ def _write_state(bridge: Any, plan: AdoptionPlan, task_id: str, order_ids: list[
         "orders": [],
         "entry_order_id": "adopted",
         "bracket_task_id": task_id,
-        "venue_key": _venue_key(bridge),
+        "venue_key": venue_key(bridge),
     })
 
 
 def _raw_symbol(symbol: str) -> str:
     return symbol.split("/")[0] + "USDT"
-
-
-def _venue_key(bridge: Any) -> str:
-    config = bridge.config
-    return "|".join((
-        str(bridge.exchange_id).lower(),
-        str(config.get("exec_base_url") or "").rstrip("/").lower(),
-        str(config.get("exec_sandbox") is True),
-    ))
 
 
 def _now() -> str:

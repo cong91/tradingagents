@@ -4,11 +4,11 @@
 //   GET /api/history     (§8)  — decision log: rating / pending / alpha (chuỗi "+1.2%")
 //   GET /api/audit       (§7)  — nhật ký thực thi: lệnh buy/sell, qty, price_est
 //   GET /api/portfolio   (§6)  — positions + realized P&L (replay FIFO)
-//   GET /api/performance — hiệu suất giao dịch, replay FIFO trên audit log
-//     (server/performance.py:202-205, đang hiện thực song song; khi server
-//     chưa đăng ký router thì 404 → trạng thái trung tính như /api/portfolio).
+//   GET /api/performance — sự kiện audit, không phải sổ khớp lệnh
+//   GET /api/performance/fills — lịch sử khớp do sàn cung cấp
 // Không tự chế endpoint ngoài hợp đồng; mọi response mang `generated_at`.
 import { parseErrorResponse } from "@/lib/api";
+import type { PerformanceHistoryData } from "./performance-history";
 
 /** Lỗi fetch: mạng đứt (backend chưa chạy) hoặc HTTP với error shape §0.1. */
 export class FetchError extends Error {
@@ -145,14 +145,27 @@ export type FuturesPosition = {
   notional_currency: string | null;
   margin_currency: string | null;
   unrealized_pnl_currency: string | null;
-  /** Thời điểm mở vị thế (ISO-8601); null = không tìm thấy trong position state. */
+  /** Thời điểm mở vị thế (ISO-8601); null = chưa có ràng buộc account bền vững
+   * giữa position state và snapshot, nên không được suy từ state cũ. */
   opened_at?: string | null;
   /** Số giờ đã giữ vị thế; null = không biết opened_at (không suy đoán). */
   held_hours?: number | null;
-  /** Tổng funding đã trả/nhận từ lúc mở (USDT; dương = nhận); null = sàn không đọc được. */
-  funding_usdt?: number | null;
-  /** Phí khứ hồi ước tính = |notional| × rate × 2; null = thiếu notional/rate. */
-  round_trip_fee_usdt?: number | null;
+  /** Funding đã trả/nhận từ lúc mở (dương = nhận); null = chưa có bằng chứng
+   * coverage/cửa sổ/currency đủ để cộng (không đặt 0 giả). */
+  funding?: number | null;
+  /** Đơn vị của funding khi được chứng minh; null = chưa xác minh. */
+  funding_currency?: string | null;
+  /** Phí khứ hồi ước tính = |notional| × rate; null = thiếu notional/rate. */
+  round_trip_fee?: number | null;
+  /** Đơn vị của phí = currency của notional đã xác minh; không gán USDT cứng. */
+  round_trip_fee_currency?: string | null;
+};
+
+export type PositionsRead = {
+  status: "complete" | "partial" | "unavailable";
+  skipped: number | null;
+  issues: { symbol: string | null; reason: string }[];
+  observed_at?: string | null;
 };
 
 export type FuturesPortfolio = {
@@ -167,6 +180,7 @@ export type FuturesPortfolio = {
   unrealized_pnl_currency: string | null;
   account_scope: "derivatives" | "trading" | "unified";
   positions: FuturesPosition[];
+  positions_read?: PositionsRead;
   status: "ok" | "error" | "unavailable";
   error: string | null;
 };
@@ -184,45 +198,32 @@ export type RealizedPnl = {
 
 export type PortfolioPayload = {
   generated_at: string;
-  currency: string;
+  currency: string | null;
   cash: number | null;
   equity_est: number | null;
   positions: PortfolioPosition[];
-  realized_pnl: RealizedPnl;
+  positions_source?: "venue" | "audit" | "unavailable";
+  realized_pnl: RealizedPnl | null;
   futures?: FuturesPortfolio | null;
-  halted_today: boolean;
+  halted_today: boolean | null;
+  snapshot?: {
+    context_id: string | null;
+    epoch: string;
+    generation: number | null;
+    freshness: "unknown";
+    dirty: boolean;
+    pending: boolean;
+    cache?: "hit" | "miss" | "stale";
+    error: string | null;
+    request_started_at: string | null;
+    response_received_at: string | null;
+  };
   warnings: string[];
   stale_after: number;
 };
 
 // ---------------------------------------------------------------------------
-// GET /api/performance — server/performance.py:183-205 (replay FIFO trên audit
-// log). Shape lấy từ compute_performance; chưa có section riêng trong hợp đồng.
-
-export type PerformanceSummary = {
-  closed_trades: number;
-  wins: number;
-  losses: number;
-  win_rate_pct: number;
-  /** Trung bình lãi mỗi ván thắng, điểm % (> 0). */
-  avg_win_pct: number;
-  /** Trung bình lỗ mỗi ván thua, điểm % (luôn ≤ 0 — losses giữ dấu, performance.py:117-118). */
-  avg_loss_pct: number;
-  expectancy_pct: number;
-};
-
-export type PerformanceOpenPosition = {
-  ticker: string;
-  qty: number;
-  entry_price: number;
-  /** null khi sàn không trả giá mark — chỉ để hiển thị, không làm lỗi response. */
-  current_price: number | null;
-  unrealized_pct: number | null;
-  market?: string | null;
-  leverage?: number | null;
-  mode: string | null;
-  entry_at: string | null;
-};
+// GET /api/performance — các sự kiện audit; vị thế và thống kê chưa đối soát.
 
 export type PerformanceBrackets = {
   placed: number;
@@ -247,10 +248,11 @@ export type PerformanceOrder = {
 
 export type PerformancePayload = {
   generated_at: string;
-  summary: PerformanceSummary;
-  open_positions: PerformanceOpenPosition[];
+  summary: null;
+  open_positions: null;
   brackets: PerformanceBrackets;
   recent_orders: PerformanceOrder[];
+  skipped_lines: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -271,8 +273,16 @@ export function fetchPortfolio(): Promise<PortfolioPayload> {
   return fetchJson<PortfolioPayload>("/api/portfolio");
 }
 
+export type PerformanceHistoryPayload = PerformanceHistoryData & {
+  generated_at: string;
+};
+
 export function fetchPerformance(): Promise<PerformancePayload> {
   return fetchJson<PerformancePayload>("/api/performance");
+}
+
+export function fetchPerformanceHistory(): Promise<PerformanceHistoryPayload> {
+  return fetchJson<PerformanceHistoryPayload>("/api/performance/fills");
 }
 
 /**

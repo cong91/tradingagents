@@ -130,7 +130,7 @@ def _settings_row(key: str, env_var: str, editable: bool) -> dict:
 
 
 def _settings_payload() -> dict:
-    from tradingagents.execution.bridge import credential_env_names
+    from tradingagents.execution.exchange_client import credential_env_names
 
     rows = [
         _settings_row(key, env_var, editable=key not in _READONLY_ENV_KEYS)

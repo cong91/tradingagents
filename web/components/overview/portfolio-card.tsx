@@ -52,7 +52,8 @@ function isEmptyPortfolio(data: PortfolioPayload): boolean {
   return (
     data.cash === null &&
     data.positions.length === 0 &&
-    data.realized_pnl.total === 0
+    data.positions_source !== "unavailable" &&
+    data.realized_pnl?.total === 0
   );
 }
 
@@ -112,29 +113,29 @@ function formatHeldHours(value: number | null | undefined): string | null {
   return `${value.toFixed(1)}h`;
 }
 
-/** Phí khứ hồi ước tính, luôn mang dấu trừ vì đây là chi phí: "-0.27$". */
-function formatRoundTripFee(value: number | null | undefined): string | null {
+/** Phí khứ hồi ước tính, luôn mang dấu trừ vì đây là chi phí: "-0.27 USDT". */
+function formatRoundTripFee(value: number | null | undefined, currency: string | null): string | null {
   if (value == null || !Number.isFinite(value)) return null;
-  return `-${Math.abs(value).toFixed(2)}$`;
+  return `-${Math.abs(value).toFixed(2)} ${currency || "đơn vị chưa rõ"}`;
 }
 
-/** Funding ròng: "funding +0.54$" / "funding -0.54$" / "funding +0.00$"; null = chưa đọc được. */
-function formatFunding(value: number | null | undefined): string | null {
+/** Funding ròng: "funding +0.54 USDT"; null = chưa có bằng chứng đủ để cộng. */
+function formatFunding(value: number | null | undefined, currency: string | null): string | null {
   if (value == null || !Number.isFinite(value)) return null;
-  return `funding ${value > 0 ? "+" : value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)}$`;
+  return `funding ${value > 0 ? "+" : value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)} ${currency || "đơn vị chưa rõ"}`;
 }
 
 /** Cột "Giữ / phí": thời gian giữ · phí khứ hồi · funding; thiếu hết → "—". */
 function heldAndCostText(position: FuturesPosition): string {
   const parts = [
     formatHeldHours(position.held_hours),
-    formatRoundTripFee(position.round_trip_fee_usdt),
-    formatFunding(position.funding_usdt),
+    formatRoundTripFee(position.round_trip_fee, position.round_trip_fee_currency ?? null),
+    formatFunding(position.funding, position.funding_currency ?? null),
   ].filter((part): part is string => part !== null);
   return parts.length > 0 ? parts.join(" · ") : "—";
 }
 
-function PositionRow({ position, currency }: { position: PortfolioPosition; currency: string }) {
+function PositionRow({ position, currency }: { position: PortfolioPosition; currency: string | null }) {
   return (
     <tr>
       <td className="py-2 pr-3 font-mono font-medium">{position.ticker}</td>
@@ -143,7 +144,7 @@ function PositionRow({ position, currency }: { position: PortfolioPosition; curr
       </td>
       <td className="py-2 pr-3 tabular-nums">
         {position.average_price != null ? (
-          formatMoney(position.average_price, currency)
+          formatMoney(position.average_price)
         ) : (
           <span title="Vị thế mở trước khi audit log bắt đầu — giá vốn không xác định">
             —
@@ -158,14 +159,20 @@ function PositionRow({ position, currency }: { position: PortfolioPosition; curr
       </td>
       <td className={`py-2 tabular-nums ${position.unrealized_pnl != null ? pnlTextClass(position.unrealized_pnl) : ""}`}>
         {position.unrealized_pnl != null
-          ? formatSignedCurrency(position.unrealized_pnl, currency)
+          ? formatSignedCurrency(position.unrealized_pnl)
           : "—"}
       </td>
     </tr>
   );
 }
 
-function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefined }) {
+function FuturesSection({
+  futures,
+  stale,
+}: {
+  futures: FuturesPortfolio | null | undefined;
+  stale: boolean;
+}) {
   if (!futures || futures.status === "unavailable") {
     return (
       <section className="space-y-2 border-t pt-4">
@@ -187,6 +194,18 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
       </section>
     );
   }
+
+  const positions: FuturesPosition[] | null = Array.isArray(futures.positions)
+    ? futures.positions
+    : null;
+  const observedAt = futures.positions_read?.observed_at;
+  const hasObservedAt = typeof observedAt === "string" && Number.isFinite(Date.parse(observedAt));
+  const completePositionsRead =
+    positions !== null &&
+    futures.positions_read?.status === "complete" &&
+    futures.positions_read.skipped === 0 &&
+    Array.isArray(futures.positions_read.issues) &&
+    futures.positions_read.issues.length === 0;
 
   return (
     <section className="space-y-3 border-t pt-4">
@@ -222,7 +241,22 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
           ) : "—"}
         </Kpi>
       </dl>
-      {futures.positions.length > 0 ? (
+      {stale ? (
+        <p role="alert" className="text-sm text-destructive">
+          Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc; không thể xác nhận trạng thái Futures hiện tại.
+        </p>
+      ) : null}
+      {!hasObservedAt ? (
+        <p role="alert" className="text-sm text-destructive">
+          Không xác định được thời điểm đọc vị thế Futures; không thể xác nhận dữ liệu hiện tại.
+        </p>
+      ) : null}
+      {!completePositionsRead ? (
+        <p role="alert" className="text-sm text-destructive">
+          Danh sách vị thế Futures có thể không đầy đủ; không thể xác nhận toàn bộ vị thế đang mở.
+        </p>
+      ) : null}
+      {positions !== null && positions.length > 0 ? (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <caption className="sr-only">Các vị thế Futures do sàn báo cáo</caption>
@@ -241,7 +275,7 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
               </tr>
             </thead>
             <tbody className="divide-y">
-              {futures.positions.map((position, index) => (
+              {positions.map((position, index) => (
                 <tr key={`${position.symbol ?? "unknown"}-${position.side ?? "unknown"}-${index}`}>
                   <td className="py-2 pr-3 font-mono font-medium">{position.symbol ?? "—"}</td>
                   <td className="py-2 pr-3">{position.side === "short" ? "Short" : position.side === "long" ? "Long" : "—"}</td>
@@ -263,8 +297,10 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
             </tbody>
           </table>
         </div>
-      ) : (
+      ) : completePositionsRead && hasObservedAt && !stale ? (
         <p className="text-sm text-muted-foreground">Sàn không báo vị thế Futures đang mở.</p>
+      ) : (
+        <p className="text-sm text-muted-foreground">Chưa thể xác nhận có vị thế Futures đang mở hay không.</p>
       )}
       <p className="text-xs text-muted-foreground">
         Notional là giá trị danh nghĩa, margin là tài sản ký quỹ; cả hai không phải tiền lãi hay dòng tiền đã nhận.
@@ -277,21 +313,33 @@ function FuturesSection({ futures }: { futures: FuturesPortfolio | null | undefi
   );
 }
 
-function PortfolioBody({ data, staleMessage, staleCode }: {
+function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
   data: PortfolioPayload;
+  stale: boolean;
+  futuresStale: boolean;
   staleMessage: string | null;
   staleCode: string | null;
 }) {
   const { realized_pnl: realized, currency } = data;
-  const emptySpot = isEmptyPortfolio(data);
+  const emptySpot = isEmptyPortfolio(data) && !stale;
+  const staleEmptySpot = stale && isEmptyPortfolio(data);
   return (
     <div className="space-y-4">
       {staleMessage !== null ? (
         <p role="alert" className="text-sm text-destructive">
           Lần poll gần nhất lỗi ({staleCode}) — đang hiển thị dữ liệu cũ: {staleMessage}
         </p>
+      ) : stale ? (
+        <p role="alert" className="text-sm text-destructive">
+          Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận.
+        </p>
       ) : null}
 
+      {data.halted_today === null ? (
+        <p role="alert" className="text-sm text-destructive">
+          Không xác định được trạng thái RiskGuard từ audit.
+        </p>
+      ) : null}
       {data.halted_today ? (
         <p className="flex items-center gap-2 rounded-lg border-l-4 border-red-600 bg-red-50 px-3 py-2 text-sm text-red-900 dark:bg-red-950 dark:text-red-100">
           <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
@@ -299,7 +347,16 @@ function PortfolioBody({ data, staleMessage, staleCode }: {
         </p>
       ) : null}
 
-      {emptySpot ? (
+      {data.positions_source === "unavailable" ? (
+        <p role="alert" className="text-sm text-destructive">
+          Không xác định được số dư và vị thế Spot.
+        </p>
+      ) : null}
+      {staleEmptySpot ? (
+        <p className="rounded-lg border border-dashed px-6 py-8 text-sm text-muted-foreground">
+          Snapshot Spot đã cũ; không thể xác nhận trạng thái Spot hiện tại.
+        </p>
+      ) : emptySpot ? (
         <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed px-6 py-8 text-center">
           <InboxIcon className="size-6 text-muted-foreground" aria-hidden="true" />
           <p className="text-sm font-medium">Chưa có dữ liệu Spot</p>
@@ -312,15 +369,19 @@ function PortfolioBody({ data, staleMessage, staleCode }: {
           <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Kpi label="Tiền mặt Spot">{formatMoney(data.cash, currency)}</Kpi>
             <Kpi label="Giá trị Spot ước tính">{formatMoney(data.equity_est, currency)}</Kpi>
-            <Kpi label="Spot đã chốt (tổng)">
-              <span className={pnlTextClass(realized.total)}>
-                {formatSignedCurrency(realized.total, currency)}
-              </span>
+            <Kpi label="Spot audit đã chốt (tham khảo)">
+              {realized ? (
+                <span className={pnlTextClass(realized.total)}>
+                  {formatSignedCurrency(realized.total)}
+                </span>
+              ) : "—"}
             </Kpi>
-            <Kpi label="Spot đã chốt hôm nay">
-              <span className={pnlTextClass(realized.today)}>
-                {formatSignedCurrency(realized.today, currency)}
-              </span>
+            <Kpi label="Spot audit hôm nay (tham khảo)">
+              {realized ? (
+                <span className={pnlTextClass(realized.today)}>
+                  {formatSignedCurrency(realized.today)}
+                </span>
+              ) : "—"}
             </Kpi>
           </dl>
 
@@ -332,10 +393,10 @@ function PortfolioBody({ data, staleMessage, staleCode }: {
                   <tr className="border-b text-left text-xs text-muted-foreground">
                     <th scope="col" className="py-2 pr-3 font-medium">Mã</th>
                     <th scope="col" className="py-2 pr-3 font-medium">Khối lượng</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">Giá vốn</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">Giá vốn audit</th>
                     <th scope="col" className="py-2 pr-3 font-medium">Giá thị trường</th>
                     <th scope="col" className="py-2 pr-3 font-medium">Giá trị</th>
-                    <th scope="col" className="py-2 font-medium">Lãi/lỗ tạm tính</th>
+                    <th scope="col" className="py-2 font-medium">Lãi/lỗ theo audit</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
@@ -349,25 +410,30 @@ function PortfolioBody({ data, staleMessage, staleCode }: {
         </>
       )}
 
-      <FuturesSection futures={data.futures} />
+      <FuturesSection futures={data.futures} stale={stale || futuresStale} />
 
       <div className="space-y-1 text-xs text-muted-foreground">
-        <p>
-          {realized.closed_trades} giao dịch Spot đã khớp
-          {realized.unknown_basis_closes > 0
-            ? ` · ${realized.unknown_basis_closes} lượt đóng không rõ giá vốn (loại khỏi P&L)`
-            : ""}
-          {realized.consecutive_losses > 0
-            ? ` · ${realized.consecutive_losses} lỗ liên tiếp (cảnh báo RiskGuard)`
-            : ""}
-          .
-        </p>
-        <p>
-          “Đã chốt hôm nay” tính theo UTC ngày hiện tại và chỉ gồm lệnh đã đóng
-          — khác con số RiskGuard dùng (cộng thêm lãi/lỗ tạm tính của vị thế mở
-          trong ngày). Vị thế mở trước khi audit log bắt đầu không có giá vốn
-          (hiển thị “—”).
-        </p>
+        {!staleEmptySpot && realized ? (
+          <>
+            <p>
+              {realized.closed_trades} lượt đóng được ghi nhận trong audit log
+              {realized.unknown_basis_closes > 0
+                ? ` · ${realized.unknown_basis_closes} lượt đóng không rõ giá vốn (loại khỏi P&L)`
+                : ""}
+              {realized.consecutive_losses > 0
+                ? ` · ${realized.consecutive_losses} lỗ liên tiếp (cảnh báo RiskGuard)`
+                : ""}
+              .
+            </p>
+            <p>
+              P&amp;L Spot là phép tính từ audit log, không xác nhận khớp lệnh hoặc
+              P&amp;L thực tế của tài khoản; đơn vị tiền tệ chưa được xác minh. Hôm nay
+              tính theo ngày UTC và khác con số RiskGuard dùng (cộng thêm lãi/lỗ tạm
+              tính của vị thế mở trong ngày). Giá vốn Spot cũng chỉ là tham khảo từ
+              audit log, không xác minh theo sàn.
+            </p>
+          </>
+        ) : null}
         {data.warnings.map((warning) => (
           <p key={warning}>Cảnh báo: {warning}</p>
         ))}
@@ -379,19 +445,22 @@ function PortfolioBody({ data, staleMessage, staleCode }: {
 export function PortfolioCard({
   state,
   stale,
+  futuresStale,
   onRetry,
 }: {
   state: PanelState<PortfolioPayload>;
   stale: boolean;
+  futuresStale: boolean;
   onRetry: () => void;
 }) {
+  const isStale = stale || state.status === "stale";
   return (
     <Card>
       <CardHeader>
         <CardTitle>Danh mục</CardTitle>
         <CardDescription>
-          Vị thế đang mở và lãi/lỗ đã chốt — từ số dư sàn và replay FIFO trên
-          audit log (hợp đồng §6).
+          Snapshot danh mục khi khả dụng; P&amp;L Spot là phép tính tham khảo từ
+          audit log, chưa xác nhận khớp lệnh thực tế.
         </CardDescription>
         <CardAction>
           <div className="flex items-center gap-2">
@@ -433,6 +502,8 @@ export function PortfolioCard({
         ) : (
           <PortfolioBody
             data={state.data}
+            stale={isStale}
+            futuresStale={futuresStale}
             staleMessage={state.status === "stale" ? state.message : null}
             staleCode={state.status === "stale" ? state.code : null}
           />
@@ -441,8 +512,8 @@ export function PortfolioCard({
       {state.status !== "loading" && state.status !== "error" ? (
         <CardContent className="pt-0">
           <p className="text-xs text-muted-foreground">
-            Cập nhật {formatDateTime(state.data.generated_at)} · snapshot sàn
-            tại thời điểm đó, tự làm mới mỗi 30 giây.
+            Cập nhật {formatDateTime(state.data.generated_at)} · thời điểm tạo phản
+            hồi HTTP, không phải thời điểm dữ liệu tại sàn; tự làm mới mỗi 30 giây.
           </p>
         </CardContent>
       ) : null}

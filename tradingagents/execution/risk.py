@@ -412,15 +412,18 @@ class RiskGuard:
         self.price_of = price_of if price_of is not None else (lambda ticker: None)
 
     def _price(self, ticker: str) -> float | None:
+        # A None return is the price_of contract's documented "unpriceable"
+        # outcome, not a failure: only a raise is worth the warning.
         try:
-            price = float(self.price_of(ticker))
+            raw = self.price_of(ticker)
+            price = float(raw) if raw is not None else None
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning("risk: price_of(%r) failed: %r", ticker, exc)
             return None
         except Exception as exc:  # noqa: BLE001 - a marking failure is "no price"
             logger.warning("risk: price_of(%r) failed: %r", ticker, exc)
             return None
-        return price if math.isfinite(price) and price > 0 else None
+        return price if price is not None and math.isfinite(price) and price > 0 else None
 
     def _position_exposure(self, position: Any, currency: str | None = None) -> float | None:
         """Return gross exposure in account currency; ``None`` means unknown.
@@ -560,21 +563,28 @@ class RiskGuard:
             ):
                 pnl += trade.pnl
         for ticker, queue in open_lots.items():
+            # Marking hits the venue, so only pay for it when a lot from the
+            # considered window actually needs a mark; older lots are excluded
+            # from the figure regardless of what the mark would say.
+            relevant = [
+                lot for lot in queue
+                if lot.opened == today and _after_reset(lot.opened_when, considered_from)
+            ]
+            if not relevant:
+                continue
             current = self._price(ticker)
             if current is None:
-                for lot in queue:
-                    if lot.opened == today and _after_reset(lot.opened_when, considered_from):
-                        logger.warning(
-                            "risk: cannot mark open lot %r (%s bought at %s); "
-                            "its unrealized P&L is excluded from the daily figure",
-                            ticker,
-                            lot.quantity,
-                            lot.price,
-                        )
+                for lot in relevant:
+                    logger.warning(
+                        "risk: cannot mark open lot %r (%s bought at %s); "
+                        "its unrealized P&L is excluded from the daily figure",
+                        ticker,
+                        lot.quantity,
+                        lot.price,
+                    )
                 continue
-            for lot in queue:
-                if lot.opened == today and _after_reset(lot.opened_when, considered_from):
-                    pnl += (current - lot.price) * lot.quantity
+            for lot in relevant:
+                pnl += (current - lot.price) * lot.quantity
         return pnl
 
     def check(
