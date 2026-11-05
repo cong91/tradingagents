@@ -31,10 +31,34 @@ _DEFAULT_REQUEST_TIMEOUT = 60.0
 class _IncompleteStreamError(RuntimeError):
     """The Responses relay ended without a successful terminal event."""
 
-    def __init__(self, status: str | None, reason: str | None = None):
+    def __init__(self, status: str | None, reason: str | None = None, evidence: str = ""):
         self.retryable = reason is None
         detail = f" with reason {reason!r}" if reason is not None else ""
-        super().__init__(f"Responses stream ended with status {status!r}{detail}")
+        context = f" ({evidence})" if evidence else ""
+        super().__init__(f"Responses stream ended with status {status!r}{detail}{context}")
+
+
+def _stream_evidence(chunks: list) -> str:
+    """What a buffered attempt carried, so a statusless stream stays diagnosable.
+
+    A statusless end can mean the relay truncated mid-pipeline or answered
+    without any terminal event; the chunk shape tells the two apart in the
+    cycle funnel without another live incident.
+    """
+    if not chunks:
+        return "no chunks arrived"
+    # ``super()._stream`` yields generation chunks; the payload sits on their
+    # ``message`` (same access the terminal-status reader above uses), so a
+    # bare ``chunk.content`` would report every stream as empty.
+    content = 0
+    calls = 0
+    for chunk in chunks:
+        message = getattr(chunk, "message", chunk)
+        if getattr(message, "content", None):
+            content += 1
+        if getattr(message, "tool_call_chunks", None) or getattr(message, "tool_calls", None):
+            calls += 1
+    return f"{len(chunks)} chunks, {content} with content, {calls} with tool calls"
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -60,6 +84,16 @@ def _is_connection_error(exc: Exception) -> bool:
                 # retry applies the same as a dropped connection.
                 "server_error",
                 "overloaded",
+                # Per-model line capacity and dispatch answers observed live as
+                # ResponseError/APIError payloads: "All lines for this model are
+                # temporarily busy, please retry", "Upstream service temporarily
+                # unavailable, please retry", and
+                # code='sg_continuation_dispatch_unavailable' (a continuation
+                # the relay could not dispatch to any line). All are the relay
+                # asking for the same request again, not a content rejection.
+                "temporarily busy",
+                "temporarily unavailable",
+                "continuation_dispatch_unavailable",
             )
         ):
             return True
@@ -188,7 +222,9 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
                     terminal_status = status or terminal_status
                     incomplete_reason = reason or incomplete_reason
                 if responses_mode and terminal_status != "completed":
-                    raise _IncompleteStreamError(terminal_status, incomplete_reason)
+                    raise _IncompleteStreamError(
+                        terminal_status, incomplete_reason, _stream_evidence(chunks)
+                    )
                 yield from chunks
                 return
             except Exception as exc:
@@ -228,7 +264,9 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
                     terminal_status = status or terminal_status
                     incomplete_reason = reason or incomplete_reason
                 if responses_mode and terminal_status != "completed":
-                    raise _IncompleteStreamError(terminal_status, incomplete_reason)
+                    raise _IncompleteStreamError(
+                        terminal_status, incomplete_reason, _stream_evidence(chunks)
+                    )
                 for chunk in chunks:
                     yield chunk
                 return

@@ -178,7 +178,15 @@ class FakeDerivExchange:
 
     def fetch_balance(self, params=None):
         self.calls.append(("fetch_balance",))
-        return {"info": {"totalMarginBalance": "1000", "asset": "USDT"}}
+        # Shape of the live /fapi account payload: the totals are quoted in the
+        # account's margin asset, which only ``assets`` names -- there is no
+        # top-level ``asset`` key (probed on the demo venue 2026-11-05). A fake
+        # that invents one hides the currency derivation from every execute
+        # test, which is exactly how the live entry refusal shipped.
+        return {"info": {
+            "totalMarginBalance": "1000",
+            "assets": [{"asset": "USDT", "walletBalance": "1000"}],
+        }}
 
 
 def freeze(monkeypatch):

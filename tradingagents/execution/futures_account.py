@@ -183,7 +183,32 @@ def _account_records(balance: dict[str, Any]) -> list[dict[str, Any]]:
     return [info] if info else []
 
 
-def _account_values(balance: dict[str, Any], exchange_id: str) -> dict[str, Any]:
+def _binance_margin_asset(info: dict[str, Any], config: dict[str, Any]) -> str | None:
+    """Margin asset the Binance futures account totals are quoted in.
+
+    The raw ``/fapi`` account payload has no top-level ``asset`` key: balances
+    are listed per asset under ``assets``, while ``totalMarginBalance`` and
+    friends are quoted in the account's margin asset. The configured quote
+    currency names it; the payload must list that asset, so a misconfigured
+    quote cannot silently relabel the totals.
+    """
+    quote = str(config.get("exec_quote_currency") or "").strip().upper()
+    if not quote:
+        return None
+    assets = info.get("assets")
+    if not isinstance(assets, list):
+        return None
+    names = {
+        str(row.get("asset")).strip().upper()
+        for row in assets
+        if isinstance(row, dict) and row.get("asset")
+    }
+    return quote if quote in names else None
+
+
+def _account_values(
+    balance: dict[str, Any], exchange_id: str, config: dict[str, Any]
+) -> dict[str, Any]:
     records = _account_records(balance)
     if exchange_id == "okx":
         record = next((item for item in records if _first_number(item, "totalEq") is not None), {})
@@ -255,15 +280,21 @@ def _account_values(balance: dict[str, Any], exchange_id: str) -> dict[str, Any]
             "account_scope": "unified",
         }
     info = balance.get("info") if isinstance(balance.get("info"), dict) else {}
+    currency = info.get("asset") or info.get("currency")
+    if currency is None and exchange_id == "binance":
+        # The Binance payload carries no top-level asset key; without this the
+        # live entry re-check refuses every order with "futures equity or
+        # currency is unavailable".
+        currency = _binance_margin_asset(info, config)
     return {
         "equity": _account_value(balance, ("equity", "totalEquity", "totalMarginBalance")),
         "wallet_balance": _account_value(balance, ("walletBalance", "totalWalletBalance")),
         "available_balance": _account_value(balance, ("availableBalance",)),
         "unrealized_pnl": _account_value(balance, ("unrealizedPnl", "totalUnrealizedProfit")),
-        "equity_currency": info.get("asset") or info.get("currency"),
-        "wallet_balance_currency": info.get("asset") or info.get("currency"),
-        "available_balance_currency": info.get("asset") or info.get("currency"),
-        "unrealized_pnl_currency": info.get("asset") or info.get("currency"),
+        "equity_currency": currency,
+        "wallet_balance_currency": currency,
+        "available_balance_currency": currency,
+        "unrealized_pnl_currency": currency,
         "account_scope": "derivatives",
     }
 
@@ -591,7 +622,7 @@ def read_futures_balance(bridge, settle: str | None = None) -> FuturesAccountSna
         if values is None:
             raise ValueError(f"futures wallet has no {settle} balance row")
     if values is None:
-        values = _account_values(balance, exchange_id)
+        values = _account_values(balance, exchange_id, bridge.config)
     return FuturesAccountSnapshot(**values, venue_profile=_venue_profile(bridge))
 
 

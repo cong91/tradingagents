@@ -381,8 +381,15 @@ class DerivativesExecutor:
                 if open_orders:
                     raise ValueError("existing open orders make a new entry unsafe")
             except Exception as exc:
+                # Carry the cause itself, not only its type: the branches above
+                # raise distinct ValueErrors (unverified scope, missing equity
+                # currency, resting orders) and the venue raises its own, so a
+                # bare type name leaves every refusal indistinguishable in the
+                # audit trail and the cycle funnel.
                 raise self._refuse(
-                    order, f"fresh futures account or open orders unavailable: {type(exc).__name__}",
+                    order,
+                    "fresh futures account or open orders unavailable: "
+                    f"{type(exc).__name__}: {exc}",
                     phase="execute",
                 ) from exc
         # fail_closed=True: same rule as the spot execute re-check -- an

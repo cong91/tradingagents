@@ -476,7 +476,10 @@ def test_fresh_equity_drives_execute_exposure_cap(tmp_path, monkeypatch, equity,
 
     exchange = FakeDerivExchange()
     exchange.fetch_balance = lambda params=None: {
-        "info": {"totalMarginBalance": str(equity), "asset": "USDT"},
+        "info": {
+            "totalMarginBalance": str(equity),
+            "assets": [{"asset": "USDT", "walletBalance": str(equity)}],
+        },
     }
     executor = make_executor(
         tmp_path, monkeypatch,
@@ -509,6 +512,31 @@ def test_live_execute_rejects_unreadable_fresh_book(tmp_path, monkeypatch):
     with pytest.raises(PermissionError, match="fresh futures account"):
         executor.execute_order(order, confirm=True, portfolio=stale)
     assert not [call for call in exchange.calls if call[0] == "create_order"]
+
+
+def test_fresh_book_refusal_names_the_underlying_cause(tmp_path, monkeypatch):
+    """The refusal must carry the cause, not only its type: five distinct
+    ValueErrors and every venue error share this branch, and a bare type name
+    left the 2026-11-04/05 entry refusals undiagnosable."""
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch, config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    stale = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", stale, price=50_000.0, **bracket_kwargs())
+    exchange.contracts = None
+    with pytest.raises(PermissionError) as excinfo:
+        executor.execute_order(order, confirm=True, portfolio=stale)
+    message = str(excinfo.value)
+    assert message.startswith("fresh futures account or open orders unavailable: ")
+    assert message != "fresh futures account or open orders unavailable: ExchangeError"
+    assert "position data unavailable" in message
+    denied = [
+        event for event in read_audit(tmp_path)
+        if event["action"] == "derivatives_denied"
+    ]
+    assert denied[-1]["reason"] == message
 
 
 def test_live_entry_in_hedge_mode_is_refused_before_any_send(tmp_path, monkeypatch):
