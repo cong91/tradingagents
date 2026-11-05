@@ -1235,6 +1235,7 @@ class _StubDerivVenue(_StubVenue):
             "BTC/USDT:USDT": {
                 "base": "BTC", "quote": "USDT", "settle": "USDT",
                 "contract": True, "swap": True, "type": "swap", "active": True,
+                "linear": True,
             }
         }
 
@@ -1266,7 +1267,7 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     # a validate_client-compatible Binance transport the stub venue lacks.
     monkeypatch.setattr(
         autoloop_mod, "read_futures_account",
-        lambda bridge: FuturesAccountSnapshot(
+        lambda bridge, **_kwargs: FuturesAccountSnapshot(
             equity=_STUB_CASH, wallet_balance=_STUB_CASH,
             available_balance=_STUB_CASH, unrealized_pnl=0.0,
             venue_profile="demo",
@@ -1295,6 +1296,12 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
     monkeypatch.setattr(screening_mod, "screen_universe",
                         lambda crypto, stocks, date, top_n: [{"ticker": "BTC-USD", "asset_type": "crypto"}])
+
+    class _FakeRankingClient:
+        def fetch_tickers(self):
+            return {"BTC/USDT:USDT": {"quoteVolume": 1_000_000_000_000.0, "last": _STUB_PRICE}}
+
+    monkeypatch.setattr(screening_mod, "_public_futures_ranking_client", lambda config: _FakeRankingClient())
 
     def build(config):
         from tradingagents.execution.derivatives import DerivativesExecutor
@@ -1731,16 +1738,25 @@ def test_risk_guard_decisions_belong_to_their_own_candidate(tmp_path, monkeypatc
     _derivatives_cycle_env(tmp_path, monkeypatch)
 
     def _two_contracts(self):
-        contract = {"base": "X", "quote": "USDT", "settle": "USDT",
+        contract = {"base": "X", "quote": "USDT", "settle": "USDT", "linear": True,
                     "contract": True, "swap": True, "type": "swap", "active": True}
         markets = {}
         for base, symbol in (("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")):
             markets[symbol] = {**contract, "base": base}
         return markets
 
+    class _TwoContractRanking:
+        # Futures discovery ranks the venue's contracts by production volume;
+        # BTC outranks ETH so the cycle runs them in that order.
+        def fetch_tickers(self):
+            return {
+                "BTC/USDT:USDT": {"quoteVolume": 2_000_000_000_000.0, "last": _STUB_PRICE},
+                "ETH/USDT:USDT": {"quoteVolume": 1_000_000_000_000.0, "last": _STUB_PRICE},
+            }
+
     monkeypatch.setattr(_StubDerivVenue, "load_markets", _two_contracts)
-    monkeypatch.setattr(screening_mod, "crypto_universe",
-                        lambda config, top_n: ["BTC-USD", "ETH-USD"])
+    monkeypatch.setattr(screening_mod, "_public_futures_ranking_client",
+                        lambda config: _TwoContractRanking())
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
     monkeypatch.setattr(screening_mod, "screen_universe",
                         lambda crypto, stocks, date, top_n: [

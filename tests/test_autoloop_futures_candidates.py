@@ -647,6 +647,18 @@ def test_refill_leaves_spot_selection_unchanged():
     ) == (["BTC-USD"], [], candidates, [], None)
 
 
+def _install_futures_discovery(monkeypatch, pool):
+    """Route futures-mode discovery to ``pool``.
+
+    Futures mode builds its universe from the venue's settle-asset contracts
+    (``_futures_crypto_universe``), not the spot ``crypto_universe``; the fake
+    stands in for that builder, called once per discovery round.
+    """
+    monkeypatch.setattr(
+        autoloop, "_futures_crypto_universe", lambda _derivatives, _contracts, _summary: pool,
+    )
+
+
 def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
     """``_run_cycle`` widens discovery itself, not just the selection helper."""
     from tradingagents.dataflows import screening as screening_mod
@@ -666,7 +678,7 @@ def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
     pool = _RefillPool(contractless + ["ETH-USD", "SOL-USD"])
     screened: list[tuple[int, int]] = []
 
-    monkeypatch.setattr(screening_mod, "crypto_universe", pool)
+    _install_futures_discovery(monkeypatch, pool)
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
 
     def screen(crypto, stocks, _date, top_n, cancel_event=None):
@@ -713,7 +725,7 @@ def _wire_cycle(monkeypatch, pool, screen, bridge):
     monkeypatch.setattr(autoloop, "get_config", lambda: {"exec_derivatives": True})
     monkeypatch.setattr(autoloop, "_build_bridge", lambda *_args: bridge)
     monkeypatch.setattr(autoloop, "_build_derivatives_executor", lambda *_args: _Derivatives(bridge))
-    monkeypatch.setattr(screening_mod, "crypto_universe", pool)
+    _install_futures_discovery(monkeypatch, pool)
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
     monkeypatch.setattr(screening_mod, "screen_universe", screen)
 
