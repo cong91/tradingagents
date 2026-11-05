@@ -10,7 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { GATE_LABELS } from "./types";
+import { useT } from "@/lib/i18n";
 
 // Cổng FR5 là read-only (hợp đồng §1): LIVE chỉ mở khi CẢ HAI nửa cùng mở —
 // thẻ này chỉ hiển thị trạng thái, không có điều khiển ghi.
@@ -22,28 +22,27 @@ export function GatesCard({
   effectiveMode: string;
 }) {
   const live = effectiveMode === "live";
+  const t = useT();
+  const c = t.settings.gates;
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldCheckIcon className="size-4" aria-hidden="true" />
-          Cổng thực thi (chỉ đọc)
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          LIVE chỉ mở khi cả hai nửa cổng cùng mở. Các cổng này cố ý vắng khỏi API ghi —
-          không thể bật từ UI.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          <Badge variant="outline">Chỉ đọc</Badge>
+          <Badge variant="outline">{t.common.readOnly}</Badge>
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
-          <span className="text-sm font-medium">Chế độ thực thi hiệu lực</span>
+          <span className="text-sm font-medium">{c.effectiveMode}</span>
           {live ? (
-            <Badge variant="destructive">LIVE — LỆNH THẬT</Badge>
+            <Badge variant="destructive">{c.live}</Badge>
           ) : (
-            <Badge variant="secondary">Mô phỏng (dry)</Badge>
+            <Badge variant="secondary">{c.dry}</Badge>
           )}
         </div>
         <ul className="space-y-2">
@@ -52,11 +51,12 @@ export function GatesCard({
               key={name}
               className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
             >
-              <span className="text-sm">{GATE_LABELS[name] ?? name}</span>
+              <span className="text-sm">{t.settings.gateLabels[name] ?? name}</span>
               {open ? (
-                <Badge variant="destructive">MỞ</Badge>
+                <Badge variant="destructive">{c.open}</Badge>
               ) : (
-                <Badge variant="outline">ĐÓNG</Badge>
+                <Badge variant="outline">{c.closed}</Badge>
+
               )}
             </li>
           ))}

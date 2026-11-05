@@ -1,6 +1,6 @@
 // Shape của GET/POST /api/autoloop, POST /api/autoloop/run-now, POST /api/halt,
 // POST /api/halt/reset (server/autoloop.py) — mirror hợp đồng, không thêm gì.
-// Nhãn tiếng Việt của 6 hàng cổng an toàn sống ở đây vì ánh xạ 1-1 theo key máy chủ trả.
+// Thứ tự 6 hàng cổng an toàn sống ở đây vì ánh xạ 1-1 theo key máy chủ trả.
 
 export type AutoloopGates = {
   auto_confirm_config: boolean;
@@ -89,16 +89,13 @@ export const AUTOLOOP_MIN_INTERVAL = 15;
 export const AUTOLOOP_MAX_INTERVAL = 1440;
 export const AUTOLOOP_DEFAULT_INTERVAL = 1440;
 
-/** Thứ tự + nhãn hiển thị của 6 hàng cổng an toàn (server/autoloop.py gates()). */
-export const AUTOLOOP_GATE_ROWS: readonly { key: AutoloopGateKey; label: string; hint?: string }[] = [
-  { key: "auto_confirm_config", label: "Auto-confirm trong config" },
-  { key: "auto_confirm_env", label: "Biến môi trường TRADINGAGENTS_EXEC_AUTO_CONFIRM" },
-  { key: "exec_live_config", label: "exec_live trong config" },
-  { key: "exec_live_env", label: "Biến môi trường TRADINGAGENTS_EXEC_LIVE" },
-  {
-    key: "exec_derivatives_config",
-    label: "Futures (exec_derivatives)",
-    hint: "Cổng futures — chỉ quan sát, không điều kiện bật autoloop",
-  },
-  { key: "exec_derivatives_env", label: "Biến môi trường TRADINGAGENTS_EXEC_DERIVATIVES" },
+/** Thứ tự hiển thị của 6 hàng cổng an toàn (server/autoloop.py gates()); nhãn ở
+ * lib/i18n/messages/settings.ts (autoloop.gateRows). */
+export const AUTOLOOP_GATE_ROWS: readonly AutoloopGateKey[] = [
+  "auto_confirm_config",
+  "auto_confirm_env",
+  "exec_live_config",
+  "exec_live_env",
+  "exec_derivatives_config",
+  "exec_derivatives_env",
 ];

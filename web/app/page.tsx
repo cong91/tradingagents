@@ -1,16 +1,14 @@
 import type { Metadata } from "next";
+import { messages } from "@/lib/i18n/messages";
 import { PageHeader } from "@/components/page-header";
 import { OverviewDashboard } from "@/components/overview/dashboard";
 
-export const metadata: Metadata = { title: "Tổng quan lợi nhuận" };
+export const metadata: Metadata = { title: messages.en.pages.overview.title };
 
 export default function OverviewPage() {
   return (
     <div>
-      <PageHeader
-        title="Tổng quan lợi nhuận"
-        description="Alpha tích luỹ của các quyết định đã chốt, hiệu suất theo thời gian và lệnh thực thi gần đây — đọc trực tiếp từ backend qua /api/*."
-      />
+      <PageHeader page="overview" />
       <OverviewDashboard />
     </div>
   );

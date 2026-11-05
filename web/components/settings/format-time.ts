@@ -1,4 +1,4 @@
-// Định dạng thời gian hiển thị (vi-VN). Hợp đồng §0: ISO-8601 UTC ("Z").
+// Định dạng thời gian hiển thị (theo locale đang chọn). Hợp đồng §0: ISO-8601 UTC ("Z").
 // Primitive dùng chung ở lib/format.ts.
 
 import { formatClock, formatDateTime } from "@/lib/format";

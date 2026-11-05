@@ -22,20 +22,5 @@ export type DataSourcesPayload = {
   key_path: string;
 };
 
-export const PROVIDER_META: Record<
-  DataSourceProvider,
-  { title: string; description: string }
-> = {
-  reddit: {
-    title: "Reddit",
-    description:
-      "Cookie phiên đăng nhập cho phép tìm kiếm bằng JSON (có điểm và số bình luận). Không có cookie thì hệ thống dùng RSS công khai, bị giới hạn ~1 request/phút và không có điểm.",
-  },
-  x: {
-    title: "X (Twitter)",
-    description:
-      "X cần cookie phiên đăng nhập gồm auth_token và ct0. Dán JSON cookie từ x.com; hệ thống tự xử lý tìm kiếm bằng phiên đã lưu.",
-  },
-};
-
+// Provider titles/descriptions live in lib/i18n/messages/data-sources.ts.
 export const PROVIDER_ORDER: readonly DataSourceProvider[] = ["reddit", "x"];

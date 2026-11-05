@@ -72,18 +72,4 @@ export function changedKeys(
   return changed;
 }
 
-export const GROUP_TITLES: Record<string, { title: string; description: string }> = {
-  gates: {
-    title: "Cổng thực thi (nửa cấu hình)",
-    description:
-      "Đây là nửa cấu hình của thiết kế hai khoá. Lệnh thật chỉ đi khi nửa môi trường " +
-      "(TRADINGAGENTS_EXEC_*) cũng mở, đọc lại lúc gửi lệnh. Ghi vào đây cần xác nhận " +
-      "và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
-  },
-  risk: {
-    title: "Trần rủi ro vận hành",
-    description:
-      "Giá trị đặt ở đây thay cho .env và tồn tại qua restart. RiskGuard vẫn là nơi " +
-      "quyết định cuối cùng: đề xuất của agent vượt trần bị từ chối, không bị hạ xuống.",
-  },
-};
+// Tiêu đề/mô tả của từng nhóm: lib/i18n/messages/settings.ts (operator.groups).

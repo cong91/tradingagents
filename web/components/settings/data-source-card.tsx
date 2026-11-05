@@ -20,8 +20,8 @@ import {
   DataSourceApiError,
   toDataSourceError,
 } from "./data-source-api";
+import { useT } from "@/lib/i18n";
 import {
-  PROVIDER_META,
   PROVIDER_ORDER,
   type DataSourceSummary,
   type DataSourcesPayload,
@@ -37,7 +37,9 @@ function ProviderCard({
   summary: DataSourceSummary;
   onSaved: (payload: DataSourcesPayload) => void;
 }) {
-  const meta = PROVIDER_META[summary.provider];
+  const t = useT();
+  const c = t.dataSources;
+  const meta = c.providers[summary.provider];
   const [raw, setRaw] = useState("");
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
@@ -50,7 +52,7 @@ function ProviderCard({
     } catch {
       setFeedback({
         role: "alert",
-        text: "Nội dung không phải JSON hợp lệ. Dán nguyên văn export từ extension (bắt đầu bằng [ hoặc {).",
+        text: c.invalidJson,
       });
       return;
     }
@@ -59,14 +61,14 @@ function ProviderCard({
       const payload = await dataSourceApi.saveCookies(summary.provider, parsed);
       onSaved(payload);
       setRaw("");
-      setFeedback({ role: "status", text: `Đã lưu cookie ${meta.title}.` });
+      setFeedback({ role: "status", text: c.saved(meta.title) });
     } catch (err) {
       const failure = err instanceof DataSourceApiError ? err : toDataSourceError(err);
       setFeedback({ role: "alert", text: failure.message });
     } finally {
       setBusy(false);
     }
-  }, [meta.title, onSaved, raw, summary.provider]);
+  }, [c, meta.title, onSaved, raw, summary.provider]);
 
   const remove = useCallback(async () => {
     setBusy(true);
@@ -74,14 +76,14 @@ function ProviderCard({
     try {
       const payload = await dataSourceApi.remove(summary.provider);
       onSaved(payload);
-      setFeedback({ role: "status", text: `Đã xoá cookie ${meta.title}.` });
+      setFeedback({ role: "status", text: c.removed(meta.title) });
     } catch (err) {
       const failure = err instanceof DataSourceApiError ? err : toDataSourceError(err);
       setFeedback({ role: "alert", text: failure.message });
     } finally {
       setBusy(false);
     }
-  }, [meta.title, onSaved, summary.provider]);
+  }, [c, meta.title, onSaved, summary.provider]);
 
   return (
     <div className="space-y-3 border-t pt-3 first:border-t-0 first:pt-0">
@@ -89,16 +91,14 @@ function ProviderCard({
         <p className="text-sm font-medium">{meta.title}</p>
         {summary.configured ? (
           !summary.decryptable ? (
-            <Badge variant="destructive">Không giải mã được — import lại</Badge>
+            <Badge variant="destructive">{c.undecryptable}</Badge>
           ) : summary.valid ? (
-            <Badge variant="secondary">
-              Đã cấu hình · {summary.cookie_count} cookie
-            </Badge>
+            <Badge variant="secondary">{c.configured(summary.cookie_count)}</Badge>
           ) : (
-            <Badge variant="destructive">Thiếu cookie bắt buộc — import lại</Badge>
+            <Badge variant="destructive">{c.missingRequired}</Badge>
           )
         ) : (
-          <Badge variant="outline">Chưa cấu hình</Badge>
+          <Badge variant="outline">{c.notConfigured}</Badge>
         )}
       </div>
       <p className="text-xs text-muted-foreground">{meta.description}</p>
@@ -106,13 +106,13 @@ function ProviderCard({
       {summary.configured ? (
         <dl className="grid gap-x-4 gap-y-1 text-xs sm:grid-cols-2">
           <div>
-            <dt className="text-muted-foreground">Cookie đã lưu</dt>
+            <dt className="text-muted-foreground">{c.storedCookies}</dt>
             <dd className="font-mono break-all">
               {summary.cookie_names.length > 0 ? summary.cookie_names.join(", ") : "—"}
             </dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">Cập nhật</dt>
+            <dt className="text-muted-foreground">{c.updated}</dt>
             <dd>
               {summary.updated_at ? formatDateTimeVi(summary.updated_at) : "—"}
             </dd>
@@ -121,9 +121,7 @@ function ProviderCard({
       ) : null}
 
       <label className="block text-xs">
-        <span className="text-muted-foreground">
-          Dán JSON cookie (Cookie-Editor / EditThisCookie export)
-        </span>
+        <span className="text-muted-foreground">{c.pasteLabel}</span>
         <textarea
           value={raw}
           disabled={busy}
@@ -147,7 +145,7 @@ function ProviderCard({
           ) : (
             <UploadIcon aria-hidden="true" />
           )}
-          Lưu cookie
+          {c.save}
         </Button>
         {summary.configured ? (
           <Button
@@ -158,7 +156,7 @@ function ProviderCard({
             onClick={() => void remove()}
           >
             <Trash2Icon aria-hidden="true" />
-            Xoá
+            {c.remove}
           </Button>
         ) : null}
         {feedback ? (
@@ -179,6 +177,8 @@ function ProviderCard({
 }
 
 export function DataSourceCard() {
+  const t = useT();
+  const c = t.dataSources;
   const [payload, setPayload] = useState<DataSourcesPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -212,25 +212,22 @@ export function DataSourceCard() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <CookieIcon className="size-4" aria-hidden="true" />
-          Cookie nguồn dữ liệu
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          Reddit và X chỉ trả dữ liệu đầy đủ khi có phiên đăng nhập. Cookie được mã hoá
-          trước khi lưu PostgreSQL và không bao giờ hiển thị lại — chỉ tên và số lượng.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {loading ? (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
-            Đang tải trạng thái cookie…
+            {c.loading}
           </p>
         ) : null}
         {error ? (
           <div role="alert" className="space-y-2 text-sm text-destructive">
             <p>{error}</p>
             <Button variant="outline" size="sm" className="min-touch" onClick={() => void load()}>
-              Thử lại
+              {t.common.retry}
             </Button>
           </div>
         ) : null}
@@ -245,8 +242,8 @@ export function DataSourceCard() {
           : null}
         {payload ? (
           <p className="text-[11px] text-muted-foreground">
-            Khoá mã hoá: <span className="font-mono break-all">{payload.key_path}</span> — nằm
-            ngoài database; mất khoá này thì phải import lại cookie.
+            {c.keyPathPrefix} <span className="font-mono break-all">{payload.key_path}</span>{" "}
+            {c.keyPathSuffix}
           </p>
         ) : null}
       </CardContent>

@@ -6,6 +6,8 @@
 // thay vì mỗi màn tự viết một bản parse (trước đây bị nhân bản ~6 lần và chỉ
 // một bản xử lý được {detail}).
 
+import { getMessages } from "@/lib/i18n/messages";
+
 export type ParsedErrorBody = {
   /** Code máy chủ trả, hoặc null khi body không phải JSON / chỉ có {detail}. */
   code: string | null;
@@ -34,14 +36,16 @@ export class ApiRequestError extends Error {
   }
 }
 
-export const NETWORK_HINT =
-  "Không kết nối được backend FastAPI (port 8000) — chạy uvicorn server.main:app rồi bấm Thử lại.";
+/** Gợi ý khi backend không tới được — theo locale đang chọn lúc tạo lỗi. */
+export function networkHint(): string {
+  return getMessages().common.networkHint;
+}
 
 /** Parse body lỗi: envelope §0.1, {detail} của FastAPI, hoặc fallback theo status. */
 export async function parseErrorResponse(res: Response): Promise<ParsedErrorBody> {
   const fallback: ParsedErrorBody = {
     code: null,
-    message: `Máy chủ trả lỗi HTTP ${res.status}.`,
+    message: getMessages().common.httpError(res.status),
     details: {},
   };
   try {
@@ -74,5 +78,5 @@ export async function parseErrorResponse(res: Response): Promise<ParsedErrorBody
 /** Chuẩn hoá mọi throw của fetch thành ApiRequestError (network). */
 export function toRequestError(err: unknown): ApiRequestError {
   if (err instanceof ApiRequestError) return err;
-  return new ApiRequestError(0, "network", NETWORK_HINT);
+  return new ApiRequestError(0, "network", networkHint());
 }

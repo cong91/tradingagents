@@ -6,14 +6,15 @@
 import {
   formatAssetQuantity,
   formatDateTime,
+  formatNumber,
   formatSignedNumber,
   formatUsdPrice,
 } from "@/lib/format";
 
-const percentFormat = new Intl.NumberFormat("vi-VN", {
+const PERCENT_OPTIONS: Intl.NumberFormatOptions = {
   style: "percent",
   maximumFractionDigits: 1,
-});
+};
 
 /** Giá ước tính — luôn kèm đơn vị tiền: "83.078,00 USD". */
 export function formatPriceEst(price: number | null | undefined): string {
@@ -28,7 +29,7 @@ export function formatQty(
   return formatAssetQuantity(qty, ticker);
 }
 
-/** Chuỗi % ghi trong log ("+1.2%") → hiển thị vi-VN có dấu ("+1,2%"). */
+/** Chuỗi % ghi trong log ("+1.2%") → hiển thị theo locale có dấu ("+1,2%"). */
 export function formatLoggedPercent(
   text: string | null | undefined
 ): string | null {
@@ -50,7 +51,7 @@ export function formatFractionPercent(
 /** Tỉ lệ trúng (0..1) → "50,0%" — không cần dấu vì không phải lãi/lỗ. */
 export function formatHitRate(rate: number | null | undefined): string {
   if (rate == null || Number.isNaN(rate)) return "—";
-  return percentFormat.format(rate);
+  return formatNumber(rate, PERCENT_OPTIONS);
 }
 
 export { formatDateTime };

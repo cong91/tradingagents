@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { getMessages } from "@/lib/i18n/messages";
 import { scannerApi } from "./scanner-api";
 import type { FuturesCycle, FuturesCycleSummary, FuturesCycleSymbolRollup } from "./scanner-types";
 
@@ -40,7 +41,7 @@ export function useFuturesCycles(): FuturesCycleState {
         setError(null);
       },
       (err: unknown) => {
-        setError(err instanceof Error ? err.message : "Không tải được trạng thái futures");
+        setError(err instanceof Error ? err.message : getMessages().scanner.futures.loadFailed);
       },
     ).finally(() => setLoading(false));
   }, []);

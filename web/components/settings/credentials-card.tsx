@@ -10,31 +10,30 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { useT } from "@/lib/i18n";
 import type { CredentialRow } from "./types";
 
 // Quy tắc bất di bất dịch hợp đồng §1: không bao giờ trả nguyên văn API key —
 // thẻ này chỉ render trạng thái `configured` và chuỗi `masked` của máy chủ.
 export function CredentialsCard({ credentials }: { credentials: CredentialRow[] }) {
+  const t = useT();
+  const c = t.settings.credentials;
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <KeyRoundIcon className="size-4" aria-hidden="true" />
-          Khóa API
+          {c.title}
         </CardTitle>
-        <CardDescription>
-          Không bao giờ hiển thị nguyên văn — chỉ trạng thái cấu hình và 4 ký tự cuối.
-          Đặt khóa qua biến môi trường hoặc .env, không sửa được từ UI.
-        </CardDescription>
+        <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          <Badge variant="outline">Chỉ đọc</Badge>
+          <Badge variant="outline">{t.common.readOnly}</Badge>
         </CardAction>
       </CardHeader>
       <CardContent>
         {credentials.length === 0 ? (
           <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-            Máy chủ không trả về khóa nào. Khởi động backend rồi bấm Làm mới để xem
-            trạng thái khóa API.
+            {c.empty}
           </p>
         ) : (
           <ul className="space-y-2">
@@ -46,10 +45,11 @@ export function CredentialsCard({ credentials }: { credentials: CredentialRow[] 
                 <span className="font-mono text-xs">{credential.env_var}</span>
                 {credential.configured && credential.masked ? (
                   <Badge variant="secondary">
-                    Đã cấu hình <span className="font-mono">{credential.masked}</span>
+                    {c.configured} <span className="font-mono">{credential.masked}</span>
                   </Badge>
                 ) : (
-                  <Badge variant="outline">Chưa cấu hình</Badge>
+                  <Badge variant="outline">{c.notConfigured}</Badge>
+
                 )}
               </li>
             ))}

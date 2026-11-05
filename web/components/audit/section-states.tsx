@@ -14,10 +14,12 @@ import {
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "cn";
 import { formatDateTime } from "./display";
+import { useT } from "@/lib/i18n";
 
 export function SectionSkeleton({ rows = 4 }: { rows?: number }) {
+  const t = useT();
   return (
-    <div aria-busy="true" aria-label="Đang tải dữ liệu" className="space-y-2">
+    <div aria-busy="true" aria-label={t.audit.loadingAria} className="space-y-2">
       {Array.from({ length: rows }, (_, index) => (
         <div
           key={index}
@@ -63,6 +65,7 @@ export function ErrorState({
   message: string;
   onRetry: () => void;
 }) {
+  const t = useT();
   return (
     <div
       role="alert"
@@ -74,13 +77,13 @@ export function ErrorState({
           aria-hidden="true"
         />
         <div>
-          <p className="text-sm font-medium">Không tải được dữ liệu</p>
+          <p className="text-sm font-medium">{t.audit.loadFailed}</p>
           <p className="mt-1 text-sm text-muted-foreground">{message}</p>
         </div>
       </div>
       <Button variant="outline" className="min-touch" onClick={onRetry}>
         <RefreshCwIcon aria-hidden="true" />
-        Thử lại
+        {t.common.retry}
       </Button>
     </div>
   );
@@ -107,6 +110,7 @@ export function DataMeta({
   onRefresh: () => void;
   refreshing: boolean;
 }) {
+  const t = useT();
   const now = useTickingNow(5_000);
   const generatedMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
   const stale =
@@ -116,11 +120,11 @@ export function DataMeta({
       {stale && (
         <span className="inline-flex items-center gap-1 rounded-4xl border border-amber-500/60 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-100">
           <ClockIcon className="size-3" aria-hidden="true" />
-          Dữ liệu cũ — hãy làm mới
+          {t.audit.staleRefresh}
         </span>
       )}
       <span className="text-xs text-muted-foreground">
-        Đọc lúc {generatedAt ? formatDateTime(generatedAt) : "—"}
+        {t.audit.readAt(generatedAt ? formatDateTime(generatedAt) : "—")}
       </span>
       <Button
         variant="ghost"
@@ -133,7 +137,8 @@ export function DataMeta({
           className={cn(refreshing && "animate-spin")}
           aria-hidden="true"
         />
-        Làm mới
+        {t.common.refresh}
+
       </Button>
     </div>
   );

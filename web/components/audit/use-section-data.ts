@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiRequestError, parseErrorResponse } from "@/lib/api";
+import { getMessages } from "@/lib/i18n/messages";
 
 export type SectionError = { code: string | null; message: string };
 
@@ -32,7 +33,7 @@ async function fetchSection<T>(url: string): Promise<T> {
     throw new ApiRequestError(
       0,
       "network",
-      "Không kết nối được máy chủ — backend FastAPI (port 8000) chưa chạy hoặc lỗi mạng."
+      getMessages().audit.networkError
     );
   }
   if (!res.ok) {
@@ -49,7 +50,7 @@ function toError(err: unknown): SectionError {
   }
   return {
     code: null,
-    message: err instanceof Error ? err.message : "Lỗi không xác định.",
+    message: err instanceof Error ? err.message : getMessages().audit.unknownError,
   };
 }
 

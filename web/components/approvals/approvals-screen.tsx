@@ -35,6 +35,7 @@ import { RejectDialog } from "./reject-dialog";
 import { ResolvedList } from "./resolved-list";
 import { useApprovals } from "./use-approvals";
 import type { ApprovalItem } from "./types";
+import { useT } from "@/lib/i18n";
 
 function ActionFeedback({
   lastAction,
@@ -45,6 +46,8 @@ function ActionFeedback({
   actionError: ActionError | null;
   onDismiss: () => void;
 }) {
+  const t = useT();
+  const f = t.approvals.feedback;
   if (actionError) {
     return (
       <div
@@ -57,7 +60,7 @@ function ActionFeedback({
           variant="ghost"
           size="icon-sm"
           onClick={onDismiss}
-          aria-label="Đóng thông báo lỗi"
+          aria-label={f.dismissError}
         >
           <XIcon />
         </Button>
@@ -76,14 +79,13 @@ function ActionFeedback({
         >
           <CircleXIcon className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
           <p className="min-w-0 flex-1">
-            <strong>CẢNH BÁO:</strong> {lastAction.warning} Tuyệt đối không duyệt
-            lại kế hoạch {lastAction.id} — lệnh có thể đã tồn tại trên sàn.
+            <strong>{f.warningLabel}</strong> {lastAction.warning} {f.warningTail(lastAction.id)}
           </p>
           <Button
             variant="ghost"
             size="icon-sm"
             onClick={onDismiss}
-            aria-label="Đóng thông báo"
+            aria-label={f.dismiss}
           >
             <XIcon />
           </Button>
@@ -98,19 +100,19 @@ function ActionFeedback({
       >
         <CircleCheckIcon className="mt-0.5 size-5 shrink-0 text-profit" aria-hidden="true" />
         <p className="min-w-0 flex-1">
-          Đã duyệt {lastAction.id}.{" "}
+          {f.approved(lastAction.id)}{" "}
           {lastAction.orderId
-            ? `Mã lệnh trên sàn: ${lastAction.orderId}.`
+            ? f.orderId(lastAction.orderId)
             : lastAction.mode
-              ? `Chế độ thực thi: ${lastAction.mode === "live" ? "LIVE" : "mô phỏng (dry)"}.`
+              ? f.execMode(lastAction.mode === "live")
               : ""}{" "}
-          Đã ghi audit approval_granted.
+          {f.auditGranted}
         </p>
         <Button
           variant="ghost"
           size="icon-sm"
           onClick={onDismiss}
-          aria-label="Đóng thông báo"
+          aria-label={f.dismiss}
         >
           <XIcon />
         </Button>
@@ -126,13 +128,13 @@ function ActionFeedback({
     >
       <CircleCheckIcon className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
       <p className="min-w-0 flex-1">
-        Đã từ chối {lastAction.id} — không có lệnh nào được gửi, lý do đã ghi vào audit.
+        {f.rejected(lastAction.id)}
       </p>
       <Button
         variant="ghost"
         size="icon-sm"
         onClick={onDismiss}
-        aria-label="Đóng thông báo"
+        aria-label={f.dismiss}
       >
         <XIcon />
       </Button>
@@ -141,6 +143,8 @@ function ActionFeedback({
 }
 
 export function ApprovalsScreen() {
+  const t = useT();
+  const q = t.approvals.queue;
   const [approveTarget, setApproveTarget] = useState<ApprovalItem | null>(null);
   const [rejectTarget, setRejectTarget] = useState<ApprovalItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -239,11 +243,8 @@ export function ApprovalsScreen() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Hàng đợi chờ duyệt</CardTitle>
-          <CardDescription>
-            Nguồn duy nhất của hàng đợi là pipeline hằng ngày (POST /api/daily).
-            Duyệt là đường duy nhất đưa lệnh vào thực thi.
-          </CardDescription>
+          <CardTitle>{q.title}</CardTitle>
+          <CardDescription>{q.description}</CardDescription>
           <CardAction>
             <div className="flex items-center gap-2">
               {stale && (
@@ -251,12 +252,12 @@ export function ApprovalsScreen() {
                   variant="outline"
                   className="border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
                 >
-                  Dữ liệu cũ
+                  {t.common.staleData}
                 </Badge>
               )}
               {hasData && snapshot.generated_at && (
                 <span className="hidden text-xs text-muted-foreground sm:inline">
-                  Cập nhật {formatDateTime(snapshot.generated_at)}
+                  {q.updated(formatDateTime(snapshot.generated_at))}
                 </span>
               )}
               <Button
@@ -271,7 +272,7 @@ export function ApprovalsScreen() {
                 ) : (
                   <RefreshCwIcon aria-hidden="true" />
                 )}
-                Làm mới
+                {t.common.refresh}
               </Button>
             </div>
           </CardAction>
@@ -280,7 +281,7 @@ export function ApprovalsScreen() {
           {initialLoading && !hasData ? (
             // loading — skeleton 3 hàng
             <div className="space-y-2" aria-busy="true" aria-live="polite">
-              <span className="sr-only">Đang tải hàng đợi phê duyệt…</span>
+              <span className="sr-only">{q.loading}</span>
               {[0, 1, 2].map((i) => (
                 <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />
               ))}
@@ -292,11 +293,11 @@ export function ApprovalsScreen() {
               className="flex flex-col items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm"
             >
               <p className="font-medium text-destructive">
-                Không tải được hàng đợi phê duyệt
+                {q.loadFailed}
               </p>
               <p className="text-muted-foreground">{loadError}</p>
               <p className="text-xs text-muted-foreground">
-                Backend FastAPI có thể chưa chạy. Khởi động từ thư mục dự án:{" "}
+                {q.backendHint}{" "}
                 <code className="rounded bg-muted px-1 py-0.5">
                   .venv\Scripts\python.exe -m uvicorn server.main:app --port 8000
                 </code>
@@ -306,25 +307,21 @@ export function ApprovalsScreen() {
                 className="min-touch"
                 onClick={() => void refresh()}
               >
-                Thử lại
+                {t.common.retry}
               </Button>
             </div>
           ) : pendingItems.length === 0 ? (
             // empty — nói rõ việc cần làm tiếp theo
             <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed p-8 text-center">
               <InboxIcon className="size-6 text-muted-foreground" aria-hidden="true" />
-              <p className="font-medium">Chưa có kế hoạch lệnh nào chờ duyệt</p>
-              <p className="max-w-md text-sm text-muted-foreground">
-                Kế hoạch lệnh chỉ được tạo khi pipeline hằng ngày chạy và phát
-                hiện coin có tín hiệu giao dịch. Hãy chạy pipeline từ màn M3 —
-                Tìm cặp giao dịch, rồi quay lại đây để duyệt.
-              </p>
+              <p className="font-medium">{q.emptyTitle}</p>
+              <p className="max-w-md text-sm text-muted-foreground">{q.emptyBody}</p>
               <Button
                 className="min-touch"
                 nativeButton={false}
                 render={<Link href="/scanner" />}
               >
-                Mở màn Tìm cặp giao dịch
+                {q.openScanner}
               </Button>
             </div>
           ) : (
@@ -343,7 +340,8 @@ export function ApprovalsScreen() {
 
           {paused && hasData && (
             <p className="mt-3 text-xs text-muted-foreground">
-              Đang tạm dừng làm mới tự động khi có hộp thoại hành động mở.
+              {q.paused}
+
             </p>
           )}
         </CardContent>

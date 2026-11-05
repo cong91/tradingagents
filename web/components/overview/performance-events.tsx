@@ -1,50 +1,43 @@
 import { Badge } from "@/components/ui/badge";
 import { formatDateTime, formatQuantityValue, MINUS_SIGN } from "@/lib/format";
 
+import { useT, type Messages } from "@/lib/i18n";
+
 import type { PerformanceOrder } from "./contract";
 import { historicalCurrencies } from "./historical-currency";
 
-function actionBadge(action: string | null): {
+const ACTION_VARIANTS: Record<string, "outline" | "secondary" | "destructive"> = {
+  buy: "outline",
+  sell: "outline",
+  bracket_placed: "secondary",
+  bracket_failed: "destructive",
+  rejected_by_risk: "destructive",
+  rejected_at_execute: "destructive",
+  execute_denied: "destructive",
+  derivatives_denied: "destructive",
+  time_stop_closed: "secondary",
+  time_stop_postponed: "secondary",
+  position_state_failed: "destructive",
+  scale_out_refused: "destructive",
+  no_order: "secondary",
+};
+
+type EventsCopy = Messages["performance"]["events"];
+
+function actionBadge(c: EventsCopy, action: string | null): {
   label: string;
   variant: "outline" | "secondary" | "destructive";
 } {
-  switch (action) {
-    case "buy":
-      return { label: "Mua", variant: "outline" };
-    case "sell":
-      return { label: "Bán", variant: "outline" };
-    case "bracket_placed":
-      return { label: "Đặt lệnh bảo vệ", variant: "secondary" };
-    case "bracket_failed":
-      return { label: "Lỗi đặt lệnh bảo vệ", variant: "destructive" };
-    case "rejected_by_risk":
-      return { label: "Từ chối bởi kiểm soát rủi ro", variant: "destructive" };
-    case "rejected_at_execute":
-      return { label: "Từ chối khi thực thi", variant: "destructive" };
-    case "execute_denied":
-      return { label: "Không cho phép thực thi", variant: "destructive" };
-    case "derivatives_denied":
-      return { label: "Từ chối Futures", variant: "destructive" };
-    case "time_stop_closed":
-      return { label: "Đóng theo thời hạn", variant: "secondary" };
-    case "time_stop_postponed":
-      return { label: "Hoãn đóng theo thời hạn", variant: "secondary" };
-    case "position_state_failed":
-      return { label: "Lỗi lưu trạng thái vị thế", variant: "destructive" };
-    case "scale_out_refused":
-      return { label: "Từ chối chốt từng phần", variant: "destructive" };
-    case "no_order":
-      return { label: "Không tạo lệnh", variant: "secondary" };
-    default:
-      return { label: action || "—", variant: "outline" };
-  }
+  const known = action ? c.actions[action] : undefined;
+  if (action && known) return { label: known, variant: ACTION_VARIANTS[action] ?? "outline" };
+  return { label: action || "—", variant: "outline" };
 }
 
-function modeLabel(mode: string | null): string {
-  if (mode === "dry") return "Dry (mô phỏng)";
-  if (mode === "demo") return "Demo";
-  if (mode === "live") return "Live (chế độ sàn)";
-  return mode ? `Chưa xác định (${mode})` : "—";
+function modeLabel(c: EventsCopy, mode: string | null): string {
+  if (mode === "dry") return c.modeDry;
+  if (mode === "demo") return c.modeDemo;
+  if (mode === "live") return c.modeLive;
+  return mode ? c.modeUnknown(mode) : "—";
 }
 
 function marketLabel(market: string | null | undefined): string {
@@ -63,10 +56,14 @@ function quantityValue(value: number | null | undefined, signed = false): string
   return `${sign}${formatted}`;
 }
 
-function estimatedPrice(value: number | null, symbol: string | null | undefined): string {
+function estimatedPrice(
+  value: number | null,
+  symbol: string | null | undefined,
+  unknownCurrency: string,
+): string {
   const amount = quantityValue(value);
   if (amount === "—") return amount;
-  return `${amount} ${historicalCurrencies(symbol).quote ?? "đơn vị chưa rõ"}`;
+  return `${amount} ${historicalCurrencies(symbol).quote ?? unknownCurrency}`;
 }
 
 export function PerformanceEvents({
@@ -76,49 +73,50 @@ export function PerformanceEvents({
   events: PerformanceOrder[];
   skippedLines: number | null;
 }) {
+  const t = useT();
+  const c = t.performance.events;
   return (
-    <section className="min-w-0 space-y-2" aria-label="Nhật ký sự kiện">
-      <h3 className="text-sm font-medium">Nhật ký sự kiện</h3>
+    <section className="min-w-0 space-y-2" aria-label={c.title}>
+      <h3 className="text-sm font-medium">{c.title}</h3>
       <p className="text-xs text-muted-foreground">
-        Dữ liệu nhật ký không xác nhận khớp lệnh. Live là chế độ thực thi qua sàn,
-        không xác định môi trường demo hay production.
+        {c.note}
       </p>
       {skippedLines == null ? (
         <p role="status" className="text-sm text-destructive">
-          Không xác minh được nhật ký có dòng bị bỏ qua hay không.
+          {c.skippedUnknown}
         </p>
       ) : skippedLines > 0 ? (
         <p role="status" className="text-sm text-destructive">
-          Cảnh báo: {skippedLines} dòng nhật ký hỏng đã bị bỏ qua; dữ liệu có thể chưa đầy đủ.
+          {c.skipped(skippedLines)}
         </p>
       ) : null}
       {events.length === 0 ? (
         <p className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
-          Không có sự kiện trong dữ liệu nhật ký đã đọc.
+          {c.empty}
         </p>
       ) : (
         <div
           role="region"
-          aria-label="Bảng nhật ký sự kiện, có thể cuộn ngang"
+          aria-label={c.tableAria}
           tabIndex={0}
           className="min-w-0 overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         >
           <table className="w-full min-w-[850px] text-sm">
-            <caption className="sr-only">Các sự kiện trong nhật ký thực thi</caption>
+            <caption className="sr-only">{c.caption}</caption>
             <thead>
               <tr className="border-b text-left text-xs text-muted-foreground">
-                <th scope="col" className="py-2 pr-4 font-medium">Thời gian</th>
-                <th scope="col" className="py-2 pr-4 font-medium">Mã</th>
-                <th scope="col" className="py-2 pr-4 font-medium">Sự kiện</th>
-                <th scope="col" className="py-2 pr-4 font-medium">Thị trường</th>
-                <th scope="col" className="py-2 pr-4 text-right font-medium">Khối lượng (dữ liệu nhật ký)</th>
-                <th scope="col" className="py-2 pr-4 text-right font-medium">Giá ước tính</th>
-                <th scope="col" className="py-2 font-medium">Chế độ</th>
+                <th scope="col" className="py-2 pr-4 font-medium">{c.time}</th>
+                <th scope="col" className="py-2 pr-4 font-medium">{c.ticker}</th>
+                <th scope="col" className="py-2 pr-4 font-medium">{c.event}</th>
+                <th scope="col" className="py-2 pr-4 font-medium">{c.market}</th>
+                <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantity}</th>
+                <th scope="col" className="py-2 pr-4 text-right font-medium">{c.priceEst}</th>
+                <th scope="col" className="py-2 font-medium">{c.mode}</th>
               </tr>
             </thead>
             <tbody className="divide-y">
               {events.map((event, index) => {
-                const action = actionBadge(event.action);
+                const action = actionBadge(c, event.action);
                 return (
                   <tr key={`${event.timestamp ?? ""}-${event.order_id ?? ""}-${index}`}>
                     <td className="py-2 pr-4 whitespace-nowrap tabular-nums">{formatDateTime(event.timestamp)}</td>
@@ -126,8 +124,8 @@ export function PerformanceEvents({
                     <td className="py-2 pr-4"><Badge variant={action.variant}>{action.label}</Badge></td>
                     <td className="py-2 pr-4">{marketLabel(event.market)}</td>
                     <td className="py-2 pr-4 text-right whitespace-nowrap tabular-nums">{quantityValue(event.qty, true)}</td>
-                    <td className="py-2 pr-4 text-right whitespace-nowrap tabular-nums">{estimatedPrice(event.price_est, event.ccxt_symbol)}</td>
-                    <td className="py-2"><Badge variant="secondary">{modeLabel(event.mode)}</Badge></td>
+                    <td className="py-2 pr-4 text-right whitespace-nowrap tabular-nums">{estimatedPrice(event.price_est, event.ccxt_symbol, t.performance.unknownCurrency)}</td>
+                    <td className="py-2"><Badge variant="secondary">{modeLabel(c, event.mode)}</Badge></td>
                   </tr>
                 );
               })}

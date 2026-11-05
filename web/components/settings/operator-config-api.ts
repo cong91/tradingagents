@@ -1,6 +1,6 @@
 // Fetch cho thẻ "Override vận hành". Mọi thay đổi cổng phải kèm confirm=true và
 // reason (server/operator_config.py) — lớp này là chỗ duy nhất dựng body đó.
-import { NETWORK_HINT, parseErrorResponse } from "@/lib/api";
+import { networkHint, parseErrorResponse } from "@/lib/api";
 
 import type { OperatorConfigPayload } from "./operator-config-types";
 
@@ -20,7 +20,7 @@ export class OperatorConfigApiError extends Error {
 
 export function toOperatorError(err: unknown): OperatorConfigApiError {
   if (err instanceof OperatorConfigApiError) return err;
-  return new OperatorConfigApiError(0, "network", NETWORK_HINT);
+  return new OperatorConfigApiError(0, "network", networkHint());
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {

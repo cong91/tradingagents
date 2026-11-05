@@ -1,17 +1,15 @@
 import type { Metadata } from "next";
+import { messages } from "@/lib/i18n/messages";
 
 import { ApprovalsScreen } from "@/components/approvals/approvals-screen";
 import { PageHeader } from "@/components/page-header";
 
-export const metadata: Metadata = { title: "Duyệt lệnh" };
+export const metadata: Metadata = { title: messages.en.pages.approvals.title };
 
 export default function ApprovalsPage() {
   return (
     <div>
-      <PageHeader
-        title="Duyệt lệnh"
-        description="Hàng đợi phê duyệt kế hoạch lệnh từ pipeline hằng ngày. Duyệt là con đường duy nhất đưa lệnh vào thực thi; từ chối không đụng sàn."
-      />
+      <PageHeader page="approvals" />
       <ApprovalsScreen />
     </div>
   );
