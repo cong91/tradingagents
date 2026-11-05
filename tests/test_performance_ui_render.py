@@ -46,6 +46,18 @@ Module._resolveFilename = function (request, parent, isMain, options) {
   return resolveFilename.call(this, resolvedRequest, parent, isMain, options);
 };
 
+// The control panel is locale-aware (#15): components read their copy through
+// useT() (server snapshot = getServerLocale()) and their numbers/dates through
+// getLocale(). The assertions below check the Vietnamese dictionary, which is
+// the source shape every other locale is typed against, so pin both snapshots
+// before rendering.
+const requestedLocale = process.env.RENDER_LOCALE;
+if (requestedLocale) {
+  const i18nLocale = require(path.join(webRoot, "lib/i18n/locale.ts"));
+  i18nLocale.getServerLocale = () => requestedLocale;
+  i18nLocale.getLocale = () => requestedLocale;
+}
+
 const { PerformancePositions } = require(
   path.join(webRoot, "components/overview/performance-positions.tsx")
 );
@@ -350,11 +362,13 @@ def _cases():
     return cases
 
 
-@pytest.fixture(scope="module")
-def rendered():
+def _render(locale: str | None) -> dict[str, RenderedHtml]:
+    """Render every case through node; ``locale`` overrides the server locale."""
     require_web_renderer()
     env = os.environ.copy()
     env.update({"TZ": "UTC", "NODE_ENV": "production"})
+    if locale is not None:
+        env["RENDER_LOCALE"] = locale
     result = subprocess.run(
         ["node", "-e", NODE_RENDERER],
         cwd=WEB_ROOT,
@@ -367,6 +381,29 @@ def rendered():
     )
     assert result.returncode == 0, result.stderr
     return {name: RenderedHtml(markup) for name, markup in json.loads(result.stdout).items()}
+
+
+@pytest.fixture(scope="module")
+def rendered():
+    """The Vietnamese dictionary: the source shape every locale is typed against."""
+    return _render("vi")
+
+
+@pytest.fixture(scope="module")
+def rendered_default_locale():
+    """No override: the browser's first paint, which must be the default locale."""
+    return _render(None)
+
+
+def test_default_locale_renders_english_copy(rendered_default_locale):
+    """The default locale must not leak the Vietnamese source strings."""
+    page = rendered_default_locale["missing_futures_positions"]
+
+    assert (
+        "The Futures position list is unavailable; open positions cannot be confirmed."
+        in page.text
+    )
+    assert "Danh sách vị thế Futures không khả dụng" not in page.text
 
 
 def test_venue_snapshot_renders_reported_spot_and_futures_with_full_precision(rendered):
