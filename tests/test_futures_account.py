@@ -174,6 +174,65 @@ def test_read_futures_account_applies_inverse_contract_size_to_base_quantity():
     assert snapshot.positions[0].notional_currency == "BTC"
 
 
+def test_read_binance_futures_account_derives_margin_asset_from_assets_rows(monkeypatch):
+    """The live /fapi payload has no top-level asset key (probed 2026-11-05).
+
+    Totals are quoted in the account's margin asset, which only ``assets``
+    names; reading it from ``info["asset"]`` alone left the currency unknown
+    and made the execute-time re-check refuse every live entry.
+    """
+    client, _ = _client(monkeypatch, [])
+    balance = {"info": {
+        "totalWalletBalance": "5532.88626908",
+        "totalUnrealizedProfit": "-11.35187178",
+        "totalMarginBalance": "5521.53439730",
+        "availableBalance": "5310.77926266",
+        "assets": [
+            {"asset": "USDC", "walletBalance": "5000.00000000"},
+            {"asset": "BTC", "walletBalance": "0.01000000"},
+            {"asset": "USDT", "walletBalance": "5532.88626908"},
+        ],
+    }}
+    monkeypatch.setattr(client, "fetch_balance", lambda params=None: balance)
+    bridge = _Bridge(client)
+    bridge.config = {
+        "exec_base_url": "https://demo-api.binance.com",
+        "exec_quote_currency": "USDT",
+    }
+
+    snapshot = read_futures_account(bridge)
+
+    assert snapshot.equity == pytest.approx(5521.53439730)
+    assert snapshot.equity_currency == "USDT"
+    assert snapshot.wallet_balance_currency == "USDT"
+    assert snapshot.available_balance_currency == "USDT"
+    assert snapshot.unrealized_pnl_currency == "USDT"
+
+
+def test_read_binance_futures_account_keeps_currency_unknown_when_quote_not_listed(monkeypatch):
+    """A payload that does not carry the configured quote keeps the currency
+    unknown instead of relabelling the totals with it."""
+    client, _ = _client(monkeypatch, [])
+    balance = {"info": {
+        "totalMarginBalance": "1000.0",
+        "assets": [{"asset": "USDC", "walletBalance": "1000.0"}],
+    }}
+    monkeypatch.setattr(client, "fetch_balance", lambda params=None: balance)
+    bridge = _Bridge(client)
+    bridge.config = {
+        "exec_base_url": "https://demo-api.binance.com",
+        "exec_quote_currency": "USDT",
+    }
+
+    snapshot = read_futures_account(bridge)
+
+    assert snapshot.equity == pytest.approx(1000.0)
+    assert snapshot.equity_currency is None
+    assert snapshot.wallet_balance_currency is None
+    assert snapshot.available_balance_currency is None
+    assert snapshot.unrealized_pnl_currency is None
+
+
 def test_read_okx_futures_account_selects_swap_positions_and_reads_nested_equity():
     exchange = _Exchange(
         {"info": {"data": [{"totalEq": "1234.5", "adjEq": "1200.0"}]}},

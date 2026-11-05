@@ -86,10 +86,38 @@ def test_connection_retry_budget_is_bounded():
             "temporarily unavailable, please retry later', misalignment=None, "
             "param=None, type='upstream_error')"
         ),
+        # Live relay per-model capacity answers (token.v-claw.org, 2026-11-03/04):
+        # no upstream_error marker, only the relay asking for the request again.
+        ValueError(
+            "ResponseError(code=None, message='All lines for this model are "
+            "temporarily busy, please retry', misalignment=None, param=None, "
+            "type=None)"
+        ),
+        ValueError(
+            "APIError: Upstream service temporarily unavailable, please retry. "
+            "Other lines were tried automatically."
+        ),
+        ValueError(
+            "ResponseError(code='sg_continuation_dispatch_unavailable', "
+            "message='continuation dispatch unavailable', misalignment=None, "
+            "param=None, type=None)"
+        ),
     ],
 )
 def test_stream_transport_errors_are_retryable(error):
     assert openai_client._is_connection_error(error) is True
+
+
+@pytest.mark.unit
+def test_relay_content_rejection_is_not_retryable():
+    """The relay's risk-control answer names the content, not the transport:
+    the same request would fail again, so it must not burn the retry budget."""
+    assert openai_client._is_connection_error(
+        ValueError(
+            "OpenAIInvalidRequestError: Error code: 400 - 本次请求未通过风控，"
+            "已拒绝，请调整内容后重试"
+        )
+    ) is False
 
 
 @pytest.mark.unit
@@ -259,6 +287,31 @@ def test_invoke_does_not_retry_responses_incomplete_from_output_limit(monkeypatc
         _relay_model().invoke("Analyze market conditions")
 
     assert calls == 1
+
+
+@pytest.mark.unit
+def test_invoke_reports_stream_evidence_when_no_terminal_event_arrives(monkeypatch):
+    """The 2026-11-05 relay failure: both attempts ended with status None, so
+    the raised error must carry what the buffered attempt held."""
+    from langchain_openai import ChatOpenAI
+
+    monkeypatch.setattr(openai_client, "_CONNECTION_RETRY_WAIT", 0.0)
+    calls = 0
+
+    def stream(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        yield _relay_chunk("partial response")
+
+    monkeypatch.setattr(ChatOpenAI, "_stream", stream)
+
+    with pytest.raises(openai_client._IncompleteStreamError) as excinfo:
+        _relay_model().invoke("Analyze market conditions")
+
+    assert calls == 2
+    message = str(excinfo.value)
+    assert "status None" in message
+    assert "1 chunks, 1 with content, 0 with tool calls" in message
 
 
 @pytest.mark.unit

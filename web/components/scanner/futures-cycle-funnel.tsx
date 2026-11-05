@@ -98,6 +98,20 @@ function executionStatusLabel(c: CyclesCopy, payload: FuturesCyclePayload): stri
   }
 }
 
+/** Failure label by phase: a context/analysis failure (relay, market data) is
+ *  not an order-send failure — naming the phase keeps the funnel from reading
+ *  as if an order had reached the venue. */
+function failureLabel(c: CyclesCopy, phase: string | null | undefined, reason: string | null | undefined): string {
+  const o = c.outcome;
+  if (phase === "execution" || phase === "entry" || phase === "protection") {
+    return reason ? o.failedReason(reason) : o.failed;
+  }
+  if (phase === "analysis" || phase === "context") {
+    return reason ? o.analysisFailedReason(reason) : o.analysisFailed;
+  }
+  return reason ? o.cycleFailedReason(reason) : o.cycleFailed;
+}
+
 function cycleOutcome(c: CyclesCopy, cycle: FuturesCycle): string {
   const payload: FuturesCyclePayload = cycle.payload ?? {};
   if (cycle.status === "completed" && cycle.phase === "entry") {
@@ -115,9 +129,10 @@ function cycleOutcome(c: CyclesCopy, cycle: FuturesCycle): string {
     if (outcome) return outcome;
   }
   // Outer-layer failure (context/analysis): failed row with execution_status
-  // not_started but a recorded failure_reason — show it instead of a generic reason.
+  // not_started but a recorded failure_reason — show it under its real phase
+  // instead of a generic reason.
   if (cycle.status === "failed" && payload.failure_reason) {
-    return c.outcome.failedReason(payload.failure_reason);
+    return failureLabel(c, cycle.phase, payload.failure_reason);
   }
   if (cycle.phase === "market") return marketRejectionLabel(c, payload.market_rejection_reason);
   if (cycle.phase === "confirmation") return confirmationLabel(c, payload.confirmation_reason);
@@ -152,7 +167,7 @@ function latestOutcome(c: CyclesCopy, row: FuturesCycleSymbolRollup): string {
       return reason ? o.failedReason(reason) : o.failed;
   }
   if (row.last_status === "failed") {
-    return reason ? o.failedReason(reason) : o.failed;
+    return failureLabel(c, row.last_phase, row.last_execution_reason);
   }
   if (row.last_phase === "market") return marketRejectionLabel(c, row.last_market_rejection_reason);
   if (row.last_phase === "confirmation") return confirmationLabel(c, row.last_confirmation_reason);

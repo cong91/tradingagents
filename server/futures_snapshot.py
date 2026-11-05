@@ -254,9 +254,11 @@ def read_futures_snapshot(bridge: Any) -> dict[str, Any]:
         if not isinstance(balance_info, dict) or not isinstance(balance_info.get("positions"), list):
             raise ValueError("Binance futures account type is not verified")
     if exchange_id == "binance" and isinstance(balance.get("info"), list):
-        values = futures_account._account_values({}, exchange_id)
+        values = futures_account._account_values({}, exchange_id, bridge.config)
     else:
-        values = futures_account._account_values(futures_balance.sanitize_balance(balance), exchange_id)
+        values = futures_account._account_values(
+            futures_balance.sanitize_balance(balance), exchange_id, bridge.config
+        )
     for key in (
         "equity_currency", "wallet_balance_currency", "available_balance_currency",
         "unrealized_pnl_currency",
