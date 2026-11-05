@@ -28,6 +28,21 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# The exception message is the only evidence of *why* a structured call failed:
+# every branch (malformed JSON, a thinking model that answered in prose, a
+# provider error) raises a distinct ValueError, so logging the type alone
+# collapses them into one indistinguishable "ValueError" and leaves the
+# failure untraceable. Bounded because a provider error can echo the request.
+_FAILURE_DETAIL_LIMIT = 500
+
+
+def _failure_detail(exc: Exception) -> str:
+    """``TypeName: message`` for a failure, bounded so one log line stays readable."""
+    detail = f"{type(exc).__name__}: {exc}"
+    if len(detail) <= _FAILURE_DETAIL_LIMIT:
+        return detail
+    return detail[:_FAILURE_DETAIL_LIMIT] + "...(truncated)"
+
 # Schema-only structured output binds exactly one tool (the schema itself), so a
 # model that reaches for a search tool emits an unknown tool call and the whole
 # structured attempt is discarded for a free-text retry. Agents on this path
@@ -76,7 +91,7 @@ def invoke_structured(structured_llm: Any | None, prompt: Any, agent_name: str) 
     except Exception as exc:
         logger.warning(
             "%s: structured-output invocation failed (%s); retrying once as free text",
-            agent_name, exc,
+            agent_name, _failure_detail(exc),
         )
         return None
 
@@ -131,12 +146,12 @@ def invoke_structured_or_freetext(
                     agent_name,
                     attempt,
                     len(attempts),
-                    type(exc).__name__,
+                    _failure_detail(exc),
                     "retrying structured output" if attempt < len(attempts)
                     else "falling back to report-only free text",
                 )
 
     if on_fallback is not None:
-        on_fallback(type(structured_error).__name__ if structured_error else "unsupported")
+        on_fallback(_failure_detail(structured_error) if structured_error else "unsupported")
     response = plain_llm.invoke(prompt)
     return response.content

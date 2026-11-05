@@ -480,7 +480,47 @@ def test_invoke_structured_fallback_reports_non_executable_status():
         on_fallback=fallback.append,
         structured_retry_instruction="return schema",
     ) == "prose"
-    assert fallback == ["ValueError"]
+    assert fallback == ["ValueError: structured output returned no parsed result"]
+
+
+@pytest.mark.unit
+def test_invoke_structured_fallback_keeps_the_cause_of_the_failure(caplog):
+    """Every branch raises a distinct ValueError, so the type alone is not evidence.
+
+    A bare "ValueError" made a provider error, malformed JSON, and a prose-only
+    answer indistinguishable, which left the production fallback untraceable.
+    """
+    from tradingagents.agents.structured import invoke_structured_or_freetext
+
+    structured = MagicMock()
+    structured.invoke.side_effect = ValueError("provider returned reasoning without a tool call")
+    plain = MagicMock()
+    plain.invoke.return_value = MagicMock(content="prose")
+    fallback = []
+
+    with caplog.at_level("WARNING"):
+        invoke_structured_or_freetext(
+            structured,
+            plain,
+            "prompt",
+            render=lambda result: result,
+            agent_name="Portfolio Manager",
+            on_fallback=fallback.append,
+        )
+
+    assert fallback == ["ValueError: provider returned reasoning without a tool call"]
+    assert "provider returned reasoning without a tool call" in caplog.text
+
+
+@pytest.mark.unit
+def test_invoke_structured_failure_detail_is_bounded():
+    """A provider error can echo the request; one log line stays readable."""
+    from tradingagents.agents.structured import _FAILURE_DETAIL_LIMIT, _failure_detail
+
+    detail = _failure_detail(ValueError("x" * (_FAILURE_DETAIL_LIMIT * 2)))
+
+    assert len(detail) < _FAILURE_DETAIL_LIMIT + 50
+    assert detail.endswith("...(truncated)")
 
 
 @pytest.mark.unit
