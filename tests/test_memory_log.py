@@ -97,6 +97,7 @@ def _structured_pm_llm(captured: dict, decision: PortfolioDecision | None = None
             rating=PortfolioRating.HOLD,
             executive_summary="Hold the position; await catalyst.",
             investment_thesis="Balanced view; neither side carried the debate.",
+            futures_execution_intent="abstain",
         )
     structured = MagicMock()
     structured.invoke.side_effect = lambda prompt: (
@@ -816,6 +817,7 @@ class TestPortfolioManagerInjection:
             investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
             price_target=215.0,
             time_horizon="3-6 months",
+            futures_execution_intent="abstain",
         )
         llm = _structured_pm_llm(captured, decision)
         pm_node = create_portfolio_manager(llm)

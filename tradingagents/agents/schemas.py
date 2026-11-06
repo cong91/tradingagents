@@ -64,7 +64,14 @@ def _coerce_optional_float(value):
 
 
 class PortfolioRating(StrEnum):
-    """5-tier rating used by the Research Manager and Portfolio Manager."""
+    """5-tier rating used by the Research Manager and Portfolio Manager.
+
+    Exactly one of Buy / Overweight / Hold / Underweight / Sell, picked based
+    on the analysts' debate. Conflicting arguments alone are not a reason to
+    Hold: commit to the stronger side, sized by how decisively it wins. Choose
+    Hold only when the evidence is still balanced after weighing, or too thin
+    to support a call.
+    """
 
     BUY = "Buy"
     OVERWEIGHT = "Overweight"
@@ -74,7 +81,7 @@ class PortfolioRating(StrEnum):
 
 
 class TraderAction(StrEnum):
-    """3-tier transaction direction used by the Trader.
+    """3-tier transaction direction used by the Trader: exactly one of Buy / Hold / Sell.
 
     The Trader's job is to translate the Research Manager's investment plan
     into a concrete transaction proposal: should the desk execute a Buy, a
@@ -157,15 +164,7 @@ class ResearchPlan(BaseModel):
     instructions the trader can execute against.
     """
 
-    recommendation: PortfolioRating = Field(
-        description=(
-            "The investment recommendation. Exactly one of Buy / Overweight / "
-            "Hold / Underweight / Sell. Conflicting arguments alone are not a "
-            "reason to Hold: commit to the stronger side, sized by how "
-            "decisively it wins. Choose Hold only when the evidence is still "
-            "balanced after weighing, or too thin to support a call."
-        ),
-    )
+    recommendation: PortfolioRating
     rationale: str = Field(
         description=(
             "Conversational summary of the key points from both sides of the "
@@ -208,9 +207,7 @@ class TraderProposal(BaseModel):
     entry, stop-loss, and sizing.
     """
 
-    action: TraderAction = Field(
-        description="The transaction direction. Exactly one of Buy / Hold / Sell.",
-    )
+    action: TraderAction
     reasoning: str = Field(
         description=(
             "The case for this action, anchored in the analysts' reports and "
@@ -250,13 +247,10 @@ class TraderProposal(BaseModel):
             "required context item is missing; never invent numbers to fill the fields."
         ),
     )
-    futures_execution_intent: FuturesExecutionIntent = Field(
-        default=FuturesExecutionIntent.ABSTAIN,
-        description=(
-            "Choose enter only when opening a new futures position is authorized; choose "
-            "manage_existing for an existing-position reduction/exit; choose abstain otherwise."
-        ),
-    )
+    # Required so every proposal states its futures intent explicitly: a
+    # default is impossible without shipping a $ref node the relay rejects
+    # ({"$ref": ..., "default": "abstain"}).
+    futures_execution_intent: FuturesExecutionIntent
 
     @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
     @classmethod
@@ -326,16 +320,7 @@ class PortfolioDecision(BaseModel):
     the rating-scale guidance.
     """
 
-    rating: PortfolioRating = Field(
-        description=(
-            "The final position rating. Exactly one of Buy / Overweight / Hold / "
-            "Underweight / Sell, picked based on the analysts' debate. "
-            "Conflicting arguments alone are not a reason to Hold: commit to the "
-            "stronger side, sized by how decisively it wins. Choose Hold only "
-            "when the evidence is still balanced after weighing, or too thin to "
-            "support a call."
-        ),
-    )
+    rating: PortfolioRating
     executive_summary: str = Field(
         description=(
             "A concise action plan covering entry strategy, position sizing, "
@@ -361,17 +346,10 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Final agent-approved futures terms. Required only when futures_execution_intent is enter.",
     )
-    futures_execution_intent: FuturesExecutionIntent = Field(
-        default=FuturesExecutionIntent.ABSTAIN,
-        description=(
-            "For crypto futures choose enter only when opening a new position is authorized "
-            "and all terms are supported; choose manage_existing for reduce/exit/protection "
-            "of an existing position; choose abstain when no futures entry is authorized. "
-            "The enter bar is symmetric: Buy/Overweight authorizes a fresh long and "
-            "Sell/Underweight a fresh short when the closed candles confirm the direction. "
-            "A qualifying setup must not default to abstain."
-        ),
-    )
+    # Required so every decision states its futures intent explicitly: a
+    # default is impossible without shipping a $ref node the relay rejects
+    # ({"$ref": ..., "default": "abstain"}).
+    futures_execution_intent: FuturesExecutionIntent
 
     @field_validator("price_target", mode="before")
     @classmethod
@@ -423,6 +401,11 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
 class SentimentBand(StrEnum):
     """Discrete sentiment direction produced by the Sentiment Analyst.
 
+    Exactly one of: Bullish / Mildly Bullish / Neutral / Mixed / Mildly
+    Bearish / Bearish. Use Mixed when sources point in clearly different
+    directions. Use Neutral only when all sources are genuinely silent or
+    non-committal.
+
     Six tiers keep the signal granular enough to be actionable while remaining
     small enough for every provider to map reliably from its JSON output.
     """
@@ -446,14 +429,7 @@ class SentimentReport(BaseModel):
     deterministic header so the saved report stays human-readable.
     """
 
-    overall_band: SentimentBand = Field(
-        description=(
-            "Overall sentiment direction. Exactly one of: "
-            "Bullish / Mildly Bullish / Neutral / Mixed / Mildly Bearish / Bearish. "
-            "Use Mixed when sources point in clearly different directions. "
-            "Use Neutral only when all sources are genuinely silent or non-committal."
-        ),
-    )
+    overall_band: SentimentBand
     overall_score: float = Field(
         ge=0.0,
         le=10.0,

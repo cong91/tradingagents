@@ -116,9 +116,10 @@ Write these sections, in this order, starting with the rating on its own line:
             on_fallback=lambda reason: fallback_holder.update(reason=reason),
             structured_retry_instruction=(
                 "Return the PortfolioDecision schema now. Set futures_execution_intent to "
-                "enter, manage_existing, or abstain explicitly. If intent is enter, include "
-                "a complete FuturesExecutionProposal; never put execution terms only in prose."
-            ) if futures_context else None,
+                "enter, manage_existing, or abstain explicitly — use abstain when this is "
+                "not a crypto futures decision. If intent is enter, include a complete "
+                "FuturesExecutionProposal; never put execution terms only in prose."
+            ),
         )
         final_rating = (
             decision_holder["decision"].rating.value

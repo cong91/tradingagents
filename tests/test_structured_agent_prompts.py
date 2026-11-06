@@ -48,7 +48,8 @@ def test_trader_prompt_states_constraint():
     from tradingagents.agents.schemas import TraderAction, TraderProposal
 
     captured = {}
-    llm = _capturing_llm(captured, TraderProposal(action=TraderAction.BUY, reasoning="x"))
+    llm = _capturing_llm(captured, TraderProposal(
+        action=TraderAction.BUY, reasoning="x", futures_execution_intent="abstain"))
     create_trader(llm)({
         "company_of_interest": "NVDA",
         "investment_plan": "**Recommendation**: Buy",
@@ -89,6 +90,7 @@ def test_portfolio_manager_prompt_states_constraint():
             rating=PortfolioRating.HOLD,
             executive_summary="x",
             investment_thesis="y",
+            futures_execution_intent="abstain",
         ),
     )
     risk = {
