@@ -94,6 +94,17 @@ _ANTHROPIC_NO_FORCED_TOOL = ModelCapabilities(
     preferred_structured_method="json_schema",
 )
 
+# 2026-11-05: token.v-claw.org (responses wire) intermittently answers prose on
+# tool-forced structured calls for the gpt-6 ``-sol`` aliases — 150
+# structured_terms_unavailable cycles; response_format json_schema removes the
+# tool round-trip entirely.
+_GPT6_SOL_RELAY = ModelCapabilities(
+    supports_tool_choice=True,
+    supports_json_mode=True,
+    supports_json_schema=True,
+    preferred_structured_method="json_schema",
+)
+
 _DEFAULT = ModelCapabilities(
     supports_tool_choice=True,
     supports_json_mode=True,
@@ -125,12 +136,16 @@ _BY_ID: dict[str, ModelCapabilities] = {
 # quirks automatically. ``deepseek-flash`` is the unversioned alias the model
 # picker offers for V4.1 Flash; it serves thinking mode and so rejects
 # ``tool_choice`` exactly like the versioned ``deepseek-v4-flash`` ID does.
+# The gpt-6 ``-sol`` pattern covers the documented ``gpt-6-sol`` alias and
+# future dotted ones; plain ``gpt-6`` and the ``-luna`` / ``-astra`` siblings
+# keep _DEFAULT (no evidence of the quirk there).
 _BY_PATTERN: list[tuple[re.Pattern[str], ModelCapabilities]] = [
     (re.compile(r"^deepseek-v\d"), _DEEPSEEK_THINKING),
     (re.compile(r"^deepseek-reasoner"), _DEEPSEEK_THINKING),
     (re.compile(r"^deepseek-flash"), _DEEPSEEK_THINKING),
     (re.compile(r"^MiniMax-M\d"), _MINIMAX_THINKING),
     (re.compile(r"^anthropic/claude-(sonnet|opus|fable)-5"), _ANTHROPIC_NO_FORCED_TOOL),
+    (re.compile(r"^gpt-6(\.\d+)?-sol$"), _GPT6_SOL_RELAY),
 ]
 
 

@@ -132,6 +132,32 @@ class TestDefault:
 
 
 @pytest.mark.unit
+class TestGpt6SolRelay:
+    """The token.v-claw.org relay prose-answers tool-forced structured calls
+    for its gpt-6 ``-sol`` aliases, so those prefer json_schema."""
+
+    def test_the_documented_deep_think_model_uses_json_schema(self):
+        # Anchor on the id the repo actually ships, not a hand-picked string:
+        # this proves the production default alias resolves to the rule.
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        assert get_capabilities(DEFAULT_CONFIG["deep_think_llm"]).preferred_structured_method == "json_schema"
+
+    def test_future_gpt_6_2_sol_inherits_json_schema(self):
+        caps = get_capabilities("gpt-6.2-sol")
+        assert caps.preferred_structured_method == "json_schema"
+        assert caps.supports_json_schema is True
+
+    def test_gpt_6_without_sol_suffix_keeps_default(self):
+        # Plain gpt-6 is not a relay sol alias: no evidence of the prose-answer
+        # quirk, so it must stay on _DEFAULT's function_calling path.
+        assert get_capabilities("gpt-6").preferred_structured_method == "function_calling"
+
+    def test_gpt_5_keeps_default(self):
+        assert get_capabilities("gpt-5").preferred_structured_method == "function_calling"
+
+
+@pytest.mark.unit
 class TestOpenRouterDeepSeekNamespace:
     """OpenRouter namespaces DeepSeek as ``deepseek/<id>``; strip it so the
     same quirks apply as the native provider (#1199)."""

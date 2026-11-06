@@ -123,8 +123,9 @@ def create_trader(llm):
             on_fallback=lambda reason: fallback_holder.update(reason=reason),
             structured_retry_instruction=(
                 "Return the TraderProposal schema now. Do not answer with prose outside the "
-                "schema fields; if futures context exists, set futures_execution_intent explicitly."
-            ) if futures_context else None,
+                "schema fields; set futures_execution_intent explicitly — use abstain when "
+                "this is not a crypto futures trade."
+            ),
         )
         decision = decision_holder.get("decision")
         trader_decision_telemetry = {

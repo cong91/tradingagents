@@ -40,7 +40,8 @@ from tradingagents.agents.trader.trader import create_trader
 @pytest.mark.unit
 class TestRenderTraderProposal:
     def test_minimal_required_fields(self):
-        p = TraderProposal(action=TraderAction.HOLD, reasoning="Balanced setup; no edge.")
+        p = TraderProposal(action=TraderAction.HOLD, reasoning="Balanced setup; no edge.",
+                           futures_execution_intent="abstain")
         md = render_trader_proposal(p)
         assert "**Action**: Hold" in md
         assert "**Reasoning**: Balanced setup; no edge." in md
@@ -55,6 +56,7 @@ class TestRenderTraderProposal:
             entry_price=189.5,
             stop_loss=178.0,
             position_sizing="6% of portfolio",
+            futures_execution_intent="abstain",
         )
         md = render_trader_proposal(p)
         assert "**Action**: Buy" in md
@@ -66,7 +68,8 @@ class TestRenderTraderProposal:
     def test_optional_fields_are_named_as_not_provided(self):
         """An omitted line reads as a field nobody asked for; the reader cannot
         tell it from a level the trader declined to set."""
-        p = TraderProposal(action=TraderAction.SELL, reasoning="Guidance cut.")
+        p = TraderProposal(action=TraderAction.SELL, reasoning="Guidance cut.",
+                           futures_execution_intent="abstain")
         md = render_trader_proposal(p)
         for field in ("Entry Price", "Stop Loss", "Position Sizing"):
             assert f"**{field}**: not provided" in md
@@ -86,6 +89,7 @@ class TestRenderTraderProposal:
                 margin_fraction=0.2,
                 rationale="A 4% invalidation distance supports 2x within the account cap.",
             ),
+            futures_execution_intent="abstain",
         )
 
         rendered = render_trader_proposal(p)
@@ -311,6 +315,51 @@ def test_portfolio_manager_missing_or_insufficient_futures_context_defaults_to_a
 
 
 @pytest.mark.unit
+def test_pm_non_crypto_retry_asks_for_the_required_intent():
+    """futures_execution_intent is required on every run, but a non-crypto
+    prompt never mentions futures. Without a retry instruction the omission
+    fails validation and the whole decision degrades to prose; the retry must
+    name the field so the model can answer abstain."""
+    risk = {
+        "history": "h", "aggressive_history": "a", "conservative_history": "c",
+        "neutral_history": "n", "current_aggressive_response": "",
+        "current_conservative_response": "", "current_neutral_response": "",
+        "latest_speaker": "Neutral", "count": 3,
+    }
+    prompts = []
+
+    def fake_invoke(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            PortfolioDecision.model_validate(
+                {"rating": "Buy", "executive_summary": "s", "investment_thesis": "t"}
+            )
+        return PortfolioDecision(
+            rating="Buy", executive_summary="s", investment_thesis="t",
+            futures_execution_intent="abstain",
+        )
+
+    structured = MagicMock()
+    structured.invoke.side_effect = fake_invoke
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    llm.invoke.return_value = MagicMock(content="prose fallback")
+
+    result = create_portfolio_manager(llm)({
+        "company_of_interest": "NVDA",
+        "asset_type": "stock",
+        "risk_debate_state": risk,
+        "investment_plan": "plan",
+        "trader_investment_plan": "trader plan",
+    })
+
+    assert len(prompts) == 2, "the required intent must trigger one structured retry"
+    assert "futures_execution_intent" in str(prompts[1])
+    assert result["pm_decision_telemetry"]["structured_output"] is True
+    assert result["final_rating"] == "Buy"
+
+
+@pytest.mark.unit
 class TestNullishFloatCoercion:
     """A weak LLM may write "None"/"N/A" into an optional float field (#1058);
     coerce those to None so the structured call validates instead of erroring."""
@@ -322,12 +371,14 @@ class TestNullishFloatCoercion:
                 reasoning="x",
                 entry_price=sentinel,
                 stop_loss=sentinel,
+                futures_execution_intent="abstain",
             )
             assert p.entry_price is None
             assert p.stop_loss is None
 
     def test_trader_real_numeric_string_still_parses(self):
-        p = TraderProposal(action=TraderAction.BUY, reasoning="x", entry_price="189.5")
+        p = TraderProposal(action=TraderAction.BUY, reasoning="x", entry_price="189.5",
+                           futures_execution_intent="abstain")
         assert p.entry_price == 189.5
 
     def test_pm_nullish_price_target_coerces_to_none(self):
@@ -336,6 +387,7 @@ class TestNullishFloatCoercion:
             executive_summary="s",
             investment_thesis="t",
             price_target="N/A",
+            futures_execution_intent="abstain",
         )
         assert d.price_target is None
 
@@ -349,6 +401,7 @@ class TestNullishFloatCoercion:
                 reasoning="x",
                 entry_price=pct,
                 stop_loss=pct,
+                futures_execution_intent="abstain",
             )
             assert p.entry_price is None
             assert p.stop_loss is None
@@ -359,6 +412,7 @@ class TestNullishFloatCoercion:
             reasoning="x",
             entry_price="$1,234.50",
             stop_loss="1,180",
+            futures_execution_intent="abstain",
         )
         assert p.entry_price == 1234.50
         assert p.stop_loss == 1180.0
@@ -371,6 +425,7 @@ class TestNullishFloatCoercion:
             reasoning="downgrade on margin compression",
             entry_price="612.40",
             stop_loss="15%",
+            futures_execution_intent="abstain",
         )
         assert p.action is TraderAction.SELL
         assert p.entry_price == 612.40
@@ -422,6 +477,7 @@ def _structured_trader_llm(captured: dict, proposal: TraderProposal | None = Non
         proposal = TraderProposal(
             action=TraderAction.BUY,
             reasoning="Strong setup.",
+            futures_execution_intent="abstain",
         )
     structured = MagicMock()
     structured.invoke.side_effect = lambda prompt: (
@@ -533,6 +589,7 @@ class TestTraderAgent:
             entry_price=189.5,
             stop_loss=178.0,
             position_sizing="6% of portfolio",
+            futures_execution_intent="abstain",
         )
         llm = _structured_trader_llm(captured, proposal)
         trader = create_trader(llm)
@@ -608,6 +665,32 @@ class TestTraderAgent:
         trader = create_trader(llm)
         result = trader(_make_trader_state())
         assert result["trader_investment_plan"] == plain_response
+
+    def test_non_crypto_retry_asks_for_the_required_intent(self):
+        """The intent is required on every run, but a non-crypto prompt never
+        mentions futures; the retry must name it or the proposal is lost."""
+        prompts = []
+
+        def fake_invoke(prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                TraderProposal.model_validate({"action": "Buy", "reasoning": "r"})
+            return TraderProposal(
+                action=TraderAction.BUY, reasoning="r", futures_execution_intent="abstain",
+            )
+
+        structured = MagicMock()
+        structured.invoke.side_effect = fake_invoke
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        llm.invoke.return_value = MagicMock(content="prose fallback")
+
+        result = create_trader(llm)(_make_trader_state())
+
+        assert len(prompts) == 2, "the required intent must trigger one structured retry"
+        assert "futures_execution_intent" in str(prompts[1])
+        assert result["trader_decision_telemetry"]["structured_output"] is True
+        assert result["trader_decision_telemetry"]["action"] == "Buy"
 
 
 # ---------------------------------------------------------------------------
@@ -821,15 +904,25 @@ class TestSentimentAnalystAgent:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("source", [
-    pytest.param(lambda: ResearchPlan.model_fields["recommendation"].description, id="ResearchPlan.recommendation"),
-    pytest.param(lambda: PortfolioDecision.model_fields["rating"].description, id="PortfolioDecision.rating"),
+    # The per-field descriptions moved onto the shared PortfolioRating
+    # docstring; assert the RENDERED schema text, so the check fails if
+    # Pydantic ever stops turning that docstring into a description.
+    pytest.param(
+        lambda: ResearchPlan.model_json_schema()["$defs"]["PortfolioRating"]["description"],
+        id="ResearchPlan schema description",
+    ),
+    pytest.param(
+        lambda: PortfolioDecision.model_json_schema()["$defs"]["PortfolioRating"]["description"],
+        id="PortfolioDecision schema description",
+    ),
     pytest.param(lambda: inspect.getsource(create_research_manager), id="research_manager prompt"),
     pytest.param(lambda: inspect.getsource(create_portfolio_manager), id="portfolio_manager prompt"),
 ])
 def test_conflict_alone_is_not_a_hold_trigger(source):
     # The debate always contains conflicting arguments, so a Hold condition that
     # conflict satisfies fires on every run and swallows directional calls
-    # (#1321). All four decision sites must state the same rule.
+    # (#1321). Every decision site must state the same rule: the shared
+    # PortfolioRating docstring (RM recommendation + PM rating) and the prompts.
     text = " ".join(source().split())
     assert "conflict alone is not a reason to Hold" in text or \
         "Conflicting arguments alone are not a reason to Hold" in text
@@ -845,7 +938,8 @@ def test_a_price_written_as_a_range_drops_only_that_field(written):
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 
     decision = PortfolioDecision(rating=PortfolioRating.BUY, executive_summary="s",
-                                 investment_thesis="t", price_target=written)
+                                 investment_thesis="t", price_target=written,
+                                 futures_execution_intent="abstain")
     assert decision.price_target is None
 
 
@@ -854,7 +948,8 @@ def test_a_price_that_is_a_number_survives():
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 
     decision = PortfolioDecision(rating=PortfolioRating.BUY, executive_summary="s",
-                                 investment_thesis="t", price_target="$1,150.25")
+                                 investment_thesis="t", price_target="$1,150.25",
+                                 futures_execution_intent="abstain")
     assert decision.price_target == 1150.25
 
 
@@ -864,7 +959,8 @@ def test_a_field_the_model_did_not_give_says_so():
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating, render_pm_decision
 
     rendered = render_pm_decision(PortfolioDecision(
-        rating=PortfolioRating.HOLD, executive_summary="s", investment_thesis="t"))
+        rating=PortfolioRating.HOLD, executive_summary="s", investment_thesis="t",
+        futures_execution_intent="abstain"))
     assert "Price Target" in rendered and "not provided" in rendered.lower()
 
 
@@ -872,9 +968,49 @@ def test_a_field_the_model_did_not_give_says_so():
 def test_the_trader_names_the_levels_it_did_not_give():
     from tradingagents.agents.schemas import TraderAction, TraderProposal, render_trader_proposal
 
-    rendered = render_trader_proposal(TraderProposal(action=TraderAction.HOLD, reasoning="r"))
+    rendered = render_trader_proposal(TraderProposal(
+        action=TraderAction.HOLD, reasoning="r", futures_execution_intent="abstain"))
     for field in ("Entry Price", "Stop Loss", "Position Sizing"):
         assert field in rendered
     # Entry/stop/take-profit/position-sizing plus the futures-execution line
     # all name themselves even when the model omitted them.
     assert rendered.lower().count("not provided") == 5
+
+
+# ---------------------------------------------------------------------------
+# JSON schema shape: every $ref node must be bare
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestJsonSchemaRefClean:
+    """The relay (Responses API) rejects a json_schema binding when any $ref
+    node carries side keywords ("Invalid schema ... $ref cannot have keywords
+    {'description', 'default'}"). Pydantic emits $ref + side-keys when an
+    enum-typed field is wrapped in Field(description=/default=) or given a
+    default: keep those annotations bare, with the guidance moved onto the
+    enum docstrings (rendered into $defs) and the prompts.
+    """
+
+    @staticmethod
+    def _side_keys_on_ref_nodes(node):
+        """Recursively walk dict/list schema nodes; return the side keys found
+        on every dict that holds a "$ref" key."""
+        hits = []
+        if isinstance(node, dict):
+            if "$ref" in node and len(node) > 1:
+                hits.append(sorted(set(node) - {"$ref"}))
+            for value in node.values():
+                hits.extend(TestJsonSchemaRefClean._side_keys_on_ref_nodes(value))
+        elif isinstance(node, list):
+            for item in node:
+                hits.extend(TestJsonSchemaRefClean._side_keys_on_ref_nodes(item))
+        return hits
+
+    @pytest.mark.parametrize("model", [PortfolioDecision, TraderProposal, ResearchPlan, SentimentReport])
+    def test_no_ref_node_carries_side_keywords(self, model):
+        offenders = self._side_keys_on_ref_nodes(model.model_json_schema())
+        assert offenders == [], (
+            f"{model.__name__} emits $ref nodes with side keywords, which the "
+            f"relay rejects as an invalid json_schema binding: {offenders}"
+        )
