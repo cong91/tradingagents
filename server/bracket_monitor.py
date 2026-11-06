@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 
 from server import job_store
@@ -15,6 +16,51 @@ logger = logging.getLogger(__name__)
 MONITOR_INTERVAL_SECONDS = 30
 _stop_event = threading.Event()
 _monitor_thread: threading.Thread | None = None
+_ENTRY_INTENT_PREFIX = "entry-intent:"
+_SUCCESSFUL_ENTRY_STATUSES = {"completed", "already_reconciled"}
+_LOCK_BUSY_STATUS = "lock_busy"
+
+
+def _entry_status_reason(status: str) -> str:
+    if not isinstance(status, str):
+        return "unresolved"
+    if status.startswith("error:"):
+        parts = status.split(":", 2)
+        if len(parts) > 1 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", parts[1]):
+            return f"error:{parts[1]}"
+        return "error"
+    if re.fullmatch(r"[a-z][a-z0-9_]*", status):
+        return status
+    return "unresolved"
+
+
+def _entry_error_reason(exc: Exception) -> str:
+    from tradingagents.execution.futures_operation_lock import OperationLockBusyError
+
+    if isinstance(exc, OperationLockBusyError):
+        return _LOCK_BUSY_STATUS
+    return f"error:{type(exc).__name__}"
+
+
+def _log_entry_outcome(task: dict, status: str, *, exception: Exception | None = None) -> None:
+    symbol_value = task.get("symbol")
+    symbol = symbol_value if isinstance(symbol_value, str) and symbol_value.strip() else "unknown"
+    if exception is not None:
+        reason = _entry_error_reason(exception)
+    else:
+        reason = _entry_status_reason(status)
+    if reason in _SUCCESSFUL_ENTRY_STATUSES:
+        return
+    if reason == _LOCK_BUSY_STATUS:
+        logger.warning(
+            "Entry reconciliation deferred for %s (%s); symbol lock is busy",
+            symbol, reason,
+        )
+        return
+    logger.error(
+        "Entry reconciliation deferred for %s (%s); verify venue protection manually",
+        symbol, reason,
+    )
 
 
 def _env_flag(name: str) -> bool:
@@ -39,16 +85,25 @@ def poll_active_brackets() -> list[dict]:
     outcomes = []
     deferred_counts: dict[str, int] = {}
     for task in tasks:
+        is_entry_intent = task["task_id"].startswith(_ENTRY_INTENT_PREFIX)
+        exception = None
         try:
-            if task["status"] == "pending" and can_recover:
+            if is_entry_intent:
+                status = executor.monitor_bracket(task["task_id"])
+            elif task["status"] == "pending" and can_recover:
                 status = executor.recover_bracket(task["task_id"], confirm=True)
             else:
                 status = executor.monitor_bracket(task["task_id"])
         except Exception as exc:
             status = f"error:{type(exc).__name__}:{exc}"
-            logger.warning("bracket reconciliation failed for %s: %s", task["task_id"], exc)
+            if is_entry_intent:
+                exception = exc
+            else:
+                logger.warning("bracket reconciliation failed for %s: %s", task["task_id"], exc)
         outcomes.append({"task_id": task["task_id"], "status": status})
-        if status in {
+        if is_entry_intent:
+            _log_entry_outcome(task, status, exception=exception)
+        elif status in {
             "account_identity_unknown", "account_identity_mismatch",
             "entry_reconciliation_required", "venue_mismatch",
         }:

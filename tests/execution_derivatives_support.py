@@ -76,6 +76,12 @@ class FakeDerivExchange:
         self.calls.append(("amount_to_precision", symbol, amount))
         return f"{float(amount):.6f}"
 
+    def price_to_precision(self, symbol, price):
+        if not self._markets_loaded:
+            raise ccxt.ExchangeError("fake markets not loaded")
+        self.calls.append(("price_to_precision", symbol, price))
+        return f"{float(price):.6f}"
+
     def set_leverage(self, leverage, symbol, params=None):
         self.calls.append(("set_leverage", leverage, symbol))
 

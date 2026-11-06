@@ -701,6 +701,29 @@ def test_ladder_places_full_size_stop_and_partial_targets():
     assert all(call[4]["workingType"] == "MARK_PRICE" for call in creates)
 
 
+def test_filled_leg_does_not_cancel_sibling_while_entry_is_unresolved():
+    manager, _bridge, exchange, task_id = _bracket()
+    task = job_store.load_bracket_recovery(task_id)
+    stop_id, target_id = task["placed_ids"]
+    exchange._confirm_child_fill(target_id)
+    intent_id = "entry-intent:BTC/USDT:USDT:entry-partial"
+    assert job_store.create_bracket_recovery(
+        intent_id, symbol=task["symbol"], entry_order_id="entry-partial",
+        close_side=task["close_side"], quantity=task["quantity"],
+        legs=[{"name": "entry-intent", "status": "uncertain", "order_id": "entry-1",
+               "client_order_id": "entry-partial"}],
+        now=datetime.now(UTC).isoformat(),
+    )
+    before = len(exchange.calls)
+
+    assert manager.reconcile(task_id, repair_missing=False, allow_sibling_cancel=True) == "monitoring"
+    assert not [call for call in exchange.calls[before:] if call[0] == "cancel"]
+    stored = job_store.load_bracket_recovery(task_id)
+    assert stored["legs"][0]["order_id"] == stop_id
+    assert stored["legs"][0]["status"] == "placed"
+    assert "entry reconciliation required" in stored["last_error"]
+
+
 def test_filled_tranche_keeps_the_rest_of_the_ladder_and_resizes_the_stop():
     manager, _bridge, exchange, task_id = _ladder()
     task = job_store.load_bracket_recovery(task_id)

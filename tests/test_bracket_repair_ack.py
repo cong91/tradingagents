@@ -8,6 +8,7 @@ import pytest
 from server import job_store
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.exchange_client import venue_key
+from tradingagents.execution.futures_operation_lock import operation_lock
 
 pytestmark = pytest.mark.unit
 
@@ -149,11 +150,17 @@ def _pending_task(exchange, *, legs=None):
     return BracketManager(bridge), bridge, task_id
 
 
+def _repair_with_lock(manager, exchange, task_id):
+    task = job_store.load_bracket_recovery(task_id)
+    with operation_lock(task["symbol"]):
+        return manager._repair(exchange, task)
+
+
 def test_repair_ack_with_expired_order_is_not_reported_monitoring():
     exchange = _Exchange(repair_status="EXPIRED")
     manager, _bridge, task_id = _pending_task(exchange)
 
-    result = manager._repair(exchange, job_store.load_bracket_recovery(task_id))
+    result = _repair_with_lock(manager, exchange, task_id)
 
     stored = job_store.load_bracket_recovery(task_id)
     assert result == "reconcile_incomplete"
@@ -175,7 +182,7 @@ def test_repair_ack_with_mismatched_read_stays_uncertain_without_emergency_close
         return result
 
     exchange.fetch_order = mismatched_fetch
-    result = manager._repair(exchange, job_store.load_bracket_recovery(task_id))
+    result = _repair_with_lock(manager, exchange, task_id)
 
     stored = job_store.load_bracket_recovery(task_id)
     assert result == "reconcile_incomplete"
@@ -193,7 +200,7 @@ def test_unverified_repair_ack_is_reconciled_without_duplicate_submit():
     exchange = _Exchange(fail_verification=True)
     manager, _bridge, task_id = _pending_task(exchange)
 
-    result = manager._repair(exchange, job_store.load_bracket_recovery(task_id))
+    result = _repair_with_lock(manager, exchange, task_id)
 
     uncertain = job_store.load_bracket_recovery(task_id)
     assert result == "reconcile_incomplete"
@@ -288,7 +295,7 @@ def test_lost_repair_ack_is_found_by_client_id_without_duplicate_submit():
     exchange = _Exchange(lose_ack=True)
     manager, bridge, task_id = _pending_task(exchange)
 
-    assert manager._repair(exchange, job_store.load_bracket_recovery(task_id)) == "reconcile_incomplete"
+    assert _repair_with_lock(manager, exchange, task_id) == "reconcile_incomplete"
     uncertain = job_store.load_bracket_recovery(task_id)
     assert uncertain["status"] == "submission_uncertain"
     assert uncertain["legs"][0]["order_id"] is None
@@ -531,7 +538,7 @@ def test_repair_ack_terminal_without_quantity_stays_uncertain(raw_status):
     exchange = _Exchange(repair_status=raw_status)
     manager, _bridge, task_id = _pending_task(exchange)
 
-    assert manager._repair(exchange, job_store.load_bracket_recovery(task_id)) == "reconcile_incomplete"
+    assert _repair_with_lock(manager, exchange, task_id) == "reconcile_incomplete"
     stored = job_store.load_bracket_recovery(task_id)
     assert stored["status"] == "submission_uncertain"
     assert stored["legs"][0]["status"] == "uncertain"
@@ -694,7 +701,7 @@ def test_repair_immediate_terminal_ack_requires_child_evidence():
     exchange.fetch_order = fetch_with_failed_child
     manager, _bridge, task_id = _pending_task(exchange)
 
-    assert manager._repair(exchange, job_store.load_bracket_recovery(task_id)) == "reconcile_incomplete"
+    assert _repair_with_lock(manager, exchange, task_id) == "reconcile_incomplete"
     stored = job_store.load_bracket_recovery(task_id)
     assert stored["legs"][0]["status"] == "uncertain"
     assert stored["legs"][0]["order_id"] == "1"

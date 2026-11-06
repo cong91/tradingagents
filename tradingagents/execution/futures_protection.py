@@ -17,6 +17,7 @@ from tradingagents.execution.futures_funding import (
     fetch_funding_income,
     funding_schedule,
 )
+from tradingagents.execution.futures_operation_lock import operation_lock
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -128,13 +129,70 @@ def _manage_one(
     position_key = state["position_key"]
     if not state.get("bracket_task_id"):
         return {"position_key": position_key, "status": "missing_bracket_link"}
-    owner = job_store.acquire_position_monitor_lease(position_key)
-    if owner is None:
-        return {"position_key": position_key, "status": "lease_busy"}
+    symbol, _side = _position_identity(position_key, state.get("snapshot") or {})
     try:
-        return _manage_one_with_lease(bridge, state, position_map, allow_mutation, config)
-    finally:
-        job_store.release_position_monitor_lease(position_key, owner)
+        with operation_lock(symbol) as guard:
+            guard.check()
+            owner = job_store.acquire_position_monitor_lease(position_key)
+            if owner is None:
+                return {"position_key": position_key, "status": "lease_busy"}
+            try:
+                guard.check()
+                current = job_store.load_position_state(position_key)
+                if current is None:
+                    return {"position_key": position_key, "status": "position_unknown"}
+                current = {"position_key": position_key, **current}
+                refreshed_observation = observe_futures_positions(bridge)
+                if refreshed_observation.unknown_scope or symbol in refreshed_observation.unknown_symbols:
+                    return {"position_key": position_key, "status": "position_unknown"}
+                refreshed_map = _position_map(tuple(
+                    position for position in refreshed_observation.positions
+                    if position.symbol not in refreshed_observation.unknown_symbols
+                ))
+                if any(
+                    item.get("symbol") == symbol
+                    and str(item.get("task_id") or "").startswith("entry-intent:")
+                    for item in job_store.active_bracket_recoveries()
+                ):
+                    return {"position_key": position_key, "status": "entry_reconciliation_required"}
+                if (symbol, _side) not in refreshed_map and refreshed_observation.scope_complete:
+                    task = job_store.load_bracket_recovery(current["bracket_task_id"])
+                    if (
+                        allow_mutation
+                        and task is not None
+                        and task.get("status") in {"reconciled_stop_loss", "reconciled_take_profit"}
+                        and task.get("symbol") == symbol
+                        and task.get("entry_order_id") == current.get("entry_order_id")
+                        and task.get("close_side") == ("sell" if _side == "long" else "buy")
+                        and task.get("venue_key") == venue_key(bridge)
+                        and not any(position.symbol == symbol for position in refreshed_observation.positions)
+                        and stored_account_identity(task) == stored_account_identity(current)
+                        and _identity_deferred_status(bridge, current) is None
+                        and any(leg.get("status") == "filled" for leg in task["legs"])
+                        and all(
+                            leg.get("status") in {"filled", "cancelled"}
+                            and not leg.get("retired_ids")
+                            and leg.get("replacement_price") is None
+                            for leg in task["legs"]
+                        )
+                    ):
+                        guard.check()
+                        deleted = job_store.delete_position_state(
+                            position_key, expected_revision=current["revision"],
+                        )
+                        return {"position_key": position_key,
+                                "status": "completed" if deleted else "revision_conflict"}
+                return _manage_one_with_lease(
+                    bridge, current, refreshed_map, allow_mutation, config,
+                )
+            finally:
+                guard.check()
+                job_store.release_position_monitor_lease(position_key, owner)
+    except Exception as exc:
+        return {
+            "position_key": position_key,
+            "status": f"operation_lock_error:{type(exc).__name__}",
+        }
 
 
 def _manage_one_with_lease(
@@ -233,6 +291,9 @@ def _advance_for_verified_account(
     quantity = abs(float(venue_position.quantity)) if venue_position.quantity is not None else 0.0
     mark = float(venue_position.mark_price)
     initial_stop = float(snapshot.get("initial_stop", snapshot.get("stop")))
+    precision = getattr(bridge.client(), "price_to_precision", None)
+    if callable(precision):
+        initial_stop = float(precision(symbol, initial_stop))
     stop_leg = next((leg for leg in task["legs"] if leg["name"] == "stop-loss"), None)
     target_legs = [leg for leg in task["legs"] if leg["name"].startswith("take-profit")]
     if stop_leg is None or not target_legs:

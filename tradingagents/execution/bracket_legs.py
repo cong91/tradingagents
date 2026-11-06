@@ -68,7 +68,15 @@ def matches(item: dict, task: dict, leg: dict, *, require_mark_price: bool = Fal
         return False
     if leg.get("replacement_order_id") and item_id != str(leg["replacement_order_id"]):
         return False
-    expected_client_id = leg.get("replacement_client_id") or leg.get("repair_client_id")
+    expected_client_id = (
+        leg.get("replacement_client_id")
+        or leg.get("repair_client_id")
+        or (
+            leg.get("client_order_id")
+            if not leg.get("order_id") and not leg.get("replacement_order_id")
+            else None
+        )
+    )
     if expected_client_id:
         client_ids = [value for value in (
             item.get("clientOrderId"), info(item).get("clientAlgoId"),

@@ -58,6 +58,7 @@ def poll_active_positions() -> list[dict]:
                 "account_identity_unknown", "account_identity_mismatch",
                 "missing_bracket_link", "missing_bracket_task",
                 "venue_mismatch", "bracket_identity_mismatch", "position_unknown",
+                "entry_reconciliation_required",
             }:
                 deferred_counts[status] = deferred_counts.get(status, 0) + 1
         for status, count in deferred_counts.items():
