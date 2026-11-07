@@ -77,7 +77,7 @@ def test_one_state_failure_does_not_stop_later_state(monitor_state, monkeypatch)
         def __init__(self, config):
             self._bridge = object()
 
-    def fake_manage(bridge, *, allow_mutation, config):
+    def fake_manage(bridge, *, allow_mutation, config, review_hook=None):
         calls.append((allow_mutation, config["risk_derivatives_profit_protection_enabled"]))
         return [
             {"position_key": "fails", "status": "error:RuntimeError:bad venue"},

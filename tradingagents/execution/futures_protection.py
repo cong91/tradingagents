@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from server import job_store
@@ -23,14 +24,27 @@ from tradingagents.execution.sizing import PlannedOrder
 
 logger = logging.getLogger(__name__)
 
+# A pending position review older than this is a dead worker (a restart or a
+# crash): the monitor reclaims it into the unavailable grace instead of
+# waiting forever for a verdict that will never land.
+_REVIEW_PENDING_TIMEOUT = timedelta(minutes=30.0)
+
 
 def manage_active_positions(
     bridge: Any,
     *,
     allow_mutation: bool,
     config: dict,
+    review_hook: Callable[[str, dict], None] | None = None,
 ) -> list[dict]:
-    """Advance every linked live position once, without creating new entries."""
+    """Advance every linked live position once, without creating new entries.
+
+    ``review_hook``, when wired, receives ``(position_key, payload)`` for a
+    past-deadline position below its minimum R: the analysis-backed time stop
+    asks a position review for a HOLD/CLOSE verdict instead of closing on the
+    spot. Without a hook (or with the review disabled) the mechanical close
+    is unchanged.
+    """
     states = job_store.active_position_states()
     if not states:
         return []
@@ -110,7 +124,7 @@ def manage_active_positions(
             if state["position_key"] in mark_status:
                 outcomes.append({"position_key": state["position_key"], "status": mark_status[state["position_key"]]})
                 continue
-            outcomes.append(_manage_one(bridge, state, position_map, allow_mutation, config))
+            outcomes.append(_manage_one(bridge, state, position_map, allow_mutation, config, review_hook))
         except Exception as exc:
             outcomes.append({
                 "position_key": state["position_key"],
@@ -125,6 +139,7 @@ def _manage_one(
     position_map: dict[tuple[str, str], FuturesPosition],
     allow_mutation: bool,
     config: dict,
+    review_hook: Callable[[str, dict], None] | None = None,
 ) -> dict:
     position_key = state["position_key"]
     if not state.get("bracket_task_id"):
@@ -183,7 +198,7 @@ def _manage_one(
                         return {"position_key": position_key,
                                 "status": "completed" if deleted else "revision_conflict"}
                 return _manage_one_with_lease(
-                    bridge, current, refreshed_map, allow_mutation, config,
+                    bridge, current, refreshed_map, allow_mutation, config, review_hook,
                 )
             finally:
                 guard.check()
@@ -201,6 +216,7 @@ def _manage_one_with_lease(
     position_map: dict[tuple[str, str], FuturesPosition],
     allow_mutation: bool,
     config: dict,
+    review_hook: Callable[[str, dict], None] | None = None,
 ) -> dict:
     position_key = state["position_key"]
     snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
@@ -239,7 +255,9 @@ def _manage_one_with_lease(
         return {"position_key": position_key, "status": "opened_at_unknown"}
     if deferred is not None:
         return {"position_key": position_key, "status": deferred}
-    return _advance_for_verified_account(bridge, state, task, position_map, allow_mutation, config)
+    return _advance_for_verified_account(
+        bridge, state, task, position_map, allow_mutation, config, review_hook,
+    )
 
 
 def _identity_deferred_status(bridge: Any, state: dict) -> str | None:
@@ -267,6 +285,7 @@ def _advance_for_verified_account(
     position_map: dict[tuple[str, str], FuturesPosition],
     allow_mutation: bool,
     config: dict,
+    review_hook: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """Policy logic; not reachable until account ownership is proven."""
     position_key = state["position_key"]
@@ -302,6 +321,29 @@ def _advance_for_verified_account(
     current_stop = float(stop_leg["params"]["stopLossPrice"])
     current_target = None if ladder else float(target_legs[0]["params"]["takeProfitPrice"])
     max_hold_hours = _positive_or_none(config.get("risk_derivatives_max_hold_hours", 72.0))
+    if max_hold_hours is not None and snapshot.get("time_stop_review_status") == "hold":
+        held_until = _parse_opened_at(snapshot.get("time_stop_review_until"))
+        if held_until is not None and held_until > observed_at:
+            # The reviewer granted a hold: the deadline moves to the granted
+            # time. Each new hold re-extends from the review moment, so the
+            # position is re-examined one interval at a time, never parked.
+            extension = max(0.0, (held_until - opened_at).total_seconds() / 3600.0)
+            max_hold_hours = max(max_hold_hours, extension)
+    if snapshot.get("time_stop_review_status") == "close":
+        # The position review decided to exit. Its verdict overrides every
+        # mechanical hold — the funding rescue included — because the review
+        # ran on fresher evidence than any standing rule.
+        review_last = snapshot.get("time_stop_review_last")
+        verdict_note = ""
+        if isinstance(review_last, dict) and review_last.get("reasoning"):
+            verdict_reason = str(review_last["reasoning"])[:300]
+            verdict_note = f"; review verdict close: {verdict_reason}"
+        return _close_time_stop(
+            bridge, state,
+            symbol=symbol, close_side=task["close_side"], contracts=contracts,
+            mark=mark,
+            reason=f"position review decided to close after {held_hours:.1f}h held{verdict_note}",
+        )
     policy_kwargs = {
         "side": side,
         "entry": entry,
@@ -377,6 +419,18 @@ def _advance_for_verified_account(
             if funding_note:
                 outcome["funding_note"] = funding_note
             return outcome
+        review_reason = _advance_time_stop_review(
+            bridge, state, task, snapshot, position_key, symbol, side,
+            entry=entry, mark=mark, contracts=contracts,
+            held_hours=held_hours, max_hold_hours=max_hold_hours,
+            cumulative_funding_r=cumulative_funding_r,
+            round_trip_fee_r=round_trip_fee_r, funding_note=funding_note,
+            config=config, review_hook=review_hook, observed_at=observed_at,
+        )
+        if isinstance(review_reason, dict):
+            # A review state transition already handled this tick (pending,
+            # requested, grace); its outcome dict carries the funding note.
+            return review_reason
         close_reason = (
             f"held {held_hours:.1f}h past {max_hold_hours}h without reaching "
             f"{config.get('risk_derivatives_time_stop_min_r', 1.0)}R"
@@ -387,24 +441,13 @@ def _advance_for_verified_account(
             )
         if funding_note:
             close_reason += f"; {funding_note}"
-        status = manager.close_position(bracket_task_id, reason="time_stop", allow_mutation=True)
-        if status != "time_stop_closed":
-            return {"position_key": position_key, "status": status}
-        job_store.delete_position_state(position_key, expected_revision=state["revision"])
-        audit = getattr(bridge, "audit_plan", None)
-        if callable(audit):
-            audit(
-                PlannedOrder(
-                    ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
-                    side=task["close_side"], quantity=contracts, estimated_price=mark,
-                    market="derivatives",
-                ),
-                action="time_stop_closed", confirmed=True, order_id=bracket_task_id,
-                reason=close_reason,
-                phase="execute",
-            )
-        outcome = {"position_key": position_key, "status": "time_stop_closed"}
-        if funding_note:
+        if review_reason:
+            close_reason += f"; {review_reason}"
+        outcome = _close_time_stop(
+            bridge, state, symbol=symbol, close_side=task["close_side"],
+            contracts=contracts, mark=mark, reason=close_reason,
+        )
+        if funding_note and outcome.get("status") == "time_stop_closed":
             outcome["funding_note"] = funding_note
         return outcome
     stop_changed = not _same(decision.stop, current_stop)
@@ -460,6 +503,217 @@ def _advance_for_verified_account(
         # Funding held the effective R above the minimum past the deadline.
         return {"position_key": position_key, "status": "time_stop_blocked_by_funding"}
     return {"position_key": position_key, "status": "updated" if stop_changed or target_changed or stop_size_changed or target_size_changed else "unchanged"}
+
+
+def _advance_time_stop_review(
+    bridge: Any,
+    state: dict,
+    task: dict,
+    snapshot: dict,
+    position_key: str,
+    symbol: str,
+    side: str,
+    *,
+    entry: float,
+    mark: float,
+    contracts: float,
+    held_hours: float,
+    max_hold_hours: float | None,
+    cumulative_funding_r: float | None,
+    round_trip_fee_r: float | None,
+    funding_note: str | None,
+    config: dict,
+    review_hook: Callable[[str, dict], None] | None,
+    observed_at: datetime,
+) -> dict | str:
+    """Advance the analyzed time stop for one past-deadline position.
+
+    Returns the outcome dict when a review state handled the tick (pending,
+    requested, or inside the unavailable grace), or the reason string a
+    mechanical close should record when the position must close now. The
+    review itself never runs inside the monitor's lock: this only persists
+    the request and hands it to the hook.
+    """
+    funding_outcome_note = {"funding_note": funding_note} if funding_note else {}
+    review_interval = _positive_or_none(
+        config.get("risk_derivatives_time_stop_review_interval_hours", 24.0),
+    )
+    if config.get("risk_derivatives_time_stop_review_enabled") is not True:
+        return "position review disabled"
+    if review_interval is None:
+        return "review interval misconfigured"
+    if review_hook is None:
+        return "position review unavailable"
+    grace_hours = _grace_hours(config)
+
+    review_status = snapshot.get("time_stop_review_status")
+    if review_status == "pending":
+        requested_at = _parse_opened_at(snapshot.get("time_stop_review_requested_at"))
+        if (
+            requested_at is not None
+            and observed_at - requested_at < _REVIEW_PENDING_TIMEOUT
+        ):
+            return {**funding_outcome_note, "position_key": position_key,
+                    "status": "time_stop_review_pending"}
+        # The review worker died or the process restarted: reclaim the stale
+        # request into the unavailable grace instead of waiting forever.
+        updated = {
+            **snapshot,
+            "phase": "time_stop_review_unavailable",
+            "observed_at": observed_at.isoformat(),
+            "time_stop_review_status": "unavailable",
+            "time_stop_review_until": (
+                observed_at + timedelta(hours=grace_hours)
+            ).isoformat(),
+            "time_stop_review_last": {
+                "at": observed_at.isoformat(),
+                "verdict": "unavailable",
+                "reasoning": (
+                    "review request timed out after "
+                    f"{_REVIEW_PENDING_TIMEOUT.total_seconds() / 60:.0f}m"
+                ),
+            },
+        }
+        if not job_store.save_position_state(
+            position_key, state["revision"], {**state, "snapshot": updated},
+        ):
+            return {"position_key": position_key, "status": "revision_conflict"}
+        _audit_review_event(
+            bridge, task, bracket_task_id=state["bracket_task_id"],
+            symbol=symbol, contracts=contracts, mark=mark,
+            action="time_stop_review_unavailable",
+            reason=f"review timed out; closing in {grace_hours:.1f}h grace",
+        )
+        return {**funding_outcome_note, "position_key": position_key,
+                "status": "time_stop_review_grace"}
+    if review_status == "unavailable":
+        grace_until = _parse_opened_at(snapshot.get("time_stop_review_until"))
+        if grace_until is not None and observed_at < grace_until:
+            return {**funding_outcome_note, "position_key": position_key,
+                    "status": "time_stop_review_grace"}
+        return "position review unavailable; grace expired"
+
+    # No verdict yet, or a hold whose granted extension has lapsed: ask the
+    # reviewer again. The persisted pending state deduplicates across ticks
+    # even if this process dies mid-request.
+    updated = {
+        **snapshot,
+        "phase": "time_stop_review_pending",
+        "observed_at": observed_at.isoformat(),
+        "time_stop_review_status": "pending",
+        "time_stop_review_requested_at": observed_at.isoformat(),
+    }
+    if not job_store.save_position_state(
+        position_key, state["revision"], {**state, "snapshot": updated},
+    ):
+        return {"position_key": position_key, "status": "revision_conflict"}
+    try:
+        review_hook(position_key, {
+            "position_key": position_key,
+            "bracket_task_id": state.get("bracket_task_id"),
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "mark": mark,
+            "contracts": contracts,
+            "held_hours": round(held_hours, 3),
+            "max_hold_hours": max_hold_hours,
+            "time_stop_min_r": float(config.get("risk_derivatives_time_stop_min_r", 1.0)),
+            "favorable_r": _favorable_r(snapshot, side, entry, mark),
+            "funding_r": cumulative_funding_r,
+            "fee_r": round_trip_fee_r,
+            "funding_note": funding_note,
+            "completed_targets": snapshot.get("completed_targets"),
+            "close_side": task.get("close_side"),
+        })
+    except Exception:
+        # The persisted pending request goes stale and is reclaimed on a
+        # later tick, so a hook crash must not close the position cold.
+        logger.exception("position review request failed for %s", position_key)
+    return {**funding_outcome_note, "position_key": position_key,
+            "status": "time_stop_review_requested"}
+
+
+def _close_time_stop(
+    bridge: Any,
+    state: dict,
+    *,
+    symbol: str,
+    close_side: str,
+    contracts: float,
+    mark: float,
+    reason: str,
+) -> dict:
+    """The mechanical time-stop close: reduceOnly market close, legs
+    cancelled, durable state removed, audit written."""
+    position_key = state["position_key"]
+    bracket_task_id = state["bracket_task_id"]
+    status = BracketManager(bridge).close_position(
+        bracket_task_id, reason="time_stop", allow_mutation=True,
+    )
+    if status != "time_stop_closed":
+        return {"position_key": position_key, "status": status}
+    job_store.delete_position_state(position_key, expected_revision=state["revision"])
+    audit = getattr(bridge, "audit_plan", None)
+    if callable(audit):
+        audit(
+            PlannedOrder(
+                ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
+                side=close_side, quantity=contracts, estimated_price=mark,
+                market="derivatives",
+            ),
+            action="time_stop_closed", confirmed=True, order_id=bracket_task_id,
+            reason=reason, phase="execute",
+        )
+    return {"position_key": position_key, "status": "time_stop_closed"}
+
+
+def _audit_review_event(
+    bridge: Any,
+    task: dict,
+    *,
+    bracket_task_id: str,
+    symbol: str,
+    contracts: float,
+    mark: float,
+    action: str,
+    reason: str,
+) -> None:
+    audit = getattr(bridge, "audit_plan", None)
+    if not callable(audit):
+        return
+    audit(
+        PlannedOrder(
+            ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
+            side=task["close_side"], quantity=contracts, estimated_price=mark,
+            market="derivatives",
+        ),
+        action=action, confirmed=True, order_id=bracket_task_id,
+        reason=reason, phase="execute",
+    )
+
+
+def _grace_hours(config: dict) -> float:
+    """The unavailable-grace window; anything unusable reads as no grace."""
+    try:
+        grace = float(config.get("risk_derivatives_time_stop_review_grace_hours", 6.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return grace if math.isfinite(grace) and grace > 0 else 0.0
+
+
+def _favorable_r(snapshot: dict, side: str, entry: float, mark: float) -> float | None:
+    """Price PnL in initial-risk units, or None when the geometry is unusable."""
+    try:
+        initial_stop = float(snapshot.get("initial_stop", snapshot.get("stop")))
+    except (TypeError, ValueError):
+        return None
+    risk = abs(entry - initial_stop)
+    if risk <= 0 or not math.isfinite(risk):
+        return None
+    favorable = mark - entry if side == "long" else entry - mark
+    value = favorable / risk
+    return value if math.isfinite(value) else None
 
 
 def _parse_opened_at(value: Any) -> datetime | None:

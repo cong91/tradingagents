@@ -17,6 +17,8 @@ const ACTION_VARIANTS: Record<string, "outline" | "secondary" | "destructive"> =
   derivatives_denied: "destructive",
   time_stop_closed: "secondary",
   time_stop_postponed: "secondary",
+  time_stop_review_hold: "secondary",
+  time_stop_review_unavailable: "destructive",
   position_state_failed: "destructive",
   scale_out_refused: "destructive",
   no_order: "secondary",
