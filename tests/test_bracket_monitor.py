@@ -119,6 +119,21 @@ def test_pending_recovery_requires_all_live_and_derivatives_gates(
         assert calls["monitor"] == ["pending"]
 
 
+def test_pending_entry_intent_uses_read_only_monitor_even_when_live(monitor_state, monkeypatch):
+    intent_id = "entry-intent:BTC/USDT:USDT:entry-pending"
+    _create_task(intent_id)
+    set_config({"exec_derivatives": True, "exec_live": True})
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+    calls = _install_executor(monkeypatch)
+
+    results = bracket_monitor.poll_active_brackets()
+
+    assert results == [{"task_id": intent_id, "status": f"monitored:{intent_id}"}]
+    assert calls["recover"] == []
+    assert calls["monitor"] == [intent_id]
+
+
 def test_monitoring_tasks_dispatch_to_monitor_when_live_gates_are_open(
     monitor_state, monkeypatch
 ):

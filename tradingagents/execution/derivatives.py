@@ -42,6 +42,13 @@ from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution import futures_identity
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
+from tradingagents.execution.exchange_client import venue_key
+from tradingagents.execution.futures_entry_journal import (
+    create_guarded_entry_intent,
+    entry_journal_leg,
+    update_guarded_entry_intent,
+)
+from tradingagents.execution.futures_operation_lock import OperationGuard, operation_lock
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
     risk_limited_quantity,
@@ -52,6 +59,40 @@ from tradingagents.execution.sizing import PlannedOrder, SizingRules
 from tradingagents.portfolio import PortfolioContext
 
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
+
+
+def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrder, exchange: Any) -> None:
+    from server.futures_decision_context import build_futures_portfolio
+    from tradingagents.execution.futures_account import (
+        observe_futures_positions,
+        read_futures_balance,
+    )
+
+    snapshot = read_futures_balance(executor._bridge)
+    if executor._bridge.client() is not exchange:
+        raise ValueError("futures client changed during account read")
+    positions = observe_futures_positions(executor._bridge)
+    if executor._bridge.client() is not exchange:
+        raise ValueError("futures client changed during positions read")
+    if not positions.scope_complete or positions.unknown_scope or positions.unknown_symbols:
+        raise ValueError("futures position scope is unverified")
+    snapshot = replace(snapshot, positions=positions.positions)
+    if _positive_number(snapshot.equity) is None or not snapshot.equity_currency:
+        raise ValueError("futures equity or currency is unavailable")
+    portfolio = build_futures_portfolio(snapshot)
+    open_orders = exchange.fetch_open_orders(order.ccxt_symbol)
+    if executor._bridge.client() is not exchange:
+        raise ValueError("futures client changed during open order read")
+    if not isinstance(open_orders, list) or any(not isinstance(item, dict) for item in open_orders):
+        raise ValueError("open order response is invalid")
+    if open_orders:
+        raise ValueError("existing open orders make a new entry unsafe")
+    decision = executor.risk_guard.check(
+        order, portfolio, executor.config["exec_log_path"], fail_closed=True,
+    )
+    executor._record_risk_decision("execute_locked", decision)
+    if decision.halted or not decision.allowed:
+        raise PermissionError(f"risk guard refused execution: {decision.reason}")
 
 
 def _env_derivatives_flag() -> bool:
@@ -518,6 +559,29 @@ class DerivativesExecutor:
 
     def _execute_live(self, order: PlannedOrder, confirm: bool, identity: Any = None) -> str | None:
         exchange = self._bridge.client()
+        if not getattr(exchange, "apiKey", "") or not getattr(exchange, "secret", ""):
+            self._bridge.audit_plan(
+                order, action="derivatives_denied",
+                reason="missing exchange API credentials",
+                confirmed=confirm, phase="execute",
+            )
+            from tradingagents.execution.exchange_client import credential_env_names
+
+            key_env, secret_env = credential_env_names(
+                self._bridge.exchange_id, self._bridge.config.get("exec_base_url")
+            )
+            raise RuntimeError(
+                f"live derivatives execution requires {key_env} and {secret_env}; "
+                "nothing was sent"
+            )
+        with operation_lock(order.ccxt_symbol) as guard:
+            return self._execute_live_locked(order, confirm, identity, guard)
+
+    def _execute_live_locked(
+        self, order: PlannedOrder, confirm: bool, identity: Any, guard: OperationGuard,
+    ) -> str | None:
+        guard.check()
+        exchange = self._bridge.client()
         api_key = getattr(exchange, "apiKey", "") or ""
         secret = getattr(exchange, "secret", "") or ""
         if not api_key or not secret:
@@ -548,96 +612,138 @@ class DerivativesExecutor:
 
         entry_client_id = "entry-" + secrets.token_hex(12)
         intent_id = f"entry-intent:{order.ccxt_symbol}:{entry_client_id}"
-        job_store.create_bracket_recovery(
-            intent_id, symbol=order.ccxt_symbol, entry_order_id=entry_client_id,
-            close_side="sell" if order.side == "buy" else "buy",
-            quantity=float(order.quantity),
-            legs=[{"name": "entry-intent", "status": "uncertain", "order_id": None,
-                   "client_order_id": entry_client_id}],
-            now=datetime.now(UTC).isoformat(), identity=identity,
+        created_at = datetime.now(UTC).isoformat()
+        selected_venue = venue_key(self._bridge)
+        intent_leg = entry_journal_leg(
+            order, entry_client_id, quantity=str(order.quantity), created_at=created_at,
+            identity=identity, venue=selected_venue, config=self.config,
         )
-        if any(
-            task.get("symbol") == order.ccxt_symbol and task.get("task_id") != intent_id
-            for task in job_store.active_bracket_recoveries()
-        ):
-            job_store.update_bracket_recovery(
-                intent_id, status="cancelled", placed_ids=[], attempts=0,
-                last_error="existing active task blocks entry", now=datetime.now(UTC).isoformat(),
+        try:
+            create_guarded_entry_intent(
+                guard, intent_id, order, entry_client_id, identity, selected_venue, intent_leg,
             )
-            raise self._refuse(order, "existing active task blocks entry", phase="execute")
+        except PermissionError as exc:
+            raise self._refuse(order, str(exc), phase="execute") from exc
         entry_sent = False
         try:
-            # load_markets first: ccxt's amount_to_precision requires the
-            # markets loaded (same precondition as the spot path).
+            guard.check()
+            exchange = self._bridge.client()
+            api_key = getattr(exchange, "apiKey", "") or ""
+            secret = getattr(exchange, "secret", "") or ""
+            if not api_key or not secret:
+                from tradingagents.execution.exchange_client import credential_env_names
+
+                key_env, secret_env = credential_env_names(
+                    self._bridge.exchange_id, self._bridge.config.get("exec_base_url")
+                )
+                raise RuntimeError(
+                    f"live derivatives execution requires {key_env} and {secret_env}; nothing was sent"
+                )
+            if futures_identity.compare_futures_account_identity(self._bridge, identity) \
+                    is not futures_identity.IdentityComparison.MATCH:
+                raise RuntimeError("futures account identity changed before entry; nothing was sent")
+            guard.check()
+            _refresh_live_risk_context(self, order, exchange)
+
+            # Precision depends on loaded market metadata; journal the exact
+            # venue string before margin, leverage, or order mutations.
+            guard.check()
             markets = exchange.load_markets()
+            if self._bridge.client() is not exchange:
+                raise ValueError("futures client changed while loading markets")
             resolved_symbol = self._bridge.futures_symbol_for(order.ticker, markets=markets)
             if resolved_symbol != order.ccxt_symbol:
                 raise ValueError(
                     f"futures market changed from {order.ccxt_symbol!r} to "
                     f"{resolved_symbol!r}; nothing was sent"
                 )
-            # Binance rejects reduceOnly in Hedge Mode, so the protective legs
-            # could not be placed. Other venues keep their existing contract;
-            # nothing extra is assumed about their position-mode API.
+            amount = exchange.amount_to_precision(order.ccxt_symbol, order.quantity)
+            intent_leg = entry_journal_leg(
+                order, entry_client_id, quantity=str(amount), created_at=created_at,
+                identity=identity, venue=selected_venue, config=self.config,
+            )
+            update_guarded_entry_intent(
+                guard, intent_id, status="submission_uncertain", leg=intent_leg,
+                order_id=None, error="exact rounded entry terms journaled before venue mutation",
+            )
+
             if self._bridge.exchange_id == "binance":
+                guard.check()
                 position_mode = exchange.fetch_position_mode(
                     order.ccxt_symbol, params={"subType": "linear"},
                 )
+                if self._bridge.client() is not exchange:
+                    raise ValueError("futures client changed during position-mode read")
                 if not isinstance(position_mode, dict) or position_mode.get("hedged") is not False:
                     raise ValueError(
                         "venue is in hedge mode (or reported no position mode); "
                         "reduceOnly protective legs need one-way mode; nothing was sent"
                     )
-            # Margin mode before leverage and before the entry: the venue
-            # refuses a margin-type change once a position exists, so the
-            # agent's choice must be applied (or refused) while flat. Binance
-            # answers -4046 when the symbol already carries that margin type;
-            # that is the desired end state, not a failure.
             if order.margin_mode is not None:
+                guard.check()
                 with contextlib.suppress(ccxt.MarginModeAlreadySet):
                     snapshot_observer.run(
                         self._bridge, exchange,
                         operation="set_margin_mode", symbol=order.ccxt_symbol,
-                        call=lambda: exchange.set_margin_mode(order.margin_mode, order.ccxt_symbol),
+                        call=lambda: (guard.check(), exchange.set_margin_mode(
+                            order.margin_mode, order.ccxt_symbol,
+                        ))[1],
                     )
-            # Always pin the leverage -- including 1x: skipping the call at
-            # 1x would leave the venue's per-symbol preset in charge of the
-            # real leverage.
+            guard.check()
             snapshot_observer.run(
                 self._bridge, exchange,
                 operation="set_leverage", symbol=order.ccxt_symbol,
-                call=lambda: exchange.set_leverage(int(order.leverage), order.ccxt_symbol),
+                call=lambda: (guard.check(), exchange.set_leverage(
+                    int(order.leverage), order.ccxt_symbol,
+                ))[1],
             )
-            amount = exchange.amount_to_precision(order.ccxt_symbol, order.quantity)
+            guard.check()
             entry_sent = True
             response = snapshot_observer.run(
                 self._bridge, exchange,
                 operation="create_futures_entry", symbol=order.ccxt_symbol,
-                call=lambda: exchange.create_order(
+                call=lambda: (guard.check(), exchange.create_order(
                     order.ccxt_symbol, "market", order.side, amount,
                     params={"clientOrderId": entry_client_id},
-                ),
+                ))[1],
             )
+            guard.check()
             order_id = response.get("id") if isinstance(response, dict) else None
-        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+        except (ccxt.NetworkError, ccxt.ExchangeError, RuntimeError, ValueError) as exc:
             if not entry_sent:
-                job_store.update_bracket_recovery(
-                    intent_id, status="cancelled", placed_ids=[], attempts=0,
-                    last_error="entry not submitted", now=datetime.now(UTC).isoformat(),
+                try:
+                    intent_leg["status"] = "cancelled"
+                    update_guarded_entry_intent(
+                        guard, intent_id, status="cancelled", leg=intent_leg,
+                        order_id=None, error=f"entry not submitted: {type(exc).__name__}",
+                    )
+                except Exception:
+                    pass
+            if isinstance(exc, (ccxt.NetworkError, ccxt.ExchangeError)):
+                self._bridge.audit_plan(
+                    order, action="rejected_at_execute",
+                    reason=f"exchange error: {exc}", confirmed=confirm, phase="execute",
                 )
+                raise RuntimeError(
+                    f"live derivatives order on {order.ccxt_symbol} failed: {exc}"
+                ) from exc
             self._bridge.audit_plan(
                 order, action="rejected_at_execute",
-                reason=f"exchange error: {exc}", confirmed=confirm, phase="execute",
+                reason=f"entry preflight or lock error: {exc!r}", confirmed=confirm, phase="execute",
             )
             raise RuntimeError(
-                f"live derivatives order on {order.ccxt_symbol} failed: {exc}"
+                f"live derivatives order on {order.ccxt_symbol} failed: {exc!r}"
             ) from exc
         except Exception as exc:  # safety #4: nothing escapes the path unaudited
             if not entry_sent:
-                job_store.update_bracket_recovery(
-                    intent_id, status="cancelled", placed_ids=[], attempts=0,
-                    last_error="entry not submitted", now=datetime.now(UTC).isoformat(),
-                )
+                try:
+                    intent_leg["status"] = "cancelled"
+                    update_guarded_entry_intent(
+                        guard, intent_id, status="cancelled", leg=intent_leg,
+                        order_id=None, error=f"entry not submitted: {type(exc).__name__}",
+                    )
+                except Exception:
+                    pass
             self._bridge.audit_plan(
                 order, action="rejected_at_execute",
                 reason=f"unexpected error: {exc!r}", confirmed=confirm, phase="execute",
@@ -646,8 +752,7 @@ class DerivativesExecutor:
                 f"live derivatives order on {order.ccxt_symbol} failed: {exc!r}"
             ) from exc
 
-        intent_leg = {"name": "entry-intent", "status": "uncertain", "order_id": order_id,
-                      "client_order_id": entry_client_id}
+        intent_leg.update(status="uncertain", order_id=order_id)
         response = response if isinstance(response, dict) else {}
         actual_quantity = _positive_number(response.get("filled"))
         actual_entry = _positive_number(response.get("average")) or _positive_number(response.get("price"))
@@ -721,13 +826,24 @@ class DerivativesExecutor:
         if order.stop_loss is not None or order.take_profit is not None:
             position_key = f"{order.ccxt_symbol}:{order.side}:{order_id or 'unknown'}"
             try:
+                rounded_stop = (
+                    float(exchange.price_to_precision(order.ccxt_symbol, order.stop_loss))
+                    if order.stop_loss is not None else actual_entry
+                )
+                if not math.isfinite(rounded_stop) or rounded_stop <= 0:
+                    raise ValueError("rounded stop is not finite and positive")
+                scale_out = self._scale_out_plan(actual_order)
+                target_prices = (
+                    [level.price for level in scale_out.levels] if scale_out is not None
+                    else [order.take_profit] if order.take_profit is not None else []
+                )
                 persisted = job_store.persist_futures_entry_state(
                     position_key,
                     side="long" if order.side == "buy" else "short",
                     entry=actual_entry,
                     quantity=actual_quantity,
-                    stop=float(order.stop_loss) if order.stop_loss is not None else actual_entry,
-                    targets=[float(order.take_profit)] if order.take_profit is not None else [],
+                    stop=rounded_stop,
+                    targets=[float(exchange.price_to_precision(order.ccxt_symbol, price)) for price in target_prices],
                     mark=actual_entry,
                     order_id=str(order_id) if order_id is not None else None,
                     identity=identity,
@@ -827,15 +943,27 @@ class DerivativesExecutor:
         )
 
     def monitor_bracket(self, task_id: str) -> str:
-        """Inspect protective exits; sibling cancellation requires both live gates."""
+        """Inspect protective exits; entry intents use read-only recovery first."""
         allow_cancel = (
             self.config.get("exec_derivatives") is True
             and _env_derivatives_flag()
             and self.effective_mode() == "live"
         )
-        return BracketManager(self._bridge).reconcile(
-            task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
-        )
+        task = job_store.load_bracket_recovery(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with operation_lock(task["symbol"]) as guard:
+            guard.check()
+            current = job_store.load_bracket_recovery(task_id)
+            if current is None:
+                raise KeyError(task_id)
+            if current["task_id"].startswith("entry-intent:"):
+                from tradingagents.execution.futures_entry_recovery import reconcile_entry
+
+                return reconcile_entry(self._bridge, task_id)
+            return BracketManager(self._bridge).reconcile(
+                task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
+            )
 
     def effective_mode(self) -> str:
         """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).

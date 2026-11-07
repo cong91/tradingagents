@@ -97,6 +97,11 @@ def test_cancel_binance_algo_success_response_is_terminal(tmp_path, monkeypatch)
     exchange.orders_by_id[take_id] = finished
     _register_child_fill(exchange, finished)
     exchange.cancel_response = {"info": {"algoId": stop_id, "code": "200", "msg": "success"}}
+    intent = next(task for task in store.active_bracket_recoveries() if task["task_id"].startswith("entry-intent:"))
+    store.update_bracket_recovery(
+        intent["task_id"], status="completed", placed_ids=intent["placed_ids"], attempts=0,
+        last_error=None, now=FROZEN_NOW.isoformat(),
+    )
 
     assert executor.recover_bracket(task_id) == "reconciled_take_profit"
     calls_before = len(exchange.calls)
@@ -130,6 +135,11 @@ def test_recorded_algo_id_is_not_replaced_by_same_trigger_order(tmp_path, monkey
     finished = _algo_order(take_id, order, kind="take-profit", status="FINISHED")
     exchange.orders_by_id[take_id] = finished
     _register_child_fill(exchange, finished)
+    intent = next(task for task in store.active_bracket_recoveries() if task["task_id"].startswith("entry-intent:"))
+    store.update_bracket_recovery(
+        intent["task_id"], status="completed", placed_ids=intent["placed_ids"], attempts=0,
+        last_error=None, now=FROZEN_NOW.isoformat(),
+    )
 
     assert executor.recover_bracket(task_id) == "reconciled_take_profit"
     assert [call[1] for call in exchange.calls if call[0] == "cancel_order"] == [stop_id]
@@ -205,16 +215,24 @@ def test_recovery_reconciles_existing_leg_without_duplicate(tmp_path, monkeypatc
     exchange = FakeDerivExchange(fail_bracket_calls=1)
     executor, order, task_id, store = _failed_bracket_task(tmp_path, monkeypatch, exchange)
     exchange.contracts = order.quantity  # the repair path requires a readable venue
+    task = store.load_bracket_recovery(task_id)
+    task["legs"][0]["status"] = "uncertain"
+    client_id = task["legs"][0]["client_order_id"]
+    store.update_bracket_recovery(
+        task_id, status="submission_uncertain", placed_ids=[], attempts=0,
+        last_error="simulated lost ACK", now=FROZEN_NOW.isoformat(), legs=task["legs"],
+    )
     exchange.open_orders = [{
         "id": "existing-stop", "symbol": order.ccxt_symbol, "side": "sell",
         "amount": order.quantity, "type": "market", "status": "open",
         "info": {
-            "algoId": "existing-stop", "symbol": "BTCUSDT", "side": "SELL",
+            "algoId": "existing-stop", "clientAlgoId": client_id, "symbol": "BTCUSDT", "side": "SELL",
             "algoStatus": "NEW", "orderType": "STOP_MARKET",
             "triggerPrice": "48000", "quantity": str(order.quantity),
             "reduceOnly": True, "workingType": "MARK_PRICE",
         },
     }]
+    exchange.orders_by_id["existing-stop"] = exchange.open_orders[0]
 
     assert executor.recover_bracket(task_id) == "monitoring"
     recovered = [call for call in exchange.calls if call[0] == "create_order" and call[5] and ("stopLossPrice" in call[5] or "takeProfitPrice" in call[5])]
@@ -264,6 +282,11 @@ def test_recovery_cancels_open_sibling_after_algo_leg_finishes(tmp_path, monkeyp
         },
     }
 
+    intent = next(task for task in store.active_bracket_recoveries() if task["task_id"].startswith("entry-intent:"))
+    store.update_bracket_recovery(
+        intent["task_id"], status="completed", placed_ids=intent["placed_ids"], attempts=0,
+        last_error=None, now=FROZEN_NOW.isoformat(),
+    )
     assert executor.recover_bracket(task_id) == "reconciled_take_profit"
     assert ("cancel_order", stop_id, order.ccxt_symbol, {"trigger": True}) in exchange.calls
     task = store.load_bracket_recovery(task_id)
@@ -302,6 +325,11 @@ def test_monitor_is_read_only_when_live_gate_is_closed(tmp_path, monkeypatch):
         },
     }
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
+    intent = next(task for task in store.active_bracket_recoveries() if task["task_id"].startswith("entry-intent:"))
+    store.update_bracket_recovery(
+        intent["task_id"], status="completed", placed_ids=intent["placed_ids"], attempts=0,
+        last_error=None, now=FROZEN_NOW.isoformat(),
+    )
     calls_before = len(exchange.calls)
 
     assert executor.monitor_bracket(task_id) == "reconcile_incomplete"
@@ -417,12 +445,15 @@ def test_live_bracket_long_closes_sell_with_reduce_only(tmp_path, monkeypatch):
         executor.execute_order(order, confirm=True, portfolio=book)
     bracket_calls = [call for call in exchange.calls
                      if call[0] == "create_order" and call[5] and ("stopLossPrice" in call[5] or "takeProfitPrice" in call[5])]
-    assert bracket_calls == [
-        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
-         {"stopLossPrice": 48_000.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
-        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity,
-         {"takeProfitPrice": 55_000.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
+    assert [call[:5] for call in bracket_calls] == [
+        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity),
+        ("create_order", "BTC/USDT:USDT", "market", "sell", order.quantity),
     ]
+    assert [call[5]["stopLossPrice"] for call in bracket_calls if "stopLossPrice" in call[5]] == [48_000.0]
+    assert [call[5]["takeProfitPrice"] for call in bracket_calls if "takeProfitPrice" in call[5]] == [55_000.0]
+    assert all(call[5]["reduceOnly"] is True and call[5]["workingType"] == "MARK_PRICE" for call in bracket_calls)
+    client_ids = [call[5]["clientOrderId"] for call in bracket_calls]
+    assert len(set(client_ids)) == 2 and all(value.startswith("br-") for value in client_ids)
     actions = [event["action"] for event in read_audit(tmp_path)]
     assert "bracket_verification_required" in actions
 
@@ -446,12 +477,15 @@ def test_live_bracket_short_closes_buy_with_reduce_only(tmp_path, monkeypatch):
         executor.execute_order(order, confirm=True, portfolio=book)
     bracket_calls = [call for call in exchange.calls
                      if call[0] == "create_order" and call[5] and ("stopLossPrice" in call[5] or "takeProfitPrice" in call[5])]
-    assert bracket_calls == [
-        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
-         {"stopLossPrice": 52_000.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
-        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity,
-         {"takeProfitPrice": 45_000.0, "reduceOnly": True, "workingType": "MARK_PRICE"}),
+    assert [call[:5] for call in bracket_calls] == [
+        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity),
+        ("create_order", "BTC/USDT:USDT", "market", "buy", order.quantity),
     ]
+    assert [call[5]["stopLossPrice"] for call in bracket_calls if "stopLossPrice" in call[5]] == [52_000.0]
+    assert [call[5]["takeProfitPrice"] for call in bracket_calls if "takeProfitPrice" in call[5]] == [45_000.0]
+    assert all(call[5]["reduceOnly"] is True and call[5]["workingType"] == "MARK_PRICE" for call in bracket_calls)
+    client_ids = [call[5]["clientOrderId"] for call in bracket_calls]
+    assert len(set(client_ids)) == 2 and all(value.startswith("br-") for value in client_ids)
 
 
 def test_live_entry_without_bracket_is_refused_before_any_order(tmp_path, monkeypatch):
@@ -517,6 +551,17 @@ def test_live_entry_with_scale_out_places_two_tranches_and_a_runner(tmp_path, mo
     assert quantities[2] == pytest.approx(order.quantity * 0.33)
     assert quantities[1] + quantities[2] < order.quantity
     assert all(call[5]["workingType"] == "MARK_PRICE" for call in bracket_calls)
+    entry_task = next(
+        task for task in job_store.active_bracket_recoveries()
+        if task["task_id"].startswith("entry-intent:")
+    )
+    entry_id = entry_task["legs"][0]["order_id"]
+    state = job_store.load_position_state(f"{order.ccxt_symbol}:{order.side}:{entry_id}")
+    assert state["snapshot"]["targets"] == [
+        float(exchange.price_to_precision(order.ccxt_symbol, call[5]["takeProfitPrice"]))
+        for call in bracket_calls if "takeProfitPrice" in call[5]
+    ]
+
 
 def test_scale_out_disabled_keeps_the_single_target(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
