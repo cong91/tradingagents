@@ -35,8 +35,8 @@ export const vi = {
   feedTitle: "Luồng sự kiện",
   feedDescription:
     "Sự kiện mới nhất nằm cuối danh sách. Nếu mất kết nối, màn hình tự kết nối lại và nạp phần còn thiếu — bạn không cần làm gì.",
-  feedEmptyIdle: "Chưa có sự kiện nào — bắt đầu phiên để xem luồng agent.",
-  feedEmptyWaiting: "Đang chờ sự kiện đầu tiên từ pipeline…",
+  feedEmptyIdle: "Chưa có sự kiện nào — bắt đầu phiên để xem các bước phân tích chạy.",
+  feedEmptyWaiting: "Đang chờ sự kiện đầu tiên của phiên phân tích…",
   form: {
     tickerRequired: "Nhập mã tài sản, ví dụ BTC-USD hoặc NVDA.",
     dateRequired: "Chọn ngày phân tích.",
@@ -119,13 +119,13 @@ export const vi = {
     failedUnknown: "Phiên thất bại không rõ nguyên nhân.",
     interruptedUnknown: "Phiên bị gián đoạn trước khi hoàn tất.",
     runNotFound: (id: string) =>
-      `Không tìm thấy phiên ${id} trên backend (server có thể đã khởi động lại).`,
+      `Không tìm thấy phiên ${id} trên máy chủ (máy chủ có thể đã khởi động lại).`,
     backendDown:
       "Không kết nối được máy chủ. Khởi động chương trình TradingAgents rồi thử lại (lệnh khởi động xem ở trang Duyệt lệnh khi máy chủ lỗi).",
     postUnreadable: "Không đọc được phản hồi khi bắt đầu phiên.",
-    loadNetwork: "Không kết nối được backend khi tải phiên.",
+    loadNetwork: "Không kết nối được máy chủ khi tải phiên.",
     runGone: (id: string) =>
-      `Phiên ${id} không còn trên backend (server có thể đã khởi động lại — run chỉ lưu trong bộ nhớ).`,
+      `Phiên ${id} không còn trên máy chủ (máy chủ có thể đã khởi động lại — phiên chỉ lưu trong bộ nhớ).`,
     getUnreadable: "Không đọc được phản hồi khi tải phiên.",
   },
 };

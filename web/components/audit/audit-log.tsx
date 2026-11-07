@@ -62,7 +62,10 @@ function actionVariant(
 ): "default" | "secondary" | "destructive" | "outline" {
   switch (action) {
     case "buy":
+    case "approval_granted":
       return "default";
+    case "approval_denied":
+      return "destructive";
     case "sell":
     case "awaiting_approval":
     case "bracket_placed":
@@ -258,6 +261,7 @@ function ControlLineRow({ event }: { event: AuditEvent }) {
 }
 
 function SingleRow({ group }: { group: Extract<AuditGroup, { kind: "single" }> }) {
+  const t = useT();
   const { event } = group;
   return (
     <tr
@@ -271,8 +275,13 @@ function SingleRow({ group }: { group: Extract<AuditGroup, { kind: "single" }> }
       </td>
       <TickerCell ticker={event.ticker} />
       <td className="px-3 py-2">
-        <ActionCell event={event} />
-        <ModeBadges event={event} />
+        <div className="flex flex-col items-start gap-1">
+          <ActionCell event={event} />
+          {group.anomalous && (
+            <Badge variant="destructive">{t.audit.log.group.attentionBadge}</Badge>
+          )}
+          <ModeBadges event={event} />
+        </div>
       </td>
       <QtyPriceCell event={event} />
       <ReasonCell event={event} empty="—" />
@@ -284,6 +293,11 @@ function ClusterRow({ group }: { group: ClusterGroup }) {
   const t = useT();
   const c = t.audit.log;
   const [open, setOpen] = useState(group.anomalous);
+  // Refetch định kỳ có thể mang cluster bất thường mới về sau lần mount đầu:
+  // key hàng không đổi nên React tái dùng instance — mở theo anomalous hiện tại.
+  useEffect(() => {
+    if (group.anomalous) setOpen(true);
+  }, [group.anomalous]);
   const { main, steps } = group;
   const Chevron = open ? ChevronDownIcon : ChevronRightIcon;
   const mainAction = main.action ?? steps.find((step) => step.action)?.action ?? "";

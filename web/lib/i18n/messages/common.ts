@@ -37,10 +37,10 @@ export const vi = {
     closeMenu: "Đóng điều hướng chính",
   },
   execStatus: {
-    chipLive: "● LIVE — lệnh thật",
-    chipSafe: "● An toàn — lệnh thử",
-    chipChecking: "● Đang kiểm tra…",
-    chipUnknown: "● Không kiểm tra được",
+    chipLive: "LIVE — lệnh thật",
+    chipSafe: "An toàn — lệnh thử",
+    chipChecking: "Đang kiểm tra…",
+    chipUnknown: "Không kiểm tra được",
   },
   preferences: {
     title: "Giao diện",
@@ -90,10 +90,10 @@ export const en: typeof vi = {
     closeMenu: "Close main navigation",
   },
   execStatus: {
-    chipLive: "● LIVE — real orders",
-    chipSafe: "● Safe — practice orders",
-    chipChecking: "● Checking…",
-    chipUnknown: "● Status unknown",
+    chipLive: "LIVE — real orders",
+    chipSafe: "Safe — practice orders",
+    chipChecking: "Checking…",
+    chipUnknown: "Status unknown",
   },
   preferences: {
     title: "Interface",

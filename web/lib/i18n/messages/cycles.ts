@@ -120,7 +120,7 @@ export const vi = {
   noCycles: "Không có chu kỳ nào được ghi nhận.",
   totalLine: (total: number) => `Tổng ${total} chu kỳ đã ghi nhận`,
   clickHint: ". Click một mã để xem từng chu kỳ và lý do cụ thể.",
-  caption: "Kết quả chu kỳ autoloop theo mã",
+  caption: "Kết quả vòng tự động theo mã",
   colSymbol: "Mã",
   colCycles: "Chu kỳ",
   colBreakdown: "Sơ lược",

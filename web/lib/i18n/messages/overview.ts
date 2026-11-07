@@ -174,7 +174,7 @@ export const vi = {
     screened: (n: number) => `Đã sàng ${n} mã`,
     analysisRun: "Phiên phân tích",
     runReadError: (status: number) => `Không đọc được run đang hoạt động (HTTP ${status}).`,
-    autoloopReadError: "Không đọc được trạng thái autoloop.",
+    autoloopReadError: "Không đọc được trạng thái vòng tự động.",
     dailyReadError: "Không đọc được trạng thái job hằng ngày.",
     runFallbackError: "Không đọc được phiên phân tích đang hoạt động.",
     backendUnreachable: "Không kết nối được máy chủ TradingAgents.",

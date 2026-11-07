@@ -3,7 +3,7 @@
 import { Activity, Loader2, RefreshCw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { formatSymbol } from "@/lib/format";
 import {
   FuturesCycleFunnel,
@@ -68,12 +68,18 @@ export function FuturesAutoloopPanel() {
   const c = t.scanner.futures;
 
   return (
-    <Card>
+    // Heading thật (h2 + aria-labelledby) để phần này có mặt trong outline
+    // heading của trang — CardTitle chỉ render div.
+    <section aria-labelledby="futures-autoloop-title">
+      <Card>
       <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+        <h2
+          id="futures-autoloop-title"
+          className="flex items-center gap-2 font-heading text-base leading-snug font-medium"
+        >
           <Activity className="size-4" aria-hidden />
-          Futures autoloop
-        </CardTitle>
+          {c.autoloopTitle}
+        </h2>
         <CardDescription>
           {enabled ? c.enabled : c.disabled} · {runningCycle ? c.runningCycle : c.waiting}
           {intervalMinutes != null ? c.interval(intervalMinutes) : ""}{c.liveData}
@@ -106,7 +112,8 @@ export function FuturesAutoloopPanel() {
           {t.common.refresh}
         </Button>
       </CardContent>
-    </Card>
+      </Card>
+    </section>
   );
 }
 
@@ -141,8 +148,8 @@ function FuturesCycleRow({ cycle }: { cycle: FuturesCycle }) {
         <span className="text-xs text-muted-foreground">{formatTimestamp(cycle.updated_at)}</span>
       </div>
       <dl className="mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
-        <div><dt className="text-muted-foreground">Cycle</dt><dd className="font-mono break-all">{cycle.cycle_id}</dd></div>
-        <div><dt className="text-muted-foreground">Unified market</dt><dd className="font-mono break-all" title={unifiedSymbol ?? cycle.symbol}>{formatSymbol(unifiedSymbol ?? cycle.symbol)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.cycleId}</dt><dd className="font-mono break-all">{cycle.cycle_id}</dd></div>
+        <div><dt className="text-muted-foreground">{c.unifiedMarket}</dt><dd className="font-mono break-all" title={unifiedSymbol ?? cycle.symbol}>{formatSymbol(unifiedSymbol ?? cycle.symbol)}</dd></div>
         <div><dt className="text-muted-foreground">{c.candle4h}</dt><dd>{formatTimestamp(cycle.four_hour_open)} / {valueLabel(t, snapshot.four_hour_close)}</dd></div>
         <div><dt className="text-muted-foreground">{c.candle1h}</dt><dd>{formatTimestamp(cycle.one_hour_open)} / {valueLabel(t, snapshot.one_hour_close)}</dd></div>
         <div><dt className="text-muted-foreground">{c.dir1h}</dt><dd>{directionLabel(t, snapshot.one_hour_direction)}</dd></div>
@@ -153,13 +160,13 @@ function FuturesCycleRow({ cycle }: { cycle: FuturesCycle }) {
         <div><dt className="text-muted-foreground">{c.signalReason}</dt><dd>{label(t, payload.signal_reason)}</dd></div>
         <div><dt className="text-muted-foreground">{c.marketRejected}</dt><dd>{label(t, payload.market_rejection_reason)}</dd></div>
         <div><dt className="text-muted-foreground">{c.planReason}</dt><dd>{label(t, payload.plan_reason ?? plan.reason)}</dd></div>
-        <div><dt className="text-muted-foreground">Execution</dt><dd>{label(t, payload.execution_status)}</dd></div>
-        <div><dt className="text-muted-foreground">Entry / order</dt><dd>{payload.entry_order_id ?? payload.order_id ?? (payload.executed ? c.executed : c.noData)}</dd></div>
-        <div><dt className="text-muted-foreground">SL / TP</dt><dd>{numberLabel(t, plan.stop_loss)} / {numberLabel(t, plan.take_profit)}</dd></div>
-        <div><dt className="text-muted-foreground">Claim</dt><dd>{payload.claims?.map((claim) => claim.status ?? "claimed").join(", ") || (cycle.status === "claimed" ? "claimed" : c.noData)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.execution}</dt><dd>{label(t, payload.execution_status)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.entryOrder}</dt><dd>{payload.entry_order_id ?? payload.order_id ?? (payload.executed ? c.executed : c.noData)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.slTp}</dt><dd>{numberLabel(t, plan.stop_loss)} / {numberLabel(t, plan.take_profit)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.claim}</dt><dd>{payload.claims?.map((claim) => claim.status ?? "claimed").join(", ") || (cycle.status === "claimed" ? "claimed" : c.noData)}</dd></div>
         <div><dt className="text-muted-foreground">{c.protection}</dt><dd>{label(t, payload.protection_state)}</dd></div>
-        <div><dt className="text-muted-foreground">Position</dt><dd>{payload.position_state ? valueLabel(t, payload.position_state) : c.noData}</dd></div>
-        <div><dt className="text-muted-foreground">Recovery</dt><dd>{label(t, payload.recovery_state)}</dd></div>
+        <div><dt className="text-muted-foreground">{c.position}</dt><dd>{payload.position_state ? valueLabel(t, payload.position_state) : c.noData}</dd></div>
+        <div><dt className="text-muted-foreground">{c.recovery}</dt><dd>{label(t, payload.recovery_state)}</dd></div>
       </dl>
       {renderCandidates(t, payload.candidates)}
       <AgentDecisionNote note={payload.agent_decision_note} />

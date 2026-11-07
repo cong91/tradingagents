@@ -61,7 +61,6 @@ export function ExecStatusChipView({
     <div role="status" aria-live="polite" className="flex flex-wrap items-center gap-1.5">
       <Link
         href="/settings#exec-gates"
-        aria-label={label}
         className={cn(
           "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium",
           tone
@@ -70,6 +69,9 @@ export function ExecStatusChipView({
         {state.status === "loading" && (
           <LoaderCircleIcon className="size-3 shrink-0 animate-spin" aria-hidden="true" />
         )}
+        {/* Chấm trạng thái là trang trí: aria-hidden để screen reader không đọc "bullet",
+            chữ nhãn tự là tên truy cập của link. */}
+        <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-current" />
         <span className="truncate">{label}</span>
       </Link>
       {state.status === "error" && (
