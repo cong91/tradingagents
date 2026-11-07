@@ -1,6 +1,6 @@
 "use client";
 
-// State màn M3 cho watchlist (contract §2): load đầu tiên → ready/error,
+// State watchlist của phần quét trên /cycles (contract §2): load đầu tiên → ready/error,
 // add/remove qua POST/DELETE. Thao tác thêm/xóa là reversable nên không có
 // confirm-dialog; lỗi hành động hiển thị ngay tại form.
 import { useCallback, useEffect, useRef, useState } from "react";

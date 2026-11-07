@@ -6,37 +6,27 @@ export const vi = {
   overview: {
     title: "Tổng quan lợi nhuận",
     description:
-      "Alpha tích luỹ của các quyết định đã chốt, hiệu suất theo thời gian và lệnh thực thi gần đây — đọc trực tiếp từ backend qua /api/*.",
+      "Alpha tích luỹ của các quyết định đã chốt, hiệu suất theo thời gian và lệnh thực thi gần đây.",
   },
   approvals: {
     title: "Duyệt lệnh",
     description:
-      "Hàng đợi phê duyệt kế hoạch lệnh từ pipeline hằng ngày. Duyệt là con đường duy nhất đưa lệnh vào thực thi; từ chối không đụng sàn.",
+      "Hàng đợi phê duyệt kế hoạch lệnh do vòng quét hằng ngày của bot tạo ra. Duyệt là con đường duy nhất đưa lệnh vào thực thi; từ chối không đụng sàn.",
   },
   audit: {
-    title: "Lịch sử & Audit",
+    title: "Lịch sử & quyết định",
     description:
-      "Nhật ký kiểm soát thực thi, quyết định đã lưu và tổng kết backtest. Màn chỉ đọc — mọi hành động đặt lệnh nằm ở màn Duyệt lệnh.",
-  },
-  pipeline: {
-    title: "Agent Pipeline",
-    description:
-      "Bắt đầu một phiên phân tích (POST /api/runs) và theo dõi luồng agent theo thời gian thực qua SSE: analyst → tranh luận → trader → rủi ro → quyết định cuối.",
-  },
-  scanner: {
-    title: "Tìm cặp giao dịch",
-    description:
-      "Quản lý danh sách theo dõi (watchlist) và chạy quét pipeline cho từng mã trước khi đưa vào hàng duyệt lệnh.",
+      "Nhật ký thực thi của bot (các bước của cùng một lệnh live gộp chung một hàng), quyết định đã lưu và tổng kết backtest. Trang chỉ đọc — mọi hành động đặt lệnh nằm ở Duyệt lệnh.",
   },
   cycles: {
-    title: "Chu kỳ quét",
+    title: "Hoạt động bot",
     description:
-      "Phễu kết quả mọi chu kỳ autoloop và lý do từng mã bị loại hoặc được triển khai — click một mã để xem chi tiết từng chu kỳ.",
+      "Mọi thứ bot đang làm: chạy phân tích, danh sách theo dõi, vòng quét tự động và kết quả từng chu kỳ. Click một mã để xem lý do được triển khai hoặc bị loại.",
   },
   settings: {
     title: "Cấu hình",
     description:
-      "Đọc và ghi cài đặt engine qua GET / PUT /api/settings. Thay đổi áp dụng cho phiên phân tích mới; khóa API và cổng LIVE chỉ-đọc theo thiết kế.",
+      "Cấu hình mô hình phân tích, giới hạn rủi ro và xem trạng thái các cổng an toàn. Thay đổi áp dụng cho phiên phân tích mới; khóa API và cổng «Lệnh thật» chỉ xem, không bật được từ đây.",
   },
 } satisfies Record<string, PageCopy>;
 
@@ -44,37 +34,27 @@ export const en: typeof vi = {
   overview: {
     title: "P&L overview",
     description:
-      "Cumulative alpha of resolved decisions, performance over time and recent executed orders — read live from the backend via /api/*.",
+      "Cumulative alpha of resolved decisions, performance over time and recent executed orders.",
   },
   approvals: {
     title: "Order approvals",
     description:
-      "Approval queue for order plans produced by the daily pipeline. Approving is the only path to execution; rejecting never touches the exchange.",
+      "Approval queue for order plans produced by the bot's daily scan. Approving is the only path to execution; rejecting never touches the exchange.",
   },
   audit: {
-    title: "History & Audit",
+    title: "History & decisions",
     description:
-      "Execution control log, saved decisions and backtest summaries. Read-only screen — every order action lives on the Order approvals screen.",
-  },
-  pipeline: {
-    title: "Agent Pipeline",
-    description:
-      "Start an analysis run (POST /api/runs) and follow the agent flow in real time over SSE: analysts → debate → trader → risk → final decision.",
-  },
-  scanner: {
-    title: "Pair scanner",
-    description:
-      "Manage the watchlist and run pipeline scans per ticker before they enter the approval queue.",
+      "The bot's execution log (steps of the same live order grouped into one row), saved decisions and backtest summaries. Read-only — every order action lives on Approvals.",
   },
   cycles: {
-    title: "Scan cycles",
+    title: "Bot activity",
     description:
-      "Outcome funnel of every autoloop cycle and why each symbol was rejected or deployed — click a symbol to see per-cycle details.",
+      "Everything the bot is doing: run analyses, manage the watchlist, the automatic scan loop and the outcome of every cycle. Click a symbol to see why it was deployed or rejected.",
   },
   settings: {
     title: "Settings",
     description:
-      "Read and write engine settings via GET / PUT /api/settings. Changes apply to new analysis runs; API keys and the LIVE gate are read-only by design.",
+      "Configure the analysis models, risk limits and view the safety gates. Changes apply to new analysis runs; API keys and the \"Real orders\" gate are read-only here.",
   },
 };
 

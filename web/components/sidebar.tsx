@@ -9,19 +9,16 @@ import {
   LayoutDashboardIcon,
   ListChecksIcon,
   MenuIcon,
-  ScanSearchIcon,
   SettingsIcon,
-  WorkflowIcon,
   XIcon,
 } from "lucide-react";
 import { cn } from "cn";
 import { useT } from "@/lib/i18n";
+import { ExecStatusChip } from "@/components/exec-status-chip";
 
 const NAV_ITEMS = [
   { key: "overview", href: "/", icon: LayoutDashboardIcon },
-  { key: "pipeline", href: "/pipeline", icon: WorkflowIcon },
-  { key: "scanner", href: "/scanner", icon: ScanSearchIcon },
-  { key: "cycles", href: "/cycles", icon: ListChecksIcon },
+  { key: "botActivity", href: "/cycles", icon: ListChecksIcon },
   { key: "approvals", href: "/approvals", icon: ClipboardCheckIcon },
   { key: "settings", href: "/settings", icon: SettingsIcon },
   { key: "audit", href: "/audit", icon: HistoryIcon },
@@ -34,6 +31,10 @@ export function Sidebar() {
 
   return (
     <aside className="flex w-full flex-col border-b bg-sidebar md:w-56 md:shrink-0 md:border-b-0 md:border-r">
+      {/* Chip nằm NGOÀI vùng nav collapsible: thấy cả khi menu mobile đóng. */}
+      <div className="flex items-center px-4 pt-3 md:px-3">
+        <ExecStatusChip />
+      </div>
       <button
         type="button"
         aria-controls="primary-navigation"

@@ -144,7 +144,7 @@ function HistorySection({ state }: { state: ReadyPanel<HistoryPayload> }) {
       <EmptyState
         title={t.overview.noDecisionsTitle}
         hint={t.overview.noDecisionsHint}
-        action={{ label: t.overview.noDecisionsAction, href: "/pipeline" }}
+        action={{ label: t.overview.noDecisionsAction, href: "/cycles" }}
       />
     );
   }

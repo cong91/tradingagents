@@ -4,18 +4,17 @@ Giao diện quản trị cho fork TradingAgents: theo dõi các agent từ phân
 
 Kiến trúc: **Next.js 16 (App Router) + Tailwind v4 + lightweight-charts** ở thư mục này, gọi **backend FastAPI** tại `../server/` (engine LangGraph/ccxt giữ nguyên trong `../tradingagents/`). Toàn bộ endpoint được quy định trong `../docs/ui-api-contract.md` — frontend không tự chế API ngoài hợp đồng.
 
-## 6 màn hình
+## 5 màn hình
 
 | Route | Màn hình | Nguồn dữ liệu |
 | --- | --- | --- |
 | `/` | Tổng quan lợi nhuận (P&L, alpha, lệnh gần đây) | `/api/health`, `/api/history`, `/api/audit` |
-| `/pipeline` | Agent Pipeline — chạy phiên + stream SSE | `/api/runs` |
-| `/scanner` | Tìm cặp giao dịch — watchlist + quét | `/api/watchlist`, `/api/daily` |
+| `/cycles` | Hoạt động bot — chạy phiên phân tích + watchlist/quét + vòng tự động | `/api/runs`, `/api/watchlist`, `/api/daily`, `/api/autoloop` |
 | `/approvals` | Duyệt lệnh — cổng duyệt trước khi vào lệnh thật | `/api/approvals` |
 | `/settings` | Cấu hình LLM / rủi ro / sàn & lịch | `/api/settings` |
 | `/audit` | Lịch sử quyết định, audit log, backtest | `/api/audit`, `/api/history`, `/api/backtest` |
 
-Mode bar toàn cục hiển thị **SANDBOX/LIVE** đọc từ `/api/settings` — LIVE (lệnh thật) luôn hiển thị bằng chữ + biểu tượng, không dùng màu làm tín hiệu duy nhất.
+Chip trạng thái cổng thực thi trong sidebar đọc `/api/settings` — LIVE (lệnh thật) luôn hiển thị bằng chữ, không dùng màu làm tín hiệu duy nhất.
 
 ## Chạy
 

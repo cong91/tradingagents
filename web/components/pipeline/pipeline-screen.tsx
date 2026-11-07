@@ -1,8 +1,9 @@
 "use client";
 
-// Compose màn M2 Agent Pipeline: form chạy phiên + thẻ phiên (meta, tracker,
-// kết quả) + thẻ luồng sự kiện. Mỗi trạng thái (loading/empty/error/stale)
-// đều có hiển thị riêng theo hợp đồng §0.2 và §3.
+// Section "Chạy phân tích ngay" của trang /cycles (trước đây là màn /pipeline):
+// form chạy phiên + thẻ phiên (meta, tracker, kết quả) + thẻ luồng sự kiện.
+// Mỗi trạng thái (loading/empty/error/stale) đều có hiển thị riêng
+// theo hợp đồng §0.2 và §3.
 
 import { LoaderCircleIcon, RadioTowerIcon, TriangleAlertIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -110,7 +111,13 @@ export function PipelineScreen() {
   const busy = phase.phase === "starting" || phase.phase === "streaming";
 
   return (
-    <div className="space-y-4">
+    <section aria-labelledby="run-analysis-title" className="space-y-4">
+      <div className="space-y-1">
+        <h2 id="run-analysis-title" className="text-xl font-semibold tracking-tight">
+          {p.cardTitle}
+        </h2>
+        <p className="text-sm text-muted-foreground">{p.cardDescription}</p>
+      </div>
       <Card>
         <CardHeader>
           <CardTitle>{p.newRunTitle}</CardTitle>
@@ -202,6 +209,6 @@ export function PipelineScreen() {
           />
         </CardContent>
       </Card>
-    </div>
+    </section>
   );
 }

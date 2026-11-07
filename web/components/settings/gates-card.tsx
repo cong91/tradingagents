@@ -24,8 +24,17 @@ export function GatesCard({
   const live = effectiveMode === "live";
   const t = useT();
   const c = t.settings.gates;
+  // Giải thích theo trạng thái đọc được của cổng «Lệnh thật»; giá trị ngoài
+  // contract live|dry (server lạ / chưa đọc được) rơi về nhắc Làm mới.
+  const explain =
+    effectiveMode === "live"
+      ? c.explainLive
+      : effectiveMode === "dry"
+        ? c.explainSafe
+        : c.explainChecking;
   return (
-    <Card>
+    // id là đích của chip trạng thái cổng trong sidebar (/settings#exec-gates).
+    <Card id="exec-gates">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldCheckIcon className="size-4" aria-hidden="true" />
@@ -45,6 +54,7 @@ export function GatesCard({
             <Badge variant="secondary">{c.dry}</Badge>
           )}
         </div>
+        <p className="text-sm text-muted-foreground">{explain}</p>
         <ul className="space-y-2">
           {Object.entries(gates).map(([name, open]) => (
             <li

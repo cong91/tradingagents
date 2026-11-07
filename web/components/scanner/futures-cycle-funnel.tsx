@@ -7,6 +7,7 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { formatSymbol } from "@/lib/format";
 import { useT, type Messages } from "@/lib/i18n";
 import { scannerApi } from "./scanner-api";
 import { formatTimestamp } from "./scanner-format";
@@ -27,6 +28,28 @@ const FUNNEL_KEYS = [
   "not_executed",
   "execution_failed",
 ] as const;
+
+// Badge status chu kỳ (statusLabels + variant theo status); giá trị lạ →
+// nguyên văn. Panel chính và danh sách mở rộng dùng chung.
+export const STATUS_VARIANT: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
+  claimed: "outline",
+  running: "default",
+  completed: "secondary",
+  interrupted: "destructive",
+  recovery_pending: "destructive",
+  failed: "destructive",
+};
+
+export function statusLabel(c: Messages["cycles"], status: string | null | undefined): string {
+  return (status && c.statusLabels[status]) || status || "";
+}
+
+/** Chu kỳ mới nhất của mã đang claimed/running — payload job_store map vào
+ *  bucket in_flight; dùng last_status (semantics "kết quả gần nhất"), không
+ *  dùng row.in_flight (đếm cả chu kỳ kẹt cũ, không treo nhãn vĩnh viễn). */
+function isInFlight(row: FuturesCycleSymbolRollup): boolean {
+  return row.last_status === "claimed" || row.last_status === "running";
+}
 
 type CyclesCopy = Messages["cycles"];
 
@@ -151,6 +174,9 @@ function cycleOutcome(c: CyclesCopy, cycle: FuturesCycle): string {
 function latestOutcome(c: CyclesCopy, row: FuturesCycleSymbolRollup): string {
   const o = c.outcome;
   const reason = row.last_execution_reason;
+  // Nhánh in-flight đứng TRƯỚC mọi nhánh last_*: chu kỳ claimed/running chưa
+  // có kết quả — không được suy ra "analyzed"/proposal/noData.
+  if (isInFlight(row)) return o.inFlight;
   if (row.last_status === "completed" && row.last_phase === "entry"
       && row.last_execution_status === "executed"
       && row.last_executed !== "false") {
@@ -250,6 +276,7 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
 
   const Chevron = open ? ChevronDown : ChevronRight;
   const breakdown = breakdownParts(c, row);
+  const inFlight = isInFlight(row);
 
   return (
     <>
@@ -262,7 +289,7 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
             className="flex min-touch items-center gap-1.5 rounded-md px-1.5 py-1 text-left font-mono text-sm hover:bg-sidebar-accent/60"
           >
             <Chevron className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-            {row.symbol}
+            {formatSymbol(row.symbol)}
           </button>
         </td>
         <td className="py-2 pr-3 tabular-nums">{row.total}</td>
@@ -273,7 +300,9 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
             <span className="text-muted-foreground">{c.noData}</span>
           )}
         </td>
-        <td className="py-2 pr-3">{signalLabel(c, row.last_signal)}</td>
+        <td className="py-2 pr-3">
+          {inFlight && !row.last_signal ? c.outcome.inFlight : signalLabel(c, row.last_signal)}
+        </td>
         <td className="py-2 pr-3 text-xs">{latestOutcome(c, row)}</td>
         <td className="py-2 whitespace-nowrap text-xs text-muted-foreground">
           {formatTimestamp(row.last_updated)}
@@ -285,7 +314,7 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
             {loading ? (
               <p className="flex items-center gap-2 px-2 text-xs text-muted-foreground">
                 <Loader2 className="size-3.5 animate-spin" aria-hidden />
-                {c.loadingSymbol(row.symbol)}
+                {c.loadingSymbol(formatSymbol(row.symbol))}
               </p>
             ) : null}
             {error ? <p role="alert" className="px-2 text-xs text-destructive">{error}</p> : null}
@@ -300,6 +329,9 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
                       <span className="whitespace-nowrap text-muted-foreground">
                         {formatTimestamp(cycle.created_at)}
                       </span>
+                      <Badge variant={STATUS_VARIANT[cycle.status] ?? "outline"}>
+                        {statusLabel(c, cycle.status)}
+                      </Badge>
                       <Badge variant="outline">{phaseLabel(c, cycle.phase)}</Badge>
                       <span className="font-medium">{signalLabel(c, cycle.payload?.signal)}</span>
                       <span className="text-muted-foreground">— {cycleOutcome(c, cycle)}</span>

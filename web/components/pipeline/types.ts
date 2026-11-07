@@ -1,4 +1,4 @@
-// Wire types cho màn M2 — khớp docs/ui-api-contract.md §3 và server/runs.py.
+// Wire types cho phiên phân tích — khớp docs/ui-api-contract.md §3 và server/runs.py.
 // Chỉ mô tả dữ liệu trao đổi với backend; không chứa logic.
 
 export type RunStatus =

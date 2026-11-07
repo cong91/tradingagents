@@ -6,8 +6,8 @@ export const vi = {
     `Lần poll gần nhất lỗi (${code}) — đang hiển thị dữ liệu cũ: ${message}`,
   noDecisionsTitle: "Chưa có quyết định nào trong nhật ký",
   noDecisionsHint:
-    "Lịch sử quyết định được ghi lại khi một phiên phân tích chạy xong. Hãy chạy pipeline để bắt đầu.",
-  noDecisionsAction: "Chạy phân tích ở Agent Pipeline",
+    "Lịch sử quyết định được ghi lại khi một phiên phân tích chạy xong. Hãy chạy phân tích để bắt đầu.",
+  noDecisionsAction: "Chạy phân tích trong Hoạt động bot",
   noResolvedTitle: "Chưa có quyết định nào đã chốt để vẽ biểu đồ",
   noResolvedHint:
     "Một quyết định chỉ có alpha sau thời gian nắm giữ. Các quyết định đang chờ sẽ về đây khi được chốt.",
@@ -19,7 +19,7 @@ export const vi = {
   skippedLines: (n: number) => `Cảnh báo: ${n} dòng log hỏng đã bị bỏ qua.`,
   noDataYet: "Chưa có dữ liệu",
   updatedAt: (time: string) => `Cập nhật lúc ${time}`,
-  haltedToday: "RiskGuard đã dừng giao dịch hôm nay.",
+  haltedToday: "Bot đã dừng đặt lệnh mới hôm nay (bộ bảo vệ rủi ro chặn).",
   viewAudit: "Xem audit",
   pendingApprovals: (n: number) => `${n} lệnh đang chờ duyệt.`,
   openApprovals: "Mở màn Duyệt lệnh",
@@ -44,17 +44,21 @@ export const vi = {
     pendingReview: (pending: number, review: number) => `${pending} chờ chốt · ${review} REVIEW`,
   },
   chartAria: "Biểu đồ alpha tích luỹ theo ngày, đơn vị phần trăm",
+  chart: {
+    legend: "Alpha tích luỹ (%)",
+    tooltipDate: "Ngày",
+    tooltipValue: "Giá trị",
+    tooltipHint: "Di chuột trên biểu đồ để xem từng ngày",
+  },
   orders: {
     emptyTitle: "Chưa có lệnh nào được thực thi",
     emptyHint:
-      "Lệnh xuất hiện sau khi pipeline tạo kế hoạch và kế hoạch đó được duyệt ở màn Duyệt lệnh.",
+      "Lệnh xuất hiện sau khi vòng quét tạo kế hoạch và kế hoạch đó được duyệt ở trang Duyệt lệnh.",
     time: "Thời gian",
     pair: "Cặp",
     order: "Lệnh",
-    quantity: "Khối lượng",
-    estPrice: "Giá ước tính",
+    quantityPrice: "Khối lượng / Giá",
     flowNotional: "Spot dòng tiền / Futures notional",
-    mode: "Chế độ",
     orderId: "Order ID",
   },
   unknownCurrency: "đơn vị chưa rõ",
@@ -65,7 +69,7 @@ export const vi = {
     loading: "Đang tải danh mục…",
     missingTitle: "Chưa có dữ liệu danh mục",
     missingBody:
-      "Backend chưa hiện thực GET /api/portfolio (hợp đồng §6). Card này sẽ có dữ liệu sau khi server cập nhật.",
+      "Chưa có dữ liệu danh mục — tính năng này đang được xây dựng phía máy chủ và sẽ tự hiển thị khi sẵn sàng. Đây không phải lỗi của bạn.",
     cannotRead: (code: string) => `Không đọc được danh mục (${code})`,
     unknownBasis: "Vị thế mở trước khi audit log bắt đầu — giá vốn không xác định",
     futuresPositions: "Vị thế Futures",
@@ -102,7 +106,7 @@ export const vi = {
     heldFeesNote:
       "Cột “Giữ / phí” là chi phí ước tính để tham khảo — phí khứ hồi và funding không phải số tiền đã bị trừ khỏi số dư trong snapshot này.",
     snapshotStale: "Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận.",
-    riskGuardUnknown: "Không xác định được trạng thái RiskGuard từ audit.",
+    riskGuardUnknown: "Không xác định được trạng thái dừng giao dịch của bot.",
     spotUnavailable: "Không xác định được số dư và vị thế Spot.",
     spotStale: "Snapshot Spot đã cũ; không thể xác nhận trạng thái Spot hiện tại.",
     notionalNote:
@@ -123,9 +127,9 @@ export const vi = {
     unrealizedEst: "Lãi/lỗ theo audit",
     closedTrades: (n: number) => `${n} lượt đóng được ghi nhận trong audit log`,
     unknownBasisCloses: (n: number) => ` · ${n} lượt đóng không rõ giá vốn (loại khỏi P&L)`,
-    consecutiveLosses: (n: number) => ` · ${n} lỗ liên tiếp (cảnh báo RiskGuard)`,
+    consecutiveLosses: (n: number) => ` · ${n} lỗ liên tiếp (cảnh báo bộ bảo vệ rủi ro)`,
     todayNote:
-      "P&L Spot là phép tính từ audit log, không xác nhận khớp lệnh hoặc P&L thực tế của tài khoản; đơn vị tiền tệ chưa được xác minh. Hôm nay tính theo ngày UTC và khác con số RiskGuard dùng (cộng thêm lãi/lỗ tạm tính của vị thế mở trong ngày). Giá vốn Spot cũng chỉ là tham khảo từ audit log, không xác minh theo sàn.",
+      "P&L Spot là phép tính từ audit log, không xác nhận khớp lệnh hoặc P&L thực tế của tài khoản; đơn vị tiền tệ chưa được xác minh. Hôm nay tính theo ngày UTC và khác con số bộ bảo vệ rủi ro dùng (cộng thêm lãi/lỗ tạm tính của vị thế mở trong ngày). Giá vốn Spot cũng chỉ là tham khảo từ audit log, không xác minh theo sàn.",
     footer: (time: string) =>
       `Cập nhật ${time} · thời điểm tạo phản hồi HTTP, không phải thời điểm dữ liệu tại sàn; tự làm mới mỗi 30 giây.`,
   },
@@ -155,6 +159,7 @@ export const vi = {
       cancelled: "Đã dừng",
       interrupted: "Bị gián đoạn",
       timeout: "Hết thời gian",
+      idle: "Nhàn rỗi",
     } as Record<string, string>,
     ticker: (ticker: string) => `Mã ${ticker}`,
     agent: (node: string) => `Agent ${node}`,
@@ -172,7 +177,7 @@ export const vi = {
     autoloopReadError: "Không đọc được trạng thái autoloop.",
     dailyReadError: "Không đọc được trạng thái job hằng ngày.",
     runFallbackError: "Không đọc được phiên phân tích đang hoạt động.",
-    backendUnreachable: "Không kết nối được backend FastAPI.",
+    backendUnreachable: "Không kết nối được máy chủ TradingAgents.",
   },
 };
 
@@ -181,8 +186,8 @@ export const en: typeof vi = {
   staleNote: (code, message) => `Latest poll failed (${code}) — showing stale data: ${message}`,
   noDecisionsTitle: "No decisions in the log yet",
   noDecisionsHint:
-    "Decision history is recorded when an analysis run finishes. Run the pipeline to get started.",
-  noDecisionsAction: "Run an analysis in Agent Pipeline",
+    "Decision history is recorded when an analysis run finishes. Run an analysis to get started.",
+  noDecisionsAction: "Run an analysis in Bot activity",
   noResolvedTitle: "No resolved decisions to chart yet",
   noResolvedHint:
     "A decision only has alpha after its holding period. Pending decisions will appear here once resolved.",
@@ -194,7 +199,7 @@ export const en: typeof vi = {
   skippedLines: (n) => `Warning: ${n} corrupt log lines were skipped.`,
   noDataYet: "No data yet",
   updatedAt: (time) => `Updated at ${time}`,
-  haltedToday: "RiskGuard has halted trading for today.",
+  haltedToday: "The bot has stopped placing new orders today (blocked by its risk guard).",
   viewAudit: "View audit",
   pendingApprovals: (n) => `${n} ${n === 1 ? "order is" : "orders are"} awaiting approval.`,
   openApprovals: "Open Order approvals",
@@ -217,17 +222,21 @@ export const en: typeof vi = {
     pendingReview: (pending, review) => `${pending} pending · ${review} REVIEW`,
   },
   chartAria: "Chart of cumulative alpha by day, in percent",
+  chart: {
+    legend: "Cumulative alpha (%)",
+    tooltipDate: "Date",
+    tooltipValue: "Value",
+    tooltipHint: "Hover the chart to see each day",
+  },
   orders: {
     emptyTitle: "No orders executed yet",
     emptyHint:
-      "Orders appear once the pipeline produces a plan and that plan is approved on the Order approvals screen.",
+      "Orders appear once a scan produces a plan and that plan is approved on Approvals.",
     time: "Time",
     pair: "Pair",
     order: "Order",
-    quantity: "Quantity",
-    estPrice: "Est. price",
+    quantityPrice: "Quantity / Price",
     flowNotional: "Spot cash flow / Futures notional",
-    mode: "Mode",
     orderId: "Order ID",
   },
   unknownCurrency: "unknown unit",
@@ -238,7 +247,7 @@ export const en: typeof vi = {
     loading: "Loading portfolio…",
     missingTitle: "No portfolio data yet",
     missingBody:
-      "The backend does not implement GET /api/portfolio yet (contract §6). This card will populate once the server is updated.",
+      "No portfolio data yet — this feature is still being built on the server and will appear automatically when ready. This is not an error on your side.",
     cannotRead: (code) => `Could not read the portfolio (${code})`,
     unknownBasis: "Position opened before the audit log started — cost basis unknown",
     futuresPositions: "Futures positions",
@@ -275,7 +284,7 @@ export const en: typeof vi = {
     heldFeesNote:
       "The “Held / fees” column is an estimated cost for reference — round-trip fees and funding are not amounts already deducted from the balance in this snapshot.",
     snapshotStale: "Snapshot is stale; the current Spot and Futures state is unconfirmed.",
-    riskGuardUnknown: "Could not determine RiskGuard status from the audit log.",
+    riskGuardUnknown: "Could not determine the bot's trading-halt status.",
     spotUnavailable: "Spot balance and positions could not be determined.",
     spotStale: "Spot snapshot is stale; the current Spot state cannot be confirmed.",
     notionalNote:
@@ -296,9 +305,9 @@ export const en: typeof vi = {
     unrealizedEst: "P&L per audit",
     closedTrades: (n) => `${n} ${n === 1 ? "close" : "closes"} recorded in the audit log`,
     unknownBasisCloses: (n) => ` · ${n} closes with unknown cost basis (excluded from P&L)`,
-    consecutiveLosses: (n) => ` · ${n} consecutive losses (RiskGuard warning)`,
+    consecutiveLosses: (n) => ` · ${n} consecutive losses (risk-guard warning)`,
     todayNote:
-      "Spot P&L is computed from the audit log; it does not confirm fills or the account's actual P&L, and the currency unit is unverified. “Today” uses the UTC day and differs from the RiskGuard figure, which also adds today's unrealized P&L of open positions. Spot cost basis is likewise a reference from the audit log, not verified against the exchange.",
+      "Spot P&L is computed from the audit log; it does not confirm fills or the account's actual P&L, and the currency unit is unverified. “Today” uses the UTC day and differs from the risk-guard figure, which also adds today's unrealized P&L of open positions. Spot cost basis is likewise a reference from the audit log, not verified against the exchange.",
     footer: (time) =>
       `Updated ${time} · time the HTTP response was built, not when the exchange data was read; refreshes every 30 seconds.`,
   },
@@ -345,6 +354,6 @@ export const en: typeof vi = {
     autoloopReadError: "Could not read autoloop status.",
     dailyReadError: "Could not read daily job status.",
     runFallbackError: "Could not read the active analysis run.",
-    backendUnreachable: "Cannot reach the FastAPI backend.",
+    backendUnreachable: "Cannot reach the TradingAgents server.",
   },
 };

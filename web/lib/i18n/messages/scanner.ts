@@ -1,4 +1,5 @@
-// M3 "Pair scanner" screen: watchlist, futures autoloop, scan panel, job results/history.
+// Watchlist, futures autoloop, scan panel and job results/history cards —
+// rendered on the /cycles "Bot activity" page after the scanner screen was merged into it.
 
 export const vi = {
   cashIn: "Tiền vào",
@@ -12,7 +13,10 @@ export const vi = {
     interrupted: "Bị gián đoạn",
   } as Record<string, string>,
   networkError:
-    "Không kết nối được backend — hãy chắc chắn server FastAPI đang chạy (uvicorn server.main:app --port 8000).",
+    "Không kết nối được máy chủ — hãy chắc chắn chương trình TradingAgents đang chạy.",
+  section: {
+    title: "Quét & danh sách theo dõi",
+  },
   watchlist: {
     inputRequired: "Nhập một mã giao dịch, ví dụ BTC-USD.",
     title: "Danh sách theo dõi",
@@ -60,7 +64,7 @@ export const vi = {
     protection: "Bảo vệ",
   },
   scan: {
-    title: "Quét pipeline",
+    title: "Chạy quét",
     description:
       "Quét tự động: server tự sàng universe (crypto top khối lượng sàn + cổ phiếu Mỹ đang mạnh 52 tuần) bằng bộ tiêu chí thực chiến — động lượng, RSI, đỉnh 52 tuần, breakout kèm khối lượng, thanh khoản — rồi chạy pipeline LLM trên các ứng viên điểm cao nhất. Không cần danh sách theo dõi. “Quét ngay” chạy trên watchlist hiện hành; mỗi mã là một pipeline LLM đầy đủ nên job có thể mất nhiều phút.",
     sending: "Đang gửi…",
@@ -147,7 +151,10 @@ export const en: typeof vi = {
     interrupted: "Interrupted",
   },
   networkError:
-    "Cannot reach the backend — make sure the FastAPI server is running (uvicorn server.main:app --port 8000).",
+    "Cannot reach the server — make sure the TradingAgents app is running.",
+  section: {
+    title: "Scan & watchlist",
+  },
   watchlist: {
     inputRequired: "Enter a ticker, e.g. BTC-USD.",
     title: "Watchlist",
@@ -195,7 +202,7 @@ export const en: typeof vi = {
     protection: "Protection",
   },
   scan: {
-    title: "Pipeline scan",
+    title: "Run a scan",
     description:
       "Auto scan: the server screens the universe itself (top-volume crypto on the exchange + US stocks with 52-week strength) using practical criteria — momentum, RSI, 52-week highs, volume-backed breakouts, liquidity — then runs the LLM pipeline on the highest-scoring candidates. No watchlist needed. “Scan now” runs on the current watchlist; every ticker is a full LLM pipeline, so a job can take several minutes.",
     sending: "Sending…",
