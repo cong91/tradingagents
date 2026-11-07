@@ -50,7 +50,7 @@ def test_portfolio_unknown_quantity_preserves_unknown_value_and_equity(
         "status": "ok",
         "error": None,
     }
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: futures)
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge, **_: futures)
     monkeypatch.setattr(portfolio_mod, "_fifo_basis", lambda lots: (40.0, "fifo"))
 
     body = portfolio_mod.get_portfolio()

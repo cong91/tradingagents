@@ -118,7 +118,7 @@ def test_portfolio_wiring_attaches_fee_only(monkeypatch, tmp_path):
         )),
     )
     monkeypatch.setattr(portfolio_mod, "_build_bridge", lambda config: bridge)
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda _bridge: _futures_payload())
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda _bridge, **_: _futures_payload())
 
     body = portfolio_mod.get_portfolio()
 

@@ -94,8 +94,8 @@ def test_zero_entry_price_position_survives_real_ccxt_filter(monkeypatch):
     assert calls == [
         ("balance", {"type": "future", "subType": "linear"}), ("risk", {}),
     ]
-    assert snapshot["positions_read"]["status"] == "partial"
-    assert _issues(snapshot) == ["scope_unverified"]
+    assert snapshot["positions_read"]["status"] == "complete"
+    assert _issues(snapshot) == []
     assert snapshot["positions_read"]["skipped"] == 0
     assert snapshot["positions"] == [{
         "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 1.0, "quantity": 1.0,
@@ -113,7 +113,7 @@ def test_matching_profile_reads_v3_without_symbol_filter(monkeypatch, profile):
     result = read_futures_snapshot(_Bridge(client, profile))
     assert calls[-1] == ("risk", {})
     assert result["venue_profile"] == profile
-    assert result["positions_read"]["status"] == "partial"
+    assert result["positions_read"]["status"] == "complete"
 
 
 @pytest.mark.parametrize("bad_url", [
@@ -251,8 +251,8 @@ def test_route_change_during_balance_prevents_second_private_request(monkeypatch
 
 
 @pytest.mark.parametrize(("rows", "expected", "skipped"), [
-    ([], ["scope_unverified"], 0),
-    ([_row(positionAmt="0", notional="0")], ["scope_unverified"], 0),
+    ([], [], 0),
+    ([_row(positionAmt="0", notional="0")], [], 0),
     ([_row(positionAmt=None)], ["scope_unverified", "missing_size"], 1),
     ([_row(positionAmt="NaN")], ["scope_unverified", "invalid_size"], 1),
     ([_row(positionAmt="1e-400")], ["scope_unverified", "invalid_size"], 1),
@@ -275,6 +275,7 @@ def test_raw_rows_are_classified_without_leaking_payload(monkeypatch, rows, expe
     assert snapshot["positions"] == []
     assert _issues(snapshot) == expected
     assert snapshot["positions_read"]["skipped"] == skipped
+    assert snapshot["positions_read"]["status"] == ("partial" if expected else "complete")
     assert "private-secret" not in json.dumps(snapshot)
 
 
@@ -397,6 +398,92 @@ def test_wrong_production_profile_never_contacts_demo(monkeypatch):
     with pytest.raises(ValueError):
         read_futures_snapshot(_Bridge(client, profile="production"))
     assert calls == []
+
+
+class _RebindingBridge:
+    """A bridge whose client is swapped after the first request: the same
+    rebind hazard _binance_position_rows guards against mid-read."""
+
+    exchange_id = "binance"
+
+    def __init__(self, client):
+        self.exchange = client
+        self.config = {"exec_base_url": "https://demo-api.binance.com"}
+        self.calls = 0
+
+    def client(self):
+        self.calls += 1
+        return self.exchange if self.calls == 1 else object()
+
+
+def test_client_rebind_during_position_read_keeps_scope_unverified(monkeypatch):
+    client, _ = _exchange(monkeypatch, [_row()])
+    snapshot = read_futures_snapshot(_RebindingBridge(client))
+    assert [item["symbol"] for item in snapshot["positions"]] == ["BTC/USDT:USDT"]
+    assert _issues(snapshot) == ["scope_unverified"]
+    assert snapshot["positions_read"]["status"] == "partial"
+
+
+def _monitored_state(position_key, side, *, exchange="binance", profile="demo"):
+    return {
+        "position_key": position_key, "revision": 1,
+        "snapshot": {"side": side},
+        "account_identity_exchange": exchange,
+        "account_identity_profile": profile,
+    }
+
+
+def test_certified_read_covering_the_monitor_claims_complete(monkeypatch):
+    client, _ = _exchange(monkeypatch, [_row()])
+    states = [_monitored_state("BTC/USDT:USDT:buy:e1", "long")]
+
+    snapshot = read_futures_snapshot(_Bridge(client), monitor_states=lambda: states)
+
+    assert _issues(snapshot) == []
+    assert snapshot["positions_read"]["status"] == "complete"
+
+
+def test_certified_list_missing_a_monitored_position_stays_partial(monkeypatch):
+    client, _ = _exchange(monkeypatch, [_row()])
+    states = [_monitored_state("ZEC/USDT:USDT:sell:e1", "short")]
+
+    snapshot = read_futures_snapshot(_Bridge(client), monitor_states=lambda: states)
+
+    assert snapshot["positions_read"]["issues"] == [
+        {"symbol": "ZEC/USDT:USDT", "reason": "monitor_position_missing"},
+    ]
+    assert snapshot["positions_read"]["status"] == "partial"
+
+
+def test_unreadable_monitor_states_block_the_complete_claim(monkeypatch):
+    client, _ = _exchange(monkeypatch, [_row()])
+
+    def unreadable():
+        raise RuntimeError("control store offline")
+
+    snapshot = read_futures_snapshot(_Bridge(client), monitor_states=unreadable)
+
+    assert _issues(snapshot) == ["monitor_state_unreadable"]
+    assert snapshot["positions_read"]["status"] == "partial"
+
+
+@pytest.mark.parametrize("state", [
+    _monitored_state("XMR/USDT:USDT:sell:e1", "short", profile="production"),
+    _monitored_state("XMR/USDT:USDT:sell:e1", "short", exchange="bybit"),
+    {"position_key": "XMR/USDT:USDT:sell:e1", "snapshot": {"side": "short"}},
+    _monitored_state("garbage-key", "short"),
+])
+def test_unattributable_monitor_states_are_skipped_by_the_coverage_check(
+    monkeypatch, state,
+):
+    client, _ = _exchange(monkeypatch, [_row()])
+
+    snapshot = read_futures_snapshot(
+        _Bridge(client), monitor_states=lambda: [state],
+    )
+
+    assert _issues(snapshot) == []
+    assert snapshot["positions_read"]["status"] == "complete"
 
 
 @pytest.mark.parametrize("bad_base", [

@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
-from server import audit as audit_log, performance_history_cache, portfolio_snapshot
+from server import audit as audit_log, job_store, performance_history_cache, portfolio_snapshot
 from server.contract import ApiError, utc_now_iso
 from server.futures_snapshot import read_futures_snapshot
 from server.position_cost import attach_position_costs
@@ -226,7 +226,12 @@ def _get_portfolio(config: dict, bridge=None):
     }
     if live and not performance_history_cache.is_rate_limited():
         try:
-            futures = read_futures_snapshot(bridge)
+            # The monitor's bound states are the coverage evidence: a certified
+            # venue list that still misses one means the panel must not claim
+            # completeness (see read_futures_snapshot).
+            futures = read_futures_snapshot(
+                bridge, monitor_states=job_store.active_position_states,
+            )
         except Exception as exc:
             _mark_rate_limit(exc, bridge)
             futures["status"] = "error"

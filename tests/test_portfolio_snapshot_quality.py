@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import portfolio as portfolio_mod, position_cost as position_cost_mod
+from server import job_store, portfolio as portfolio_mod, position_cost as position_cost_mod
 from tradingagents.dataflows.config import set_config
 from tradingagents.portfolio import PortfolioContext
 
@@ -109,7 +109,7 @@ def test_live_snapshot_quality_and_costs_preserve_spot(
     snapshot["positions_read"] = quality
     calls = []
 
-    def read(received):
+    def read(received, **_):
         calls.append(("read", received))
         return snapshot
 
@@ -138,7 +138,7 @@ def test_dry_mode_uses_audit_and_reports_futures_unavailable(
     config["exec_live"] = config_live
     bridge.effective_mode = lambda: "dry"
 
-    def no_futures_read(bridge):
+    def no_futures_read(bridge, **_):
         pytest.fail("dry mode must not read futures")
 
     monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", no_futures_read)
@@ -166,7 +166,7 @@ def test_dry_mode_uses_audit_and_reports_futures_unavailable(
 
 @pytest.mark.parametrize("exception", [RuntimeError("private secret"), ValueError("private secret")])
 def test_snapshot_failure_is_sanitized_and_keeps_spot(monkeypatch, portfolio_setup, exception):
-    def fail_read(bridge):
+    def fail_read(bridge, **_):
         raise exception
 
     monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", fail_read)
@@ -184,7 +184,7 @@ def test_position_cost_failure_warns_without_losing_snapshot(monkeypatch, portfo
     snapshot["positions_read"] = {"status": "partial", "skipped": 1, "issues": [
         {"symbol": None, "reason": "missing_symbol"},
     ]}
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: snapshot)
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge, **_: snapshot)
 
     def fail_costs(futures, config):
         raise ValueError("private secret")
@@ -210,7 +210,7 @@ def test_actual_cost_enrichment_attaches_fee_without_state_or_funding_reads(
         {"symbol": None, "reason": "scope_unverified"},
     ]}
     snapshot["positions"][0]["notional_currency"] = "USDT"
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: snapshot)
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge, **_: snapshot)
     monkeypatch.setattr(portfolio_mod, "attach_position_costs", position_cost_mod.attach_position_costs)
 
     class UnusedClient:
@@ -274,8 +274,14 @@ def test_real_snapshot_reader_wired_to_fake_exchange(
                 rows.append({"symbol": "BTCUSDT", "positionSide": "BOTH", "positionAmt": None})
             return rows
 
-    bridge.client = lambda: FakeExchange()
+    # The real bridge caches its client; the identity-stability check inside
+    # read_futures_snapshot sees a fresh instance per call as a rebind.
+    fake_exchange = FakeExchange()
+    bridge.client = lambda: fake_exchange
     monkeypatch.setattr(portfolio_mod, "attach_position_costs", lambda *args: None)
+    # The control store is not part of this unit fixture: pin an empty
+    # monitored book so the coverage cross-check is deterministic here.
+    monkeypatch.setattr(job_store, "active_position_states", lambda: [])
 
     before = datetime.now(UTC)
     body = portfolio_mod.get_portfolio()
@@ -291,16 +297,22 @@ def test_real_snapshot_reader_wired_to_fake_exchange(
         assert body["futures"]["status"] == "ok"
         assert body["futures"]["equity"] == 1200.0
         quality = body["futures"]["positions_read"]
-        assert quality["status"] == "partial"
         if read_state == "positions_error":
+            assert quality["status"] == "partial"
             assert quality["skipped"] is None
             assert quality["issues"] == [{"symbol": None, "reason": "read_failed"}]
             assert quality["observed_at"] is None
         else:
+            # A clean Binance V3 read is certified; the partial case keeps the
+            # scope marker because a skipped row de-certifies the response.
+            assert quality["status"] == ("complete" if read_state == "complete" else "partial")
             assert quality["skipped"] == (1 if read_state == "partial" else 0)
-            issues = [{"symbol": None, "reason": "scope_unverified"}]
+            issues = []
             if read_state == "partial":
-                issues.append({"symbol": None, "reason": "missing_size"})
+                issues.extend([
+                    {"symbol": None, "reason": "scope_unverified"},
+                    {"symbol": None, "reason": "missing_size"},
+                ])
             assert quality["issues"] == issues
             observed_at = datetime.fromisoformat(quality["observed_at"])
             assert observed_at.utcoffset() == UTC.utcoffset(observed_at)
@@ -328,7 +340,7 @@ def test_sync_mode_wraps_the_route_with_snapshot_metadata(monkeypatch, tmp_path,
 
     venue_reads = []
 
-    def read_snapshot(_bridge):
+    def read_snapshot(_bridge, **_):
         venue_reads.append(1)
         return snapshot
 
@@ -386,7 +398,7 @@ def test_sync_mode_without_account_identity_returns_unknown_without_venue_reads(
     monkeypatch.setattr(portfolio_mod, "_build_bridge", lambda config: bridge)
     monkeypatch.setattr(portfolio_mod.audit_log, "read_events", lambda: ([], 0))
 
-    def unexpected_read(_bridge):
+    def unexpected_read(_bridge, **_):
         pytest.fail("no venue read without a bound account identity")
 
     monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", unexpected_read)
@@ -421,7 +433,7 @@ def test_coordinator_binds_context_to_the_same_bridge_across_rotation(monkeypatc
             sync_portfolio=lambda: PortfolioContext(cash=1, currency="USDT", positions=[]),
         )
 
-    def read(bridge):
+    def read(bridge, **_):
         observed.append(bridge.client())
         return {"status": "ok", "positions": [], "account_scope": "derivatives"}
 
@@ -448,7 +460,7 @@ def test_spot_and_audit_failures_do_not_hide_futures(monkeypatch):
         sync_portfolio=lambda: (_ for _ in ()).throw(RuntimeError("private")),
     )
     monkeypatch.setattr(portfolio_mod.audit_log, "read_events", lambda: (_ for _ in ()).throw(OSError()))
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: {
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge, **_: {
         "status": "ok", "positions": [{"symbol": "BTC/USDT:USDT"}],
     })
     monkeypatch.setattr(portfolio_mod, "attach_position_costs", lambda *args: None)
@@ -471,7 +483,7 @@ def test_spot_rate_limit_defers_futures_and_starts_shared_cooldown(monkeypatch):
         sync_portfolio=lambda: (_ for _ in ()).throw(error),
     )
     monkeypatch.setattr(portfolio_mod.audit_log, "read_events", lambda: ([], 0))
-    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge: pytest.fail("rate limited"))
+    monkeypatch.setattr(portfolio_mod, "read_futures_snapshot", lambda bridge, **_: pytest.fail("rate limited"))
     body = portfolio_mod._get_portfolio({"exec_live": True}, bridge=bridge)
     assert history_cache.is_rate_limited()
     assert body["futures"]["status"] == "unavailable"

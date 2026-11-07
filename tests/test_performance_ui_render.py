@@ -334,6 +334,17 @@ def _cases():
                 "issues": [{"symbol": None, "reason": "scope_unverified"}],
             })),
         },
+        "monitor_position_missing": {
+            "component": "positions",
+            "props": _portfolio_props(futures=_futures(
+                [_position("ZEC/USDT:USDT")], read={
+                    **_read_status("partial"),
+                    "issues": [
+                        {"symbol": "ZEC/USDT:USDT", "reason": "monitor_position_missing"},
+                    ],
+                },
+            )),
+        },
         "history_fills": {"component": "history", "props": {"history": history}},
     }
     for component in ("performance", "portfolio"):
@@ -438,6 +449,16 @@ def test_partial_futures_snapshot_warns_that_positions_may_be_missing(rendered):
     page = rendered["partial_futures_positions"]
 
     assert "Chưa xác minh được danh sách Futures đầy đủ; có thể còn vị thế chưa hiển thị." in page.text
+
+
+def test_missing_monitored_position_names_the_symbol_and_reason(rendered):
+    page = rendered["monitor_position_missing"]
+
+    assert (
+        "ZEC/USDT:USDT: Vị thế đang được hệ thống quản lý nhưng không có trong danh sách sàn"
+        in page.text
+    )
+    assert "Chưa xác minh được danh sách Futures đầy đủ" in page.text
 
 
 def test_empty_partial_futures_snapshot_is_not_claimed_to_be_flat(rendered):

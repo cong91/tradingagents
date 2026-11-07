@@ -54,6 +54,9 @@ export const vi = {
     issues: {
       read_failed: "Không đọc được danh sách vị thế từ sàn",
       scope_unverified: "Chưa xác minh đầy đủ phạm vi hoặc phân trang của sàn",
+      monitor_position_missing:
+        "Vị thế đang được hệ thống quản lý nhưng không có trong danh sách sàn",
+      monitor_state_unreadable: "Không đọc được sổ vị thế của hệ thống để đối chiếu",
       invalid_response: "Phản hồi danh sách vị thế không hợp lệ",
       invalid_row: "Dữ liệu vị thế không hợp lệ",
       missing_symbol: "Thiếu mã vị thế",
@@ -205,6 +208,9 @@ export const en: typeof vi = {
     issues: {
       read_failed: "Could not read the position list from the exchange",
       scope_unverified: "Exchange scope or pagination not fully verified",
+      monitor_position_missing:
+        "Position managed by the system but absent from the exchange list",
+      monitor_state_unreadable: "The system's position book could not be read for cross-checking",
       invalid_response: "Invalid position list response",
       invalid_row: "Invalid position data",
       missing_symbol: "Missing position symbol",

@@ -145,7 +145,7 @@ def test_live_read_rejects_changed_binding_for_direct_and_coordinator(monkeypatc
     monkeypatch.setattr(portfolio, "get_config", lambda: config.copy())
     monkeypatch.setattr(portfolio, "_build_bridge", FakeBridge)
     monkeypatch.setattr(portfolio.audit_log, "read_events", lambda: ([], 0))
-    monkeypatch.setattr(portfolio, "read_futures_snapshot", lambda bridge: {
+    monkeypatch.setattr(portfolio, "read_futures_snapshot", lambda bridge, **_: {
         "status": "ok", "positions": [], "positions_read": {"observed_at": None},
     })
     monkeypatch.setattr(portfolio, "attach_position_costs", lambda *args: None)

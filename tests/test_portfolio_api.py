@@ -263,8 +263,7 @@ def test_portfolio_live_futures_are_separate_from_spot_equity(
     assert futures["equity_currency"] is None
     assert futures["wallet_balance_currency"] is None
     assert futures["positions_read"] == {
-        "status": "partial", "skipped": 0,
-        "issues": [{"symbol": None, "reason": "scope_unverified"}],
+        "status": "complete", "skipped": 0, "issues": [],
         "observed_at": _futures_observed_at,
     }
     (position,) = futures["positions"]

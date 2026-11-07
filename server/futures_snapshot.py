@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -26,6 +27,49 @@ _POSITION_NUMBERS = (
 
 class _PositionCooldownError(RuntimeError):
     """A concurrent rate limit prevents a new position read."""
+
+
+def _monitor_coverage_issues(
+    monitor_states: Callable[[], list],
+    exchange_id: str,
+    profile: str,
+    venue_keys: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Positions the monitor manages but the venue snapshot does not show.
+
+    Only states bound to this exchange and venue profile are attributable to
+    the snapshot's account; unbound legacy rows and other books are skipped.
+    A state whose key cannot be parsed is the protection poll's diagnostic,
+    not the display snapshot's.
+    """
+    from tradingagents.execution.futures_protection import _position_identity
+
+    try:
+        states = monitor_states()
+    except Exception:
+        return [{"symbol": None, "reason": "monitor_state_unreadable"}]
+    if not isinstance(states, list):
+        return [{"symbol": None, "reason": "monitor_state_unreadable"}]
+    missing: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        if (
+            state.get("account_identity_exchange") != exchange_id
+            or state.get("account_identity_profile") != profile
+        ):
+            continue
+        try:
+            key = _position_identity(
+                str(state.get("position_key") or ""), state.get("snapshot") or {},
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if key not in venue_keys and key not in seen:
+            seen.add(key)
+            missing.append({"symbol": key[0], "reason": "monitor_position_missing"})
+    return missing
 
 
 def _finite_number(value: Any) -> float | None:
@@ -221,14 +265,23 @@ def _normalize(
     return replace(position, quantity=quantity, notional_currency=notional_currency).as_dict()
 
 
-def read_futures_snapshot(bridge: Any) -> dict[str, Any]:
+def read_futures_snapshot(
+    bridge: Any, *, monitor_states: Callable[[], list] | None = None,
+) -> dict[str, Any]:
     """Read one portfolio account snapshot with sanitized position diagnostics.
 
     The account fields match ``FuturesAccountSnapshot.as_dict()``. The added
-    ``positions_read`` is partial because neither normalized CCXT positions nor
-    the Binance raw endpoint currently prove complete account scope. It contains
-    a skipped-row count, sanitized issues, and the UTC observation time after
-    the positions call returns. Invalid balances and unsupported venues raise.
+    ``positions_read`` reports whether the venue position list could be proven
+    complete. A Binance raw V3 read whose every row is interpretable and whose
+    client survived the read unchanged certifies the account-wide book — the
+    same contract the protection monitor settles state deletion on — and when
+    ``monitor_states`` is supplied the certified list must also cover every
+    monitored position bound to this venue profile; a missing one surfaces as
+    a ``monitor_position_missing`` issue instead of a claimed-complete read.
+    Uncertified venues and uncertified reads stay ``partial`` with
+    ``scope_unverified``. It contains a skipped-row count, sanitized issues,
+    and the UTC observation time after the positions call returns. Invalid
+    balances and unsupported venues raise.
     """
     exchange_id = str(getattr(bridge, "exchange_id", "")).lower()
     balance_params, position_params = futures_account._futures_params(exchange_id, bridge.config)
@@ -236,6 +289,7 @@ def read_futures_snapshot(bridge: Any) -> dict[str, Any]:
     if performance_history_cache.is_rate_limited():
         raise RuntimeError("futures read deferred during rate limit cooldown")
     client = bridge.client()
+    venue_client = client
     if exchange_id == "binance":
         binance_futures_positions.validate_client(
             client, profile, bridge.config.get("exec_base_url") or "https://demo-api.binance.com",
@@ -302,10 +356,14 @@ def read_futures_snapshot(bridge: Any) -> dict[str, Any]:
         skipped_count = None
         issues.append({"symbol": None, "reason": response_error})
     else:
-        issues.append({"symbol": None, "reason": "scope_unverified"})
         prepared = (
             binance_futures_positions.prepare_rows(rows, client)
             if exchange_id == "binance" else [(row, None, None) for row in rows]
+        )
+        certified_read = (
+            exchange_id == "binance"
+            and bridge.client() is venue_client
+            and all(reason is None for _, _, reason in prepared)
         )
         for raw, market, reason in prepared:
             if reason is not None:
@@ -332,6 +390,15 @@ def read_futures_snapshot(bridge: Any) -> dict[str, Any]:
             if reason is not None:
                 issues.append({"symbol": None, "reason": reason})
                 skipped_count += 1
+        certifiable = certified_read and skipped_count == 0
+        if not certifiable:
+            # The venue response itself could not prove account-wide scope.
+            issues.insert(0, {"symbol": None, "reason": "scope_unverified"})
+        elif monitor_states is not None:
+            venue_keys = {(item["symbol"], item["side"]) for item in positions}
+            issues.extend(
+                _monitor_coverage_issues(monitor_states, exchange_id, profile, venue_keys)
+            )
 
     snapshot = futures_account.FuturesAccountSnapshot(**values, venue_profile=profile).as_dict()
     snapshot["positions"] = positions
