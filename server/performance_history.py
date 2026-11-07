@@ -17,7 +17,10 @@ router = APIRouter(prefix="/api", tags=["performance"])
 
 _MAX_SYMBOLS = 12
 _FUTURES_SYMBOL = re.compile(r"^[A-Z0-9]{1,30}/[A-Z0-9]{1,15}:[A-Z0-9]{1,15}(?:-[0-9]{6})?$")
-_ACTIONS = {"buy", "sell", "bracket_placed", "bracket_failed", "time_stop_closed"}
+_ACTIONS = {
+    "buy", "sell", "bracket_placed", "bracket_failed", "time_stop_closed",
+    "time_stop_review_hold", "time_stop_review_unavailable",
+}
 _AUDIT_WARNING_CODES = {
     "audit_lines_skipped",
     "audit_venue_unverified",

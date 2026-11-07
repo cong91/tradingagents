@@ -169,6 +169,41 @@ _ALLOWED: dict[str, dict] = {
             "ngay. 0 = tắt hoãn, đóng đúng hạn."
         ),
     },
+    "risk_derivatives_time_stop_review_enabled": {
+        "type": "bool",
+        "gate": False,
+        "group": "risk",
+        "label": "Phân tích vị thế trước khi time stop",
+        "hint": (
+            "Bật: quá hạn giữ tối đa, hệ thống chạy một vòng phân tích vị thế "
+            "(một call LLM) để quyết định GIỮ (gia hạn hạn mức, hẹn phân tích "
+            "lại sau) hay ĐÓNG. Nếu vòng phân tích không chạy được, vị thế "
+            "được nộp thêm 'grace' giờ trước khi đóng cơ học. Tắt: quá hạn là "
+            "đóng cơ học như trước."
+        ),
+    },
+    "risk_derivatives_time_stop_review_interval_hours": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Chu kỳ phân tích lại sau khi giữ (giờ)",
+        "hint": (
+            "Khi phân tích kết luận GIỮ, hết khoảng giờ này hệ thống phân tích "
+            "lại vị thế một lần nữa. 0 hoặc giá trị lỗi = tắt phân tích, quá "
+            "hạn đóng cơ học."
+        ),
+    },
+    "risk_derivatives_time_stop_review_grace_hours": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Grace khi phân tích lỗi (giờ)",
+        "hint": (
+            "Nếu vòng phân tích không chạy được (LLM lỗi, trả sai định dạng), "
+            "vị thế được trì hoãn đóng thêm khoảng giờ này trước khi áp time "
+            "stop cơ học. 0 = không grace, đóng ngay."
+        ),
+    },
 }
 
 _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}

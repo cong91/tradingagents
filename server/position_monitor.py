@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 
-from server import job_store
+from server import job_store, position_review
 from tradingagents.dataflows.config import get_config
 from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.futures_protection import manage_active_positions
@@ -47,9 +47,21 @@ def poll_active_positions() -> list[dict]:
             for state in states
         ]
     executor = _build_executor(config)
+    bridge = executor._bridge
+
+    def review_hook(position_key: str, payload: dict) -> None:
+        position_review.request_review(
+            position_key, payload,
+            # A fresh bridge inside the review thread: the review's venue
+            # reads must not share a ccxt client with this still-polling
+            # monitor.
+            bridge_factory=lambda: _build_executor(config)._bridge,
+            config=config,
+        )
+
     try:
         outcomes = manage_active_positions(
-            executor._bridge, allow_mutation=True, config=config,
+            bridge, allow_mutation=True, config=config, review_hook=review_hook,
         )
         deferred_counts: dict[str, int] = {}
         for outcome in outcomes:

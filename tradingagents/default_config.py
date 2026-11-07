@@ -81,6 +81,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_MIN_R": "risk_derivatives_time_stop_min_r",
     "TRADINGAGENTS_RISK_DERIVATIVES_ROUND_TRIP_FEE_RATE": "risk_derivatives_round_trip_fee_rate",
     "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_POSTPONE_MINUTES": "risk_derivatives_time_stop_postpone_minutes",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_ENABLED": "risk_derivatives_time_stop_review_enabled",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_INTERVAL_HOURS": "risk_derivatives_time_stop_review_interval_hours",
+    "TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_GRACE_HOURS": "risk_derivatives_time_stop_review_grace_hours",
     "TRADINGAGENTS_EXEC_EXCHANGE_ID":                  "exec_exchange_id",
     "TRADINGAGENTS_EXEC_BASE_URL":                     "exec_base_url",
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
@@ -321,6 +324,15 @@ def build_default_config() -> dict:
         # deadline, and a settlement inside this many minutes that would PAY
         # the position holds the close until after settlement.
         "risk_derivatives_time_stop_postpone_minutes": 90.0,
+        # Analyzed time stop: past the hold deadline a position review (one
+        # structured LLM call over the position's evidence) decides HOLD —
+        # extending the deadline one interval at a time — or CLOSE. While the
+        # review itself is unavailable the close waits this many hours before
+        # falling back to the mechanical time stop. Disabled restores the
+        # mechanical close at the deadline.
+        "risk_derivatives_time_stop_review_enabled": True,
+        "risk_derivatives_time_stop_review_interval_hours": 24.0,
+        "risk_derivatives_time_stop_review_grace_hours": 6.0,
         # Refuse tiny stop nudges that would churn conditional orders every poll,
         # and treat a venue mark older than this as unusable (no mutation).
         "risk_derivatives_min_stop_move_r": 0.1,

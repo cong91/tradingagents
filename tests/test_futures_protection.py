@@ -978,3 +978,303 @@ def test_funding_is_only_consulted_once_the_raw_boundary_trips(monkeypatch):
 
     assert result == [{"position_key": position_key, "status": "updated"}]
     assert exchange.funding_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Analyzed time stop: a past-deadline position below its minimum R asks a
+# position review for a HOLD (deadline extended one interval) or CLOSE verdict
+# instead of closing mechanically.
+# ---------------------------------------------------------------------------
+
+_REVIEW_CONFIG = {
+    **_TIME_STOP_CONFIG,
+    "risk_derivatives_time_stop_review_enabled": True,
+    "risk_derivatives_time_stop_review_interval_hours": 24.0,
+    "risk_derivatives_time_stop_review_grace_hours": 6.0,
+}
+
+
+def _set_review_fields(position_key: str, **fields) -> None:
+    state = job_store.load_position_state(position_key)
+    state["snapshot"].update(fields)
+    assert job_store.save_position_state(position_key, state["revision"], state)
+
+
+def _recording_hook():
+    requests: list[tuple[str, dict]] = []
+
+    def hook(position_key: str, payload: dict) -> None:
+        requests.append((position_key, payload))
+
+    return hook, requests
+
+
+def _stale_review_exchange():
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 105.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+    return exchange
+
+
+def test_time_stop_past_deadline_requests_a_review_instead_of_closing(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _stale_review_exchange()
+    hook, requests = _recording_hook()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_review_requested"}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == "pending"
+    assert snapshot["phase"] == "time_stop_review_pending"
+    assert datetime.fromisoformat(snapshot["time_stop_review_requested_at"]).tzinfo is not None
+    assert len(requests) == 1
+    requested_key, payload = requests[0]
+    assert requested_key == position_key
+    assert payload["symbol"] == "TIA/USDT:USDT"
+    assert payload["side"] == "long"
+    assert payload["favorable_r"] == pytest.approx(0.5)  # (105 - 100) / (100 - 90)
+    assert payload["funding_r"] == pytest.approx(0.0)
+    assert payload["fee_r"] == pytest.approx(0.01)  # 0.001 * 100 / 10
+
+
+def test_fresh_pending_review_defers_the_close(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="pending",
+        time_stop_review_requested_at=datetime.now(UTC).isoformat(),
+        phase="time_stop_review_pending",
+    )
+    exchange = _stale_review_exchange()
+    hook, requests = _recording_hook()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_review_pending"}]
+    assert requests == []
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert job_store.load_position_state(position_key) is not None
+
+
+def test_stale_pending_review_is_reclaimed_into_the_grace(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="pending",
+        time_stop_review_requested_at=(
+            datetime.now(UTC) - timedelta(minutes=45)
+        ).isoformat(),
+    )
+    exchange = _stale_review_exchange()
+    hook, _requests = _recording_hook()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config=_REVIEW_CONFIG, review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_review_grace"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == "unavailable"
+    grace_until = datetime.fromisoformat(snapshot["time_stop_review_until"])
+    assert timedelta(hours=5) < grace_until - datetime.now(UTC) <= timedelta(hours=6)
+    assert [event["action"] for event in bridge.audit] == ["time_stop_review_unavailable"]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_unavailable_grace_blocks_the_close(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="unavailable",
+        time_stop_review_until=(datetime.now(UTC) + timedelta(hours=3)).isoformat(),
+    )
+    exchange = _stale_review_exchange()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=_recording_hook()[0],
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_review_grace"}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert job_store.load_position_state(position_key) is not None
+
+
+def test_unavailable_grace_expiry_closes_mechanically(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="unavailable",
+        time_stop_review_until=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+    )
+    exchange = _stale_review_exchange()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=_recording_hook()[0],
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert job_store.load_position_state(position_key) is None
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+    assert "grace expired" in bridge.audit[0]["reason"]
+
+
+def test_review_close_verdict_closes_with_the_reason_audited(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="close",
+        time_stop_review_last={
+            "verdict": "close",
+            "reasoning": "thesis broken; funding turning against the short",
+        },
+    )
+    exchange = _stale_review_exchange()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=_recording_hook()[0],
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert job_store.load_position_state(position_key) is None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+    assert "review verdict close: thesis broken" in bridge.audit[0]["reason"]
+
+
+def test_review_hold_verdict_extends_the_deadline(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="hold",
+        time_stop_review_until=(datetime.now(UTC) + timedelta(hours=24)).isoformat(),
+        time_stop_review_count=1,
+    )
+    exchange = _stale_review_exchange()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=_recording_hook()[0],
+    )
+
+    assert result == [{"position_key": position_key, "status": "unchanged"}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == "hold"
+    assert snapshot["time_stop_review_count"] == 1
+
+
+def test_expired_hold_rerequests_the_review(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="hold",
+        time_stop_review_until=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        time_stop_review_count=1,
+    )
+    exchange = _stale_review_exchange()
+    hook, requests = _recording_hook()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_review_requested"}]
+    assert len(requests) == 1
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == "pending"
+
+
+def test_review_disabled_keeps_the_mechanical_close(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    exchange = _stale_review_exchange()
+    hook, requests = _recording_hook()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config=_TIME_STOP_CONFIG, review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert requests == []
+    assert job_store.load_position_state(position_key) is None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+
+
+def test_settlement_postpone_still_precedes_the_review(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id, exchange = _short_position_state()
+    settlement_ms = int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000)
+    exchange.funding_rows = [{"amount": 2.0}]
+    exchange.funding_rate = {"fundingRate": 0.0001, "nextFundingTimestamp": settlement_ms}
+    exchange.orders = _resting_leg_orders()
+    hook, _requests = _recording_hook()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_postponed_funding"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot.get("time_stop_review_status") is None
+
+
+def test_close_verdict_overrides_a_funding_rescue(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id, exchange = _short_position_state()
+    # +30 USDT of funding on 10 USDT of initial risk is +3.0R: the mechanical
+    # rescue would hold the position, but the reviewer's close verdict wins.
+    exchange.funding_rows = [{"amount": 15.0}, {"amount": 15.0}]
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="close",
+        time_stop_review_last={
+            "verdict": "close",
+            "reasoning": "carry income is not a thesis",
+        },
+    )
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+
+    result = manage_active_positions(bridge, allow_mutation=True, config=_REVIEW_CONFIG)
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert job_store.load_position_state(position_key) is None
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
+    assert "review verdict close: carry income is not a thesis" in bridge.audit[0]["reason"]

@@ -165,6 +165,9 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert config["risk_derivatives_time_stop_min_r"] == 1.0
     assert config["risk_derivatives_round_trip_fee_rate"] == 0.001
     assert config["risk_derivatives_time_stop_postpone_minutes"] == 90.0
+    assert config["risk_derivatives_time_stop_review_enabled"] is True
+    assert config["risk_derivatives_time_stop_review_interval_hours"] == 24.0
+    assert config["risk_derivatives_time_stop_review_grace_hours"] == 6.0
     assert config["risk_derivatives_min_stop_move_r"] == 0.1
     assert config["risk_derivatives_mark_max_age_seconds"] == 120.0
     assert config["risk_derivatives_scale_out_enabled"] is False
@@ -192,6 +195,9 @@ def test_risk_float_and_int_coercion(monkeypatch):
         TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_MIN_R="0.5",
         TRADINGAGENTS_RISK_DERIVATIVES_ROUND_TRIP_FEE_RATE="0.0004",
         TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_POSTPONE_MINUTES="45",
+        TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_ENABLED="false",
+        TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_INTERVAL_HOURS="12",
+        TRADINGAGENTS_RISK_DERIVATIVES_TIME_STOP_REVIEW_GRACE_HOURS="2",
         TRADINGAGENTS_EXEC_EXCHANGE_ID="okx",
     )
     assert config["risk_max_daily_loss_pct"] == 2.5
@@ -207,7 +213,18 @@ def test_risk_float_and_int_coercion(monkeypatch):
     assert config["risk_derivatives_round_trip_fee_rate"] == 0.0004
     assert isinstance(config["risk_derivatives_round_trip_fee_rate"], float)
     assert config["risk_derivatives_time_stop_postpone_minutes"] == 45.0
+    assert config["risk_derivatives_time_stop_review_enabled"] is False
+    assert config["risk_derivatives_time_stop_review_interval_hours"] == 12.0
+    assert config["risk_derivatives_time_stop_review_grace_hours"] == 2.0
     assert config["exec_exchange_id"] == "okx"
+
+
+def test_time_stop_review_keys_are_operator_configurable():
+    from server.operator_config import _ALLOWED
+
+    assert _ALLOWED["risk_derivatives_time_stop_review_enabled"]["type"] == "bool"
+    assert _ALLOWED["risk_derivatives_time_stop_review_interval_hours"]["type"] == "float"
+    assert _ALLOWED["risk_derivatives_time_stop_review_grace_hours"]["type"] == "float"
 
 
 @pytest.mark.parametrize(
