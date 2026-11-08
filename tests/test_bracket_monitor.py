@@ -314,6 +314,7 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
     from server import main
 
     calls = []
+    monkeypatch.setattr(main, "_apply_engine_settings", lambda: calls.append("engine-settings"))
     monkeypatch.setattr(main, "_apply_operator_config", lambda: calls.append("config"))
     monkeypatch.setattr(main, "_open_state_db", lambda: calls.append("database"))
     monkeypatch.setattr(main.watchlist, "ensure_seeded", lambda: calls.append("watchlist"))
@@ -337,9 +338,12 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
         exit_lifespan.send(None)
 
     assert calls == [
-        # Migrations first: operator overrides are read from PostgreSQL, so the
-        # table must exist before the config is applied.
+        # Migrations first: engine settings and operator overrides are read
+        # from PostgreSQL, so the tables must exist before the config is
+        # applied. Engine settings go between the env layer and the operator
+        # overrides, so a deliberate operator override still wins.
         "database",
+        "engine-settings",
         "config",
         "watchlist",
         "autoloop",

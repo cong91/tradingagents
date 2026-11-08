@@ -65,6 +65,30 @@ _STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE"}
 logger = logging.getLogger(__name__)
 
 
+def _apply_engine_settings() -> None:
+    """Apply settings saved through PUT /api/settings from PostgreSQL.
+
+    Sits between the env layer and the operator overrides: .env stays the
+    deployment default (credentials, venue URL, the gate env halves), a save
+    from the control panel outranks it without a restart, and a deliberate
+    operator override still wins. Only keys the settings API accepts are
+    applied; a stored row for an unknown or read-only key is ignored rather
+    than injected into config.
+    """
+    from server.settings import _ENV_BY_KEY, _READONLY_ENV_KEYS
+    from tradingagents.dataflows.config import set_config
+
+    stored = control_store.load_engine_settings()
+    applied = {
+        key: value
+        for key, value in stored.items()
+        if key in _ENV_BY_KEY and key not in _READONLY_ENV_KEYS
+    }
+    if applied:
+        set_config(applied)
+        logger.info("applied %d engine setting(s) from PostgreSQL", len(applied))
+
+
 def _apply_operator_config() -> None:
     """Apply the operator's stored overrides from PostgreSQL.
 
@@ -107,9 +131,11 @@ def _open_state_db() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    # Migrations first: operator overrides live in PostgreSQL, so the table has
-    # to exist before they can be read back into the process config.
+    # Migrations first: operator overrides and engine settings live in
+    # PostgreSQL, so those tables have to exist before they can be read back
+    # into the process config.
     _open_state_db()
+    _apply_engine_settings()
     _apply_operator_config()
     watchlist.ensure_seeded()
     # Session cookies for the sentiment vendors live encrypted in PostgreSQL;

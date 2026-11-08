@@ -471,7 +471,7 @@ def test_migration_is_additive_nullable_and_not_backfilled():
     assert "update bracket_recovery_tasks" not in sql
     from server import postgres
 
-    assert [migration.version for migration in postgres._load_migrations()] == [1, 2, 3, 4, 5]
+    assert [migration.version for migration in postgres._load_migrations()] == [1, 2, 3, 4, 5, 6]
 
 
 @pytest.mark.integration

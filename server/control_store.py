@@ -1,9 +1,10 @@
 """PostgreSQL persistence for the control panel's operator-facing state.
 
 One concern: the records an operator reads or sets that used to be small files
-— approval queue, watchlist, scheduler state, operator overrides and the server
-action trail. They are stored in ``server/migrations/0002_control_plane.sql``
-and ``0003_operator_settings.sql``.
+— approval queue, watchlist, scheduler state, operator overrides, engine
+settings and the server action trail. They are stored in
+``server/migrations/0002_control_plane.sql``, ``0003_operator_settings.sql``
+and ``0006_engine_settings.sql``.
 
 The execution audit the RiskGuard replays stays a JSONL file by design
 (``exec_log_path``): it is a cross-process safety contract, not API state.
@@ -170,3 +171,31 @@ def delete_operator_setting(key: str) -> bool:
             "DELETE FROM control_operator_settings WHERE key = %s", (key,)
         )
     return cursor.rowcount == 1
+
+
+# --- engine settings --------------------------------------------------------
+
+
+def load_engine_settings() -> dict:
+    """The settings saved through PUT /api/settings as ``{key: value}``."""
+    with db.read() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM control_engine_settings ORDER BY key"
+        ).fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def set_engine_settings(updates: dict, *, updated_by: str | None = None) -> None:
+    """Upsert every setting in one transaction, so a partial save cannot stick."""
+    now = _now()
+    with db.session() as conn:
+        for key, value in updates.items():
+            conn.execute(
+                """INSERT INTO control_engine_settings (key, value, updated_at, updated_by)
+                   VALUES (%s, %s::jsonb, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET
+                       value = excluded.value,
+                       updated_at = excluded.updated_at,
+                       updated_by = excluded.updated_by""",
+                (key, _json(value), now, updated_by),
+            )
