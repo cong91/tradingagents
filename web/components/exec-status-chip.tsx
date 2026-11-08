@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { LoaderCircleIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "cn";
@@ -15,9 +15,6 @@ export type ModeState =
 type SettingsPayload = {
   effective_exec_mode?: unknown;
 };
-
-// Settings stale sau 30s — chip tự refresh cùng chu kỳ (cơ chế cũ của ModeBar).
-const REFRESH_INTERVAL_MS = 30_000;
 
 type ChipTone = "live" | "dry" | "loading" | "error";
 
@@ -86,8 +83,15 @@ export function ExecStatusChipView({
 // Chip trạng thái cổng thực thi, luôn hiển thị trong sidebar (thay banner
 // full-width). Nhãn chỉ đo cổng «Lệnh thật»: effective_exec_mode là "live" khi
 // CẢ HAI nửa mở (exec_live + TRADINGAGENTS_EXEC_LIVE) — không đo exec_auto_confirm.
+//
+// Không polling theo đồng hồ. Giá trị này chỉ đổi qua hai con đường và cả hai
+// đều có tín hiệu đẩy: (1) PUT/DELETE /api/operator-config → máy chủ phát sự
+// kiện trên GET /api/settings/events (SSE); (2) sửa .env → phải restart máy
+// chủ → stream đứt, EventSource tự nối lại và nhận "reset" ngay. Fallback khi
+// SSE không có sẵn/khả năng: refetch khi tab quay lại hiển thị hoặc mạng hồi.
 export function ExecStatusChip() {
   const [state, setState] = useState<ModeState>({ status: "loading" });
+  const lastFetchAt = useRef(0);
 
   // Thuần: fetch rồi trả trạng thái; setState chỉ chạy trong callback promise.
   const fetchMode = useCallback(async (): Promise<ModeState> => {
@@ -102,14 +106,37 @@ export function ExecStatusChip() {
   }, []);
 
   const refresh = useCallback(() => {
+    lastFetchAt.current = Date.now();
     void fetchMode().then(setState);
   }, [fetchMode]);
 
+  // Kết nối SSE luôn phát "reset" lúc mở — bỏ qua nếu vừa fetch để mỗi lần
+  // load trang chỉ t đúng một request.
+  const refreshIfQuiet = useCallback(() => {
+    if (Date.now() - lastFetchAt.current >= 2_000) refresh();
+  }, [refresh]);
+
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, [refresh]);
+    if (typeof EventSource === "undefined") return;
+    const source = new EventSource("/api/settings/events");
+    const onChanged = () => refreshIfQuiet();
+    source.addEventListener("reset", onChanged);
+    source.addEventListener("changed", onChanged);
+    return () => source.close();
+  }, [refresh, refreshIfQuiet]);
+
+  useEffect(() => {
+    const onWake = () => {
+      if (document.visibilityState === "visible") refreshIfQuiet();
+    };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("online", onWake);
+    return () => {
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("online", onWake);
+    };
+  }, [refreshIfQuiet]);
 
   return <ExecStatusChipView state={state} onRetry={refresh} />;
 }

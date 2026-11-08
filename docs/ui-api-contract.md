@@ -141,6 +141,16 @@ Response 200:
 
 Trạng thái: loading · empty (không xảy ra — luôn có defaults) · error 500 · stale sau 30s.
 
+### GET /api/settings/events
+
+SSE phát **gợi ý vô hiệu hoá** (hints), không phát dữ liệu — giống `GET /api/snapshot/events`. Mục đích: chip cổng thực thi không cần poll `/api/settings` theo đồng hồ.
+
+- Luồng mở: phát `event: reset` (`{"reason":"connect"}`) ngay khi kết nối — client refetch một lần rồi giữ giá trị.
+- `PUT`/`DELETE /api/operator-config` thành công → server phát `event: changed` (`{"id":N,"type":"changed","reason":"operator_config_updated|operator_config_reset"}`) cho mọi kết nối; client refetch.
+- Restart máy chủ làm đứt stream: EventSource tự nối lại → nhận `reset` mới → refetch (che cả các thay đổi env đòi restart).
+- Client vẫn refetch khi tab quay lại hiển thị (`visibilitychange`) và khi mạng hồi (`online`) — không có polling theo đồng hồ ở chip.
+- Nguồn: `server/settings_events.py`; publish gọi từ `server/operator_config.py`.
+
 ### PUT /api/settings
 
 Request:

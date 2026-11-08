@@ -43,6 +43,7 @@ from server import (
     postgres,
     runs,
     settings,
+    settings_events,
     snapshot_events,
     watchlist,
 )
@@ -158,6 +159,7 @@ async def csrf_guard(request: Request, call_next):
 
 for _router in (
     settings.router,
+    settings_events.router,
     snapshot_events.router,
     operator_config.router,
     watchlist.router,
