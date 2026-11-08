@@ -18,7 +18,6 @@ from server import control_store
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import (
-    _BOOL_TRUE,
     _ENV_OVERRIDES,
     DEFAULT_CONFIG,
     _coerce,
@@ -56,15 +55,8 @@ _ENV_BY_KEY = {key: env for env, key in _ENV_OVERRIDES.items()}
 _READONLY_ENV_KEYS = {"exec_base_url"}
 
 
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name)
-    return bool(raw) and raw.strip().lower() in _BOOL_TRUE
-
-
 def effective_exec_mode() -> str:
-    """``bridge.effective_mode()`` (bridge.py:480-486): live only when the
-    ``exec_live`` config literal is True AND ``TRADINGAGENTS_EXEC_LIVE`` reads
-    true at call time, fail-closed."""
+    """Return the current config-controlled execution mode."""
     from tradingagents.execution.bridge import ExchangeBridge
 
     try:
@@ -161,11 +153,8 @@ def _settings_payload() -> dict:
         "credentials": credentials,
         "gates_readonly": {
             "exec_live_config": get_config().get("exec_live") is True,
-            "TRADINGAGENTS_EXEC_LIVE": _env_flag("TRADINGAGENTS_EXEC_LIVE"),
             "exec_auto_confirm_config": get_config().get("exec_auto_confirm") is True,
-            "TRADINGAGENTS_EXEC_AUTO_CONFIRM": _env_flag("TRADINGAGENTS_EXEC_AUTO_CONFIRM"),
             "exec_derivatives_config": get_config().get("exec_derivatives") is True,
-            "TRADINGAGENTS_EXEC_DERIVATIVES": _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES"),
         },
         "effective_exec_mode": effective_exec_mode(),
     }

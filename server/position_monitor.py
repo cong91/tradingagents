@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 
 from server import job_store, position_review
 from tradingagents.dataflows.config import get_config
-from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.futures_protection import manage_active_positions
 
 logger = logging.getLogger(__name__)
@@ -16,11 +14,6 @@ logger = logging.getLogger(__name__)
 MONITOR_INTERVAL_SECONDS = 30
 _stop_event = threading.Event()
 _monitor_thread: threading.Thread | None = None
-
-
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name)
-    return bool(raw and raw.strip().lower() in _BOOL_TRUE)
 
 
 def _build_executor(config: dict):
@@ -36,9 +29,7 @@ def poll_active_positions() -> list[dict]:
     config = get_config()
     allow_mutation = (
         config.get("exec_derivatives") is True
-        and _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES")
         and config.get("exec_live") is True
-        and _env_flag("TRADINGAGENTS_EXEC_LIVE")
         and config.get("risk_derivatives_profit_protection_enabled") is True
     )
     if not allow_mutation:

@@ -199,6 +199,12 @@ def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
     else:
         base_url = config.get(f"{tier}_think_backend_url")
     kwargs = build_llm_kwargs({**config, "llm_provider": provider})
+    if provider not in {"chatgpt", "bedrock"}:
+        from .runtime_credentials import provider_api_key
+
+        api_key = provider_api_key(provider, tier)
+        if api_key:
+            kwargs["api_key"] = api_key
     # OpenRouter-only: the request's "models" list fails over between upstreams.
     fallbacks = tier_fallback_models(config, tier)
     if provider == "openrouter" and fallbacks:

@@ -6,14 +6,14 @@ One concern: run the engine's own once-a-day cycle on a timer (plus run-now)
 and stop everything on demand. The cycle mirrors server/daily.py's auto scan
 (screen a universe, run the LLM pipeline on the top candidates) but resolves
 every plan through the engine's own confirm policy — ``_handle_plan`` from
-``tradingagents/execution/daily.py``: auto-confirm DRY only when the config
-``exec_auto_confirm`` literal AND the ``TRADINGAGENTS_EXEC_AUTO_CONFIRM`` env
-flag read true at call time, LIVE additionally requires the FR5 double gate.
+``tradingagents/execution/daily.py``: auto-confirm DRY when the current
+process config ``exec_auto_confirm`` is a literal True, LIVE additionally
+requires the current config ``exec_live`` gate.
 This cycle NEVER executes outside that policy, and a plan it does not
 execute is only audited (the approval queue belongs to the daily-job
 surface). Enabling the loop through the API is fail-closed behind the same
-config+env gates: ``409 gate_closed`` — the UI can never arm an unattended
-loop the engine's policy itself would refuse.
+config gate: ``409 gate_closed`` — the UI can never arm an unattended loop
+the engine's policy itself would refuse.
 
 The kill switch is deliberately ungated: ``POST /api/halt`` appends a
 ``{"event": "halt"}`` line to the shared execution audit log, which the
@@ -32,7 +32,6 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import os
 import queue
 import threading
 import time
@@ -69,7 +68,6 @@ from server.futures_decision_context import (
 from tradingagents.agents.rating import RATINGS_5_TIER, parse_rating
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.market_data import fetch_closed_candles
-from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.daily import DailyResult, _handle_plan
 from tradingagents.execution.futures_account import read_futures_account
@@ -321,39 +319,15 @@ def _screen_with_timeout(
 # --- gates ------------------------------------------------------------------
 
 
-def _env_flag(name: str) -> bool:
-    """Env gate read at call time, fail-closed.
-
-    The exact read the engine's own policy does for both halves
-    (execution/daily.py:67-76, bridge.py:592-603), so the UI's gate display
-    can never disagree with what ``_handle_plan`` will decide.
-    """
-    raw = os.environ.get(name)
-    if not raw:
-        return False
-    return raw.strip().lower() in _BOOL_TRUE
-
-
 def gates() -> dict:
-    """The confirm-policy gate state as GET /api/autoloop reports it.
-
-    ``all_open`` (the enable precondition) is only the two auto-confirm
-    halves: config literal True AND env true — matching ``_handle_plan``'s
-    first two checks. The FR5 live halves and the FR-D derivatives halves are
-    reported for observability but never unlock this API surface: live and
-    futures remain the engine policy's decision.
-    """
+    """The config-only execution gate state as GET /api/autoloop reports it."""
     config = get_config()
     auto_confirm_config = config.get("exec_auto_confirm") is True
-    auto_confirm_env = _env_flag("TRADINGAGENTS_EXEC_AUTO_CONFIRM")
     return {
         "auto_confirm_config": auto_confirm_config,
-        "auto_confirm_env": auto_confirm_env,
         "exec_live_config": config.get("exec_live") is True,
-        "exec_live_env": _env_flag("TRADINGAGENTS_EXEC_LIVE"),
         "exec_derivatives_config": config.get("exec_derivatives") is True,
-        "exec_derivatives_env": _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES"),
-        "all_open": auto_confirm_config and auto_confirm_env,
+        "all_open": auto_confirm_config,
     }
 
 
@@ -2302,9 +2276,8 @@ async def set_autoloop(request: Request):
     if enabled and not state["all_open"]:
         raise ApiError(
             409, "gate_closed",
-            "enabling the autoloop requires the auto-confirm gates open "
-            "(exec_auto_confirm=True in config AND TRADINGAGENTS_EXEC_AUTO_CONFIRM=true "
-            "in the environment); the engine's own policy stays fail-closed",
+            "enabling the autoloop requires exec_auto_confirm=True in the "
+            "current process config; the engine's own policy stays fail-closed",
             {"gates": state},
         )
     _save_state({"enabled": enabled, "interval_minutes": interval, "updated_at": utc_now_iso()})

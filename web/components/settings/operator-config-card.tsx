@@ -240,57 +240,61 @@ export function OperatorConfigCard() {
                 ) : null}
               </div>
               <ul className="divide-y rounded-lg border">
-                {rows.map((row) => (
-                  <li
-                    key={row.key}
-                    className="grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium">{row.label}</span>
-                        {row.override ? (
-                          <Badge variant="secondary">{c.overridden}</Badge>
-                        ) : (
-                          <Badge variant="outline">{c.default}</Badge>
-                        )}
-                        {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
+                {rows.map((row) => {
+                  const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : row.label;
+                  const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : row.hint;
+                  return (
+                    <li
+                      key={row.key}
+                      className="grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-medium">{rowLabel}</span>
+                          {row.override ? (
+                            <Badge variant="secondary">{c.overridden}</Badge>
+                          ) : (
+                            <Badge variant="outline">{c.default}</Badge>
+                          )}
+                          {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
+                        </div>
+                        <p className="mt-0.5 text-xs text-muted-foreground">{rowHint}</p>
+                        <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
+                          {c.rowMeta(
+                            row.key,
+                            formatValue(t, row, row.value),
+                            formatValue(t, row, row.default),
+                            row.updated_at ? formatDateTimeVi(row.updated_at) : null
+                          )}
+                        </p>
                       </div>
-                      <p className="mt-0.5 text-xs text-muted-foreground">{row.hint}</p>
-                      <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-                        {c.rowMeta(
-                          row.key,
-                          formatValue(t, row, row.value),
-                          formatValue(t, row, row.default),
-                          row.updated_at ? formatDateTimeVi(row.updated_at) : null
-                        )}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1">
-                        <RowField
-                          row={row}
-                          value={draft[row.key] ?? ""}
-                          disabled={saving}
-                          onChange={(next) =>
-                            setDraft((current) => ({ ...current, [row.key]: next }))
-                          }
-                        />
-                      </span>
-                      {row.override ? (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="min-touch shrink-0"
-                          disabled={saving}
-                          onClick={() => void reset(row.key)}
-                          aria-label={c.resetAria(row.label)}
-                        >
-                          <RotateCcwIcon aria-hidden="true" />
-                        </Button>
-                      ) : null}
-                    </div>
-                  </li>
-                ))}
+                      <div className="flex items-center gap-2">
+                        <span className="min-w-0 flex-1">
+                          <RowField
+                            row={row}
+                            value={draft[row.key] ?? ""}
+                            disabled={saving}
+                            onChange={(next) =>
+                              setDraft((current) => ({ ...current, [row.key]: next }))
+                            }
+                          />
+                        </span>
+                        {row.override ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="min-touch shrink-0"
+                            disabled={saving}
+                            onClick={() => void reset(row.key)}
+                            aria-label={c.resetAria(rowLabel)}
+                          >
+                            <RotateCcwIcon aria-hidden="true" />
+                          </Button>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           );

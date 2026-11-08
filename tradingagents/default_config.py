@@ -42,10 +42,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
-    # Execution bridge (L1 ccxt): quote currency only. TRADINGAGENTS_EXEC_LIVE
-    # is deliberately NOT here — it is the env half of the FR5 double gate and
-    # its only consumer is the fail-closed execute-time read in the bridge;
-    # folding it into config at import would collapse the two gates into one.
+    # Execution bridge (L1 ccxt): quote currency only. The three execution
+    # switches below are runtime config/operator gates and deliberately do not
+    # have environment overrides; .env is deployment-only for credentials,
+    # venue URL, and data/risk settings.
     "TRADINGAGENTS_EXEC_QUOTE_CURRENCY":    "exec_quote_currency",
     # Risk guard limits (L2, FR-K): percentages coerce as floats, the streak
     # cap as an int. exec_symbol_overrides/exec_watchlist are deliberately NOT
@@ -280,10 +280,8 @@ def build_default_config() -> dict:
             ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
             "":     "SPY",         # default for US-listed tickers (no suffix)
         },
-        # Execution bridge (L1 ccxt, Binance spot). Live requires BOTH this gate —
-        # armed as a literal True in code, never via env — and the
-        # TRADINGAGENTS_EXEC_LIVE env flag, re-read at execute time, fail-closed.
-        # Keeping the halves independent means no single switch arms live trading.
+        # Execution bridge (L1 ccxt, Binance spot). Live is controlled by the
+        # current config/operator switch and is never environment-overridable.
         "exec_live": False,
         "exec_log_path": os.getenv("TRADINGAGENTS_EXEC_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "execution", "audit.jsonl"),
         "exec_quote_currency": "USDT",
@@ -375,11 +373,9 @@ def build_default_config() -> dict:
         "exec_sandbox": False,
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],
-        # L2 FR5-style gates. Deliberately NOT in _ENV_OVERRIDES (same reasoning
-        # as exec_live above): the env halves TRADINGAGENTS_EXEC_AUTO_CONFIRM /
-        # TRADINGAGENTS_EXEC_DERIVATIVES are read fail-closed at call time, so no
-        # single switch can arm automatic or derivatives trading. Derivatives
-        # additionally requires per-order confirm=True even in dry-run.
+        # L2 runtime gates are config/operator switches only. The operator
+        # surface applies them in-process and persists them in PostgreSQL;
+        # they are intentionally absent from _ENV_OVERRIDES.
         "exec_auto_confirm": False,
         "exec_derivatives": False,
 

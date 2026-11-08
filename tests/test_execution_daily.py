@@ -111,38 +111,20 @@ def test_missing_auto_confirm_falls_back_with_audit_reason(tmp_path):
 
 
 def test_env_auto_confirm_alone_never_arms(tmp_path, monkeypatch):
-    # The env flag is only the second half; the config literal is required.
+    # The legacy env variable has no effect; config remains the only switch.
     monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
     results = run_daily(["BTC-USD"], config=make_config(tmp_path))
     assert results[0].executed is False
     assert "awaiting approval" in results[0].reason
 
 
-def test_auto_confirm_dry_without_env_flag_falls_back(tmp_path):
-    # FR-S2: the third gate needs BOTH halves even for a dry fill -- config
-    # literal True alone must not arm unattended execution; the missing env
-    # half falls back to waiting for approval, nothing executed.
-    results = run_daily(
-        ["BTC-USD"], config=make_config(tmp_path, exec_auto_confirm=True)
-    )
-    result = results[0]
-    assert result.executed is False
-    assert result.order_id is None
-    assert "awaiting approval" in result.reason
-    events = read_audit(tmp_path)
-    assert events[-1]["action"] == "awaiting_approval"
-    assert "TRADINGAGENTS_EXEC_AUTO_CONFIRM" in events[-1]["reason"]
-
-
-def test_auto_confirm_dry_executes_when_both_gate_halves_open(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
-    monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
+def test_auto_confirm_dry_executes_from_config_switch(tmp_path):
     results = run_daily(
         ["BTC-USD"], config=make_config(tmp_path, exec_auto_confirm=True)
     )
     result = results[0]
     assert result.executed is True
-    assert result.order_id is None  # dry fill
+    assert result.order_id is None
     events = read_audit(tmp_path)
     assert events[-1]["action"] == "buy"
     assert events[-1]["phase"] == "execute"
@@ -166,24 +148,20 @@ def test_halt_blocks_execution(tmp_path, monkeypatch):
     assert read_audit(tmp_path)[-1]["action"] == "rejected_by_risk"
 
 
-def test_live_auto_confirm_requires_both_live_gates(tmp_path, monkeypatch):
-    # config auto-confirm on and exec_live armed, env EXEC_LIVE true -- but
-    # the env AUTO_CONFIRM half missing: falls back to approval, nothing sent.
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
-    monkeypatch.delenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", raising=False)
+def test_live_auto_confirm_requires_configured_credentials(tmp_path):
+    # With both config switches on, the legacy env variables no longer gate
+    # execution; the live path reaches its normal venue credential check.
     results = run_daily(
         ["BTC-USD"],
         config=make_config(tmp_path, exec_auto_confirm=True, exec_live=True),
     )
     result = results[0]
     assert result.executed is False
-    assert "awaiting approval" in result.reason
-    assert read_audit(tmp_path)[-1]["action"] == "awaiting_approval"
+    assert "BINANCE_DEMO_API_KEY" in result.reason
+    assert read_audit(tmp_path)[-1]["action"] == "execute_denied"
 
 
 def test_live_auto_confirm_executes_when_all_gates_open(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
     from tradingagents.execution.bridge import ExchangeBridge
 
     sent = []
@@ -200,8 +178,6 @@ def test_live_auto_confirm_executes_when_all_gates_open(tmp_path, monkeypatch):
     assert results[0].executed is True
     assert results[0].order_id == "order-77"
     assert len(sent) == 1
-    # the stubbed _execute_live writes no audit of its own; the last line is
-    # the plan line, and the order itself was sent with confirm=True
     assert read_audit(tmp_path)[-1]["action"] == "buy"
     assert sent[0].side == "buy"
 

@@ -35,6 +35,8 @@ from server import (
     health,
     history,
     job_store,
+    llm_credentials,
+    llm_credentials_api,
     operator_config,
     performance,
     performance_history,
@@ -68,8 +70,8 @@ logger = logging.getLogger(__name__)
 def _apply_engine_settings() -> None:
     """Apply settings saved through PUT /api/settings from PostgreSQL.
 
-    Sits between the env layer and the operator overrides: .env stays the
-    deployment default (credentials, venue URL, the gate env halves), a save
+    Sits between the env layer and the operator overrides: deployment env
+    supplies deployment defaults (credentials and venue settings), a save
     from the control panel outranks it without a restart, and a deliberate
     operator override still wins. Only keys the settings API accepts are
     applied; a stored row for an unknown or read-only key is ignored rather
@@ -147,6 +149,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             "re-import them from the Cấu hình screen",
             ", ".join(sorted(undecryptable)),
         )
+    llm_undecryptable = llm_credentials.push_to_engine()
+    if llm_undecryptable:
+        logger.warning(
+            "stored LLM credentials could not be decrypted: %s",
+            ", ".join(sorted(llm_undecryptable)),
+        )
     with suppress(OSError):  # unreadable data dir must not keep the server down; the loop stays off
         autoloop.ensure_started()
     bracket_monitor.start()
@@ -200,5 +208,6 @@ for _router in (
     performance_history.router,
     autoloop.router,
     data_sources.router,
+    llm_credentials_api.router,
 ):
     app.include_router(_router)

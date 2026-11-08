@@ -7,15 +7,13 @@ restart and are visible/auditable instead of being a file only a shell can see.
 Two rules shape this surface:
 
 * **Explicit allowlist.** Only the keys in ``_ALLOWED`` may be written. They are
-  the knobs that ``PUT /api/settings`` deliberately refuses (the config halves
-  of the execution gates) plus a few operational limits an operator may want to
-  force regardless of ``.env``. Everything else belongs to ``/api/settings``.
-* **Gates stay a double switch.** This table holds the config half only; the
-  environment halves (``TRADINGAGENTS_EXEC_LIVE``, ``_AUTO_CONFIRM``,
-  ``_DERIVATIVES``) are still read fail-closed at execute time from the
-  process environment. Arming a gate here therefore requires an explicit
-  ``confirm`` flag plus a written reason, and every change records its old and
-  new value in the server action trail.
+  the knobs that ``PUT /api/settings`` deliberately refuses (the operator
+  execution gates) plus a few operational limits an operator may want to force
+  regardless of ``.env``. Everything else belongs to ``/api/settings``.
+* **Gates are config-only runtime switches.** The three execution keys are
+  applied in-process and persisted in PostgreSQL. Arming a gate here requires
+  an explicit ``confirm`` flag plus a written reason, and every change records
+  its old and new value in the server action trail.
 """
 
 from __future__ import annotations
@@ -37,30 +35,29 @@ _ALLOWED: dict[str, dict] = {
         "type": "bool",
         "gate": True,
         "group": "gates",
-        "label": "Cổng LIVE — nửa cấu hình (exec_live)",
+        "label": "Cổng LIVE (exec_live)",
         "hint": (
-            "Chỉ là MỘT nửa của cổng FR5. Lệnh thật vẫn cần nửa môi trường "
-            "TRADINGAGENTS_EXEC_LIVE đọc lúc gửi lệnh. Tắt cổng này là đóng ngay."
+            "Bật/tắt quyền live bằng công tắc cấu hình hiện tại. Tắt cổng này là đóng ngay."
         ),
     },
     "exec_auto_confirm": {
         "type": "bool",
         "gate": True,
         "group": "gates",
-        "label": "Tự động xác nhận — nửa cấu hình (exec_auto_confirm)",
+        "label": "Tự động xác nhận (exec_auto_confirm)",
         "hint": (
-            "Nửa cấu hình của cổng cho autoloop tự duyệt kế hoạch. Vẫn cần "
-            "TRADINGAGENTS_EXEC_AUTO_CONFIRM trong môi trường."
+            "Công tắc cho autoloop tự động xác nhận kế hoạch; việc gửi live vẫn "
+            "cần exec_live và confirm/RiskGuard."
         ),
     },
     "exec_derivatives": {
         "type": "bool",
         "gate": True,
         "group": "gates",
-        "label": "Phái sinh — nửa cấu hình (exec_derivatives)",
+        "label": "Phái sinh (exec_derivatives)",
         "hint": (
-            "Nửa cấu hình của cổng futures. Vẫn cần "
-            "TRADINGAGENTS_EXEC_DERIVATIVES; executor còn đòi confirm=True."
+            "Công tắc cho futures. Executor vẫn đòi explicit futures intent, "
+            "confirm=True và RiskGuard."
         ),
     },
     "risk_max_derivatives_leverage": {

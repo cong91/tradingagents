@@ -132,12 +132,11 @@ def read_audit(tmp_path):
 
 
 def live_bridge(tmp_path, monkeypatch, exchange, **kwargs):
-    """A bridge with both gates open (config exec_live + env flag)."""
+    """A bridge with the config-controlled live gate open."""
     return make_bridge(
         tmp_path, monkeypatch,
         config={"exec_live": True},
         factory=lambda: exchange,
-        env={"TRADINGAGENTS_EXEC_LIVE": "true"},
         **kwargs,
     )
 
@@ -431,7 +430,7 @@ def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("value", ["false", "off", "0", "garbage", ""])
-def test_env_flag_is_fail_closed(tmp_path, monkeypatch, value):
+def test_legacy_live_env_does_not_change_config_gate(tmp_path, monkeypatch, value):
     exchange = FakeExchange()
     bridge = make_bridge(
         tmp_path, monkeypatch,
@@ -440,14 +439,12 @@ def test_env_flag_is_fail_closed(tmp_path, monkeypatch, value):
         env={"TRADINGAGENTS_EXEC_LIVE": value},
     )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    bridge.execute_order(order, confirm=True)  # must succeed as a dry run
-    assert not any(call[0] == "create_order" for call in exchange.calls)
-    assert read_audit(tmp_path)[-1]["mode"] == "dry"
+    assert bridge.execute_order(order, confirm=True) == "order-123"
+    assert any(call[0] == "create_order" for call in exchange.calls)
+    assert read_audit(tmp_path)[-1]["mode"] == "live"
 
 
-def test_env_flag_alone_never_arms_live(tmp_path, monkeypatch):
-    # The env flag is only one half: without config exec_live=True the bridge
-    # stays dry even with confirm=True (pins the two-gate independence).
+def test_legacy_live_env_alone_does_not_arm_live(tmp_path, monkeypatch):
     exchange = FakeExchange()
     bridge = make_bridge(
         tmp_path, monkeypatch,
@@ -460,9 +457,7 @@ def test_env_flag_alone_never_arms_live(tmp_path, monkeypatch):
     assert read_audit(tmp_path)[-1]["mode"] == "dry"
 
 
-def test_exec_live_env_var_is_not_a_config_override(monkeypatch):
-    # FR5 needs two independent gates: the env flag must never fold into
-    # DEFAULT_CONFIG via _ENV_OVERRIDES, or one variable would arm both halves.
+def test_legacy_live_env_is_not_a_config_override(monkeypatch):
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     config = _apply_env_overrides(deepcopy(DEFAULT_CONFIG))
     assert config["exec_live"] is False
@@ -488,13 +483,30 @@ def test_planned_mode_is_informational_gate_is_decided_at_execute(tmp_path, monk
     exchange = FakeExchange()
     bridge = make_bridge(
         tmp_path, monkeypatch,
-        config={"exec_live": True},
+        config={"exec_live": False},
         factory=lambda: exchange,
-    )  # env gate closed at plan time
+    )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     assert order.mode == "dry"
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")  # opened afterwards
-    assert bridge.execute_order(order, confirm=True) == "order-123"
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
+    assert bridge.execute_order(order, confirm=True) is None
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+
+
+def test_gate_closure_after_bridge_creation_blocks_new_order(tmp_path, monkeypatch):
+    exchange = FakeExchange()
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_live": True},
+        factory=lambda: exchange,
+    )
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    from tradingagents.dataflows.config import set_config
+
+    set_config({"exec_live": False})
+    assert bridge.execute_order(order, confirm=True) is None
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+    assert read_audit(tmp_path)[-1]["mode"] == "dry"
 
 
 def test_live_without_credentials_is_denied(tmp_path, monkeypatch):

@@ -13,10 +13,30 @@ from server import approvals, audit as audit_log, runs
 from server.contract import utc_now_iso
 from server.settings import effective_exec_mode
 from tradingagents.dataflows.config import get_config
+from tradingagents.llm_clients.factory import tier_provider
+from tradingagents.llm_clients.provider_metadata import get_provider
+from tradingagents.llm_clients.runtime_credentials import resolve_credential
 
 router = APIRouter(prefix="/api", tags=["health"])
 
 _LLM_KEY_VARS = {"openai": "OPENAI_API_KEY", "google": "GOOGLE_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+
+
+def _llm_key_status(config: dict) -> tuple[dict[str, bool], bool]:
+    """Report active tier credential readiness without exposing key values."""
+    statuses: dict[str, bool] = {}
+    ready = True
+    for tier in ("quick", "deep"):
+        provider = tier_provider(config, tier)
+        credential = resolve_credential(provider, tier)
+        configured = credential.value is not None
+        statuses[f"{tier}:{provider}"] = configured
+        metadata = get_provider(provider)
+        if metadata and metadata["credential_required"] and not configured:
+            ready = False
+    # Retain the legacy provider booleans for existing health consumers.
+    statuses.update({name: bool(os.environ.get(var)) for name, var in _LLM_KEY_VARS.items()})
+    return statuses, ready
 
 
 def _audit_log_readable() -> bool:
@@ -36,10 +56,7 @@ def get_health():
     except Exception:  # an unreadable log is degraded, not a 500
         halted, audit_readable = False, False
 
-    provider = str(config.get("llm_provider", "openai"))
-    keys = {name: bool(os.environ.get(var)) for name, var in _LLM_KEY_VARS.items()}
-    key_for_provider = keys.get(provider)
-    llm_ready = key_for_provider is None or key_for_provider  # unknown providers don't degrade
+    keys, llm_ready = _llm_key_status(config)
 
     return {
         "status": "ok" if audit_readable and llm_ready else "degraded",

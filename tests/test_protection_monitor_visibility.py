@@ -207,7 +207,6 @@ def test_position_poll_reports_deferred_protection(monkeypatch, caplog, status):
         "exec_derivatives": True, "exec_live": True,
         "risk_derivatives_profit_protection_enabled": True,
     })
-    monkeypatch.setattr(position_monitor, "_env_flag", lambda _name: True)
     monkeypatch.setattr(position_monitor, "_build_executor", lambda _config: SimpleNamespace(
         _bridge=object(),
     ))
@@ -232,7 +231,6 @@ def test_successful_position_poll_does_not_report_deferred_protection(monkeypatc
         "exec_derivatives": True, "exec_live": True,
         "risk_derivatives_profit_protection_enabled": True,
     })
-    monkeypatch.setattr(position_monitor, "_env_flag", lambda _name: True)
     monkeypatch.setattr(position_monitor, "_build_executor", lambda _config: SimpleNamespace(
         _bridge=object(),
     ))

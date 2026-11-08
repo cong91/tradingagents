@@ -12,8 +12,8 @@ import {
 } from "@/components/ui/card";
 import { useT } from "@/lib/i18n";
 
-// Cổng FR5 là read-only (hợp đồng §1): LIVE chỉ mở khi CẢ HAI nửa cùng mở —
-// thẻ này chỉ hiển thị trạng thái, không có điều khiển ghi.
+// Gate status is read-only on this summary card; changes are made in the
+// operator configuration card with confirmation and an audit reason.
 export function GatesCard({
   gates,
   effectiveMode,

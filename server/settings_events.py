@@ -1,11 +1,10 @@
 """SSE transport for UI settings invalidation hints.
 
-Effective exec mode changes only through deliberate mutations: an operator
-config PUT (``server/operator_config.py``) or an env edit plus a restart.
+Effective exec mode changes through deliberate operator-config mutations.
 Instead of the client polling ``GET /api/settings`` on a timer, the server
-publishes a change hint here and every connected tab refetches once. A
-restart drops the stream, so reconnects start with a ``reset`` event that
-triggers the same refetch — env halves are covered without any polling.
+publishes a change hint here and every connected tab refetches once. A restart
+drops the stream, so reconnects start with a ``reset`` event that triggers the
+same refetch.
 
 Events are hints, not data: the client reacts by re-fetching the settings.
 Blocking waits use the same ``threading.Condition`` pattern as the snapshot

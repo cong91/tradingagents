@@ -4,21 +4,18 @@ A ``DerivativesExecutor`` composes an ``ExchangeBridge`` (shared config
 merge, venue client, audit shape, redaction and RiskGuard) and adds only
 the derivatives-specific surface: unified symbols ``base/quote:settle``
 (e.g. ``BTC/USDT:USDT``), short semantics (side ``sell`` opens a short, no
-held position required), margin sizing with leverage, and the three-layer
-fail-closed gate:
+held position required), margin sizing with leverage, and the config gate:
 
-(a) the config ``exec_derivatives`` key must be a literal True;
-(b) the ``TRADINGAGENTS_EXEC_DERIVATIVES`` env flag must read true at call
-    time, fail-closed (same pattern as TRADINGAGENTS_EXEC_LIVE);
-(c) every execution needs ``confirm=True`` -- INCLUDING dry-runs, unlike
+(a) the current process config ``exec_derivatives`` key must be a literal True;
+(b) every execution needs ``confirm=True`` -- INCLUDING dry-runs, unlike
     the L1 spot bridge, per FR-D2.
 
 Missing any layer refuses with an audit line and sends nothing.
 
-PRD principle, restated for the operator: the derivatives gates ship OFF.
+PRD principle, restated for the operator: the derivatives gate ships OFF.
 A sandbox or dry-run never proves the live path -- per-order confirm is
 required even in dry-run so the operator consciously re-arms every send,
-and the live path additionally needs both FR5 gates plus a raised
+and the live path additionally needs the FR5 config gate plus a raised
 ``risk_max_derivatives_exposure_pct`` (default 0 blocks all notional).
 
 Risk: the shared RiskGuard caps leverage at ``risk_max_derivatives_leverage``
@@ -38,7 +35,6 @@ from typing import Any
 from server import job_store, snapshot_observer
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
-from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution import futures_identity
 from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
@@ -59,6 +55,11 @@ from tradingagents.execution.sizing import PlannedOrder, SizingRules
 from tradingagents.portfolio import PortfolioContext
 
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
+
+
+def _derivatives_gate_open(executor: DerivativesExecutor) -> bool:
+    """Read the current derivatives switch, including caller config overrides."""
+    return executor._bridge._runtime_gate("exec_derivatives")
 
 
 def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrder, exchange: Any) -> None:
@@ -97,21 +98,6 @@ def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrde
     executor._record_risk_decision("execute_locked", decision)
     if decision.halted or not decision.allowed:
         raise PermissionError(f"risk guard refused execution: {decision.reason}")
-
-
-def _env_derivatives_flag() -> bool:
-    """Read TRADINGAGENTS_EXEC_DERIVATIVES at call time, fail-closed.
-
-    The flag is deliberately absent from _ENV_OVERRIDES: its only consumer
-    is this read, so it can never fold into the config half of the gate.
-    None/"" or anything outside true/1/yes/on keeps derivatives closed.
-    """
-    import os
-
-    raw = os.environ.get("TRADINGAGENTS_EXEC_DERIVATIVES")
-    if not raw:
-        return False
-    return raw.strip().lower() in _BOOL_TRUE
 
 
 class DerivativesExecutor:
@@ -180,17 +166,10 @@ class DerivativesExecutor:
             ticker=ticker, ccxt_symbol=offline_symbol, signal="REVIEW",
             market="derivatives",
         )
-        if self.config.get("exec_derivatives") is not True:
+        if not _derivatives_gate_open(self):
             raise self._refuse(
                 shell,
-                "exec_derivatives is not armed in config (literal True required); "
-                "nothing was planned",
-                phase="resolve",
-            )
-        if not _env_derivatives_flag():
-            raise self._refuse(
-                shell,
-                "TRADINGAGENTS_EXEC_DERIVATIVES is not set to true at call time; "
+                "exec_derivatives is not armed in current process config (literal True required); "
                 "nothing was planned",
                 phase="resolve",
             )
@@ -245,17 +224,10 @@ class DerivativesExecutor:
             market="derivatives", leverage=leverage,
             futures_execution_intent=authorized,
         )
-        if self.config.get("exec_derivatives") is not True:
+        if not _derivatives_gate_open(self):
             raise self._refuse(
                 shell,
-                "exec_derivatives is not armed in config (literal True required); "
-                "nothing was planned",
-                phase="plan",
-            )
-        if not _env_derivatives_flag():
-            raise self._refuse(
-                shell,
-                "TRADINGAGENTS_EXEC_DERIVATIVES is not set to true at call time; "
+                "exec_derivatives is not armed in current process config (literal True required); "
                 "nothing was planned",
                 phase="plan",
             )
@@ -370,17 +342,10 @@ class DerivativesExecutor:
                 confirmed=confirm, phase="execute",
             )
             raise PermissionError(str(exc)) from exc
-        if self.config.get("exec_derivatives") is not True:
+        if not _derivatives_gate_open(self):
             raise self._refuse(
                 order,
-                "exec_derivatives is not armed in config (literal True required); "
-                "nothing was sent",
-                phase="execute",
-            )
-        if not _env_derivatives_flag():
-            raise self._refuse(
-                order,
-                "TRADINGAGENTS_EXEC_DERIVATIVES is not set to true at call time; "
+                "exec_derivatives is not armed in current process config (literal True required); "
                 "nothing was sent",
                 phase="execute",
             )
@@ -957,8 +922,8 @@ class DerivativesExecutor:
         """Repair protective exits only while live and derivatives gates are open."""
         if confirm is not True:
             raise PermissionError("bracket recovery requires confirm=True")
-        if self.config.get("exec_derivatives") is not True or not _env_derivatives_flag():
-            raise PermissionError("bracket recovery requires derivatives execution gates")
+        if not _derivatives_gate_open(self):
+            raise PermissionError("bracket recovery requires derivatives execution gate")
         if self.effective_mode() != "live":
             raise PermissionError("bracket recovery requires live execution gates")
         return BracketManager(self._bridge).reconcile(
@@ -968,8 +933,7 @@ class DerivativesExecutor:
     def monitor_bracket(self, task_id: str) -> str:
         """Inspect protective exits; entry intents use read-only recovery first."""
         allow_cancel = (
-            self.config.get("exec_derivatives") is True
-            and _env_derivatives_flag()
+            _derivatives_gate_open(self)
             and self.effective_mode() == "live"
         )
         task = job_store.load_bracket_recovery(task_id)
