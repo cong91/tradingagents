@@ -8,7 +8,7 @@
 //
 // Lưu ý cấu trúc: mọi setState trong luồng poll nằm trong callback của promise
 // (.then/.catch/.finally) — effect chỉ lên lịch, không chạy setState đồng bộ
-// (react-hooks/set-state-in-effect), cùng pattern với components/mode-bar.tsx.
+// (react-hooks/set-state-in-effect), cùng pattern với components/exec-status-chip.tsx.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getMessages } from "@/lib/i18n/messages";

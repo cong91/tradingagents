@@ -24,7 +24,7 @@ import math
 
 from fastapi import APIRouter, Request
 
-from server import audit as audit_log, control_store
+from server import audit as audit_log, control_store, settings_events
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -320,6 +320,7 @@ async def put_operator_config(request: Request):
         control_store.set_operator_setting(key, value, updated_by=actor)
 
     set_config(validated)  # in-memory: effective for runs created after this call
+    settings_events.publish_change("operator_config_updated")
 
     audit_log.record(
         "operator_config_updated",
@@ -346,6 +347,7 @@ async def delete_operator_config(key: str, request: Request):
 
     default = DEFAULT_CONFIG.get(key)
     set_config({key: default})  # restore the shipped default in this process
+    settings_events.publish_change("operator_config_reset")
 
     audit_log.record(
         "operator_config_reset",

@@ -70,11 +70,28 @@ const { PortfolioCard } = require(
 const { PerformanceCard } = require(
   path.join(webRoot, "components/overview/performance-card.tsx")
 );
+const { ExecStatusChipView } = require(
+  path.join(webRoot, "components/exec-status-chip.tsx")
+);
+const { AuditLogTable } = require(
+  path.join(webRoot, "components/audit/audit-log.tsx")
+);
+const { FuturesCycleFunnel } = require(
+  path.join(webRoot, "components/scanner/futures-cycle-funnel.tsx")
+);
+const { ResolvedList } = require(
+  path.join(webRoot, "components/approvals/resolved-list.tsx")
+);
 const cases = JSON.parse(fs.readFileSync(0, "utf8"));
 const rendered = Object.fromEntries(Object.entries(cases).map(([name, item]) => {
   const component = item.component === "history" ? PerformanceHistory
     : item.component === "portfolio" ? PortfolioCard
-    : item.component === "performance" ? PerformanceCard : PerformancePositions;
+    : item.component === "performance" ? PerformanceCard
+    : item.component === "chip" ? ExecStatusChipView
+    : item.component === "audit_table" ? AuditLogTable
+    : item.component === "funnel" ? FuturesCycleFunnel
+    : item.component === "resolved" ? ResolvedList
+    : PerformancePositions;
   return [name, renderToStaticMarkup(React.createElement(component, item.props))];
 }));
 process.stdout.write(JSON.stringify(rendered));
@@ -226,6 +243,60 @@ def _card_case(
     return {"component": component, "props": props}
 
 
+def _rollup(**overrides):
+    """Rollup theo mã từ GET /api/autoloop/cycles (scanner-types.ts:234-263)."""
+    base = {
+        "symbol": "UNI/USDT:USDT",
+        "total": 2, "entered": 0, "awaiting_approval": 0, "risk_rejected": 0,
+        "not_executed": 0, "execution_failed": 0, "proposal_rejected": 1,
+        "confirmation_rejected": 0, "market_rejected": 0, "in_flight": 1,
+        "interrupted": 0, "other": 0,
+        "last_updated": "2026-11-07T10:00:00Z",
+        "last_status": "running", "last_phase": None, "last_execution_status": None,
+        "last_executed": "", "last_execution_reason": None, "last_signal": None,
+        "last_signal_reason": None, "last_market_rejection_reason": None,
+        "last_confirmation_reason": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _funnel_summary(**overrides):
+    base = {
+        "market_rejected": 0, "confirmation_rejected": 0, "proposal_rejected": 1,
+        "entered": 0, "awaiting_approval": 0, "risk_rejected": 0, "not_executed": 0,
+        "execution_failed": 0, "in_flight": 1, "interrupted": 0, "other": 0, "total": 2,
+    }
+    base.update(overrides)
+    return base
+
+
+def _audit_event(**overrides):
+    """Một dòng audit JSONL (audit/types.ts AuditEvent)."""
+    base = {
+        "timestamp": "2026-11-07T10:00:00Z", "ticker": "UNI/USDT:USDT",
+        "action": "buy", "phase": "plan", "mode": "live",
+        "qty": 1.5, "price_est": 8.5, "order_id": None, "reason": None,
+        "_line_no": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+def _resolved_item(**overrides):
+    base = {
+        "id": "ap-1", "created_at": "2026-11-07T09:00:00Z", "run_id": None,
+        "ticker": "UNI/USDT:USDT", "ccxt_symbol": "UNI/USDT:USDT", "signal": "Buy",
+        "side": "buy", "quantity": 1.5, "price_est": 8.5, "cost": 12.75,
+        "market": "derivatives", "leverage": 2, "mode_at_plan": "live",
+        "plan_reason": None, "status": "execute_failed",
+        "resolved_at": "2026-11-07T09:05:00Z", "resolution": None,
+        "mode": "live", "order_id": None,
+    }
+    base.update(overrides)
+    return base
+
+
 def _cases():
     venue_futures = _futures(
         [
@@ -346,6 +417,85 @@ def _cases():
             )),
         },
         "history_fills": {"component": "history", "props": {"history": history}},
+        "chip_live": {"component": "chip", "props": {"state": {"status": "ready", "live": True}}},
+        "chip_dry": {"component": "chip", "props": {"state": {"status": "ready", "live": False}}},
+        "chip_loading": {"component": "chip", "props": {"state": {"status": "loading"}}},
+        "chip_error": {"component": "chip", "props": {"state": {"status": "error"}}},
+        "funnel_running": {
+            "component": "funnel",
+            "props": {"summary": _funnel_summary(), "symbols": [_rollup()]},
+        },
+        "funnel_idle": {
+            "component": "funnel",
+            "props": {
+                "summary": _funnel_summary(
+                    in_flight=0, execution_failed=1, proposal_rejected=0, total=2,
+                ),
+                "symbols": [_rollup(
+                    in_flight=0, execution_failed=1, proposal_rejected=0,
+                    last_status="failed", last_phase="analysis",
+                    last_execution_reason="llm relay timeout",
+                )],
+            },
+        },
+        "audit_grouped": {
+            "component": "audit_table",
+            "props": {"items": [
+                # Dry plan không order_id — hàng đơn.
+                _audit_event(
+                    _line_no=1, action="no_order", phase="plan", mode="dry",
+                    qty=None, price_est=None,
+                ),
+                # Live cluster điển hình: plan → execute → bracket (collapsed).
+                _audit_event(_line_no=2, order_id="ord-1"),
+                _audit_event(_line_no=3, order_id="ord-1", phase="execute", confirmed=True),
+                _audit_event(_line_no=4, order_id="ord-1", action="bracket_placed",
+                             phase="protection"),
+                # Cluster bất thường: bracket_failed với reason chứa HTML của sàn
+                # — badge "Cần kiểm tra" + steps mở sẵn.
+                _audit_event(_line_no=5, ticker="INJ/USDT:USDT", order_id="ord-2"),
+                _audit_event(
+                    _line_no=6, ticker="INJ/USDT:USDT", order_id="ord-2",
+                    action="bracket_failed", phase="protection",
+                    reason=(
+                        "live order on INJ/USDT:USDT failed: binance "
+                        "502 Bad Gateway <html><body>gateway-error-internal</body></html>"
+                    ),
+                ),
+                # Reason chỉ toàn thẻ → "không đọc được"; reason dài → cắt + "Xem đầy đủ".
+                _audit_event(
+                    _line_no=7, order_id=None, action="no_order", phase="plan",
+                    mode="dry", qty=None, price_est=None, reason="<html></html>",
+                ),
+                _audit_event(
+                    _line_no=8, order_id=None, action="no_order", phase="plan",
+                    mode="dry", qty=None, price_est=None, reason="x" * 200,
+                ),
+                # Dòng điều khiển halt — không có action.
+                _audit_event(
+                    _line_no=9, event="halt", action=None, ticker=None, qty=None,
+                    price_est=None, order_id=None, reason="daily loss cap",
+                    timestamp="2026-11-07T11:00:00Z",
+                ),
+            ]},
+        },
+        "resolved_html_reason": {
+            "component": "resolved",
+            "props": {"items": [_resolved_item(
+                resolution=(
+                    "live order on UNI/USDT:USDT failed: binance "
+                    "502 Bad Gateway <html><body>502-page</body></html>"
+                ),
+            )]},
+        },
+        "resolved_long_reason": {
+            "component": "resolved",
+            "props": {"items": [_resolved_item(resolution="y" * 200)]},
+        },
+        "resolved_unreadable_reason": {
+            "component": "resolved",
+            "props": {"items": [_resolved_item(resolution="<html><body></body></html>")]},
+        },
     }
     for component in ("performance", "portfolio"):
         for name, futures, futures_stale in (
@@ -588,7 +738,7 @@ def test_scope_only_warning_does_not_claim_partial_read(rendered):
 
 def test_unknown_spot_audit_does_not_hide_futures_or_render_zero(rendered):
     page = rendered["unknown_spot_audit"]
-    assert "Không xác định được trạng thái RiskGuard từ audit." in page.text
+    assert "Không xác định được trạng thái dừng giao dịch của bot." in page.text
     assert "Không xác định được số dư và vị thế Spot." in page.text
     assert "HYPE/USDT:USDT" in page.text
     assert "—" in page.text
@@ -606,3 +756,69 @@ def test_venue_uni_fills_are_historical_newest_first_and_preserve_unknown_values
     assert all(row["cells"][5:7] == ["—", "—"] for row in rows[1:])
     assert "0,00 USDC" not in text
     assert "Lịch sử chỉ đầy đủ một phần; có thể còn khớp lệnh chưa được ghi nhận." in page.text
+
+
+def test_exec_status_chip_renders_all_four_gate_states(rendered):
+    # Chấm trạng thái là span aria-hidden (trang trí) — text không còn "●".
+    assert "LIVE — lệnh thật" in rendered["chip_live"].text
+    assert "An toàn — lệnh thử" in rendered["chip_dry"].text
+    assert "Đang kiểm tra…" in rendered["chip_loading"].text
+    assert "Không kiểm tra được" in rendered["chip_error"].text
+    assert "Thử lại" in rendered["chip_error"].text
+
+
+def test_running_symbol_cycle_shows_analyzing_and_dashed_symbol(rendered):
+    page = rendered["funnel_running"]
+    assert "Đang phân tích…" in page.text
+    assert "UNI-USDT" in page.text
+
+    # Không có chu kỳ claimed/running → không dán nhãn đang chạy vĩnh viễn.
+    idle = rendered["funnel_idle"]
+    assert "Đang phân tích…" not in idle.text
+    assert "Phân tích lỗi — chưa vào lệnh (llm relay timeout)" in idle.text
+
+
+def test_audit_table_clusters_same_order_id_and_flags_anomalies(rendered):
+    page = rendered["audit_grouped"]
+    text = page.text
+
+    # Ký hiệu hiển thị một dạng gạch; nguyên văn chỉ còn trong title.
+    assert "UNI-USDT" in text
+    assert "INJ-USDT" in text
+    assert "gộp chung một hàng" in text
+
+    # Cluster bất thường: badge đỏ + steps mở sẵn với lý do đã strip HTML.
+    assert "Cần kiểm tra" in text
+    assert "Đặt cắt lỗ/chốt lời LỖI" in text
+    assert "502 Bad Gateway" in text
+    assert "gateway-error-internal" in text
+    assert "<html>" not in text
+
+    # Cluster bình thường thu gọn — bước con không render tĩnh.
+    assert "Đã gửi lệnh" not in text
+    assert "Đã đặt cắt lỗ + chốt lời" not in text
+
+    # Dòng không order_id giữ hàng đơn; halt là dòng điều khiển riêng.
+    assert "Dừng giao dịch trong ngày" in text
+
+    # Reason dài cắt ~140 ký tự + nút mở rộng; reason chỉ toàn thẻ → không đọc được.
+    assert "x" * 140 in text
+    assert "x" * 200 not in text
+    assert "Xem đầy đủ" in text
+    assert "Lỗi thực thi — chi tiết kỹ thuật không đọc được" in text
+
+
+def test_resolved_list_strips_html_from_resolution_and_offers_expansion(rendered):
+    page = rendered["resolved_html_reason"]
+    assert "Lý do:" in page.text
+    assert "502 Bad Gateway" in page.text
+    assert "<html>" not in page.text
+    assert "UNI-USDT" in page.text
+
+    long_page = rendered["resolved_long_reason"]
+    assert "y" * 140 in long_page.text
+    assert "y" * 200 not in long_page.text
+    assert "Xem đầy đủ" in long_page.text
+
+    unreadable = rendered["resolved_unreadable_reason"]
+    assert "Lỗi thực thi — chi tiết kỹ thuật không đọc được" in unreadable.text

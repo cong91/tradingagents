@@ -1,4 +1,4 @@
-// "Scan cycles" screen: autoloop outcome funnel, per-symbol rollup and the
+// /cycles "Bot activity" page: autoloop outcome funnel, per-symbol rollup and the
 // per-cycle drill-down (reasons a symbol was rejected or deployed).
 
 type FunnelStep = { label: string; hint: string };
@@ -26,8 +26,8 @@ export const vi = {
       hint: "Cổng duyệt chưa mở — plan chưa được gửi lên sàn",
     },
     risk_rejected: {
-      label: "RiskGuard từ chối",
-      hint: "Guard rủi ro chặn plan trước khi sinh lệnh",
+      label: "Bị bộ bảo vệ rủi ro chặn",
+      hint: "Bộ bảo vệ rủi ro chặn kế hoạch trước khi sinh lệnh",
     },
     not_executed: {
       label: "Không có lệnh",
@@ -46,6 +46,14 @@ export const vi = {
     Hold: "Giữ",
   } as Record<string, string>,
   noData: "Chưa có dữ liệu",
+  statusLabels: {
+    claimed: "Đã nhận việc — đang chuẩn bị",
+    running: "Đang chạy",
+    completed: "Hoàn tất",
+    failed: "Lỗi",
+    interrupted: "Bị gián đoạn",
+    recovery_pending: "Đang phục hồi",
+  } as Record<string, string>,
   noUsdtContract: "Không có hợp đồng futures USDT trên sàn (chỉ có spot) — không thể thực thi",
   confirmation: {
     doji_candle: "Nến doji — chưa có hướng rõ ràng",
@@ -72,11 +80,12 @@ export const vi = {
   } as Record<string, string>,
   outcome: {
     entered: "Triển khai được — đã vào lệnh",
+    inFlight: "Đang phân tích…",
     awaitingApproval: "Chờ duyệt — chưa vào lệnh",
     awaitingApprovalReason: (reason: string) => `Chờ duyệt — chưa vào lệnh (${reason})`,
     gateClosed: "cổng duyệt chưa mở",
-    riskRejected: "RiskGuard từ chối plan — chưa vào lệnh",
-    riskRejectedReason: (reason: string) => `RiskGuard từ chối plan — chưa vào lệnh (${reason})`,
+    riskRejected: "Bộ bảo vệ rủi ro từ chối kế hoạch — chưa vào lệnh",
+    riskRejectedReason: (reason: string) => `Bộ bảo vệ rủi ro từ chối kế hoạch — chưa vào lệnh (${reason})`,
     overRiskCap: "vượt trần rủi ro",
     notExecuted: "Không có lệnh",
     notExecutedReason: (reason: string) => `Không có lệnh (${reason})`,
@@ -111,7 +120,7 @@ export const vi = {
   noCycles: "Không có chu kỳ nào được ghi nhận.",
   totalLine: (total: number) => `Tổng ${total} chu kỳ đã ghi nhận`,
   clickHint: ". Click một mã để xem từng chu kỳ và lý do cụ thể.",
-  caption: "Kết quả chu kỳ autoloop theo mã",
+  caption: "Kết quả vòng tự động theo mã",
   colSymbol: "Mã",
   colCycles: "Chu kỳ",
   colBreakdown: "Sơ lược",
@@ -143,7 +152,7 @@ export const en: typeof vi = {
       hint: "Approval gate closed — the plan has not been sent to the exchange",
     },
     risk_rejected: {
-      label: "RiskGuard rejected",
+      label: "Blocked by the risk guard",
       hint: "The risk guard blocked the plan before an order was built",
     },
     not_executed: {
@@ -163,6 +172,14 @@ export const en: typeof vi = {
     Hold: "Hold",
   },
   noData: "No data yet",
+  statusLabels: {
+    claimed: "Picked up — starting",
+    running: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    interrupted: "Interrupted",
+    recovery_pending: "Recovering",
+  } as Record<string, string>,
   noUsdtContract: "No USDT futures contract on the exchange (spot only) — cannot execute",
   confirmation: {
     doji_candle: "Doji candle — no clear direction yet",
@@ -189,11 +206,12 @@ export const en: typeof vi = {
   },
   outcome: {
     entered: "Deployed — position entered",
+    inFlight: "Analyzing…",
     awaitingApproval: "Awaiting approval — not entered",
     awaitingApprovalReason: (reason) => `Awaiting approval — not entered (${reason})`,
     gateClosed: "approval gate closed",
-    riskRejected: "RiskGuard rejected the plan — not entered",
-    riskRejectedReason: (reason) => `RiskGuard rejected the plan — not entered (${reason})`,
+    riskRejected: "The risk guard rejected the plan — not entered",
+    riskRejectedReason: (reason) => `The risk guard rejected the plan — not entered (${reason})`,
     overRiskCap: "exceeds the risk cap",
     notExecuted: "No order",
     notExecutedReason: (reason) => `No order (${reason})`,

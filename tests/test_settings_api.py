@@ -2,7 +2,7 @@
 
 import pytest
 
-from server import settings as settings_mod
+from server import control_store, main as server_main
 from tests.server_api_fixtures import (
     _no_network as _no_network,
     _server_state as _server_state,
@@ -50,20 +50,52 @@ def test_settings_get_masks_credentials_and_lists_paths(client, monkeypatch):
     assert body["effective_exec_mode"] == "dry"
 
 
-def test_settings_put_applies_in_memory_and_persists_env(client, tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    env_file.write_text("# keep this comment\nTRADINGAGENTS_OUTPUT_LANGUAGE=English\n", encoding="utf-8")
-    monkeypatch.setattr(settings_mod, "ENV_PATH", env_file)
-
+def test_settings_put_persists_to_postgres_and_reapplies_at_boot(client):
     response = client.put("/api/settings", json={"settings": {"max_debate_rounds": 2}})
     assert response.status_code == 200
     assert response.json()["applied_at"]
     assert get_config()["max_debate_rounds"] == 2  # in-memory, effective for new runs
+    assert control_store.load_engine_settings() == {"max_debate_rounds": 2}
 
-    text = env_file.read_text(encoding="utf-8")
-    assert "# keep this comment" in text  # unrelated lines survive
-    assert "TRADINGAGENTS_OUTPUT_LANGUAGE=English" in text
-    assert "TRADINGAGENTS_MAX_DEBATE_ROUNDS=2" in text
+    # A fresh process re-applies the stored value at boot (the same call the
+    # lifespan makes) — the env layer alone no longer carries UI saves.
+    set_config({"max_debate_rounds": 1})
+    server_main._apply_engine_settings()
+    assert get_config()["max_debate_rounds"] == 2
+
+
+def test_boot_engine_settings_sit_between_env_and_operator_overrides(monkeypatch):
+    prior = get_config()
+    try:
+        monkeypatch.setattr(
+            control_store,
+            "load_engine_settings",
+            lambda: {
+                "max_debate_rounds": 3,
+                "risk_max_derivatives_leverage": 2,
+                # A gate key and a read-only key must never enter the config
+                # through stored engine settings.
+                "exec_live": True,
+                "exec_base_url": "https://evil.example",
+            },
+        )
+        monkeypatch.setattr(
+            control_store,
+            "load_operator_settings",
+            lambda: {"risk_max_derivatives_leverage": 3},
+        )
+        server_main._apply_engine_settings()
+        server_main._apply_operator_config()
+        config = get_config()
+        assert config["max_debate_rounds"] == 3
+        assert config["risk_max_derivatives_leverage"] == 3  # operator override wins
+        assert config["exec_live"] is False
+        assert config["exec_base_url"] == prior["exec_base_url"]
+    finally:
+        set_config({
+            key: prior[key]
+            for key in ("max_debate_rounds", "risk_max_derivatives_leverage")
+        })
 
 
 def test_settings_put_forbids_gate_and_unknown_keys(client):

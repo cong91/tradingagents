@@ -30,13 +30,13 @@ const settingMetaVi = {
   risk_max_position_pct_per_asset: { label: "Tỷ trọng vị thế tối đa mỗi tài sản", unit: "%" },
   risk_max_total_exposure_pct: { label: "Tổng mức phơi nhiễm tối đa", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Giới hạn lệnh lỗ liên tiếp" },
-  risk_max_derivatives_leverage: { label: "Đòn bẩy phái sinh tối đa", unit: "x", hint: "Trần RiskGuard. Agent đề xuất đòn bẩy thực tế; vượt trần này lệnh bị từ chối." },
+  risk_max_derivatives_leverage: { label: "Đòn bẩy phái sinh tối đa", unit: "x", hint: "Trần bộ bảo vệ rủi ro. Agent đề xuất đòn bẩy thực tế; vượt trần này lệnh bị từ chối." },
   risk_max_derivatives_exposure_pct: { label: "Phơi nhiễm phái sinh tối đa", unit: "%", hint: "0 = chặn hoàn toàn giao dịch phái sinh." },
   risk_derivatives_max_risk_fraction: { label: "Rủi ro tối đa mỗi lệnh", hint: "Tỷ lệ equity chấp nhận mất khi SL khớp (0.02 = 2%). Đề xuất của agent vượt mức này bị từ chối." },
   risk_derivatives_max_margin_fraction: { label: "Ký quỹ tối đa mỗi lệnh", hint: "Tỷ lệ equity dùng làm margin ban đầu (0.5 = 50%). Đề xuất của agent vượt mức này bị từ chối." },
   risk_derivatives_risk_fraction: { label: "Rủi ro mặc định/lệnh", hint: "Chỉ dùng khi lệnh không có đề xuất của agent (CLI/script)." },
   risk_derivatives_margin_fraction: { label: "Ký quỹ mặc định/lệnh", hint: "Chỉ dùng khi lệnh không có đề xuất của agent (CLI/script)." },
-  risk_derivatives_profit_protection_enabled: { label: "Tự khóa lợi nhuận Futures", hint: "Chỉ quản lý vị thế bot có state + bracket đã lưu. Không mở cổng LIVE/phái sinh." },
+  risk_derivatives_profit_protection_enabled: { label: "Tự khóa lợi nhuận Futures", hint: "Chỉ quản lý các vị thế do bot mở và đã có sẵn cặp lệnh cắt lỗ/chốt lời đặt trên sàn. Công tắc này không mở cổng lệnh thật hay Futures." },
   risk_derivatives_break_even_r: { label: "Mốc hòa vốn", unit: "R", hint: "Dời SL về entry khi lợi nhuận đạt bội số R này." },
   risk_derivatives_lock_profit_r: { label: "Mốc khóa lợi nhuận", unit: "R", hint: "Từ mốc này, SL khóa tối thiểu 1R." },
   risk_derivatives_trail_start_r: { label: "Bắt đầu trailing", unit: "R", hint: "Trên mốc này, SL bám mark cách 1R theo cấu hình." },
@@ -81,13 +81,13 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   risk_max_position_pct_per_asset: { label: "Max position weight per asset", unit: "%" },
   risk_max_total_exposure_pct: { label: "Max total exposure", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Consecutive losing orders limit" },
-  risk_max_derivatives_leverage: { label: "Max derivatives leverage", unit: "x", hint: "RiskGuard cap. The agent proposes the actual leverage; orders above this cap are rejected." },
+  risk_max_derivatives_leverage: { label: "Max derivatives leverage", unit: "x", hint: "Risk-guard cap. The agent proposes the actual leverage; orders above this cap are rejected." },
   risk_max_derivatives_exposure_pct: { label: "Max derivatives exposure", unit: "%", hint: "0 = block derivatives trading entirely." },
   risk_derivatives_max_risk_fraction: { label: "Max risk per order", hint: "Share of equity you accept to lose when the SL fills (0.02 = 2%). Agent proposals above this are rejected." },
   risk_derivatives_max_margin_fraction: { label: "Max margin per order", hint: "Share of equity used as initial margin (0.5 = 50%). Agent proposals above this are rejected." },
   risk_derivatives_risk_fraction: { label: "Default risk per order", hint: "Only used when an order has no agent proposal (CLI/script)." },
   risk_derivatives_margin_fraction: { label: "Default margin per order", hint: "Only used when an order has no agent proposal (CLI/script)." },
-  risk_derivatives_profit_protection_enabled: { label: "Futures profit protection", hint: "Only manages bot positions with saved state + bracket. Does not open the LIVE/derivatives gate." },
+  risk_derivatives_profit_protection_enabled: { label: "Futures profit protection", hint: "Only manages positions the bot opened that already have their stop-loss/take-profit pair placed on the exchange. Does not open the real-orders or Futures gate." },
   risk_derivatives_break_even_r: { label: "Break-even trigger", unit: "R", hint: "Move the SL to entry once profit reaches this R multiple." },
   risk_derivatives_lock_profit_r: { label: "Profit-lock trigger", unit: "R", hint: "From this level the SL locks in at least 1R." },
   risk_derivatives_trail_start_r: { label: "Trailing start", unit: "R", hint: "Above this level the SL trails the mark at the configured 1R distance." },
@@ -115,12 +115,12 @@ export const vi = {
     exec_log_path: "Nhật ký audit thực thi",
   } as Record<string, string>,
   gateLabels: {
-    exec_live_config: "LIVE · cấu hình exec_live",
-    TRADINGAGENTS_EXEC_LIVE: "LIVE · biến môi trường TRADINGAGENTS_EXEC_LIVE",
-    exec_auto_confirm_config: "Tự động duyệt · cấu hình exec_auto_confirm",
-    TRADINGAGENTS_EXEC_AUTO_CONFIRM: "Tự động duyệt · biến môi trường",
-    exec_derivatives_config: "Phái sinh · cấu hình exec_derivatives",
-    TRADINGAGENTS_EXEC_DERIVATIVES: "Phái sinh · biến môi trường",
+    exec_live_config: "Lệnh thật — nửa cấu hình (máy chủ)",
+    TRADINGAGENTS_EXEC_LIVE: "Lệnh thật — nửa môi trường (.env)",
+    exec_auto_confirm_config: "Tự động duyệt — nửa cấu hình (máy chủ)",
+    TRADINGAGENTS_EXEC_AUTO_CONFIRM: "Tự động duyệt — nửa môi trường (.env)",
+    exec_derivatives_config: "Futures — nửa cấu hình (máy chủ)",
+    TRADINGAGENTS_EXEC_DERIVATIVES: "Futures — nửa môi trường (.env)",
   } as Record<string, string>,
   groups: {
     llm: {
@@ -131,7 +131,7 @@ export const vi = {
     risk: {
       title: "Giới hạn rủi ro",
       description:
-        "Ngưỡng RiskGuard dùng để chặn lệnh và chính sách bảo vệ lợi nhuận cho vị thế Futures do bot quản lý.",
+        "Ngưỡng bộ bảo vệ rủi ro của bot dùng để chặn lệnh, cùng chính sách bảo vệ lợi nhuận cho vị thế Futures do bot quản lý.",
     },
     exec: {
       title: "Thực thi & Sàn",
@@ -140,8 +140,9 @@ export const vi = {
     },
   },
   screen: {
-    loadingDescription: "Đang tải cài đặt từ GET /api/settings…",
-    errorDescription: "Đọc và ghi cài đặt engine qua GET / PUT /api/settings.",
+    loadingDescription: "Đang tải cài đặt…",
+    errorDescription:
+      "Trang này đọc và lưu cài đặt của hệ thống phân tích. Thay đổi chỉ áp dụng cho phiên phân tích mới.",
     loadFailed: "Không tải được cài đặt",
     updatedAt: (time: string) => `Cập nhật lúc ${time}`,
     serverAhead:
@@ -149,7 +150,7 @@ export const vi = {
     loadServerData: "Nạp dữ liệu máy chủ",
     emptyTitle: "Chưa có cài đặt nào",
     emptyDescription:
-      "Máy chủ trả về danh sách cài đặt trống. Kiểm tra backend đã chạy đúng phiên bản hợp đồng rồi bấm Làm mới.",
+      "Máy chủ trả về danh sách cài đặt trống. Kiểm tra máy chủ đã chạy đúng phiên bản hợp đồng rồi bấm Làm mới.",
     otherTitle: "Cài đặt khác",
     otherDescription: "Các key máy chủ trả về ngoài các nhóm chuẩn.",
   },
@@ -175,14 +176,14 @@ export const vi = {
     memoryNote:
       " Thay đổi có thể đã có hiệu lực tạm thời trong bộ nhớ nhưng chưa ghi vào .env.",
     failed: (message: string) => `Lưu thất bại: ${message}`,
-    networkFailed: (hint: string) => `Không gửi được yêu cầu lưu tới backend. ${hint}`,
+    networkFailed: (hint: string) => `Không gửi được yêu cầu lưu tới máy chủ. ${hint}`,
   },
   credentials: {
     title: "Khóa API",
     description:
       "Không bao giờ hiển thị nguyên văn — chỉ trạng thái cấu hình và 4 ký tự cuối. Đặt khóa qua biến môi trường hoặc .env, không sửa được từ UI.",
     empty:
-      "Máy chủ không trả về khóa nào. Khởi động backend rồi bấm Làm mới để xem trạng thái khóa API.",
+      "Máy chủ không trả về khóa nào. Khởi động máy chủ rồi bấm Làm mới để xem trạng thái khóa API.",
     configured: "Đã cấu hình",
     notConfigured: "Chưa cấu hình",
   },
@@ -190,6 +191,11 @@ export const vi = {
     title: "Cổng thực thi (chỉ đọc)",
     description:
       "LIVE chỉ mở khi cả hai nửa cổng cùng mở. Các cổng này cố ý vắng khỏi API ghi — không thể bật từ UI.",
+    explainLive:
+      "Cổng «Lệnh thật» đã mở đủ HAI NỬA (cấu hình máy chủ + biến môi trường TRADINGAGENTS_EXEC_LIVE). Mọi lệnh bạn bấm Duyệt sẽ được gửi thẳng lên sàn Binance.",
+    explainSafe:
+      "Cổng «Lệnh thật» đang đóng. Lệnh bạn duyệt chỉ chạy mô phỏng — không có lệnh nào được gửi lên sàn.",
+    explainChecking: "Chưa đọc được trạng thái cổng — bấm Làm mới.",
     effectiveMode: "Chế độ thực thi hiệu lực",
     live: "LIVE — LỆNH THẬT",
     dry: "Mô phỏng (dry)",
@@ -203,28 +209,28 @@ export const vi = {
   },
   autoloop: {
     title: "Chế độ tự động",
-    loading: "Đang tải trạng thái vòng tự động từ GET /api/autoloop…",
+    loading: "Đang tải trạng thái vòng tự động…",
     loadFailed: "Không tải được trạng thái vòng tự động.",
     description:
-      "Vòng quét + giao dịch theo lịch chạy trên server: sàng universe, phân tích ứng viên rồi tự duyệt theo đúng cổng an toàn của engine. Bật chỉ được khi các cổng auto-confirm cùng mở.",
+      "Vòng quét + giao dịch theo lịch chạy trên máy chủ: sàng universe, phân tích ứng viên rồi tự duyệt theo đúng cổng an toàn của bot. Bật chỉ được khi cổng «Tự động duyệt» mở đủ hai nửa.",
     enabled: "Đang bật",
     disabled: "Đang tắt",
     gatesAria: "Cổng an toàn",
     gateOpen: "Mở",
     gateClosed: "Đóng",
     gateRows: {
-      auto_confirm_config: { label: "Auto-confirm trong config" },
-      auto_confirm_env: { label: "Biến môi trường TRADINGAGENTS_EXEC_AUTO_CONFIRM" },
-      exec_live_config: { label: "exec_live trong config" },
-      exec_live_env: { label: "Biến môi trường TRADINGAGENTS_EXEC_LIVE" },
+      auto_confirm_config: { label: "Tự động duyệt — nửa cấu hình" },
+      auto_confirm_env: { label: "Tự động duyệt — nửa môi trường" },
+      exec_live_config: { label: "Lệnh thật — nửa cấu hình" },
+      exec_live_env: { label: "Lệnh thật — nửa môi trường" },
       exec_derivatives_config: {
-        label: "Futures (exec_derivatives)",
-        hint: "Cổng futures — chỉ quan sát, không điều kiện bật autoloop",
+        label: "Futures — nửa cấu hình",
+        hint: "Chỉ quan sát, không điều kiện bật vòng tự động",
       },
-      exec_derivatives_env: { label: "Biến môi trường TRADINGAGENTS_EXEC_DERIVATIVES" },
+      exec_derivatives_env: { label: "Futures — nửa môi trường" },
     } as Record<string, { label: string; hint?: string }>,
     futuresNote:
-      "Bật futures cần đặt exec_derivatives=True trong .env theo hướng dẫn — vòng tự động sẽ mở long/short đòn bẩy cho ứng viên crypto khi cổng này mở (đòn bẩy tối đa 3×, trần exposure do RiskGuard kiểm).",
+      "Để mở giao dịch Futures, đặt biến môi trường TRADINGAGENTS_EXEC_DERIVATIVES=true trong file .env của máy chủ rồi khởi động lại — không có công tắc trên màn này. Khi cổng mở, bot được vào lệnh long/short có đòn bẩy cho coin: đòn bẩy tối đa 3× và tổng mức tiền đang chiến (exposure) bị bộ bảo vệ rủi ro của bot chặn lại.",
     allOpen: "Đủ điều kiện tự động",
     notAllOpen: "Chưa đủ điều kiện — vòng tự động không thể bật",
     enableLabel: "Bật vòng tự động",
@@ -243,16 +249,16 @@ export const vi = {
     } as Record<string, string>,
     serverResponse: (status: string) => `Phản hồi máy chủ: ${status}.`,
     haltedFeedback:
-      "Đã ghi halt vào audit log — RiskGuard chặn mọi lệnh mới còn lại hôm nay, ở cả tiến trình khác.",
-    resetFeedback: "Đã gỡ halt hôm nay — RiskGuard nhận lệnh mới bình thường.",
+      "Đã ghi nhận dừng giao dịch vào lịch sử — bot chặn mọi lệnh mới còn lại hôm nay, kể cả ở tiến trình khác.",
+    resetFeedback: "Đã gỡ dừng hôm nay — bot nhận lệnh mới bình thường.",
     cycleRunning: "Chu kỳ đang chạy…",
     runOnce: "Chạy thử một chu kỳ",
     runOnceHint: "Chạy ngay một vòng không cần chờ lịch — sàng universe rồi phân tích top ứng viên.",
     stopTitle: "STOP khẩn cấp",
     stopBody:
-      "Ghi halt vào audit log — RiskGuard chặn mọi lệnh mới còn lại hôm nay, ở cả tiến trình khác.",
-    haltActive: "Halt đang hiệu lực (theo card này)",
-    resetHalt: "Gỡ halt hôm nay",
+      "Đã ghi nhận dừng giao dịch vào lịch sử — bot chặn mọi lệnh mới còn lại hôm nay, kể cả ở tiến trình khác.",
+    haltActive: "Dừng giao dịch đang hiệu lực (theo thẻ này)",
+    resetHalt: "Gỡ dừng hôm nay",
     haltAll: "DỪNG TẤT CẢ GIAO DỊCH HÔM NAY",
     lastCycle: "Chu kỳ gần nhất: ",
     skipped: (reason: string | null) => `Bỏ qua — ${reason ?? "worker khác đang bận"}`,
@@ -279,12 +285,12 @@ export const vi = {
       gates: {
         title: "Cổng thực thi (nửa cấu hình)",
         description:
-          "Đây là nửa cấu hình của thiết kế hai khoá. Lệnh thật chỉ đi khi nửa môi trường (TRADINGAGENTS_EXEC_*) cũng mở, đọc lại lúc gửi lệnh. Ghi vào đây cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
+          "Đây là nửa cấu hình của các cổng (mỗi cổng có hai nửa). Lệnh thật chỉ đi khi nửa môi trường (biến TRADINGAGENTS_EXEC_* trong .env) cũng mở — máy chủ đọc lại lúc gửi lệnh. Ghi vào đây cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
       },
       risk: {
         title: "Trần rủi ro vận hành",
         description:
-          "Giá trị đặt ở đây thay cho .env và tồn tại qua restart. RiskGuard vẫn là nơi quyết định cuối cùng: đề xuất của agent vượt trần bị từ chối, không bị hạ xuống.",
+          "Giá trị đặt ở đây thay cho .env và tồn tại qua restart. Bộ bảo vệ rủi ro vẫn là nơi quyết định cuối cùng: đề xuất của agent vượt trần bị từ chối, không bị hạ xuống.",
       },
     } as Record<string, { title: string; description: string }>,
     overridden: "đã đặt",
@@ -315,12 +321,12 @@ export const en: typeof vi = {
     exec_log_path: "Execution audit log",
   },
   gateLabels: {
-    exec_live_config: "LIVE · exec_live config",
-    TRADINGAGENTS_EXEC_LIVE: "LIVE · TRADINGAGENTS_EXEC_LIVE env var",
-    exec_auto_confirm_config: "Auto-approve · exec_auto_confirm config",
-    TRADINGAGENTS_EXEC_AUTO_CONFIRM: "Auto-approve · env var",
-    exec_derivatives_config: "Derivatives · exec_derivatives config",
-    TRADINGAGENTS_EXEC_DERIVATIVES: "Derivatives · env var",
+    exec_live_config: "Real orders — config half (server)",
+    TRADINGAGENTS_EXEC_LIVE: "Real orders — env half (.env)",
+    exec_auto_confirm_config: "Auto-approve — config half (server)",
+    TRADINGAGENTS_EXEC_AUTO_CONFIRM: "Auto-approve — env half (.env)",
+    exec_derivatives_config: "Futures — config half (server)",
+    TRADINGAGENTS_EXEC_DERIVATIVES: "Futures — env half (.env)",
   },
   groups: {
     llm: {
@@ -331,7 +337,7 @@ export const en: typeof vi = {
     risk: {
       title: "Risk limits",
       description:
-        "RiskGuard thresholds used to block orders, plus the profit-protection policy for bot-managed Futures positions.",
+        "The bot's risk-guard thresholds that block orders, plus the profit-protection policy for bot-managed Futures positions.",
     },
     exec: {
       title: "Execution & Exchange",
@@ -340,8 +346,9 @@ export const en: typeof vi = {
     },
   },
   screen: {
-    loadingDescription: "Loading settings from GET /api/settings…",
-    errorDescription: "Read and write engine settings via GET / PUT /api/settings.",
+    loadingDescription: "Loading settings…",
+    errorDescription:
+      "This page reads and saves the analysis system's settings. Changes only apply to new analysis runs.",
     loadFailed: "Could not load settings",
     updatedAt: (time) => `Updated at ${time}`,
     serverAhead:
@@ -390,6 +397,11 @@ export const en: typeof vi = {
     title: "Execution gates (read-only)",
     description:
       "LIVE only opens when both halves of the gate are open. These gates are deliberately absent from the write API — they cannot be enabled from the UI.",
+    explainLive:
+      "The \"Real orders\" gate is open on BOTH halves (server config + the TRADINGAGENTS_EXEC_LIVE environment variable). Every order you approve is sent straight to Binance.",
+    explainSafe:
+      "The \"Real orders\" gate is closed. Approved orders run in simulation only — nothing is sent to the exchange.",
+    explainChecking: "Gate status not read yet — press Refresh.",
     effectiveMode: "Effective execution mode",
     live: "LIVE — REAL ORDERS",
     dry: "Simulated (dry)",
@@ -406,25 +418,25 @@ export const en: typeof vi = {
     loading: "Loading autoloop status from GET /api/autoloop…",
     loadFailed: "Could not load autoloop status.",
     description:
-      "Scheduled scan + trade loop running on the server: screens the universe, analyzes candidates, then auto-approves under the engine's safety gates. Can only be enabled when the auto-confirm gates are all open.",
+      "The scheduled scan + trade loop runs on the server: screens the universe, analyzes candidates, then auto-approves under the bot's safety gates. Can only be enabled when the \"Auto-approve\" gate is open on both halves.",
     enabled: "Enabled",
     disabled: "Disabled",
     gatesAria: "Safety gates",
     gateOpen: "Open",
     gateClosed: "Closed",
     gateRows: {
-      auto_confirm_config: { label: "Auto-confirm in config" },
-      auto_confirm_env: { label: "TRADINGAGENTS_EXEC_AUTO_CONFIRM env var" },
-      exec_live_config: { label: "exec_live in config" },
-      exec_live_env: { label: "TRADINGAGENTS_EXEC_LIVE env var" },
+      auto_confirm_config: { label: "Auto-approve — config half" },
+      auto_confirm_env: { label: "Auto-approve — env half" },
+      exec_live_config: { label: "Real orders — config half" },
+      exec_live_env: { label: "Real orders — env half" },
       exec_derivatives_config: {
-        label: "Futures (exec_derivatives)",
-        hint: "Futures gate — informational only, not required to enable autoloop",
+        label: "Futures — config half",
+        hint: "Informational only, not required to enable autoloop",
       },
-      exec_derivatives_env: { label: "TRADINGAGENTS_EXEC_DERIVATIVES env var" },
+      exec_derivatives_env: { label: "Futures — env half" },
     },
     futuresNote:
-      "Enabling futures requires exec_derivatives=True in .env as documented — the autoloop then opens leveraged long/short positions for crypto candidates while this gate is open (max leverage 3×, exposure cap enforced by RiskGuard).",
+      "To enable Futures, set the TRADINGAGENTS_EXEC_DERIVATIVES=true environment variable in the server's .env and restart — there is no switch on this screen. While the gate is open the bot may open leveraged long/short positions on coins: max leverage 3× and total exposure is capped by the bot's risk guard.",
     allOpen: "Ready for automation",
     notAllOpen: "Requirements not met — autoloop cannot be enabled",
     enableLabel: "Enable autoloop",
@@ -441,14 +453,14 @@ export const en: typeof vi = {
     },
     serverResponse: (status) => `Server response: ${status}.`,
     haltedFeedback:
-      "Halt written to the audit log — RiskGuard blocks every new order for the rest of today, in other processes too.",
-    resetFeedback: "Today's halt cleared — RiskGuard accepts new orders normally.",
+      "Trading halt recorded in the history — the bot blocks every new order for the rest of today, in other processes too.",
+    resetFeedback: "Today's halt cleared — the bot accepts new orders normally.",
     cycleRunning: "Cycle running…",
     runOnce: "Run one cycle now",
     runOnceHint: "Run a cycle right away without waiting for the schedule — screens the universe, then analyzes the top candidates.",
     stopTitle: "Emergency STOP",
     stopBody:
-      "Writes a halt to the audit log — RiskGuard blocks every new order for the rest of today, in other processes too.",
+      "Trading halt recorded in the history — the bot blocks every new order for the rest of today, in other processes too.",
     haltActive: "Halt active (per this card)",
     resetHalt: "Clear today's halt",
     haltAll: "HALT ALL TRADING TODAY",
@@ -477,12 +489,12 @@ export const en: typeof vi = {
       gates: {
         title: "Execution gates (config half)",
         description:
-          "This is the config half of the two-key design. Real orders only go out when the environment half (TRADINGAGENTS_EXEC_*) is open too, re-read at send time. Writing here requires a confirmation and a reason; every change is recorded in the operator log.",
+          "This is the config half of the gates (each gate has two halves). Real orders only go out when the environment half (the TRADINGAGENTS_EXEC_* variables in .env) is open too — re-checked at send time. Writing here requires a confirmation and a reason; every change is recorded in the operator log.",
       },
       risk: {
         title: "Operational risk caps",
         description:
-          "Values set here replace .env and survive restarts. RiskGuard still has the final say: agent proposals above a cap are rejected, not scaled down.",
+          "Values set here replace .env and survive restarts. The risk guard still has the final say: agent proposals above a cap are rejected, not scaled down.",
       },
     },
     overridden: "overridden",

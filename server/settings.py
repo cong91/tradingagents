@@ -2,17 +2,19 @@
 
 Reads the engine's ``_ENV_OVERRIDES`` surface and masks every credential.
 PUT applies in-memory via ``set_config`` (effective for runs started after
-the change) and upserts ``TRADINGAGENTS_*`` lines into the repo ``.env``,
-preserving comments and unrelated lines. The FR5/FR-S2/FR-D gate keys are
-deliberately absent from ``_ENV_OVERRIDES`` (default_config.py:33-36) and are
-therefore unwriteable here — one switch must never arm live trading.
+the change) and persists to PostgreSQL (``control_engine_settings``,
+applied again at boot between the env layer and the operator overrides).
+The FR5/FR-S2/FR-D gate keys are deliberately absent from ``_ENV_OVERRIDES``
+(default_config.py:33-36) and are therefore unwriteable here — one switch
+must never arm live trading. ``.env`` is deployment-only configuration and
+is never written at runtime.
 """
 
 import os
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 
+from server import control_store
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import (
@@ -47,8 +49,8 @@ _NULL_DEFAULT_TYPES = {
     "max_tokens": "int|null",
 }
 
-# The repo .env the CLI also reads (tradingagents/__init__.py loads it).
-ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+# The deployment .env the CLI also reads (tradingagents/__init__.py loads it)
+# is deployment-only configuration: read at boot, never written at runtime.
 
 _ENV_BY_KEY = {key: env for env, key in _ENV_OVERRIDES.items()}
 _READONLY_ENV_KEYS = {"exec_base_url"}
@@ -169,33 +171,6 @@ def _settings_payload() -> dict:
     }
 
 
-def _render_env_value(value) -> str:
-    if value is None:
-        return ""  # KEY= reads back as unset: _apply_env_overrides skips empty values
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _persist_env(updates: dict) -> None:
-    """Upsert ``TRADINGAGENTS_*`` lines into .env, keeping comments and other
-    lines intact; tmp-file + replace so a crash cannot truncate the file."""
-    lines = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
-    for env_var, value in updates.items():
-        rendered = f"{env_var}={_render_env_value(value)}"
-        for index, line in enumerate(lines):
-            if line.split("=", 1)[0].strip() == env_var:
-                lines[index] = rendered
-                break
-        else:
-            lines.append(rendered)
-    tmp_path = ENV_PATH.with_name(ENV_PATH.name + ".tmp")
-    tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp_path.replace(ENV_PATH)
-
-
 @router.get("/settings")
 def get_settings():
     return _settings_payload()
@@ -223,8 +198,11 @@ async def put_settings(request: Request):
             ) from exc
 
     set_config(validated)  # in-memory: effective for runs created after this call
-    _persist_env({_ENV_BY_KEY[key]: value for key, value in validated.items()})
-    audit_log.record("settings_updated", keys=sorted(validated))
+    # Durable in PostgreSQL (0006_engine_settings.sql), re-applied at boot
+    # between the env layer and the operator overrides — .env is never written
+    # at runtime.
+    control_store.set_engine_settings(validated)
+    audit_log.record("settings_updated", keys=sorted(validated), persisted="postgresql")
     payload = _settings_payload()
     payload["applied_at"] = utc_now_iso()
     return payload

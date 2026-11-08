@@ -1,4 +1,5 @@
-// M3 "Pair scanner" screen: watchlist, futures autoloop, scan panel, job results/history.
+// Watchlist, futures autoloop, scan panel and job results/history cards —
+// rendered on the /cycles "Bot activity" page after the scanner screen was merged into it.
 
 export const vi = {
   cashIn: "Tiền vào",
@@ -12,12 +13,15 @@ export const vi = {
     interrupted: "Bị gián đoạn",
   } as Record<string, string>,
   networkError:
-    "Không kết nối được backend — hãy chắc chắn server FastAPI đang chạy (uvicorn server.main:app --port 8000).",
+    "Không kết nối được máy chủ — hãy chắc chắn chương trình TradingAgents đang chạy.",
+  section: {
+    title: "Quét & danh sách theo dõi",
+  },
   watchlist: {
     inputRequired: "Nhập một mã giao dịch, ví dụ BTC-USD.",
     title: "Danh sách theo dõi",
     description:
-      "Các mã sẽ được quét trong pipeline. Thêm hoặc xóa tại đây — server lưu và đồng bộ với engine.",
+      "Các mã sẽ được bot quét định kỳ. Thêm hoặc xóa tại đây — máy chủ lưu và đồng bộ với bộ phân tích.",
     stale: "Dữ liệu cũ — bấm Làm mới",
     inputLabel: "Mã giao dịch cần thêm",
     add: "Thêm mã",
@@ -35,8 +39,17 @@ export const vi = {
     candidates: "Ứng viên / skip",
     enabled: "Đang bật",
     disabled: "Đang tắt",
-    runningCycle: "Đang chạy cycle",
+    runningCycle: "Đang chạy chu kỳ",
     waiting: "Đang chờ",
+    autoloopTitle: "Vòng tự động futures",
+    cycleId: "Mã chu kỳ",
+    unifiedMarket: "Thị trường chuẩn hoá",
+    execution: "Thực thi",
+    entryOrder: "Lệnh vào / mã lệnh",
+    slTp: "Cắt lỗ / chốt lời",
+    claim: "Trạng thái nhận việc",
+    position: "Vị thế",
+    recovery: "Phục hồi",
     interval: (n: number) => ` · nhịp ${n} phút`,
     liveData: ". Dữ liệu đọc trực tiếp từ server.",
     loading: "Đang tải trạng thái futures…",
@@ -60,7 +73,7 @@ export const vi = {
     protection: "Bảo vệ",
   },
   scan: {
-    title: "Quét pipeline",
+    title: "Chạy quét",
     description:
       "Quét tự động: server tự sàng universe (crypto top khối lượng sàn + cổ phiếu Mỹ đang mạnh 52 tuần) bằng bộ tiêu chí thực chiến — động lượng, RSI, đỉnh 52 tuần, breakout kèm khối lượng, thanh khoản — rồi chạy pipeline LLM trên các ứng viên điểm cao nhất. Không cần danh sách theo dõi. “Quét ngay” chạy trên watchlist hiện hành; mỗi mã là một pipeline LLM đầy đủ nên job có thể mất nhiều phút.",
     sending: "Đang gửi…",
@@ -78,7 +91,7 @@ export const vi = {
     loading: "Đang tải lịch sử…",
     empty: "Chưa có lần quét nào được ghi lại.",
     loadFailed: "Không tải được lịch sử job",
-    caption: "Lịch sử các lần quét pipeline",
+    caption: "Lịch sử các lần bot quét",
     colTime: "Thời gian",
     colKind: "Kiểu",
     colStatus: "Trạng thái",
@@ -100,10 +113,10 @@ export const vi = {
     stuck: (ticker: string | null) =>
       `Không ghi nhận tiến triển trong hơn 15 phút${ticker ? ` khi đang xử lý ${ticker}` : ""}. Kiểm tra log hoặc bấm “Dừng” nếu nhà cung cấp dữ liệu/LLM không phản hồi.`,
     screening:
-      "Đang sàng thị trường (crypto + cổ phiếu Mỹ)… Bước này chỉ tính chỉ báo, không tốn LLM — sau đó pipeline LLM mới chạy trên các ứng viên điểm cao nhất.",
+      "Đang sàng thị trường (crypto + cổ phiếu Mỹ)… Bước này chỉ tính chỉ báo, không tốn AI — sau đó bộ phân tích AI mới chạy trên các ứng viên điểm cao nhất.",
     screeningEmpty:
-      "Bước sàng lọc không cho ứng viên nào đủ điểm — không có mã nào đáng chạy pipeline lúc này. Thử lại sau phiên giao dịch kế tiếp.",
-    caption: "Kết quả quét pipeline theo từng mã",
+      "Bước sàng lọc không cho ứng viên nào đủ điểm — không có mã nào đáng cho bot phân tích lúc này. Thử lại sau phiên giao dịch kế tiếp.",
+    caption: "Kết quả quét theo từng mã",
     colPair: "Cặp",
     colSignal: "Tín hiệu",
     colPlan: "Lệnh đề xuất",
@@ -123,7 +136,7 @@ export const vi = {
     viewQueue: "Xem hàng duyệt",
     screeningResult: "Kết quả sàng lọc",
     universe: (crypto: number, stock: number, total: number, top: number, mock: boolean) =>
-      `universe: ${crypto} crypto (top khối lượng) + ${stock} cổ phiếu (mạnh 52 tuần) = ${total} mã · top ${top} ứng viên đi tiếp vào pipeline${mock ? " (mock)" : ""}`,
+      `Dải quét: ${crypto} crypto (top khối lượng) + ${stock} cổ phiếu (mạnh 52 tuần) = ${total} mã · top ${top} ứng viên đi tiếp vào bước phân tích${mock ? " (thử)" : ""}`,
     screeningCaption: "Ứng viên sau sàng lọc kỹ thuật, xếp theo điểm",
     colTicker: "Mã",
     colType: "Loại",
@@ -147,7 +160,10 @@ export const en: typeof vi = {
     interrupted: "Interrupted",
   },
   networkError:
-    "Cannot reach the backend — make sure the FastAPI server is running (uvicorn server.main:app --port 8000).",
+    "Cannot reach the server — make sure the TradingAgents app is running.",
+  section: {
+    title: "Scan & watchlist",
+  },
   watchlist: {
     inputRequired: "Enter a ticker, e.g. BTC-USD.",
     title: "Watchlist",
@@ -172,6 +188,15 @@ export const en: typeof vi = {
     disabled: "Disabled",
     runningCycle: "Cycle running",
     waiting: "Waiting",
+    autoloopTitle: "Futures auto loop",
+    cycleId: "Cycle ID",
+    unifiedMarket: "Unified market",
+    execution: "Execution",
+    entryOrder: "Entry / order",
+    slTp: "SL / TP",
+    claim: "Claim",
+    position: "Position",
+    recovery: "Recovery",
     interval: (n) => ` · every ${n} min`,
     liveData: ". Data read live from the server.",
     loading: "Loading futures status…",
@@ -195,7 +220,7 @@ export const en: typeof vi = {
     protection: "Protection",
   },
   scan: {
-    title: "Pipeline scan",
+    title: "Run a scan",
     description:
       "Auto scan: the server screens the universe itself (top-volume crypto on the exchange + US stocks with 52-week strength) using practical criteria — momentum, RSI, 52-week highs, volume-backed breakouts, liquidity — then runs the LLM pipeline on the highest-scoring candidates. No watchlist needed. “Scan now” runs on the current watchlist; every ticker is a full LLM pipeline, so a job can take several minutes.",
     sending: "Sending…",

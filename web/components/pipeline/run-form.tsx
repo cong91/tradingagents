@@ -1,6 +1,7 @@
 "use client";
 
-// Form khởi chạy phiên phân tích — hành động chính duy nhất của màn M2.
+// Form khởi chạy phiên phân tích — hành động chính của section Chạy phân tích
+// ngay trên /cycles.
 // Gửi POST /api/runs (hợp đồng §3): ngày không được ở tương lai (UTC),
 // asset_type bắt buộc tường minh, mode "mock" cho phép demo không cần khoá LLM.
 

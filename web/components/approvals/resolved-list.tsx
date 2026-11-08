@@ -12,6 +12,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ReasonText } from "@/components/ui/reason-text";
+import { formatReason, formatSymbol } from "@/lib/format";
 
 import { formatDateTime, formatOrderAmount } from "./format";
 import { ApprovalStatusBadge, SideChip } from "./labels";
@@ -47,8 +49,11 @@ export function ResolvedList({ items }: { items: ApprovalItem[] }) {
                 <span className="w-20 shrink-0 font-medium tabular-nums">
                   {item.id}
                 </span>
-                <span className="min-w-0 flex-1 truncate">
-                  {item.ticker ?? "—"}
+                <span
+                  className="min-w-0 flex-1 truncate"
+                  title={item.ticker ?? undefined}
+                >
+                  {item.ticker ? formatSymbol(item.ticker) : "—"}
                 </span>
                 <SideChip side={item.side} />
                 <span className="tabular-nums text-muted-foreground">
@@ -72,9 +77,17 @@ export function ResolvedList({ items }: { items: ApprovalItem[] }) {
                   {item.resolved_at ? formatDateTime(item.resolved_at) : ""}
                 </span>
                 {item.resolution && (
-                  <span className="w-full truncate text-xs text-muted-foreground">
-                    {t.approvals.card.reason(item.resolution)}
-
+                  <span
+                    className="w-full text-xs text-muted-foreground"
+                    title={formatReason(item.resolution) || undefined}
+                  >
+                    {t.approvals.card.reasonPrefix}
+                    <ReasonText
+                      text={item.resolution}
+                      expandLabel={t.approvals.card.reasonExpand}
+                      collapseLabel={t.approvals.card.reasonCollapse}
+                      unreadableLabel={t.approvals.card.reasonUnreadable}
+                    />
                   </span>
                 )}
               </li>

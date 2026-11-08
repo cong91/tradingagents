@@ -1,4 +1,5 @@
-// M2 "Agent Pipeline" screen: run form, run card, stage tracker, SSE event feed.
+// Analysis-run card, stage tracker and SSE event feed — rendered on the
+// /cycles "Bot activity" page after the pipeline screen was merged into it.
 
 export const vi = {
   status: {
@@ -16,24 +17,26 @@ export const vi = {
   startFailed: "Không chạy được phiên",
   attach: (id: string) => `Theo dõi phiên đang chạy (${id})`,
   staleHint:
-    "Không nhận được sự kiện mới hơn 60 giây trong khi phiên vẫn đang chạy. v1 chưa có nút huỷ phiên — hãy đợi thêm, kiểm tra log server, hoặc khởi động lại server.",
+    "Không có sự kiện mới trong hơn 60 giây trong khi phiên vẫn đang chạy. Phiên hiện chưa có nút huỷ — hãy đợi thêm hoặc khởi động lại chương trình server.",
   newRunTitle: "Chạy phân tích mới",
   newRunDescription:
-    "POST /api/runs → GET /api/runs/{id}/events (SSE). Phiên chỉ phân tích — không bao giờ sinh lệnh giao dịch.",
+    "Chạy một vòng phân tích cho một mã tự chọn. Phiên chỉ phân tích — không bao giờ đặt lệnh giao dịch.",
+  cardTitle: "Chạy phân tích ngay",
+  cardDescription: "Theo dõi luồng agent theo thời gian thực: phân tích → tranh luận → trader → rủi ro → quyết định cuối.",
   running: "Phiên đang chạy",
   runTitle: "Phiên phân tích",
-  runDescription: "Chạy đúng một phiên tại một thời điểm (worker duy nhất — hợp đồng §3).",
+  runDescription: "Mỗi lần chỉ chạy một phiên phân tích — nút Chạy sẽ tạm khóa khi phiên khác đang chạy.",
   hanging: "Đang treo?",
-  sseLive: "SSE trực tiếp",
+  sseLive: "Cập nhật trực tiếp",
   reconnecting: "Đang kết nối lại…",
   idle:
-    "Chưa có phiên phân tích nào. Nhập mã tài sản ở trên và nhấn “Chạy phân tích” — chọn chế độ Mock để chạy thử mà không cần khoá LLM.",
-  starting: "Đang gửi yêu cầu tới backend…",
+    "Chưa có phiên phân tích nào. Nhập mã tài sản ở trên và nhấn “Chạy phân tích” — chọn chế độ Thử (Mock) để chạy demo không cần khóa API AI.",
+  starting: "Đang gửi yêu cầu…",
   feedTitle: "Luồng sự kiện",
   feedDescription:
-    "Mới nhất nằm cuối danh sách; mất kết nối SSE sẽ tự reconnect với Last-Event-ID và phát lại phần thiếu.",
-  feedEmptyIdle: "Chưa có sự kiện nào — bắt đầu phiên để xem luồng agent.",
-  feedEmptyWaiting: "Đang chờ sự kiện đầu tiên từ pipeline…",
+    "Sự kiện mới nhất nằm cuối danh sách. Nếu mất kết nối, màn hình tự kết nối lại và nạp phần còn thiếu — bạn không cần làm gì.",
+  feedEmptyIdle: "Chưa có sự kiện nào — bắt đầu phiên để xem các bước phân tích chạy.",
+  feedEmptyWaiting: "Đang chờ sự kiện đầu tiên của phiên phân tích…",
   form: {
     tickerRequired: "Nhập mã tài sản, ví dụ BTC-USD hoặc NVDA.",
     dateRequired: "Chọn ngày phân tích.",
@@ -116,14 +119,14 @@ export const vi = {
     failedUnknown: "Phiên thất bại không rõ nguyên nhân.",
     interruptedUnknown: "Phiên bị gián đoạn trước khi hoàn tất.",
     runNotFound: (id: string) =>
-      `Không tìm thấy phiên ${id} trên backend (server có thể đã khởi động lại).`,
+      `Không tìm thấy phiên ${id} trên máy chủ (máy chủ có thể đã khởi động lại).`,
     backendDown:
-      "Không kết nối được backend. Hãy khởi động server FastAPI (uvicorn server.main:app --port 8000) rồi thử lại.",
-    postUnreadable: "Phản hồi POST /api/runs không đọc được.",
-    loadNetwork: "Không kết nối được backend khi tải phiên.",
+      "Không kết nối được máy chủ. Khởi động chương trình TradingAgents rồi thử lại (lệnh khởi động xem ở trang Duyệt lệnh khi máy chủ lỗi).",
+    postUnreadable: "Không đọc được phản hồi khi bắt đầu phiên.",
+    loadNetwork: "Không kết nối được máy chủ khi tải phiên.",
     runGone: (id: string) =>
-      `Phiên ${id} không còn trên backend (server có thể đã khởi động lại — run chỉ lưu trong bộ nhớ).`,
-    getUnreadable: "Phản hồi GET /api/runs/{id} không đọc được.",
+      `Phiên ${id} không còn trên máy chủ (máy chủ có thể đã khởi động lại — phiên chỉ lưu trong bộ nhớ).`,
+    getUnreadable: "Không đọc được phản hồi khi tải phiên.",
   },
 };
 
@@ -143,22 +146,24 @@ export const en: typeof vi = {
   startFailed: "Could not start the run",
   attach: (id) => `Follow the running session (${id})`,
   staleHint:
-    "No new events for over 60 seconds while the run is still in progress. v1 has no cancel button — wait a bit longer, check the server log, or restart the server.",
+    "No new events for over 60 seconds while the run is still active. There is no cancel button yet — wait a bit longer or restart the server app.",
   newRunTitle: "Start a new analysis",
   newRunDescription:
-    "POST /api/runs → GET /api/runs/{id}/events (SSE). Runs only analyze — they never create trade orders.",
+    "Run one analysis round for any ticker you choose. Analysis only — it never places trade orders.",
+  cardTitle: "Run analysis now",
+  cardDescription: "Follow the agent flow in real time: analysis → debate → trader → risk → final decision.",
   running: "Run in progress",
   runTitle: "Analysis run",
-  runDescription: "Exactly one run at a time (single worker — contract §3).",
+  runDescription: "Only one analysis runs at a time — the Run button is briefly disabled while another run is active.",
   hanging: "Stalled?",
-  sseLive: "Live SSE",
+  sseLive: "Live updates",
   reconnecting: "Reconnecting…",
   idle:
-    "No analysis runs yet. Enter a ticker above and press “Run analysis” — choose Mock mode for a trial run without LLM keys.",
-  starting: "Sending request to the backend…",
+    "No analysis yet. Enter a ticker above and press “Run analysis” — choose Practice (Mock) mode for a demo run without AI API keys.",
+  starting: "Sending the request…",
   feedTitle: "Event stream",
   feedDescription:
-    "Newest at the bottom; a dropped SSE connection reconnects automatically with Last-Event-ID and replays what was missed.",
+    "Newest events appear at the bottom. If the connection drops, the screen reconnects and catches up automatically — you don't need to do anything.",
   feedEmptyIdle: "No events yet — start a run to watch the agent flow.",
   feedEmptyWaiting: "Waiting for the first pipeline event…",
   form: {
@@ -244,11 +249,11 @@ export const en: typeof vi = {
     interruptedUnknown: "The run was interrupted before completing.",
     runNotFound: (id) => `Run ${id} was not found on the backend (the server may have restarted).`,
     backendDown:
-      "Cannot reach the backend. Start the FastAPI server (uvicorn server.main:app --port 8000), then retry.",
-    postUnreadable: "Could not read the POST /api/runs response.",
+      "Cannot reach the server. Start the TradingAgents app and retry (see the start command on Approvals when the server is down).",
+    postUnreadable: "Could not read the response when starting the run.",
     loadNetwork: "Cannot reach the backend while loading the run.",
     runGone: (id) =>
       `Run ${id} no longer exists on the backend (the server may have restarted — runs live in memory only).`,
-    getUnreadable: "Could not read the GET /api/runs/{id} response.",
+    getUnreadable: "Could not read the response while loading the run.",
   },
 };

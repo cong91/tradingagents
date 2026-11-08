@@ -110,7 +110,7 @@ export function DecisionHistoryCard() {
                 ? c.emptyHintFresh
                 : c.emptyHintFiltered(data?.total ?? 0)
             }
-            actionHref="/pipeline"
+            actionHref="/cycles"
             actionLabel={c.emptyAction}
           />
         )}

@@ -296,8 +296,9 @@ export function ApprovalsScreen() {
                 {q.loadFailed}
               </p>
               <p className="text-muted-foreground">{loadError}</p>
+              <p className="text-xs text-muted-foreground">{q.backendHint}</p>
               <p className="text-xs text-muted-foreground">
-                {q.backendHint}{" "}
+                {q.backendCommandLabel}{" "}
                 <code className="rounded bg-muted px-1 py-0.5">
                   .venv\Scripts\python.exe -m uvicorn server.main:app --port 8000
                 </code>
@@ -319,7 +320,7 @@ export function ApprovalsScreen() {
               <Button
                 className="min-touch"
                 nativeButton={false}
-                render={<Link href="/scanner" />}
+                render={<Link href="/cycles" />}
               >
                 {q.openScanner}
               </Button>

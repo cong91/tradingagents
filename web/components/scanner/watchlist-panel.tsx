@@ -1,6 +1,6 @@
 "use client";
 
-// Card watchlist của màn M3: thêm/xóa mã, 4 trạng thái loading/empty/error/stale
+// Card watchlist của phần quét trên /cycles: thêm/xóa mã, 4 trạng thái loading/empty/error/stale
 // theo contract §0.2 + §2 (stale sau 60 giây). Xóa là reversable → không confirm.
 import { useEffect, useState, type FormEvent } from "react";
 import { Plus, RefreshCw, TriangleAlert, X } from "lucide-react";

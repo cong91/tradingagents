@@ -141,6 +141,16 @@ Response 200:
 
 Trạng thái: loading · empty (không xảy ra — luôn có defaults) · error 500 · stale sau 30s.
 
+### GET /api/settings/events
+
+SSE phát **gợi ý vô hiệu hoá** (hints), không phát dữ liệu — giống `GET /api/snapshot/events`. Mục đích: chip cổng thực thi không cần poll `/api/settings` theo đồng hồ.
+
+- Luồng mở: phát `event: reset` (`{"reason":"connect"}`) ngay khi kết nối — client refetch một lần rồi giữ giá trị.
+- `PUT`/`DELETE /api/operator-config` thành công → server phát `event: changed` (`{"id":N,"type":"changed","reason":"operator_config_updated|operator_config_reset"}`) cho mọi kết nối; client refetch.
+- Restart máy chủ làm đứt stream: EventSource tự nối lại → nhận `reset` mới → refetch (che cả các thay đổi env đòi restart).
+- Client vẫn refetch khi tab quay lại hiển thị (`visibilitychange`) và khi mạng hồi (`online`) — không có polling theo đồng hồ ở chip.
+- Nguồn: `server/settings_events.py`; publish gọi từ `server/operator_config.py`.
+
 ### PUT /api/settings
 
 Request:
@@ -159,12 +169,12 @@ Xử lý:
 
 1. Validate từng key: phải thuộc `_ENV_OVERRIDES` (trừ `exec_base_url` read-only); coerce theo kiểu default như `_coerce` (`default_config.py:60-80`) — sai kiểu → `422 coercion_error` kèm `details: {"env_var": "...", "message": "expected a boolean (true/1/yes/on/false/0/no/off), got 'treu'"}`.
 2. Áp in-memory: `set_config({key: value})` (`dataflows/config.py`) — có hiệu lực với run mới tạo sau đó; run đang chạy không thấy (bridge chụp config lúc dựng — `bridge.py:110-121`).
-3. Persist vào `.env` (upsert dòng `TRADINGAGENTS_…`, giữ nguyên các dòng khác và comment). Ghi `encoding="utf-8"`.
+3. Persist vào PostgreSQL, bảng `control_engine_settings` (migration `0006`) — một transaction cho cả batch. `.env` **không bao giờ bị ghi lúc runtime**: nó là cấu hình triển khai (bí mật, venue URL, nửa env của cổng) và chỉ là tầng default dưới giá trị lưu UI. Lúc khởi động server nạp lại: env → engine settings (bảng này) → operator overrides, nên giá trị UI sống qua restart và operator override vẫn thắng.
 4. Nếu key là `exec_sandbox` → cảnh báo không cần (an toàn); nếu key là `risk_*` → nhớ rằng giá trị mới chỉ dùng cho guard dựng sau (`bridge.py:147-156`).
 
 Response 200: cùng shape GET + `"applied_at"`. Restart không bắt buộc vì (2) đã áp in-memory.
 
-Errors: 403 `forbidden_key` (key read-only hoặc key lạ), 422, 500 (không ghi được `.env`).
+Errors: 403 `forbidden_key` (key read-only hoặc key lạ), 422, 500 (không ghi được persistence).
 
 Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
 
@@ -977,7 +987,7 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | # | Method | Path | Ghi đè engine? |
 |---|--------|------|----------------|
 | 1 | GET   | `/api/settings`                  | đọc config + env, mask credential |
-| 2 | PUT   | `/api/settings`                  | set_config in-memory + upsert `.env`; cấm key gate |
+| 2 | PUT   | `/api/settings`                  | set_config in-memory + upsert PostgreSQL `control_engine_settings`; cấm key gate |
 | 3 | GET   | `/api/watchlist`                 | file state riêng, sync `exec_watchlist` |
 | 4 | POST  | `/api/watchlist`                 | " |
 | 5 | DELETE| `/api/watchlist/{symbol}`        | " |
@@ -1015,7 +1025,7 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 2. **Job/run là state trong database, không phải in-memory** (rev 7 — đã sửa). `server/data/control.db` (SQLite, stdlib `sqlite3`, WAL) lưu `jobs`/`job_results`/`runs`/`run_events`. Restart server không mất lịch sử: `GET /api/daily/{id}` và `GET /api/runs/{id}` đọc lại từ DB, và stream của một run đã xong replay được từ `run_events`. Job/run bị process chết bỏ lại ở `running` được set `interrupted` lúc khởi động (`main.py:_open_state_db` → `daily.reconcile()` / `runs.reconcile()`, mỗi cái ghi một audit line) — vì worker lock suy ra từ status, không reconcile thì job mồ côi sẽ trả 409 cho mọi job sau, vĩnh viễn và vô hình. Engine audit (`exec_log_path`) **vẫn là JSONL**: đó là contract replay của RiskGuard xuyên process, không phải state của API layer.
 3. **`exec_watchlist` không env-overridable** (`default_config.py:38-41`) — persistence phải là file riêng của API layer, không phải `.env`; mọi nơi đọc watchlist phải đi qua layer này hoặc sync vào `DEFAULT_CONFIG` lúc khởi động, nếu không CLI và UI sẽ trôi về default `["BTC-USD","ETH-USD"]` (đã làm ở `watchlist.py:39-44`).
 4. **Env-gates phải read-only trong API** — nếu PUT settings cho phép ghi `TRADINGAGENTS_EXEC_LIVE`/`_AUTO_CONFIRM`/`_DERIVATIVES` thì double-gate FR5 (`bridge.py:33-36, 527-538`) sụp thành một công tắc. Contract cấm; cần test chặn.
-5. **`.env` ghi từ API** có xung đột với format/comment hiện có và với việc user sửa tay cùng lúc; coercion phải chạy trước khi ghi để không sinh `.env` làm process chết lúc startup (`_apply_env_overrides` raise — `default_config.py:83-93`). Cân nhắc lock/ghi-đổi-tên.
+5. **`.env` không còn bị ghi từ API** (đã sửa — migration `0006`): settings PUT persist vào PostgreSQL `control_engine_settings`, nạp lại lúc boot giữa tầng env và tầng operator override; `.env` thuần cấu hình triển khai (bí mật, venue URL, nửa env cổng) và chỉ đổi kèm restart. Lỗi persistence giờ là lỗi PostgreSQL thông thường (500), không còn rủi ro sinh `.env` hỏng làm process chết lúc startup.
 6. **`set_config` process-wide** (`dataflows/config.py`, gọi tại `trading_graph.py:65`) — v1 serialize 1 job/run qua worker lock; muốn song song phải tách process (subprocess per job) — quyết định để sau v1.
 7. **Mock phụ thuộc artifact cũ + stub venue lệch thật**: `full_states_log_*.json` chỉ tồn tại sau run hoàn tất (`trading_graph.py:346`); repo không có `results/` (dữ liệu thật ở `~/.tradingagents/logs`) — synthetic fallback là bắt buộc. Giá/balance của stub venue là fixture — số liệu mock không phản ánh venue thật; plan mock chỉ là demo (`mock: true`, approve bị chặn 409 `mock_not_executable`) — cần test chặn để dữ liệu tổng hợp không bao giờ thành lệnh thật.
 8. **`/api/audit` scan toàn file**: file append-only không giới hạn; khi lớn cần index/mmap — chưa thiết kế. Dòng JSON hỏng bị bỏ qua im lặng (như `risk.py:156-157`) — UI cần thấy `skipped_lines`.

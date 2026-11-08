@@ -148,6 +148,45 @@ export function formatAssetQuantity(
   return unit ? `${numberFormat(QTY_OPTIONS).format(qty)} ${unit}` : numberFormat(QTY_OPTIONS).format(qty);
 }
 
+/**
+ * Ký hiệu hiển thị một dạng gạch duy nhất: bỏ hậu tố settle kể từ ":"
+ * ("UNI/USDT:USDT" → "UNI/USDT"), đổi "/" thành "-" ("BASE/QUOTE" →
+ * "BASE-QUOTE"), uppercase + trim ("INJ-USD" giữ nguyên). Chỉ cho ô HIỂN THỊ —
+ * ô lọc/bảng đối soát sàn giữ nguyên văn vì server so exact và test pin raw.
+ */
+export function formatSymbol(symbol: string | null | undefined): string {
+  if (!symbol) return symbol ?? "";
+  return symbol
+    .trim()
+    .toUpperCase()
+    .split(":")[0]
+    .replace(/\//g, "-");
+}
+
+const HTML_TAG_RE = /<[^>]*>/g;
+// Decode &amp; CUỐI cùng để không ăn đúp (&amp;lt; phải còn là text "&lt;").
+const BASIC_ENTITIES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/&lt;/g, "<"],
+  [/&gt;/g, ">"],
+  [/&quot;/g, '"'],
+  [/&#39;/g, "'"],
+  [/&amp;/g, "&"],
+];
+
+/**
+ * Làm sạch reason do backend nối nguyên body HTML của sàn (ccxt bọc lỗi 502…):
+ * bỏ thẻ, decode 5 entity cơ bản, gộp whitespace. Chỉ lớp hiển thị — dữ liệu
+ * server giữ nguyên; React escape nên không có rủi ro XSS.
+ */
+export function formatReason(text: string | null | undefined): string {
+  if (!text) return "";
+  let cleaned = text.replace(HTML_TAG_RE, " ");
+  for (const [pattern, char] of BASIC_ENTITIES) {
+    cleaned = cleaned.replace(pattern, char);
+  }
+  return cleaned.replace(/\s+/g, " ").trim();
+}
+
 const CLOCK_OPTIONS: Intl.DateTimeFormatOptions = {
   hour: "2-digit",
   minute: "2-digit",

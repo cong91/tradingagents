@@ -111,7 +111,7 @@ export function OverviewActivityCard() {
             <ActivityRow
               title={a.dailyScan}
               status={job?.status ?? (data.daily?.active_job_id ? "running" : "idle")}
-              href="/scanner"
+              href="/cycles"
               detail={[
                 job?.current_ticker ? a.ticker(job.current_ticker) : null,
                 job ? a.results(job.results.length, job.tickers.length) : null,
@@ -123,7 +123,7 @@ export function OverviewActivityCard() {
               title={a.analysisRun}
 
               status={run?.status ?? "idle"}
-              href="/pipeline"
+              href="/cycles"
               detail={run ? [run.ticker, run.trade_date, run.run_id] : []}
               error={data.errors.run ?? run?.error?.message}
             />

@@ -1,6 +1,6 @@
 "use client";
 
-// Toàn bộ tương tác API của màn M2 (hợp đồng docs/ui-api-contract.md §3):
+// Toàn bộ tương tác API của phiên phân tích trên /cycles (hợp đồng docs/ui-api-contract.md §3):
 // - POST /api/runs → 201 payload; 409 conflict khi đã có run active (worker duy nhất).
 // - GET /api/runs/{id}/events (SSE): EventSource tự reconnect và gửi lại
 //   Last-Event-ID; server phát lại buffer từ seq+1 (server/runs.py:453-469).

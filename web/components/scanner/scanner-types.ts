@@ -1,4 +1,4 @@
-// Shape dữ liệu hợp đồng cho màn M3 (docs/ui-api-contract.md §2 watchlist, §5 daily pipeline rev 3).
+// Shape dữ liệu hợp đồng cho phần quét trên /cycles (docs/ui-api-contract.md §2 watchlist, §5 daily pipeline rev 3).
 // §5 rev 3: worker per-coin, enqueue ngay khi coin xong, job KHÔNG BAO GIỜ tự
 // thực thi — kết quả chỉ mang kế hoạch (plan) + approval_id, không có
 // executed/order_id (bất biến §5: mọi lệnh chỉ đi qua màn Duyệt lệnh).

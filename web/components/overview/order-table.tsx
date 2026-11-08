@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import { formatDateWith, formatQuantityValue } from "@/lib/format";
+import { formatDateWith, formatQuantityValue, formatSymbol } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { EmptyState } from "./empty-state";
 import type { AuditItem } from "./contract";
@@ -42,10 +42,8 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
             <th scope="col" className="py-2 pr-4 font-medium">{c.time}</th>
             <th scope="col" className="py-2 pr-4 font-medium">{c.pair}</th>
             <th scope="col" className="py-2 pr-4 font-medium">{c.order}</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantity}</th>
-            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.estPrice}</th>
+            <th scope="col" className="py-2 pr-4 text-right font-medium">{c.quantityPrice}</th>
             <th scope="col" className="py-2 pr-4 text-right font-medium">{c.flowNotional}</th>
-            <th scope="col" className="py-2 pr-4 font-medium">{c.mode}</th>
             <th scope="col" className="py-2 font-medium">{c.orderId}</th>
           </tr>
         </thead>
@@ -61,25 +59,29 @@ export function OrderTable({ items }: { items: AuditItem[] }) {
             return (
               <tr key={`${order.timestamp ?? ""}-${order.order_id ?? index}`} className="border-b last:border-0">
                 <td className="py-2 pr-4 whitespace-nowrap tabular-nums">{formatTime(order.timestamp)}</td>
-                <td className="py-2 pr-4 font-medium">{order.ticker ?? "—"}</td>
+                <td className="py-2 pr-4 font-medium" title={order.ticker ?? undefined}>
+                  {order.ticker ? formatSymbol(order.ticker) : "—"}
+                </td>
                 <td className="py-2 pr-4">
                   <div className="flex flex-wrap items-center gap-1">
                     <Badge variant="outline">{isBuy ? t.common.buy : t.common.sell}</Badge>
                     <Badge variant="secondary">{isDerivatives ? "Futures" : "Spot"}</Badge>
+                    <Badge variant={order.mode === "live" ? "destructive" : "secondary"}>
+                      {order.mode === "live" ? "LIVE" : t.common.simulated}
+                    </Badge>
                   </div>
                 </td>
-                <td className="py-2 pr-4 text-right tabular-nums">{qty != null ? formatQuantityValue(qty) : "—"}</td>
-                <td className="py-2 pr-4 text-right tabular-nums">{formatHistoricalMoney(price, quote)}</td>
+                <td className="py-2 pr-4 text-right tabular-nums">
+                  {qty != null || price != null
+                    ? [qty != null ? formatQuantityValue(qty) : null, price != null ? formatHistoricalMoney(price, quote) : null]
+                        .filter(Boolean)
+                        .join(" · ")
+                    : "—"}
+                </td>
                 <td className={`py-2 pr-4 text-right tabular-nums ${!isDerivatives && flow != null && flow !== 0 ? flow > 0 ? "text-profit" : "text-loss" : ""}`}>
                   {isDerivatives
                     ? `${formatHistoricalMoney(notional, quote)} notional${order.leverage != null ? ` · ${formatQuantityValue(order.leverage)}x · margin ${formatHistoricalMoney(order.cost, settle)}` : order.cost != null ? ` · margin ${formatHistoricalMoney(order.cost, settle)}` : ""}`
                     : flow != null ? formatHistoricalSignedMoney(flow, quote) : "—"}
-                </td>
-                <td className="py-2 pr-4">
-                  <Badge variant={order.mode === "live" ? "destructive" : "secondary"}>
-                    {order.mode === "live" ? "LIVE" : t.common.simulated}
-
-                  </Badge>
                 </td>
                 <td className="py-2 font-mono text-xs">{order.order_id ?? "—"}</td>
               </tr>
