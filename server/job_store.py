@@ -13,12 +13,18 @@ database in lockstep with no drift and no partial write to reason about.
 
 import dataclasses
 import json
+import logging
+import math
 import re
 import secrets
 import time
 from datetime import UTC, datetime
 
+import psycopg
+
 from server import db
+
+logger = logging.getLogger(__name__)
 
 # Statuses a job can be left in by a process that died mid-flight. Anything
 # still active when a new process starts was orphaned — see reconcile_orphans.
@@ -637,6 +643,50 @@ def active_position_states() -> list[dict]:
         }
         for row in rows
     ]
+
+
+def futures_position_stops() -> dict[str, float]:
+    """Initial stop of every durable futures position, keyed "BASE-USD".
+
+    RiskGuard's open-heat cap needs the stop of each open derivatives
+    position, but the venue book reports notional only -- the protective
+    level lives in the persisted entry state written by
+    ``persist_futures_entry_state``. Keys mirror how ``build_futures_portfolio``
+    derives ``market_symbol``: the position key is ``{ccxt_symbol}:{side}:{id}``,
+    so the base comes from the part before the first ``:`` then the part
+    before the ``/`` (``ZEC/USDT:USDT:sell:7`` -> ``ZEC-USD``).
+
+    A database failure returns an empty map instead of raising: a missing
+    stop makes RiskGuard fail the open-heat cap closed for that position,
+    which is the safe direction -- this read must never crash a plan cycle.
+    ``RuntimeError`` covers the missing-DSN boundary in ``postgres.connect``
+    (offline tooling and tests); ``psycopg.Error`` covers a live database
+    failure.
+    """
+    try:
+        rows = active_position_states()
+    except (psycopg.Error, RuntimeError) as exc:
+        logger.warning("futures position stops unavailable: %s", exc)
+        return {}
+    stops: dict[str, float] = {}
+    for row in rows:
+        snapshot = row.get("snapshot") or {}
+        stop = snapshot.get("initial_stop")
+        if stop is None:
+            stop = snapshot.get("stop")
+        try:
+            value = float(stop)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        base = (
+            str(row.get("position_key") or "").split(":", 1)[0]
+            .partition("/")[0].strip().upper()
+        )
+        if base:
+            stops[f"{base}-USD"] = value
+    return stops
 
 
 def save_position_state(position_key: str, expected_revision: int, state: dict,

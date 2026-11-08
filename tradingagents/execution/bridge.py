@@ -130,6 +130,11 @@ class ExchangeBridge:
             max_consecutive_loss_count=int(self.config["risk_max_consecutive_loss_count"]),
             max_derivatives_leverage=float(self.config["risk_max_derivatives_leverage"]),
             max_derivatives_exposure_pct=float(self.config["risk_max_derivatives_exposure_pct"]),
+            max_derivatives_exposure_hard_pct=float(self.config["risk_max_derivatives_exposure_hard_pct"]),
+            risk_derivatives_override_min_r=float(self.config["risk_derivatives_override_min_r"]),
+            risk_derivatives_override_max_risk_fraction=float(self.config["risk_derivatives_override_max_risk_fraction"]),
+            risk_derivatives_override_max_per_day=int(self.config["risk_derivatives_override_max_per_day"]),
+            max_open_heat_pct=float(self.config["risk_max_open_heat_pct"]),
         )
         return RiskGuard(limits=limits, price_of=self._price_of_ticker)
 

@@ -7,10 +7,13 @@ and the timestamp/terminal behavior of the persistence helpers.
 """
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from server import futures_cycle_telemetry as fct
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.execution.risk import RiskLimits
 
 
 @pytest.mark.unit
@@ -318,6 +321,35 @@ def test_effective_caps_reports_every_guard_limit():
     assert caps["max_position_pct_per_asset"] == 40.0
     assert caps["max_total_exposure_pct"] == 150.0
     assert caps["max_risk_fraction"] == 0.02 and caps["max_margin_fraction"] == 0.5
+
+
+@pytest.mark.unit
+def test_effective_caps_needs_no_entry_for_the_override_and_heat_limits():
+    """The conditional override and heat caps ride on RiskLimits itself, so a
+    guard built from config carries them through derivatives.risk_guard.limits
+    automatically — effective_caps only adds explicit entries for keys read
+    from config that are NOT limits fields (max_risk_fraction/max_margin_fraction).
+    Pin the shipped RiskLimits defaults against DEFAULT_CONFIG so the two never
+    drift apart silently."""
+    limits = RiskLimits()
+    for field, key in (
+        ("max_derivatives_exposure_hard_pct", "risk_max_derivatives_exposure_hard_pct"),
+        ("risk_derivatives_override_min_r", "risk_derivatives_override_min_r"),
+        (
+            "risk_derivatives_override_max_risk_fraction",
+            "risk_derivatives_override_max_risk_fraction",
+        ),
+        ("risk_derivatives_override_max_per_day", "risk_derivatives_override_max_per_day"),
+        ("max_open_heat_pct", "risk_max_open_heat_pct"),
+    ):
+        assert getattr(limits, field) == DEFAULT_CONFIG[key]
+    caps = fct.effective_caps(
+        SimpleNamespace(risk_guard=SimpleNamespace(limits=limits)),
+        auto_cap=3.0, config={},
+    )
+    # A real RiskLimits flows through the same read the fake limit classes take.
+    assert caps["effective_leverage"] == 1.0
+    assert caps["max_derivatives_exposure_pct"] == 0.0
 
 
 @pytest.mark.unit

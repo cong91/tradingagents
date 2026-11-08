@@ -79,7 +79,11 @@ def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrde
     snapshot = replace(snapshot, positions=positions.positions)
     if _positive_number(snapshot.equity) is None or not snapshot.equity_currency:
         raise ValueError("futures equity or currency is unavailable")
-    portfolio = build_futures_portfolio(snapshot)
+    # The open-heat cap reads Position.stop_loss; the venue book does not
+    # carry stops, so the persisted entry state supplies them.
+    portfolio = build_futures_portfolio(
+        snapshot, position_stops=job_store.futures_position_stops(),
+    )
     open_orders = exchange.fetch_open_orders(order.ccxt_symbol)
     if executor._bridge.client() is not exchange:
         raise ValueError("futures client changed during open order read")
@@ -139,6 +143,7 @@ class DerivativesExecutor:
             "allowed": bool(decision.allowed),
             "halted": bool(decision.halted),
             "reason": decision.reason,
+            "override_used": bool(getattr(decision, "override_used", False)),
         })
 
     # --- symbols ---------------------------------------------------------
@@ -207,6 +212,8 @@ class DerivativesExecutor:
         margin_fraction: float | None = None,
         margin_mode: str | None = None,
         futures_execution_intent: str | None = None,
+        confirmation_ok: bool | None = None,
+        funding_rate: float | None = None,
     ) -> PlannedOrder:
         """Size a derivatives plan; refuses (audited) unless gates (a)+(b) are open.
 
@@ -224,6 +231,9 @@ class DerivativesExecutor:
         ``risk_fraction``/``margin_fraction``/``margin_mode`` are the decision
         agents' terms; ``None`` keeps the configured sizing defaults. The
         plan refuses (never substitutes) when a term is unusable.
+
+        ``confirmation_ok``/``funding_rate`` carry the conditional soft-cap
+        override evidence on the plan for the risk guard to measure.
         """
         offline_symbol = self.symbol_for(ticker)
         # The shell stays valid while the terms are still unvalidated: an
@@ -270,6 +280,7 @@ class DerivativesExecutor:
                 risk_fraction=risk_fraction, margin_fraction=margin_fraction,
                 margin_mode=margin_mode,
                 futures_execution_intent=authorized,
+                confirmation_ok=confirmation_ok, funding_rate=funding_rate,
             )
             order.mode = mode
             self._bridge.audit_plan(order, action="no_order", reason=order.reason, phase="plan")
@@ -281,10 +292,13 @@ class DerivativesExecutor:
             risk_fraction=risk_fraction, margin_fraction=margin_fraction,
             margin_mode=margin_mode,
             futures_execution_intent=authorized,
+            confirmation_ok=confirmation_ok, funding_rate=funding_rate,
         )
         order.mode = mode
         decision = self.risk_guard.check(order, portfolio, self.config["exec_log_path"])
         self._record_risk_decision("plan", decision)
+        if decision.allowed and decision.override_used:
+            order.override_reservation_id = decision.override_reservation_id
         if decision.halted:
             self._bridge.audit_plan(
                 order, action="rejected_by_risk", reason=decision.reason, phase="plan"
@@ -413,7 +427,11 @@ class DerivativesExecutor:
                 snapshot = replace(snapshot, positions=positions.positions)
                 if _positive_number(snapshot.equity) is None or not snapshot.equity_currency:
                     raise ValueError("futures equity or currency is unavailable")
-                portfolio = build_futures_portfolio(snapshot)
+                # Same stop sourcing as the locked re-check below: the
+                # open-heat cap must see identical books at both guard calls.
+                portfolio = build_futures_portfolio(
+                    snapshot, position_stops=job_store.futures_position_stops(),
+                )
                 open_orders = client.fetch_open_orders(order.ccxt_symbol)
                 if self._bridge.client() is not client:
                     raise ValueError("futures client changed during open order read")
@@ -435,7 +453,9 @@ class DerivativesExecutor:
                 ) from exc
         # fail_closed=True: same rule as the spot execute re-check -- an
         # unreadable audit log hides the halt/streak state a send decision
-        # needs, so it refuses instead of passing.
+        # needs, so it refuses instead of passing. For a soft-cap override,
+        # the re-check requires the current-day reservation carried by this
+        # plan and counts every other reservation against the daily budget.
         decision = self.risk_guard.check(
             order, portfolio, self.config["exec_log_path"], fail_closed=True
         )
@@ -479,6 +499,8 @@ class DerivativesExecutor:
         margin_fraction: float | None = None,
         margin_mode: str | None = None,
         futures_execution_intent: str | None = None,
+        confirmation_ok: bool | None = None,
+        funding_rate: float | None = None,
     ) -> PlannedOrder:
         """Derivatives mapping of the 5-tier signal; always returns a plan."""
         book = portfolio if portfolio is not None else PortfolioContext()
@@ -554,6 +576,7 @@ class DerivativesExecutor:
             side=side, quantity=quantity, estimated_price=price, cost=cost,
             market="derivatives", leverage=leverage, margin_mode=plan_margin_mode,
             futures_execution_intent=futures_execution_intent,
+            confirmation_ok=confirmation_ok, funding_rate=funding_rate,
             stop_loss=stop_loss, take_profit=take_profit,
         )
 

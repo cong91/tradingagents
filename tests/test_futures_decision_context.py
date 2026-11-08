@@ -1,5 +1,6 @@
 """Offline regression tests for futures decision-context preparation."""
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from server.futures_decision_context import (
 from tradingagents.execution.futures_account import FuturesAccountSnapshot, FuturesPosition
 from tradingagents.execution.risk import RiskGuard, RiskLimits
 from tradingagents.execution.sizing import PlannedOrder
+from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
 
@@ -428,3 +430,262 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
     assert f"Maximum leverage: {expected:g}x" in seen["context"]
     assert seen["portfolio"].position_in("BTC-USD").quantity == pytest.approx(-2.0)
     assert executor.risk_guard._equity(seen["portfolio"]) == pytest.approx(1_000.0)
+
+
+def test_build_futures_portfolio_attaches_position_stops():
+    """The open-heat cap reads Position.stop_loss; the map is keyed exactly
+    like the market_symbol build_futures_portfolio derives ("BASE-USD")."""
+    snapshot = _account(positions=(FuturesPosition(
+        symbol="BTC/USDT:USDT", quantity=1.0, mark_price=100.0,
+        notional=100.0, notional_currency="USDT",
+    ),))
+
+    stopped = build_futures_portfolio(snapshot, position_stops={"BTC-USD": 48_000.0})
+    assert stopped.positions[0].market_symbol == "BTC-USD"
+    assert stopped.positions[0].stop_loss == pytest.approx(48_000.0)
+
+    mismatched = build_futures_portfolio(snapshot, position_stops={"SOL-USD": 100.0})
+    assert mismatched.positions[0].stop_loss is None
+
+    assert build_futures_portfolio(snapshot).positions[0].stop_loss is None
+
+
+def test_render_context_reports_current_notional_headroom_override_rules_and_heat():
+    """The Hard limits block carries the numbers already computed (current
+    notional, headroom) and spells the conditional override rule out, so the
+    PM never has to infer what unlocks the hard cap."""
+    config = {
+        "risk_max_derivatives_exposure_pct": 25.0,
+        "risk_max_derivatives_exposure_hard_pct": 35.0,
+        "risk_derivatives_override_min_r": 2.0,
+        "risk_derivatives_override_max_risk_fraction": 0.01,
+        "risk_derivatives_override_max_per_day": 1,
+        "risk_max_open_heat_pct": 6.0,
+    }
+    account = _account(positions=(FuturesPosition(
+        symbol="ETH/USDT:USDT", quantity=1.5, mark_price=100.0,
+        notional=150.0, notional_currency="USDT",
+    ),))
+    context = render_futures_decision_context(
+        _market_context(), account, "BTC-USD", config, BRACKETS, max_leverage=3.0,
+    )
+
+    assert (
+        "Current derivatives notional: 15.00% of equity | Cap: 25% | "
+        "Remaining headroom: 10.00%" in context
+    )
+    assert (
+        "Between the normal cap and the hard cap of 35%, an entry is allowed "
+        "ONLY if ALL hold" in context
+    )
+    assert "closed 1h+4h candles confirm the direction" in context
+    assert "reward/risk >= 2" in context
+    assert "risk-at-stop <= 0.01" in context
+    assert "funding is not adverse" in context
+    assert "daily override budget (1) is not spent" in context
+    assert "The executor verifies these mechanically" in context
+    assert "refused, not resized" in context
+    assert "Maximum open heat (total risk-at-stop across open positions): 6% of equity" in context
+
+
+def test_render_context_hides_override_rules_and_heat_when_disabled():
+    """hard = 0 and heat = 0 disable the mechanisms; describing them would
+    invite the PM to propose entries the executor then refuses."""
+    context = render_futures_decision_context(
+        _market_context(), _account(), "BTC-USD", {}, BRACKETS, max_leverage=3.0,
+    )
+
+    assert "Between the normal cap" not in context
+    assert "Maximum open heat" not in context
+    # The current-notional line itself stays: soft cap 0 -> zero headroom.
+    assert (
+        "Current derivatives notional: 0.00% of equity | Cap: 0% | "
+        "Remaining headroom: 0.00%" in context
+    )
+
+
+def test_render_context_reports_notional_unavailable_without_equity():
+    account = _account(equity=None, available_balance=900.0, positions=(FuturesPosition(
+        symbol="ETH/USDT:USDT", quantity=1.5, mark_price=100.0,
+        notional=150.0, notional_currency="USDT",
+    ),))
+    context = render_futures_decision_context(
+        _market_context(), account, "BTC-USD", {}, BRACKETS, max_leverage=3.0,
+    )
+
+    assert "Current derivatives notional: unavailable" in context
+
+
+def test_render_context_reports_notional_unavailable_without_positive_equity():
+    """A zero or negative equity is a broken account, not a debt-free one:
+    RiskGuard derives an infinite deriv_pct from it and refuses every entry,
+    so the context line must not fabricate remaining headroom."""
+    for equity in (0.0, -12.5):
+        account = _account(equity=equity, available_balance=900.0, positions=(FuturesPosition(
+            symbol="ETH/USDT:USDT", quantity=1.5, mark_price=100.0,
+            notional=150.0, notional_currency="USDT",
+        ),))
+        context = render_futures_decision_context(
+            _market_context(), account, "BTC-USD", {}, BRACKETS, max_leverage=3.0,
+        )
+        assert "Current derivatives notional: unavailable" in context
+        assert "Remaining headroom" not in context
+
+
+def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
+    """The planning call carries the computed override evidence: confirmation
+    from the closed 1h/4h pair and the venue funding rate read at market
+    context time — the values the risk guard measures mechanically."""
+    from server import autoloop
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    one_hour_ms, four_hour_ms = 3_600_000, 14_400_000
+    one_open = now_ms - (now_ms % one_hour_ms) - one_hour_ms
+    four_open = now_ms - (now_ms % four_hour_ms) - four_hour_ms
+    candle_1h = SimpleNamespace(
+        open=100, high=110, low=90, close=105,
+        open_time=one_open, close_time=one_open + one_hour_ms,
+    )
+    candle_4h = SimpleNamespace(
+        open=100, high=110, low=90, close=105,
+        open_time=four_open, close_time=four_open + four_hour_ms,
+    )
+    context = {
+        "requested_ticker": "BTC-USD",
+        "symbol": "BTC/USDT:USDT",
+        "unified_symbol": "BTC/USDT:USDT",
+        "one_hour": candle_1h,
+        "four_hour": candle_4h,
+        "one_hour_open": datetime.fromtimestamp(one_open / 1000, UTC).isoformat(),
+        "one_hour_close": candle_1h.close,
+        "four_hour_open": datetime.fromtimestamp(four_open / 1000, UTC).isoformat(),
+        "four_hour_close": candle_4h.close,
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bullish",
+        "funding_rate": -0.0001,
+    }
+    book = PortfolioContext(cash=1_000.0, currency="USDT")
+    seen: dict = {}
+    executor = SimpleNamespace(
+        _bridge=SimpleNamespace(client=lambda: SimpleNamespace(
+            fetch_ticker=lambda symbol: {"last": 100.0},
+        )),
+        risk_guard=RiskGuard(),
+        risk_guard_decisions=[],
+        config={"exec_auto_confirm": False},
+    )
+
+    def plan_order(ticker, signal, portfolio=None, **kwargs):
+        seen["portfolio"] = portfolio
+        seen.update(kwargs)
+        return PlannedOrder(
+            ticker=ticker, ccxt_symbol="BTC/USDT:USDT", signal=signal,
+            side="buy", quantity=1.0, estimated_price=100.0, cost=100.0,
+            market="derivatives", leverage=3.0, margin_mode="isolated",
+            stop_loss=90.0, take_profit=110.0, futures_execution_intent="enter",
+        )
+
+    executor.plan_order = plan_order
+    executor.audit_plan = lambda *args, **kwargs: None
+    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
+    # The terminal write goes straight through job_store (not the patched
+    # persist alias), so patch it at the module seam like the telemetry tests.
+    monkeypatch.setattr(autoloop.job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        autoloop, "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),
+    )
+    proposal = {
+        "margin_mode": "isolated", "leverage": 3,
+        "risk_fraction": 0.01, "margin_fraction": 0.25,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+    }
+
+    result = autoloop.DailyResult(ticker="BTC-USD")
+    autoloop._process_futures_candidate(
+        executor, "BTC-USD", "Buy", {}, result,
+        context=context, proposal=proposal, portfolio=book,
+        brackets=BRACKETS, intent="enter",
+    )
+
+    assert not seen.get("rejections")
+    assert seen["confirmation_ok"] is True
+    assert seen["funding_rate"] == pytest.approx(-0.0001)
+    assert seen["futures_execution_intent"] == "enter"
+    assert seen["portfolio"] is book
+    assert result.reason == "awaiting approval"
+
+
+def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monkeypatch):
+    """No funding data -> the plan carries funding_rate=None (override
+    eligibility fails downstream; the normal path is unaffected)."""
+    from server import autoloop
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    one_hour_ms, four_hour_ms = 3_600_000, 14_400_000
+    one_open = now_ms - (now_ms % one_hour_ms) - one_hour_ms
+    four_open = now_ms - (now_ms % four_hour_ms) - four_hour_ms
+    candle_1h = SimpleNamespace(
+        open=100, high=110, low=90, close=105,
+        open_time=one_open, close_time=one_open + one_hour_ms,
+    )
+    candle_4h = SimpleNamespace(
+        open=100, high=110, low=90, close=105,
+        open_time=four_open, close_time=four_open + four_hour_ms,
+    )
+    context = {
+        "requested_ticker": "BTC-USD",
+        "symbol": "BTC/USDT:USDT",
+        "unified_symbol": "BTC/USDT:USDT",
+        "one_hour": candle_1h,
+        "four_hour": candle_4h,
+        "one_hour_open": datetime.fromtimestamp(one_open / 1000, UTC).isoformat(),
+        "one_hour_close": candle_1h.close,
+        "four_hour_open": datetime.fromtimestamp(four_open / 1000, UTC).isoformat(),
+        "four_hour_close": candle_4h.close,
+        "one_hour_direction": "bullish",
+        "four_hour_direction": "bullish",
+    }
+    seen: dict = {}
+    executor = SimpleNamespace(
+        _bridge=SimpleNamespace(client=lambda: SimpleNamespace(
+            fetch_ticker=lambda symbol: {"last": 100.0},
+        )),
+        risk_guard=RiskGuard(),
+        risk_guard_decisions=[],
+        config={"exec_auto_confirm": False},
+        audit_plan=lambda *args, **kwargs: None,
+        plan_order=lambda ticker, signal, portfolio=None, **kwargs: (
+            seen.update(kwargs),
+            PlannedOrder(
+                ticker=ticker, ccxt_symbol="BTC/USDT:USDT", signal=signal,
+                side="buy", quantity=1.0, estimated_price=100.0, cost=100.0,
+                market="derivatives", leverage=3.0, margin_mode="isolated",
+                stop_loss=90.0, take_profit=110.0, futures_execution_intent="enter",
+            ),
+        )[1],
+    )
+    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(autoloop.job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        autoloop, "_record_futures_cycle_rejection",
+        lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),
+    )
+    proposal = {
+        "margin_mode": "isolated", "leverage": 3,
+        "risk_fraction": 0.01, "margin_fraction": 0.25,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+    }
+
+    result = autoloop.DailyResult(ticker="BTC-USD")
+    autoloop._process_futures_candidate(
+        executor, "BTC-USD", "Buy", {}, result,
+        context=context, proposal=proposal,
+        portfolio=PortfolioContext(cash=1_000.0, currency="USDT"),
+        brackets=BRACKETS, intent="enter",
+    )
+
+    assert seen["confirmation_ok"] is True
+    assert seen["funding_rate"] is None

@@ -1277,3 +1277,268 @@ def test_missing_log_is_a_fresh_log_even_when_failing_closed(tmp_path):
         plan(), PortfolioContext(cash=1_000.0), tmp_path / "missing.jsonl", fail_closed=True
     )
     assert decision.allowed is True
+
+
+# --- conditional derivatives override (two-bracket soft/hard cap) -------------
+
+
+def deriv_plan(
+    side="buy", cost=250.0, ticker="BTC-USD", leverage=1.0,
+    entry=50_000.0, stop=48_100.0, target=56_000.0,
+    confirmation_ok=True, funding_rate=-0.0001,
+):
+    """A derivatives plan carrying the soft-cap override evidence fields."""
+    from types import SimpleNamespace
+
+    quantity = cost * leverage / entry
+    return SimpleNamespace(
+        side=side, cost=cost, ticker=ticker, ccxt_symbol="BTC/USDT:USDT",
+        market="derivatives", leverage=leverage, quantity=quantity,
+        estimated_price=entry, stop_loss=stop, take_profit=target,
+        confirmation_ok=confirmation_ok, funding_rate=funding_rate,
+    )
+
+
+def override_limits(**overrides) -> RiskLimits:
+    base = {
+        "max_derivatives_exposure_pct": 25.0,
+        "max_derivatives_exposure_hard_pct": 35.0,
+        "risk_derivatives_override_max_per_day": 1,
+    }
+    base.update(overrides)
+    return RiskLimits(**base)
+
+
+def _deriv_position(ticker, notional, average_price=None, stop_loss=None):
+    return Position(
+        ticker=ticker, quantity=None, notional=notional, notional_currency="USDT",
+        market="derivatives", market_symbol=ticker,
+        average_price=average_price, stop_loss=stop_loss,
+    )
+
+
+def override_events(path: Path) -> list[dict]:
+    return [e for e in read_events(path) if e.get("event") == "derivatives_override_used"]
+
+
+def _override_book() -> PortfolioContext:
+    """Book with a 7.4% derivatives position on another asset (equity 1000)."""
+    return PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[_deriv_position("SOL-USD", notional=74.0)],
+    )
+
+
+def test_derivatives_override_passes_with_all_conditions_met(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = _override_book()
+    # notional 250: derivatives total (74 + 250) = 32.4% of equity -- above the
+    # 25% soft cap, inside the 35% hard cap; risk-at-stop 0.95% <= 1%, R 3.16.
+    decision = guard(override_limits()).check(deriv_plan(), book, audit)
+    assert decision.allowed is True
+    assert decision.override_used is True
+    used = override_events(audit)
+    assert len(used) == 1
+    assert used[0]["ccxt_symbol"] == "BTC/USDT:USDT"
+    assert used[0]["hard_pct"] == 35.0
+    assert used[0]["deriv_pct"] == pytest.approx(32.4)
+
+
+def test_override_refused_when_confirmation_is_not_true(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    decision = guard(override_limits()).check(
+        deriv_plan(confirmation_ok=False), _override_book(), audit,
+    )
+    assert decision.allowed is False
+    assert "confirmation_ok is not True" in decision.reason
+
+
+def test_override_refused_when_funding_is_unfavorable(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # a long pays positive funding: the sign must favor the side
+    decision = guard(override_limits()).check(
+        deriv_plan(funding_rate=0.0001), _override_book(), audit,
+    )
+    assert decision.allowed is False
+    assert "funding_rate" in decision.reason
+
+
+def test_override_refused_when_r_multiple_is_below_the_minimum(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # entry 50000, stop 48100, target 53000: R = 3000/1900 = 1.58 < 2
+    decision = guard(override_limits()).check(
+        deriv_plan(target=53_000.0), _override_book(), audit,
+    )
+    assert decision.allowed is False
+    assert "r_multiple 1.58 below 2.00" in decision.reason
+
+
+def test_override_refused_when_risk_at_stop_exceeds_the_fraction_cap(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # stop 8% away: 250 * 0.08 / 1000 = 2% of equity > the 1% cap (R = 5 passes)
+    decision = guard(override_limits()).check(
+        deriv_plan(stop=46_000.0, target=70_000.0), _override_book(), audit,
+    )
+    assert decision.allowed is False
+    assert "risk-at-stop 0.02 above the cap 0.01" in decision.reason
+
+
+def test_override_refused_when_the_daily_budget_is_spent(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    write_events(audit, [{
+        "event": "derivatives_override_used", "timestamp": ts(FROZEN_NOW, hour=8),
+        "ccxt_symbol": "SOL/USDT:USDT", "deriv_pct": 30.0, "hard_pct": 35.0,
+    }])
+    decision = guard(override_limits()).check(
+        deriv_plan(), _override_book(), audit,
+    )
+    assert decision.allowed is False
+    assert "daily override budget exhausted (1/1)" in decision.reason
+
+
+def test_override_refused_when_deriv_pct_is_above_the_hard_cap(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # 40% derivatives notional: every eligibility condition holds but the hard
+    # cap is 35% -- refused even so
+    decision = guard(override_limits()).check(
+        deriv_plan(cost=400.0, entry=50_000.0, stop=48_800.0, target=56_000.0),
+        PortfolioContext(cash=1_000.0), audit,
+    )
+    assert decision.allowed is False
+    assert "deriv_pct 40.00% above hard cap 35.00%" in decision.reason
+
+
+def test_per_asset_cap_lifts_to_hard_only_for_an_approved_override(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # 30% of equity on ONE symbol: above the 25% per-asset cap, so it passes
+    # only when the approved override lifts this order's cap to 35%
+    approved = guard(override_limits()).check(
+        deriv_plan(cost=300.0, entry=50_000.0, stop=48_500.0, target=54_000.0),
+        PortfolioContext(cash=1_000.0), audit,
+    )
+    assert approved.allowed is True
+    assert approved.override_used is True
+
+    # not eligible -> per-asset stays at 25% and refuses the same order
+    denied = guard(override_limits()).check(
+        deriv_plan(cost=300.0, entry=50_000.0, stop=48_500.0, target=54_000.0,
+                   confirmation_ok=False),
+        PortfolioContext(cash=1_000.0), tmp_path / "denied.jsonl",
+    )
+    assert denied.allowed is False
+    assert "confirmation_ok is not True" in denied.reason
+    assert "per-asset" in denied.reason
+
+
+def test_default_limits_keep_the_old_refusal_and_never_use_the_override(
+    tmp_path, monkeypatch,
+):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # defaults: hard 0 / budget 0 / heat 0 -- the historical single-bracket
+    # refusal, no override event, override_used stays False
+    decision = guard().check(deriv_plan(), _override_book(), audit)
+    assert decision.allowed is False
+    assert decision.override_used is False
+    assert (
+        "derivatives notional would reach 32.40% of equity, above the limit 0.00%"
+        in decision.reason
+    )
+    # no override event written at all -- the log is never even created
+    assert not audit.exists() or override_events(audit) == []
+
+
+# --- open heat (portfolio heat) cap -------------------------------------------
+
+
+def _heat_limits() -> RiskLimits:
+    return RiskLimits(
+        max_derivatives_leverage=10.0,
+        max_derivatives_exposure_pct=1_000.0,
+        max_position_pct_per_asset=1_000.0,
+        max_total_exposure_pct=1_000.0,
+        max_open_heat_pct=6.0,
+    )
+
+
+def test_open_heat_at_the_cap_passes_and_a_further_order_refuses(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # two open positions risking 2% of equity each; the new order risks 2%
+    book = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[
+            _deriv_position("SOL-USD", notional=100.0, average_price=100.0, stop_loss=80.0),
+            _deriv_position("XPL-USD", notional=100.0, average_price=50.0, stop_loss=40.0),
+        ],
+    )
+    order = deriv_plan(cost=100.0, entry=50_000.0, stop=40_000.0, target=70_000.0)
+    decision = guard(_heat_limits()).check(order, book, audit)
+    assert decision.allowed is True  # 2 + 2 + 2 = 6% == the cap, not above
+    assert decision.override_used is False
+
+    # a third 2%-risk open position (the previous fill) pushes the next order past
+    filled = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[
+            _deriv_position("SOL-USD", notional=100.0, average_price=100.0, stop_loss=80.0),
+            _deriv_position("XPL-USD", notional=100.0, average_price=50.0, stop_loss=40.0),
+            _deriv_position("AVAX-USD", notional=100.0, average_price=50.0, stop_loss=40.0),
+        ],
+    )
+    refused = guard(_heat_limits()).check(order, filled, audit)
+    assert refused.allowed is False
+    assert "open heat would reach 8.00% of equity, above the limit 6.00%" in refused.reason
+
+
+def test_open_heat_refuses_fail_closed_when_a_position_has_no_stop(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[
+            _deriv_position("SOL-USD", notional=100.0, average_price=100.0, stop_loss=None),
+            _deriv_position("XPL-USD", notional=100.0, average_price=50.0, stop_loss=40.0),
+        ],
+    )
+    decision = guard(_heat_limits()).check(
+        deriv_plan(cost=100.0, entry=50_000.0, stop=40_000.0, target=70_000.0),
+        book, audit,
+    )
+    assert decision.allowed is False
+    assert "SOL-USD has no recorded stop; open heat cannot be computed" in decision.reason
+
+
+def test_open_heat_refuses_a_new_order_without_a_computable_stop(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    decision = guard(_heat_limits()).check(
+        deriv_plan(cost=100.0, entry=50_000.0, stop=None, target=70_000.0),
+        PortfolioContext(cash=1_000.0), audit,
+    )
+    assert decision.allowed is False
+    assert "new order lacks a computable stop; open heat cannot be computed" in decision.reason
+
+
+def test_open_heat_with_the_default_zero_cap_is_never_evaluated(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    book = PortfolioContext(
+        cash=1_000.0, currency="USDT",
+        positions=[_deriv_position("SOL-USD", notional=100.0, average_price=100.0, stop_loss=None)],
+    )
+    # plan() carries no stop at all and the position has none: with the
+    # default heat cap 0 the heat check never runs and cannot refuse.
+    decision = guard(RiskLimits(max_derivatives_exposure_pct=1_000.0)).check(
+        plan(cost=100.0, market="derivatives"), book, audit,
+    )
+    assert decision.allowed is True
+    assert "open heat" not in (decision.reason or "")

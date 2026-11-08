@@ -77,6 +77,56 @@ _ALLOWED: dict[str, dict] = {
         "label": "Phơi nhiễm phái sinh tối đa (%)",
         "hint": "0 = chặn hoàn toàn giao dịch phái sinh.",
     },
+    "risk_max_derivatives_exposure_hard_pct": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Phơi nhiễm phái sinh tối đa khi vượt trần (%)",
+        "hint": (
+            "Trần cứng của cơ chế vượt trần: chỉ lệnh đạt đủ điều kiện "
+            "(confirmation 1h+4h, R đủ cao, rủi ro chặt, funding thuận, còn "
+            "ngân sách trong ngày) mới được đẩy tổng phơi nhiễm tới mức này. "
+            "0 = tắt cơ chế vượt trần."
+        ),
+    },
+    "risk_derivatives_override_min_r": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "R tối thiểu để vượt trần",
+        "hint": "Lời mục tiêu / rủi ro stop tối thiểu của đề xuất để đủ điều kiện vượt trần.",
+    },
+    "risk_derivatives_override_max_risk_fraction": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Rủi ro tối đa mỗi lệnh khi vượt trần (phần equity)",
+        "hint": (
+            "Lệnh vượt trần phải rủi ro chặt hơn bình thường: 0.01 = tối đa "
+            "1% equity nếu stop khớp."
+        ),
+    },
+    "risk_derivatives_override_max_per_day": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Số lệnh vượt trần tối đa mỗi ngày (UTC)",
+        "hint": (
+            "0 = không bao giờ vượt trần. Mỗi lần dùng ghi một dòng "
+            "derivatives_override_used vào audit."
+        ),
+    },
+    "risk_max_open_heat_pct": {
+        "type": "float",
+        "gate": False,
+        "group": "risk",
+        "label": "Tổng rủi ro đang mở tối đa — heat (%)",
+        "hint": (
+            "Tổng phần equity mất nếu MỌI stop khớp cùng lúc (mọi vị thế + "
+            "lệnh mới). LƯU Ý khác các trần khác: 0 = TẮT (không chặn), "
+            ">0 = bật. Khuyến nghị 6."
+        ),
+    },
     "risk_derivatives_scale_out_enabled": {
         "type": "bool",
         "gate": False,

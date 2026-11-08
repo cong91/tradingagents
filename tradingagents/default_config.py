@@ -57,6 +57,11 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT":   "risk_max_consecutive_loss_count",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE":     "risk_max_derivatives_leverage",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT": "risk_max_derivatives_exposure_pct",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_HARD_PCT": "risk_max_derivatives_exposure_hard_pct",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MIN_R": "risk_derivatives_override_min_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_RISK_FRACTION": "risk_derivatives_override_max_risk_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_PER_DAY": "risk_derivatives_override_max_per_day",
+    "TRADINGAGENTS_RISK_MAX_OPEN_HEAT_PCT": "risk_max_open_heat_pct",
     "TRADINGAGENTS_RISK_DERIVATIVES_MAX_RISK_FRACTION": "risk_derivatives_max_risk_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_MAX_MARGIN_FRACTION": "risk_derivatives_max_margin_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_RISK_FRACTION": "risk_derivatives_risk_fraction",
@@ -300,6 +305,18 @@ def build_default_config() -> dict:
         "risk_max_consecutive_loss_count": 3,
         "risk_max_derivatives_leverage": 1.0,
         "risk_max_derivatives_exposure_pct": 0.0,
+        # Conditional derivatives override (two-bracket cap): a derivatives
+        # entry above the soft cap may pass up to the hard cap when every
+        # eligibility check holds (explicit confirmation, funding sign favoring
+        # the side, R >= min_r, risk-at-stop <= max_risk_fraction, daily budget
+        # left); the per-asset cap lifts to the hard bracket for that one order.
+        # 0 disables each knob (hard cap / daily budget / heat cap); the tier
+        # needs hard_pct > soft (risk_max_derivatives_exposure_pct) > 0.
+        "risk_max_derivatives_exposure_hard_pct": 0.0,
+        "risk_derivatives_override_min_r": 2.0,
+        "risk_derivatives_override_max_risk_fraction": 0.01,
+        "risk_derivatives_override_max_per_day": 0,
+        "risk_max_open_heat_pct": 0.0,
         # Decisions the futures agents own, and the ceilings the executor enforces
         # on them. The agent proposes; a proposal above these caps is refused, never
         # silently clamped to a different size.

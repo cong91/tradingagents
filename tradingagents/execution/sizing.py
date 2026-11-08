@@ -72,6 +72,12 @@ class PlannedOrder(BaseModel):
     stop_loss: float | None = None
     take_profit: float | None = None
     futures_execution_intent: Literal["enter"] | None = None
+    # Soft-cap override evidence: True only when the caller explicitly confirmed.
+    confirmation_ok: bool | None = None
+    # Funding rate at plan time; its sign must favor the side for eligibility.
+    funding_rate: float | None = None
+    # Audit reservation proving this plan consumed one override budget unit.
+    override_reservation_id: str | None = None
 
 
 def compute(

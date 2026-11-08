@@ -1085,7 +1085,11 @@ def _process_candidate(
                 futures_cycle_id, phase="market", payload=futures_cycle_payload,
                 timestamp=futures_cycle_timestamps["market_context_finished_at"],
             )
-            futures_portfolio = build_futures_portfolio(futures_account)
+            # The open-heat cap reads Position.stop_loss; the venue book does
+            # not carry stops, so the persisted entry state supplies them.
+            futures_portfolio = build_futures_portfolio(
+                futures_account, position_stops=job_store.futures_position_stops(),
+            )
             with telemetry.span("protective_bracket", ticker):
                 # Both directions: the agents need the engine's reference levels
                 # before they decide, and the entry path must reuse these reads
@@ -1988,6 +1992,10 @@ def _process_futures_candidate(
                 margin_fraction=terms["margin_fraction"],
                 margin_mode=terms["margin_mode"],
                 futures_execution_intent=intent,
+                # Soft-cap override evidence: measured mechanically by the
+                # risk guard from the closed candles and funding read above.
+                confirmation_ok=confirmation_ok,
+                funding_rate=context.get("funding_rate"),
             )
         result.plan = plan
         phase_timestamps["planning_finished_at"] = utc_now_iso()
