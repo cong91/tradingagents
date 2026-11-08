@@ -67,6 +67,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import secrets
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -92,6 +93,21 @@ def _finite_number(raw: Any) -> bool:
     return math.isfinite(value)
 
 
+def _finite_value(raw: Any) -> float | None:
+    """``raw`` as a finite float, or None when missing/inf/NaN/unconvertible."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _positive_finite(raw: Any) -> float | None:
+    """``_finite_value`` that also rejects zero and negatives."""
+    value = _finite_value(raw)
+    return value if value is not None and value > 0 else None
+
+
 def _non_finite_account_fields(portfolio: PortfolioContext) -> list[str]:
     """Book fields the percentage math cannot use, as ``ticker.field`` labels."""
     bad: list[str] = []
@@ -107,7 +123,7 @@ def _non_finite_account_fields(portfolio: PortfolioContext) -> list[str]:
 
 
 class RiskLimits(BaseModel):
-    """The six FR-K limits; defaults mirror DEFAULT_CONFIG's risk_* keys."""
+    """The FR-K limits; defaults mirror DEFAULT_CONFIG's risk_* keys."""
 
     model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
     max_daily_loss_pct: float = Field(default=5.0, ge=0)
@@ -116,6 +132,15 @@ class RiskLimits(BaseModel):
     max_consecutive_loss_count: int = Field(default=3, ge=1)
     max_derivatives_leverage: float = Field(default=1.0, ge=0)
     max_derivatives_exposure_pct: float = Field(default=0.0, ge=0)
+    # Two-bracket derivatives cap: hard > soft > 0 arms the conditional
+    # override tier; 0 keeps the historical single-bracket refusal.
+    max_derivatives_exposure_hard_pct: float = Field(default=0.0, ge=0)
+    risk_derivatives_override_min_r: float = Field(default=2.0, ge=0)
+    risk_derivatives_override_max_risk_fraction: float = Field(default=0.01, ge=0)
+    risk_derivatives_override_max_per_day: int = Field(default=0, ge=0)
+    # Portfolio heat: risk-at-stop of open derivatives positions plus the new
+    # order, as % of equity; 0 disables the cap.
+    max_open_heat_pct: float = Field(default=0.0, ge=0)
 
 
 class RiskDecision(BaseModel):
@@ -124,6 +149,8 @@ class RiskDecision(BaseModel):
     allowed: bool
     halted: bool
     reason: str | None = None
+    override_used: bool = False
+    override_reservation_id: str | None = None
 
 
 def _utc_now() -> datetime:
@@ -654,6 +681,8 @@ class RiskGuard:
         # Validate the candidate before marking the book or calculating any
         # percentage exposure. A bad value must never reach fail-open handling.
         reasons: list[str] = []
+        override_used = False
+        override_reservation_id: str | None = None
         side = getattr(order_plan, "side", None)
         is_derivatives = getattr(order_plan, "market", "spot") == "derivatives"
         cost = getattr(order_plan, "cost", None)
@@ -853,6 +882,7 @@ class RiskGuard:
             current_asset = 0.0
             total_exposure = 0.0
             derivatives_exposure = 0.0
+            derivatives_positions: list[tuple[Any, float]] = []
             for position in (portfolio.positions if portfolio is not None else []):
                 position_ticker = str(getattr(position, "ticker", "") or "")
                 market_symbol = getattr(position, "market_symbol", None)
@@ -876,13 +906,49 @@ class RiskGuard:
                 total_exposure += exposure
                 if getattr(position, "market", "spot") == "derivatives":
                     derivatives_exposure += exposure
+                    derivatives_positions.append((position, exposure))
+
+            # The conditional override is decided BEFORE the per-asset
+            # comparison: an approved override lifts THIS order's per-asset cap
+            # to the hard bracket. hard 0 (or hard <= soft) keeps the
+            # historical single-bracket behaviour unchanged.
+            per_asset_cap = self.limits.max_position_pct_per_asset
+            soft = self.limits.max_derivatives_exposure_pct
+            hard = self.limits.max_derivatives_exposure_hard_pct
+            if is_derivatives:
+                deriv_pct = ((derivatives_exposure + notional) / equity) * 100 if equity > 0 else float("inf")
+                if deriv_pct > soft:
+                    if hard > 0 and hard > soft:
+                        failures = self._derivatives_override_failures(
+                            order_plan, side, notional, equity, events, today,
+                            fail_closed=fail_closed,
+                        )
+                        if not failures and deriv_pct <= hard:
+                            override_used = True
+                            override_reservation_id = getattr(
+                                order_plan, "override_reservation_id", None,
+                            )
+                            per_asset_cap = hard
+                        else:
+                            if deriv_pct > hard:
+                                failures.append(
+                                    f"deriv_pct {deriv_pct:.2f}% above hard cap {hard:.2f}%"
+                                )
+                            reasons.append(
+                                "derivatives override refused: " + "; ".join(failures)
+                            )
+                    else:
+                        reasons.append(
+                            f"derivatives notional would reach {deriv_pct:.2f}% of equity, "
+                            f"above the limit {soft:.2f}%"
+                        )
 
             per_asset = notional if is_derivatives else float(cost)
             position_pct = ((current_asset + per_asset) / equity) * 100 if equity > 0 else float("inf")
-            if position_pct > self.limits.max_position_pct_per_asset:
+            if position_pct > per_asset_cap:
                 reasons.append(
                     f"position {ticker} would reach {position_pct:.2f}% of equity, "
-                    f"above the per-asset limit {self.limits.max_position_pct_per_asset:.2f}%"
+                    f"above the per-asset limit {per_asset_cap:.2f}%"
                 )
             exposure_pct = ((total_exposure + notional) / equity) * 100 if equity > 0 else float("inf")
             if exposure_pct > self.limits.max_total_exposure_pct:
@@ -890,17 +956,176 @@ class RiskGuard:
                     f"total exposure would reach {exposure_pct:.2f}% of equity, "
                     f"above the limit {self.limits.max_total_exposure_pct:.2f}%"
                 )
-            if is_derivatives:
-                deriv_pct = ((derivatives_exposure + notional) / equity) * 100 if equity > 0 else float("inf")
-                if deriv_pct > self.limits.max_derivatives_exposure_pct:
+
+            # Open heat: risk-at-stop of every open derivatives position plus
+            # the new order, as % of equity; 0 disables the cap entirely.
+            if is_derivatives and self.limits.max_open_heat_pct > 0:
+                heat_risk = self._open_heat_risk(
+                    order_plan, notional, derivatives_positions, reasons,
+                )
+                heat_pct = (heat_risk / equity) * 100 if equity > 0 else float("inf")
+                if heat_pct > self.limits.max_open_heat_pct:
                     reasons.append(
-                        f"derivatives notional would reach {deriv_pct:.2f}% of equity, "
-                        f"above the limit {self.limits.max_derivatives_exposure_pct:.2f}%"
+                        f"open heat would reach {heat_pct:.2f}% of equity, "
+                        f"above the limit {self.limits.max_open_heat_pct:.2f}%"
                     )
+
+            # Each approved plan reserves one unit. Execute-time re-checks
+            # validate that same reservation and never append another event.
+            if override_used and not reasons:
+                if fail_closed:
+                    override_reservation_id = getattr(
+                        order_plan, "override_reservation_id", None,
+                    )
+                else:
+                    override_reservation_id = secrets.token_hex(16)
+                    append_event(path, {
+                        "event": "derivatives_override_used",
+                        "timestamp": _utc_now_iso(),
+                        "reservation_id": override_reservation_id,
+                        "ccxt_symbol": getattr(order_plan, "ccxt_symbol", None),
+                        "deriv_pct": deriv_pct,
+                        "hard_pct": hard,
+                    })
 
         if reasons:
             return RiskDecision(allowed=False, halted=False, reason="; ".join(reasons))
-        return RiskDecision(allowed=True, halted=False, reason=None)
+        return RiskDecision(
+            allowed=True, halted=False, reason=None, override_used=override_used,
+            override_reservation_id=override_reservation_id,
+        )
+
+    def _derivatives_override_failures(
+        self,
+        order_plan: Any,
+        side: str,
+        notional: float,
+        equity: float,
+        events: list[dict[str, Any]],
+        today: date,
+        fail_closed: bool,
+    ) -> list[str]:
+        """Name every failed eligibility condition of the conditional override.
+
+        Empty list = eligible. Every condition is measured mechanically from
+        the order plan itself (getattr -- the plan is ``Any``); LLM prose or
+        rationale is never consulted. The budget reads the events ``check``
+        already loaded with the caller's ``fail_closed`` value: an unreadable
+        log at execute time refuses earlier (fail-closed) and never reaches
+        here, while a plan-time read stays fail-open.
+
+        A reservation ID is required at execute time and must name a current-day
+        audit event. The execute check excludes that one event from the daily
+        count (the plan already charged it); every other reservation stays in
+        the count. Plan-time checks count all current-day events before the new
+        reservation is appended.
+        """
+        failures: list[str] = []
+        if getattr(order_plan, "confirmation_ok", None) is not True:
+            failures.append("confirmation_ok is not True")
+        funding_rate = getattr(order_plan, "funding_rate", None)
+        favorable = (
+            (side == "sell" and funding_rate is not None and funding_rate >= 0)
+            or (side == "buy" and funding_rate is not None and funding_rate <= 0)
+        )
+        if not favorable:
+            failures.append(
+                "funding_rate is None"
+                if funding_rate is None
+                else f"funding_rate {funding_rate:.6g} is unfavorable for a {side} entry"
+            )
+        entry = _positive_finite(getattr(order_plan, "estimated_price", None))
+        stop = _finite_value(getattr(order_plan, "stop_loss", None))
+        target = _finite_value(getattr(order_plan, "take_profit", None))
+        r_multiple = None
+        if entry is not None and stop is not None and target is not None:
+            distance = abs(entry - stop)
+            if distance > 0:
+                r_multiple = abs(target - entry) / distance
+        if r_multiple is None:
+            failures.append(
+                "r_multiple not computable: entry, stop_loss and take_profit are required"
+            )
+        elif r_multiple < self.limits.risk_derivatives_override_min_r:
+            failures.append(
+                f"r_multiple {r_multiple:.2f} below "
+                f"{self.limits.risk_derivatives_override_min_r:.2f}"
+            )
+        risk_at_stop = None
+        if entry is not None and stop is not None and equity > 0:
+            risk_at_stop = notional * abs(entry - stop) / entry / equity
+        if risk_at_stop is None:
+            failures.append("risk-at-stop not computable: entry and stop_loss are required")
+        elif risk_at_stop > self.limits.risk_derivatives_override_max_risk_fraction:
+            failures.append(
+                f"risk-at-stop {risk_at_stop:.4g} above the cap "
+                f"{self.limits.risk_derivatives_override_max_risk_fraction:.4g}"
+            )
+        if fail_closed:
+            reservation_id = getattr(order_plan, "override_reservation_id", None)
+            reservation_exists = any(
+                event.get("event") == "derivatives_override_used"
+                and event.get("reservation_id") == reservation_id
+                and _event_date(event) == today
+                for event in events
+            )
+            if not reservation_id or not reservation_exists:
+                failures.append(
+                    "plan-time budget reservation is missing or expired"
+                )
+                return failures
+            used = sum(
+                1 for event in events
+                if event.get("event") == "derivatives_override_used"
+                and _event_date(event) == today
+                and event.get("reservation_id") != reservation_id
+            )
+            budget = self.limits.risk_derivatives_override_max_per_day
+            if used >= budget:
+                failures.append(f"daily override budget exhausted ({used}/{budget})")
+            return failures
+        budget = self.limits.risk_derivatives_override_max_per_day
+        used = sum(
+            1 for event in events
+            if event.get("event") == "derivatives_override_used"
+            and _event_date(event) == today
+        )
+        if used >= budget:
+            failures.append(f"daily override budget exhausted ({used}/{budget})")
+        return failures
+
+    def _open_heat_risk(
+        self,
+        order_plan: Any,
+        notional: float,
+        derivatives_positions: list[tuple[Any, float]],
+        reasons: list[str],
+    ) -> float:
+        """Risk-at-stop of the new order plus every open derivatives position.
+
+        A missing stop anywhere appends a fail-closed reason (the order is
+        refused by ``check``) instead of dropping that risk from the total --
+        same convention as unknown exposure.
+        """
+        risk = 0.0
+        entry = _positive_finite(getattr(order_plan, "estimated_price", None))
+        stop = _positive_finite(getattr(order_plan, "stop_loss", None))
+        if entry is None or stop is None:
+            reasons.append("new order lacks a computable stop; open heat cannot be computed")
+        else:
+            risk += notional * abs(entry - stop) / entry
+        for position, exposure in derivatives_positions:
+            average = _positive_finite(getattr(position, "average_price", None))
+            position_stop = _finite_value(getattr(position, "stop_loss", None))
+            if average is None or position_stop is None:
+                position_ticker = str(getattr(position, "ticker", "") or "") or "?"
+                reasons.append(
+                    f"existing position {position_ticker} has no recorded stop; "
+                    "open heat cannot be computed"
+                )
+                continue
+            risk += exposure * abs(average - position_stop) / average
+        return risk
 
     def _append_halt(self, path: Path, reason: str) -> None:
         """Append the halt line once the breach is detected (sticky for today)."""

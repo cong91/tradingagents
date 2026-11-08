@@ -151,6 +151,12 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert isinstance(config["risk_max_consecutive_loss_count"], int)
     assert config["risk_max_derivatives_leverage"] == 1.0
     assert config["risk_max_derivatives_exposure_pct"] == 0.0
+    assert config["risk_max_derivatives_exposure_hard_pct"] == 0.0
+    assert config["risk_derivatives_override_min_r"] == 2.0
+    assert config["risk_derivatives_override_max_risk_fraction"] == 0.01
+    assert config["risk_derivatives_override_max_per_day"] == 0
+    assert isinstance(config["risk_derivatives_override_max_per_day"], int)
+    assert config["risk_max_open_heat_pct"] == 0.0
     assert config["risk_derivatives_max_risk_fraction"] == 0.02
     assert config["risk_derivatives_max_margin_fraction"] == 0.5
     assert config["risk_derivatives_risk_fraction"] == 0.01
@@ -225,6 +231,24 @@ def test_time_stop_review_keys_are_operator_configurable():
     assert _ALLOWED["risk_derivatives_time_stop_review_enabled"]["type"] == "bool"
     assert _ALLOWED["risk_derivatives_time_stop_review_interval_hours"]["type"] == "float"
     assert _ALLOWED["risk_derivatives_time_stop_review_grace_hours"]["type"] == "float"
+
+
+def test_soft_cap_override_keys_are_operator_configurable():
+    """The conditional override and heat caps are operator-settable risk keys.
+    The daily budget is an int in DEFAULT_CONFIG but the operator surface
+    coerces floats only, so it is declared "float" there too."""
+    from server.operator_config import _ALLOWED
+
+    for key in (
+        "risk_max_derivatives_exposure_hard_pct",
+        "risk_derivatives_override_min_r",
+        "risk_derivatives_override_max_risk_fraction",
+        "risk_derivatives_override_max_per_day",
+        "risk_max_open_heat_pct",
+    ):
+        assert _ALLOWED[key]["type"] == "float"
+        assert _ALLOWED[key]["group"] == "risk"
+        assert _ALLOWED[key]["gate"] is False
 
 
 @pytest.mark.parametrize(

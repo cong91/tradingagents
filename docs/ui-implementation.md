@@ -350,13 +350,11 @@ không cần sửa code.
   do đó **chưa được phép** chạy `--host` ngoài loopback. Để mở bind cần
   lần lượt: thêm token (middleware auth), đưa token vào `web/` khi gọi
   `/api/*`, rồi mới đổi port/host.
-- **Cổng thực thi FR5 chỉ có hai khóa, cả hai ngoài tay API.** PUT
-  `/api/settings` cấm ghi key gate (403 `forbidden_key` — test
-  `test_settings_put_forbids_gate_and_unknown_keys`); mode bar đọc
-  `effective_exec_mode` = "live" chỉ khi `exec_live` (config) và
-  `TRADINGAGENTS_EXEC_LIVE` (env) cùng mở. Approve tiếp tục chặn 412 khi
-  cổng đóng (`server/approvals.py`). Không có endpoint reset halt trong v1
-  (contract §10 mục 8 — operator dùng CLI).
+- **Quyền thực thi do operator config điều khiển.** PUT
+  `/api/operator-config` cập nhật `exec_live`, `exec_auto_confirm` và
+  `exec_derivatives` với xác nhận + lý do; mode bar đọc `effective_exec_mode`,
+  và gate tắt sẽ chặn lệnh mới ở bước thực thi. Không còn biến môi trường gate
+  thứ hai; `.env` chỉ giữ credential/venue deployment.
 - **Giao diện của guard không thay thế net-isolation**: 3000/8000 vẫn là
   port local; nếu phải mở ra LAN, làm theo §6 trên và review lại toàn bộ
   mục này.

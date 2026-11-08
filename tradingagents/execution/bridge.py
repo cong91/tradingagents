@@ -7,11 +7,8 @@ the audit trail (safety #5). ``exec_symbol_overrides`` maps a pipeline ticker
 to a full ccxt symbol and wins over the default ``base/quote`` mapping.
 
 Gate model (FR5): the effective mode is computed AT EXECUTE TIME and is
-authoritative -- live only when BOTH independent gates are open: the config
-``exec_live`` key must be a literal True (armed in code; deliberately NOT
-env-overridable) AND the ``TRADINGAGENTS_EXEC_LIVE`` env flag must read true
-at that moment, fail-closed (anything but true/1/yes/on means dry). The env
-flag's only consumer is that read, so one variable can never arm both halves.
+authoritative -- live only when the process config ``exec_live`` key is a
+literal True (operator/config switch; deliberately not environment-controlled).
 ``PlannedOrder.mode`` is informational and never grants execution rights.
 Dry-run never touches the exchange (simulated fill), so it needs no confirm;
 live execution requires an explicit ``confirm=True`` and never runs without
@@ -30,15 +27,14 @@ anything is sent, so a halt raised by any process on the shared audit log
 blocks both the dry and live paths.
 
 Audit lines carry a ``phase`` field ("plan" or "execute"): the risk guard
-replays only executed lines, so a planned order is never double-counted as
-a filled one. Lines without ``phase`` (legacy, control events) are treated
-as executed history.
+replays only executed lines, so a planned order is never double-counted as a
+filled one. Lines without ``phase`` (legacy, control events) are treated as
+executed history.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -46,9 +42,8 @@ from typing import Any
 
 from server import snapshot_observer
 from tradingagents.agents.rating import RATINGS_5_TIER
-from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.config import config_key_revision, get_config
 from tradingagents.dataflows.symbols import crypto_base, futures_base
-from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.exchange_client import (
     _default_exchange_factory,
@@ -62,6 +57,8 @@ from tradingagents.portfolio import PortfolioContext, Position
 logger = logging.getLogger(__name__)
 
 _UNIFIED_FUTURES_SYMBOL = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+:[A-Z0-9]+$")
+_RUNTIME_GATE_KEYS = frozenset({"exec_live", "exec_auto_confirm", "exec_derivatives"})
+
 
 class PreTradeRejection(RuntimeError):
     """A live order was refused before reaching the exchange; already audited.
@@ -80,9 +77,10 @@ class ExchangeBridge:
     ``config`` is shallow-merged OVER a fresh deepcopy of the process config
     (``get_config()`` already returns a copy), so a partial dict like
     ``{"exec_live": True}`` never raises KeyError and every unspecified key
-    keeps its process value. The merge happens once at construction: a later
-    ``set_config()`` is NOT seen by an existing bridge -- build a new one.
-    ``rules`` overrides the default FR2 sizing mapping when given.
+    keeps its process value. Venue, sizing, and policy settings use that
+    construction snapshot; runtime gate checks read the current process config
+    so an operator can close a gate for an existing bridge. ``rules`` overrides
+    the default FR2 sizing mapping when given.
     ``exchange_id`` overrides ``exec_exchange_id``; the default factory
     resolves it to the ccxt class of the same (lowercase) name.
     ``risk_guard`` overrides the default guard built from the ``risk_*``
@@ -99,6 +97,12 @@ class ExchangeBridge:
     ) -> None:
         base = get_config()
         self.config: dict = {**base, **config} if config is not None else base
+        self._gate_config_override = config is not None and any(
+            key in config for key in _RUNTIME_GATE_KEYS
+        )
+        self._gate_config_revisions = {
+            key: config_key_revision(key) for key in _RUNTIME_GATE_KEYS
+        }
         self.exchange_id = str(
             exchange_id if exchange_id is not None else self.config.get("exec_exchange_id")
         ).strip().lower()
@@ -130,6 +134,11 @@ class ExchangeBridge:
             max_consecutive_loss_count=int(self.config["risk_max_consecutive_loss_count"]),
             max_derivatives_leverage=float(self.config["risk_max_derivatives_leverage"]),
             max_derivatives_exposure_pct=float(self.config["risk_max_derivatives_exposure_pct"]),
+            max_derivatives_exposure_hard_pct=float(self.config["risk_max_derivatives_exposure_hard_pct"]),
+            risk_derivatives_override_min_r=float(self.config["risk_derivatives_override_min_r"]),
+            risk_derivatives_override_max_risk_fraction=float(self.config["risk_derivatives_override_max_risk_fraction"]),
+            risk_derivatives_override_max_per_day=int(self.config["risk_derivatives_override_max_per_day"]),
+            max_open_heat_pct=float(self.config["risk_max_open_heat_pct"]),
         )
         return RiskGuard(limits=limits, price_of=self._price_of_ticker)
 
@@ -657,13 +666,23 @@ class ExchangeBridge:
                 f"the audit log failed: {exc}"
             ) from exc
 
+    def _runtime_gate(self, key: str) -> bool:
+        """Read an execution switch, honoring later process-level closures.
+
+        A caller-supplied gate override remains effective until the process
+        config changes. Once an operator mutation advances the revision, the
+        process-wide value becomes authoritative so an existing bridge cannot
+        keep a gate open after it was turned off.
+        """
+        if key not in _RUNTIME_GATE_KEYS:
+            raise ValueError(f"unsupported runtime gate {key!r}")
+        if self._gate_config_override and config_key_revision(key) == self._gate_config_revisions[key]:
+            return self.config.get(key) is True
+        return get_config().get(key) is True
+
     def _effective_mode(self) -> str:
-        # ``is True`` on purpose: the config gate only opens on a real boolean
-        # (what _coerce produces, or an explicit True injection). Strings like
-        # "false" or "0" in the config dict must fail closed, not ride Python
-        # truthiness.
-        live = self.config.get("exec_live") is True and self._env_live_flag()
-        return "live" if live else "dry"
+        # ``is True`` on purpose: strings and other truthy values fail closed.
+        return "live" if self._runtime_gate("exec_live") else "dry"
 
     def effective_mode(self) -> str:
         """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).
@@ -710,20 +729,6 @@ class ExchangeBridge:
         recording, rate limiting and credential redaction stay in one place.
         """
         return self._exchange_or_raise()
-
-    @staticmethod
-    def _env_live_flag() -> bool:
-        """Read TRADINGAGENTS_EXEC_LIVE at call time, fail-closed.
-
-        This read is the ONLY consumer of the flag: it is deliberately absent
-        from _ENV_OVERRIDES, so the same variable can never fold into the
-        config half of the gate and collapse FR5's two conditions into one.
-        None/"" or anything outside true/1/yes/on keeps the bridge dry.
-        """
-        raw = os.environ.get("TRADINGAGENTS_EXEC_LIVE")
-        if not raw:
-            return False
-        return raw.strip().lower() in _BOOL_TRUE
 
     def _exchange_or_raise(self) -> Any:
         if self._exchange is None:

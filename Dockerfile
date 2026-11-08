@@ -8,9 +8,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
 COPY . .
-# The control panel is a web service: FastAPI/uvicorn and the PostgreSQL
-# driver come from the `web` extra, so one image serves the API.
-RUN pip install --no-cache-dir ".[web]"
+# Install the project and web extra separately. Keeping the optional web
+# packages in their own resolver pass avoids pip's deep backtracking across the
+# full LLM/data dependency graph on a clean Docker build.
+RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir "fastapi>=0.115" "uvicorn>=0.30" "httpx>=0.27"
 
 FROM python:3.13-slim
 

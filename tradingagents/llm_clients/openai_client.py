@@ -595,15 +595,20 @@ class OpenAIClient(BaseLLMClient):
             if base_url:
                 llm_kwargs["base_url"] = base_url
 
-            # API key: required unless key_optional; keyless local servers get a
-            # placeholder. The env-var name is the single source in api_key_env.
-            # A signed-in provider sends its own credential, and only that.
+            # API key: an explicit tier credential wins over the env fallback;
+            # key_optional providers still receive their placeholder when neither
+            # source is configured. The env-var name is the single source in
+            # api_key_env. A signed-in provider sends its own credential, and only
+            # that.
             api_key_env = get_api_key_env(self.provider)
+            explicit_api_key = self.kwargs.get("api_key")
             api_key = os.environ.get(api_key_env) if api_key_env else None
             if spec.credential is not None:
-                if "api_key" in self.kwargs:
+                if explicit_api_key is not None:
                     raise ValueError(f"Provider '{self.provider}' uses its sign-in, not an api_key.")
                 llm_kwargs["api_key"] = spec.credential()
+            elif explicit_api_key:
+                llm_kwargs["api_key"] = explicit_api_key
             elif api_key:
                 llm_kwargs["api_key"] = api_key
             elif spec.key_optional:

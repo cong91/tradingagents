@@ -42,10 +42,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
-    # Execution bridge (L1 ccxt): quote currency only. TRADINGAGENTS_EXEC_LIVE
-    # is deliberately NOT here — it is the env half of the FR5 double gate and
-    # its only consumer is the fail-closed execute-time read in the bridge;
-    # folding it into config at import would collapse the two gates into one.
+    # Execution bridge (L1 ccxt): quote currency only. The three execution
+    # switches below are runtime config/operator gates and deliberately do not
+    # have environment overrides; .env is deployment-only for credentials,
+    # venue URL, and data/risk settings.
     "TRADINGAGENTS_EXEC_QUOTE_CURRENCY":    "exec_quote_currency",
     # Risk guard limits (L2, FR-K): percentages coerce as floats, the streak
     # cap as an int. exec_symbol_overrides/exec_watchlist are deliberately NOT
@@ -57,6 +57,11 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_MAX_CONSECUTIVE_LOSS_COUNT":   "risk_max_consecutive_loss_count",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_LEVERAGE":     "risk_max_derivatives_leverage",
     "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_PCT": "risk_max_derivatives_exposure_pct",
+    "TRADINGAGENTS_RISK_MAX_DERIVATIVES_EXPOSURE_HARD_PCT": "risk_max_derivatives_exposure_hard_pct",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MIN_R": "risk_derivatives_override_min_r",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_RISK_FRACTION": "risk_derivatives_override_max_risk_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_PER_DAY": "risk_derivatives_override_max_per_day",
+    "TRADINGAGENTS_RISK_MAX_OPEN_HEAT_PCT": "risk_max_open_heat_pct",
     "TRADINGAGENTS_RISK_DERIVATIVES_MAX_RISK_FRACTION": "risk_derivatives_max_risk_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_MAX_MARGIN_FRACTION": "risk_derivatives_max_margin_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_RISK_FRACTION": "risk_derivatives_risk_fraction",
@@ -275,10 +280,8 @@ def build_default_config() -> dict:
             ".SA":  "^BVSP",       # B3 Brazil (Ibovespa)
             "":     "SPY",         # default for US-listed tickers (no suffix)
         },
-        # Execution bridge (L1 ccxt, Binance spot). Live requires BOTH this gate —
-        # armed as a literal True in code, never via env — and the
-        # TRADINGAGENTS_EXEC_LIVE env flag, re-read at execute time, fail-closed.
-        # Keeping the halves independent means no single switch arms live trading.
+        # Execution bridge (L1 ccxt, Binance spot). Live is controlled by the
+        # current config/operator switch and is never environment-overridable.
         "exec_live": False,
         "exec_log_path": os.getenv("TRADINGAGENTS_EXEC_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "execution", "audit.jsonl"),
         "exec_quote_currency": "USDT",
@@ -300,6 +303,18 @@ def build_default_config() -> dict:
         "risk_max_consecutive_loss_count": 3,
         "risk_max_derivatives_leverage": 1.0,
         "risk_max_derivatives_exposure_pct": 0.0,
+        # Conditional derivatives override (two-bracket cap): a derivatives
+        # entry above the soft cap may pass up to the hard cap when every
+        # eligibility check holds (explicit confirmation, funding sign favoring
+        # the side, R >= min_r, risk-at-stop <= max_risk_fraction, daily budget
+        # left); the per-asset cap lifts to the hard bracket for that one order.
+        # 0 disables each knob (hard cap / daily budget / heat cap); the tier
+        # needs hard_pct > soft (risk_max_derivatives_exposure_pct) > 0.
+        "risk_max_derivatives_exposure_hard_pct": 0.0,
+        "risk_derivatives_override_min_r": 2.0,
+        "risk_derivatives_override_max_risk_fraction": 0.01,
+        "risk_derivatives_override_max_per_day": 0,
+        "risk_max_open_heat_pct": 0.0,
         # Decisions the futures agents own, and the ceilings the executor enforces
         # on them. The agent proposes; a proposal above these caps is refused, never
         # silently clamped to a different size.
@@ -358,11 +373,9 @@ def build_default_config() -> dict:
         "exec_sandbox": False,
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],
-        # L2 FR5-style gates. Deliberately NOT in _ENV_OVERRIDES (same reasoning
-        # as exec_live above): the env halves TRADINGAGENTS_EXEC_AUTO_CONFIRM /
-        # TRADINGAGENTS_EXEC_DERIVATIVES are read fail-closed at call time, so no
-        # single switch can arm automatic or derivatives trading. Derivatives
-        # additionally requires per-order confirm=True even in dry-run.
+        # L2 runtime gates are config/operator switches only. The operator
+        # surface applies them in-process and persists them in PostgreSQL;
+        # they are intentionally absent from _ENV_OVERRIDES.
         "exec_auto_confirm": False,
         "exec_derivatives": False,
 

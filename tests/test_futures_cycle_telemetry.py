@@ -7,10 +7,13 @@ and the timestamp/terminal behavior of the persistence helpers.
 """
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from server import futures_cycle_telemetry as fct
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.execution.risk import RiskLimits
 
 
 @pytest.mark.unit
@@ -301,8 +304,13 @@ def test_effective_caps_reports_every_guard_limit():
     class Limits:
         max_derivatives_leverage = 5.0
         max_derivatives_exposure_pct = 80.0
+        max_derivatives_exposure_hard_pct = 95.0
+        risk_derivatives_override_min_r = 2.5
+        risk_derivatives_override_max_risk_fraction = 0.008
+        risk_derivatives_override_max_per_day = 2
         max_position_pct_per_asset = 40.0
         max_total_exposure_pct = 150.0
+        max_open_heat_pct = 6.0
 
     class Guard:
         limits = Limits()
@@ -315,9 +323,43 @@ def test_effective_caps_reports_every_guard_limit():
     assert caps["risk_guard_max_leverage"] == 5.0
     assert caps["auto_max_leverage"] == 3.0
     assert caps["max_derivatives_exposure_pct"] == 80.0
+    assert caps["max_derivatives_exposure_hard_pct"] == 95.0
+    assert caps["risk_derivatives_override_min_r"] == 2.5
+    assert caps["risk_derivatives_override_max_risk_fraction"] == 0.008
+    assert caps["risk_derivatives_override_max_per_day"] == 2
     assert caps["max_position_pct_per_asset"] == 40.0
     assert caps["max_total_exposure_pct"] == 150.0
+    assert caps["max_open_heat_pct"] == 6.0
     assert caps["max_risk_fraction"] == 0.02 and caps["max_margin_fraction"] == 0.5
+
+
+@pytest.mark.unit
+def test_effective_caps_reports_override_and_heat_defaults():
+    """The serialized cycle payload exposes the actual override and heat caps."""
+    limits = RiskLimits()
+    for field, key in (
+        ("max_derivatives_exposure_hard_pct", "risk_max_derivatives_exposure_hard_pct"),
+        ("risk_derivatives_override_min_r", "risk_derivatives_override_min_r"),
+        (
+            "risk_derivatives_override_max_risk_fraction",
+            "risk_derivatives_override_max_risk_fraction",
+        ),
+        ("risk_derivatives_override_max_per_day", "risk_derivatives_override_max_per_day"),
+        ("max_open_heat_pct", "risk_max_open_heat_pct"),
+    ):
+        assert getattr(limits, field) == DEFAULT_CONFIG[key]
+    caps = fct.effective_caps(
+        SimpleNamespace(risk_guard=SimpleNamespace(limits=limits)),
+        auto_cap=3.0, config={},
+    )
+    # A real RiskLimits flows through the same read the fake limit classes take.
+    assert caps["effective_leverage"] == 1.0
+    assert caps["max_derivatives_exposure_pct"] == 0.0
+    assert caps["max_derivatives_exposure_hard_pct"] == 0.0
+    assert caps["risk_derivatives_override_min_r"] == 2.0
+    assert caps["risk_derivatives_override_max_risk_fraction"] == 0.01
+    assert caps["risk_derivatives_override_max_per_day"] == 0
+    assert caps["max_open_heat_pct"] == 0.0
 
 
 @pytest.mark.unit

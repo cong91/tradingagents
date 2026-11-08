@@ -80,15 +80,10 @@ export function ExecStatusChipView({
   );
 }
 
-// Chip trạng thái cổng thực thi, luôn hiển thị trong sidebar (thay banner
-// full-width). Nhãn chỉ đo cổng «Lệnh thật»: effective_exec_mode là "live" khi
-// CẢ HAI nửa mở (exec_live + TRADINGAGENTS_EXEC_LIVE) — không đo exec_auto_confirm.
-//
-// Không polling theo đồng hồ. Giá trị này chỉ đổi qua hai con đường và cả hai
-// đều có tín hiệu đẩy: (1) PUT/DELETE /api/operator-config → máy chủ phát sự
-// kiện trên GET /api/settings/events (SSE); (2) sửa .env → phải restart máy
-// chủ → stream đứt, EventSource tự nối lại và nhận "reset" ngay. Fallback khi
-// SSE không có sẵn/khả năng: refetch khi tab quay lại hiển thị hoặc mạng hồi.
+// Chip trạng thái quyền «Lệnh thật», luôn hiển thị trong sidebar. Nhãn đo
+// effective_exec_mode: "live" khi công tắc exec_live đang mở.
+// Không polling theo đồng hồ. Giá trị đổi qua operator-config và tín hiệu SSE;
+// fallback là refetch khi tab quay lại hiển thị hoặc mạng hồi.
 export function ExecStatusChip() {
   const [state, setState] = useState<ModeState>({ status: "loading" });
   const lastFetchAt = useRef(0);

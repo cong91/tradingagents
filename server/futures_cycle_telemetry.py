@@ -120,8 +120,17 @@ def effective_caps(
         "risk_guard_max_leverage": float(limits.max_derivatives_leverage),
         "auto_max_leverage": float(auto_cap),
         "max_derivatives_exposure_pct": float(limits.max_derivatives_exposure_pct),
+        "max_derivatives_exposure_hard_pct": float(limits.max_derivatives_exposure_hard_pct),
+        "risk_derivatives_override_min_r": float(limits.risk_derivatives_override_min_r),
+        "risk_derivatives_override_max_risk_fraction": float(
+            limits.risk_derivatives_override_max_risk_fraction
+        ),
+        "risk_derivatives_override_max_per_day": float(
+            limits.risk_derivatives_override_max_per_day
+        ),
         "max_position_pct_per_asset": float(limits.max_position_pct_per_asset),
         "max_total_exposure_pct": float(limits.max_total_exposure_pct),
+        "max_open_heat_pct": float(limits.max_open_heat_pct),
     }
     if config is not None:
         caps["max_risk_fraction"] = float(config.get("risk_derivatives_max_risk_fraction", 0.02))

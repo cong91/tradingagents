@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import threading
 
 from server import job_store
 from tradingagents.dataflows.config import get_config
-from tradingagents.default_config import _BOOL_TRUE
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +61,6 @@ def _log_entry_outcome(task: dict, status: str, *, exception: Exception | None =
     )
 
 
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name)
-    return bool(raw and raw.strip().lower() in _BOOL_TRUE)
-
-
 def poll_active_brackets() -> list[dict]:
     tasks = job_store.active_bracket_recoveries()
     if not tasks:
@@ -79,7 +72,7 @@ def poll_active_brackets() -> list[dict]:
     executor = DerivativesExecutor(config=config)
     can_recover = (
         config.get("exec_derivatives") is True
-        and _env_flag("TRADINGAGENTS_EXEC_DERIVATIVES")
+        and config.get("exec_live") is True
         and executor.effective_mode() == "live"
     )
     outcomes = []

@@ -8,18 +8,16 @@ then decides the confirm policy:
 
 - default (``exec_auto_confirm`` not a literal True): the plan is audited
   and LEFT FOR HUMAN APPROVAL -- nothing is ever sent;
-- auto-confirm DRY: executes the dry fill automatically ONLY when the
-  third gate (FR-S2) is fully open -- the config ``exec_auto_confirm`` key
-  must be a literal True AND the ``TRADINGAGENTS_EXEC_AUTO_CONFIRM`` env
-  flag must read true at call time, fail-closed;
-- auto-confirm LIVE: additionally requires the FR5 config gate
-  (``exec_live`` literal True). Anything missing falls back to
-  waiting for approval, with the reason audited.
+- auto-confirm DRY: executes the dry fill automatically when the current
+  process config ``exec_auto_confirm`` key is a literal True;
+- auto-confirm LIVE: additionally requires the current process config
+  ``exec_live`` literal True. Anything missing falls back to waiting for
+  approval, with the reason audited.
 
 WARNING: combining an unattended scheduler with auto-confirm LIVE means
 real money moves without a human in the loop. That combination is
-deliberately gated three ways and should stay off until a dry-run schedule
-has run clean for long enough that you trust the whole chain.
+deliberately gated by configuration and should stay off until a dry-run
+schedule has run clean for long enough that you trust the whole chain.
 
 Scheduling examples (one process per run; no long-lived daemon here):
 
@@ -30,7 +28,7 @@ cron (Linux/macOS), weekdays at 13:30 UTC:
 
 Windows Task Scheduler (schtasks), daily at 08:30 local:
     schtasks /Create /TN "TradingAgents daily" /SC DAILY /ST 08:30 /TR \\
-        "cmd /c cd /d C:\\path\\to\\project && .venv\\Scripts\\python.exe -c \\"from tradingagents.execution.daily import run_daily; run_daily()\\""
+        "cmd /c cd /d C:\\path\\to\\project && .venv\\Scripts\\python.exe -c \\\"from tradingagents.execution.daily import run_daily; run_daily()\\\""
 
 Note that each run spends LLM quota (one full agent pipeline per coin) and,
 with the live gates armed, can place real orders. Do NOT configure
@@ -45,7 +43,6 @@ contract applies unchanged.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -53,7 +50,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from tradingagents.default_config import _BOOL_TRUE
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.portfolio import PortfolioContext
 
@@ -65,16 +61,12 @@ _PROPAGATE_RETRY_WAIT = 20.0
 logger = logging.getLogger(__name__)
 
 
-def _env_auto_confirm_flag() -> bool:
-    """Read TRADINGAGENTS_EXEC_AUTO_CONFIRM at call time, fail-closed.
-
-    Deliberately absent from _ENV_OVERRIDES, like TRADINGAGENTS_EXEC_LIVE:
-    its only consumer is this read, so it can never arm the config half.
-    """
-    raw = os.environ.get("TRADINGAGENTS_EXEC_AUTO_CONFIRM")
-    if not raw:
-        return False
-    return raw.strip().lower() in _BOOL_TRUE
+def _gate_enabled(bridge: ExchangeBridge, key: str) -> bool:
+    """Read a runtime gate through the bridge seam, with a test-double fallback."""
+    reader = getattr(bridge, "_runtime_gate", None)
+    if callable(reader):
+        return reader(key)
+    return getattr(bridge, "config", {}).get(key) is True
 
 
 class DailyResult(BaseModel):
@@ -193,27 +185,15 @@ def _handle_plan(
         result.reason = plan.reason  # Hold, REVIEW, sizing refusal or risk rejection
         return
 
-    if bridge.config.get("exec_auto_confirm") is not True:
+    if not _gate_enabled(bridge, "exec_auto_confirm"):
         _wait_for_approval(bridge, plan, "exec_auto_confirm is not enabled; plan awaits approval")
         result.reason = "awaiting approval"
-        return
-    if not _env_auto_confirm_flag():
-        # FR-S2's second half of the third gate: the env flag must read true
-        # at call time in dry and live alike -- fail-closed, so one variable
-        # (the config literal) never arms auto-confirm alone.
-        _wait_for_approval(
-            bridge,
-            plan,
-            "auto-confirm requires TRADINGAGENTS_EXEC_AUTO_CONFIRM=true at call "
-            "time; plan awaits approval",
-        )
-        result.reason = "awaiting approval (auto-confirm env gate closed)"
         return
     if bridge.effective_mode() == "dry":
         result.order_id = execute_once()
         result.executed = True
         return
-    if bridge.config.get("exec_live") is not True:
+    if not _gate_enabled(bridge, "exec_live"):
         _wait_for_approval(
             bridge,
             plan,

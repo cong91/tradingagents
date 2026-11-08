@@ -6,6 +6,7 @@ import tradingagents.default_config as default_config
 
 # Use default config but allow it to be overridden
 _config: dict | None = None
+_config_key_revisions: dict[str, int] = {}
 
 # The config of the run in progress. A graph binds its own for the length of a
 # run, so the data tools it calls read that graph's vendors even when several
@@ -37,8 +38,16 @@ def set_config(config: dict):
     partial update like ``{"data_vendors": {"core_stock_apis": "alpha_vantage"}}``
     keeps the other nested keys from the default; scalar keys are replaced.
     """
+    global _config_key_revisions
     initialize_config()
     _merge(_config, config)
+    for key in config:
+        _config_key_revisions[key] = _config_key_revisions.get(key, 0) + 1
+
+
+def config_key_revision(key: str) -> int:
+    """Return the process-wide revision for one setting key."""
+    return _config_key_revisions.get(key, 0)
 
 
 @contextmanager

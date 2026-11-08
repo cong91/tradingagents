@@ -47,6 +47,10 @@ class Position(BaseModel):
         default=None, description="Absolute marked exposure when provided", allow_inf_nan=False,
     )
     notional_currency: str | None = Field(default=None, description="Currency for notional exposure")
+    stop_loss: float | None = Field(
+        default=None, description="Recorded stop price used by the open-heat risk math",
+        allow_inf_nan=False,
+    )
     market: Literal["spot", "derivatives"] = Field(default="spot")
     market_symbol: str | None = Field(default=None, description="Venue symbol for the held instrument")
 

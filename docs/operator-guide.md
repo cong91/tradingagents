@@ -45,18 +45,13 @@ Trình duyệt ──► web/ (Next.js, port 3000)  ── proxy /api/* ──�
 - Kế hoạch lệnh vào **hàng đợi Duyệt lệnh**. Người điều hành duyệt (hoặc từ chối)
   từng kế hoạch — duyệt là **đường duy nhất** đưa lệnh vào `execute_order`
   (`server/approvals.py:5-10`).
-- Lệnh thật (LIVE) cần **cổng FR5 hai khoá**, và hai khoá mở theo **hai đường khác
-  nhau** — điểm này quan trọng nhất của hệ thống:
-  - **Nửa config** `exec_live`: mặc định `False` (`tradingagents/default_config.py:206`)
-    và **không đặt được qua `.env`** — key cố ý vắng khỏi bảng biến môi trường
-    (`default_config.py:33-36`), PUT `/api/settings` cũng từ chối key này (403
-    `forbidden_key` — `server/settings.py:209-211`). Muốn mở phải sửa code: đổi
-    `default_config.py:206` thành `"exec_live": True` rồi khởi động lại backend, hoặc
-    một script chạy trong cùng process server gọi `set_config({"exec_live": True})`.
-    Quy trình đầy đủ ở §4.8.
-  - **Nửa môi trường** `TRADINGAGENTS_EXEC_LIVE`: **cái này mới đặt được qua `.env`**
-    — bridge đọc flag lúc gọi, fail-closed (`tradingagents/execution/bridge.py:527-539`).
-  - Giao diện web không mở được khoá nào (`server/settings.py:5-9`, hợp đồng §1 quy tắc 2).
+- Quyền **Lệnh thật**, **Tự động** và **Futures** được bật/tắt trong thẻ
+  **Override vận hành** của màn Cấu hình. Thay đổi gate cần xác nhận + lý do và
+  được ghi audit; tắt gate chặn lệnh mới ngay ở lần kiểm tra thực thi kế tiếp.
+- `.env` chỉ giữ credential và venue deployment. Không còn biến môi trường gate
+  thứ hai; `effective_exec_mode` là `live` khi quyền Lệnh thật trong cấu hình mở.
+- Giao diện web hiển thị trạng thái hiệu lực và có đường dẫn tới thẻ Override;
+  việc bật gate nhạy cảm vẫn yêu cầu xác nhận + lý do (`server/operator_config.py`).
 
 ### 1.3 Luồng một ngày làm việc
 
@@ -123,26 +118,29 @@ engine — `server/watchlist.py:47-51`).
 
 ### 2.2 API key — cài ở đâu?
 
-**Màn Cấu hình chỉ HIỂN THỊ trạng thái key, không cho sửa.** Đây là chủ đích an toàn:
-key không bao giờ được trả nguyên văn về UI — chỉ "Đã cấu hình" + 4 ký tự cuối
-(`web/components/settings/credentials-card.tsx:25-28`, `server/settings.py:140-148`).
+LLM API key được cấu hình ngay trên màn **Cấu hình → LLM provider & models**:
+chọn **Tầng nhanh** hoặc **Tầng sâu**, chọn provider, rồi nhập key vào ô write-only.
+Key được mã hóa bằng vault trước khi lưu PostgreSQL; API chỉ trả trạng thái và 4 ký tự
+cuối. Có thể lưu key khác nhau cho cùng provider ở hai tầng.
 
-Cách cài key:
+Credential sàn vẫn là deployment secret trong `.env`:
 
-1. Mở file `.env` ở thư mục gốc repo (mẫu: `.env.example`).
-2. Thêm/sửa dòng, ví dụ:
-   - `OPENAI_API_KEY=...` (hoặc `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY` tuỳ provider)
-   - `BINANCE_API_KEY=...` và `BINANCE_SECRET=...` (khi chạy lệnh thật qua sàn)
-3. Chọn đúng bộ credentials theo venue URL:
+1. Thêm/sửa credential Binance trong `.env`:
    - Binance Demo mặc định: `BINANCE_DEMO_API_KEY=...` và `BINANCE_DEMO_SECRET=...`.
-   - Binance production: `BINANCE_API_KEY=...`, `BINANCE_SECRET=...` và `TRADINGAGENTS_EXEC_BASE_URL=https://api.binance.com`.
-   Không trộn cặp key giữa hai endpoint. Backend kiểm tra URL host và chỉ đọc đúng cặp credentials tương ứng.
-4. **Khởi động lại backend** — env được đọc lúc process khởi động.
-5. Vào màn **Cấu hình**, thẻ "Khóa API" chỉ hiện trạng thái/mask của cặp credentials đang chọn; URL sàn hiện read-only ở nhóm "Thực thi & Sàn".
+   - Binance production: `BINANCE_API_KEY=...`, `BINANCE_SECRET=...` và
+     `TRADINGAGENTS_EXEC_BASE_URL=https://api.binance.com`.
+2. Không trộn cặp key giữa hai endpoint. Backend kiểm tra URL host và chỉ đọc đúng
+   cặp credential tương ứng.
+3. Khởi động lại backend sau khi đổi venue URL hoặc credential sàn.
+4. Vào Settings để kiểm tra trạng thái provider/model và quyền chạy. Lưu API key LLM
+   trong UI không cần ghi `.env` hay restart.
 
-Chuyển Demo sang production chỉ cần đổi `TRADINGAGENTS_EXEC_BASE_URL` cùng cặp API key/secret phù hợp rồi restart backend. Điều này **không mở** `exec_live`, auto-confirm hay derivatives gates; các gate vẫn fail-closed độc lập.
+Chuyển Demo sang production chỉ đổi `TRADINGAGENTS_EXEC_BASE_URL` cùng cặp API key/secret
+phù hợp rồi restart backend. Việc này không tự mở quyền **Lệnh thật**, **Tự động** hay
+**Futures**; các quyền đó được bật trong **Override vận hành** với xác nhận + lý do.
 
-Key nào cần khi nào? Xem §5.3 (Mock không cần key nào; phân tích Live cần LLM key; thực thi cần thêm đúng cặp key sàn).
+Key nào cần khi nào? Pipeline Live cần credential LLM của tier đang dùng; thực thi cần
+thêm đúng cặp credential sàn.
 
 ---
 
@@ -159,20 +157,16 @@ Sidebar trái có 6 mục (`web/components/sidebar.tsx:15-22`). Thanh **Mode bar
 
 | Hiển thị | Ý nghĩa |
 |---|---|
-| **SANDBOX** (viền xanh dương, khiên) | Không có quyền gửi lệnh live hiện tại. Có thể do `exec_live=False` (duyệt trả 412 `gate_closed`) hoặc do config đã bật nhưng env `TRADINGAGENTS_EXEC_LIVE` đang tắt (duyệt chỉ ghi dry-fill, không chạm venue). |
-| **LIVE — LỆNH THẬT** (viền đỏ, tam giác cảnh báo) | Hai gate FR5 cùng mở: lệnh được duyệt có thể gửi bằng API tới venue đã cấu hình. Venue Demo vẫn là live execution trên số dư Demo; production dùng tài khoản tiền thật. |
+| **SANDBOX** (viền xanh dương, khiên) | Quyền Lệnh thật đang đóng; duyệt chỉ mô phỏng hoặc bị chặn theo policy. |
+| **LIVE — LỆNH THẬT** (viền đỏ, tam giác cảnh báo) | Quyền Lệnh thật mở; lệnh được duyệt vẫn phải qua credential, confirm, preflight và RiskGuard. |
 | ĐANG TẢI CHẾ ĐỘ… | Request đầu tiên chưa trả về. |
 | KHÔNG KẾT NỐI (viền vàng) + nút "Thử lại" | Không đọc được `/api/settings` — backend có thể chưa chạy (xem §4.1). |
 
 > `SANDBOX` trên mode bar không chọn Binance Demo. Binance venue được xác định bởi URL read-only trong Settings; `exec_sandbox` chỉ điều khiển sandbox của các sàn khác. Với cài mới, `exec_live=False` nên bấm Duyệt trả 412.
 
 Vì sao LIVE phải hiển thị rõ ràng như vậy: duyệt lệnh LIVE là hành động không thể
-hoàn tác và mất tiền thật. LIVE chỉ bật khi **cả hai nửa cổng FR5** cùng mở —
-`exec_live=True` (config) **và** `TRADINGAGENTS_EXEC_LIVE=true` (biến môi trường);
-nếu chỉ thấy "live" trên mode bar thì nghĩa là cả hai nửa đang mở đồng thời
-(`server/settings.py:60-70`). **UI không thể bật khoá nào** — nửa config chỉ mở bằng
-cách sửa code (§4.8), nửa env mới qua `.env`/môi trường. Màu không bao giờ là tín
-hiệu duy nhất: luôn kèm icon + chữ (WCAG).
+hoàn tác và mất tiền thật. LIVE chỉ bật khi quyền `exec_live` trong Override vận hành
+đang mở; credential, confirm, venue preflight và RiskGuard vẫn là các kiểm tra bắt buộc.
 
 ### 3.1 Tổng quan lợi nhuận (`/`)
 
@@ -362,7 +356,7 @@ sẽ nằm mãi trong hàng đợi, đợi job quét sau sinh kế hoạch mới
 
 | Mã | Nghĩa | Việc cần làm |
 |---|---|---|
-| `412 gate_closed` | **Cổng FR5 (exec_live) đang đóng.** Duyệt cần `exec_live=True` trong config; item giữ nguyên "Chờ duyệt". | Đây là hành vi bình thường trên cài mới. Mở cổng theo đúng quy trình **§4.8** — chú ý: nửa config **không** đặt được qua `.env`. Trước khi duyệt lại, kiểm tra mode bar/thẻ Cổng thực thi (§4.8 bước 3). |
+| `412 gate_closed` | **Quyền Lệnh thật đang đóng.** Duyệt cần `exec_live=True` trong Override vận hành; item giữ nguyên "Chờ duyệt". | Vào **Cấu hình → Override vận hành**, bật quyền với xác nhận + lý do; kiểm tra mode bar trước khi duyệt lại. |
 | `403 risk_halted` | RiskGuard đã dừng giao dịch hôm nay (kèm lý do). | Xem §4.4 — halt tự hết khi sang ngày UTC mới; mở lại sớm là hành động phía server (lệnh ở §4.4). |
 | `409 conflict` | Item đã được xử lý nơi khác (tab khác đã duyệt/từ chối) hoặc không dựng được kế hoạch. | Danh sách tự làm mới. |
 | `409 mock_not_executable` | Kế hoạch sinh từ job mock — dữ liệu tổng hợp không thể thành lệnh thật. | Từ chối kế hoạch này. |
@@ -407,8 +401,7 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     của agent. Autoloop luôn cần `FuturesExecutionProposal` từ Trader/Portfolio Manager.
   - *Tự khóa lợi nhuận Futures* (`risk_derivatives_profit_protection_enabled`): quản lý các vị thế
     do bot đã mở và đã lưu `position_states` cùng bracket task. Mặc định bật, nhưng không tự mở
-    `exec_derivatives` hay `exec_live`; mọi mutation trên venue vẫn cần đủ cả hai nửa config/env của
-    cả hai gate.
+    `exec_derivatives` hay `exec_live`; mọi mutation trên venue cần cả quyền Futures/LIVE trong config.
   - Chính sách dùng `R = khoảng cách entry thực tế đến stop ban đầu`: bộ mặc định mới là
     `break_even_r` **0.5R** dời SL về mốc hòa vốn (đã cộng phí, xem dưới); `lock_profit_r`
     **1R** khóa tối thiểu 1R; từ `trail_start_r` **1.5R**, SL bám mark cách
@@ -428,7 +421,8 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     đúng bằng phần phí đó. Vì vậy khi chạm `break_even_r`, policy đặt SL cao hơn entry một
     khoảng `round_trip_fee_rate` (long) hoặc thấp hơn tương ứng (short). `0` = không bù phí,
     SL hòa vốn đúng bằng entry như trước.
-  - Bốn khoá điều chỉnh ngưỡng và ba khoá chi phí/thời gian ở trên cũng sửa được qua
+  - Bốn khoá điều chỉnh ngưỡng, ba khoá chi phí/thời gian ở trên cùng năm khoá của cơ chế
+    vượt trần và trần heat dưới đây cũng sửa được qua
     `/api/operator-config` (nhóm **risk**, không phải cổng thực thi — không cần `confirm`):
 
     | Khoá | Mặc định | Ý nghĩa |
@@ -440,7 +434,30 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     | `risk_derivatives_max_hold_hours` | 72.0 | Quá số giờ này mà chưa đạt mốc R tối thiểu thì đóng vị thế; `0` = tắt |
     | `risk_derivatives_time_stop_min_r` | 1.0 | Mốc R tối thiểu phải đạt trước hạn giữ tối đa |
     | `risk_derivatives_round_trip_fee_rate` | 0.001 | Phí khứ hồi dùng để nâng SL hòa vốn lên trên entry; `0` = không bù phí |
+    | `risk_max_derivatives_exposure_hard_pct` | 0 | Trần cứng cho cơ chế vượt trần phái sinh: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này; `0` = tắt |
+    | `risk_derivatives_override_min_r` | 2.0 | R tối thiểu (lời mục tiêu / rủi ro stop) của đề xuất để đủ điều kiện vượt trần |
+    | `risk_derivatives_override_max_risk_fraction` | 0.01 | Risk-at-stop tối đa cho lệnh vượt trần (0.01 = 1%), chặt hơn trần thường `risk_derivatives_max_risk_fraction` |
+    | `risk_derivatives_override_max_per_day` | 0 | Ngân sách lệnh vượt trần mỗi ngày UTC; `0` = không bao giờ vượt trần |
+    | `risk_max_open_heat_pct` | 0 | Trần tổng rủi ro đang mở (heat): tổng phần equity mất nếu mọi stop khớp cùng lúc; `0` = TẮT (khác các trần anh em), khuyến nghị 6 |
 
+  - **Hai nấc trần phơi nhiễm và cơ chế vượt trần (soft-cap override).** Trần *Phơi nhiễm phái
+    sinh tối đa* (`risk_max_derivatives_exposure_pct`, vận hành thường đặt 25%) vẫn là nấc mặc
+    định; khi đặt `risk_max_derivatives_exposure_hard_pct` > 0 (khuyến nghị 35), một lệnh phái
+    sinh bị từ chối vì vượt nấc thường có thể vẫn được duyệt nếu đáp ứng đủ **năm điều kiện tất
+    định** — mọi điều kiện do executor tự đo, không hỏi LLM: kịch bản có confirmation trên cả
+    hai khung 1h và 4h; R của đề xuất (lời mục tiêu / rủi ro stop) đạt
+    `risk_derivatives_override_min_r`; risk-at-stop của lệnh gắt hơn
+    `risk_derivatives_override_max_risk_fraction` (chặt hơn trần mỗi lệnh thường); funding
+    không bất lợi; còn ngân sách trong ngày — tối đa `risk_derivatives_override_max_per_day`
+    lệnh vượt trần mỗi ngày UTC. Lệnh được duyệt qua cơ chế này được đẩy tổng phơi nhiễm tới
+    tối đa nấc cứng, và mỗi lần dùng ghi một sự kiện audit `derivatives_override_used`.
+  - **Trần tổng rủi ro đang mở (heat).** `risk_max_open_heat_pct` chặn lệnh phái sinh mới khi
+    tổng phần equity mất nếu mọi stop đang mở khớp cùng lúc (heat) vượt trần. Lưu ý ngữ nghĩa
+    **khác các trần anh em**: `0` = **TẮT** (không phải chặn hết), > 0 = bật — khuyến nghị 6.
+    Mặc định các khoá mở soft-cap override đều `0` (`hard_pct`, `override_max_per_day`), nên
+    cơ chế tắt và hành vi không đổi so với trước; hai ngưỡng điều kiện `override_min_r` /
+    `override_max_risk_fraction` chỉ có tác dụng khi cổng đã mở. Trần heat độc lập cũng mặc
+    định `0` nên đang tắt.
   - Monitor chỉ mutate khi đọc được position mode và account đang **One-way**; Hedge Mode trả
     `hedge_mode_unsupported` vì Binance không nhận `reduceOnly` ở chế độ đó. Mark được đọc riêng
     từ endpoint mark price; mark cũ hơn `mark_max_age_seconds` (mặc định 120s) trả `mark_stale`
@@ -462,16 +479,10 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
   - Lưu ý: giá trị mới chỉ áp cho guard/monitor được dựng sau khi lưu (`types.ts:120`).
 - **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
 
-**Các thẻ chỉ-đọc:**
-- *Khóa API* — trạng thái key (mục §2.2); không sửa được từ UI.
-- *Cổng thực thi (chỉ đọc)* — hiển thị **cả 6 hàng cổng MỞ/ĐÓNG** — 3 cặp cổng, mỗi
-  cặp gồm nửa config và nửa biến môi trường: *LIVE* (`exec_live` /
-  `TRADINGAGENTS_EXEC_LIVE`), *Tự động duyệt* (`exec_auto_confirm` / env), *Phái sinh*
-  (`exec_derivatives` / env) — `server/settings.py:154-161`. Thẻ cũng hiển thị "Chế độ
-  thực thi hiệu lực": LIVE — LỆNH THẬT hoặc "Mô phỏng (dry)". Các cổng cố ý vắng khỏi
-  API ghi — **không thể bật LIVE từ UI** (`gates-card.tsx:32-35`).
-- *Đường dẫn* — nơi engine đọc/ghi (thư mục kết quả, cache, nhật ký quyết định, nhật
-  ký audit thực thi).
+**Các thẻ chính:**
+- *LLM provider & models* — chọn tầng nhanh/sâu, provider, model, URL và reasoning; API key nhập write-only theo từng tier/provider.
+- *Quyền chạy* — xem trạng thái Lệnh thật, Tự động và Futures; thay đổi nhạy cảm thực hiện ở Override vận hành.
+- *Đường dẫn* — nơi engine đọc/ghi (thư mục kết quả, cache, nhật ký quyết định, nhật ký audit thực thi).
 
 **Cách lưu:** sửa vài ô → thanh **Save bar** xuất hiện, chỉ gửi các key bạn đã sửa →
 lỗi 422 (kiểu dữ liệu sai) được map về đúng ô. Có badge "Dữ liệu cũ" khi poll lỗi;
@@ -588,38 +599,22 @@ Run live dựng graph xong mới gọi LLM — thiếu key → phiên kết thú
 trong thẻ kết quả. Màn Cấu hình (thẻ Khóa API) và `/api/health` cho biết key đã cấu
 hình chưa. Phân tích Mock không bao giờ dính lỗi này.
 
-### 4.8 Duyệt trả 412 `gate_closed` — mở cổng FR5 đúng cách
+### 4.8 Duyệt trả 412 `gate_closed` — mở quyền Lệnh thật
 
-**Triệu chứng:** bấm "Duyệt lệnh" → hộp thoại báo lỗi "Cổng FR5 (exec_live) đang
-đóng…"; item vẫn "Chờ duyệt". **Đây là trạng thái mặc định của cài mới** (`exec_live:
-False` — `default_config.py:206`) — không phải lỗi.
+**Triệu chứng:** bấm "Duyệt lệnh" → hộp thoại báo lỗi `gate_closed`; item vẫn
+"Chờ duyệt". Đây là trạng thái mặc định của cài mới (`exec_live: False`) — không
+phải lỗi.
 
-**Quy trình mở cổng** (operator tự chịu trách nhiệm với từng bước):
+**Quy trình mở quyền:**
 
-1. **Mở nửa config `exec_live`** — đường duy nhất là sửa code, vì key này cố ý vắng
-   khỏi bảng biến môi trường (`default_config.py:33-36`) và bị PUT settings từ chối
-   (403 `forbidden_key` — `server/settings.py:209-211`):
-   - Sửa `tradingagents/default_config.py:206`: `"exec_live": False` →
-     `"exec_live": True`;
-   - hoặc để một script chạy **trong cùng process server** gọi
-     `set_config({"exec_live": True})` (gọi từ script riêng ngoài server không tác
-     động tới process đang chạy — config là state của process).
-   - Khởi động lại backend nếu bạn sửa file mặc định.
-2. **Kiểm tra nửa môi trường trước khi duyệt** — mở màn Cấu hình → thẻ "Cổng thực thi
-   (chỉ đọc)": hàng `LIVE · cấu hình exec_live` phải là **MỞ**. Nhìn luôn hàng
-   `LIVE · biến môi trường TRADINGAGENTS_EXEC_LIVE`:
-   - Nếu env **ĐÓNG**: lần duyệt tiếp theo sẽ là **dry-fill** (ghi sổ mô phỏng) —
-     an toàn để tập thao tác.
-   - Nếu env **ĐÃ MỞ sẵn** (ai đó bật trong `.env` từ trước): lần duyệt tiếp theo
-     là **LỆNH THẬT**. Mode bar sẽ chuyển sang "LIVE — LỆNH THẬT" sau khi restart
-     backend — **đọc mode bar ngay trước khi bấm Duyệt**; đây là cảnh báo bắt buộc:
-     việc arm nửa config biến lần duyệt kế tiếp thành lệnh thật, không phải dry-fill.
-3. **Duyệt lại** kế hoạch — bây giờ server chấp nhận và đi qua RiskGuard như §3.4.
+1. Vào **Cấu hình → Override vận hành**.
+2. Bật **Lệnh thật**, tick xác nhận và nhập lý do. Thay đổi được lưu PostgreSQL,
+   audit và áp dụng cho các quyết định mới; không cần sửa code hay `.env`.
+3. Kiểm tra mode bar chuyển sang **LIVE — LỆNH THẬT**, rồi duyệt lại kế hoạch.
+   Backend vẫn kiểm tra credential sàn, `confirm=True`, venue preflight và RiskGuard.
 
-**Cách thu hồi:** đặt lại `"exec_live": False` và restart backend. Nửa env tắt bằng
-cách bỏ/sửa `TRADINGAGENTS_EXEC_LIVE` trong `.env` rồi restart (env đọc lúc gọi —
-`bridge.py:527-539`, một số đường đọc có thể nhận giá trị mới không cần restart, nhưng
-đừng dựa vào điều đó).
+**Cách thu hồi:** tắt **Lệnh thật** trong Override vận hành. Lệnh mới bị chặn ở lần
+kiểm tra thực thi kế tiếp; vị thế đang mở không tự đóng chỉ vì gate bị tắt.
 
 ### 4.9 Lỗi 503 `audit_log_unreadable` — hồi phục
 
@@ -698,11 +693,10 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
 | Kịch bản | Cần gì | Dữ liệu từ đâu |
 |---|---|---|
 | Pipeline **Mock** | Không cần key gì, không cần mạng | Replay state log thật nếu có; không có → fixture tổng hợp (`server/runs.py:203-247`). Signal từ file replay, ví dụ "Hold". |
-| Pipeline **Live** | LLM key của `llm_provider` | Graph LangGraph thật + data vendor; mất nhiều phút; ghi báo cáo thật. |
+- **Pipeline Live** | Credential LLM của tier đang dùng | Graph LangGraph thật + data vendor; mất nhiều phút; ghi báo cáo thật.
 | Quét **"Quét ngay"** (hiện là live) | LLM key | Job per-coin như Pipeline Live; plan qua RiskGuard thật. Chế độ mock của daily job (API `POST /api/daily` `mode:"mock"`) dùng stub venue với **số demo cố định** — giá 83 078, tiền mặt 9 500 (`server/daily.py:45-46`); plan mock mang `mock:true`, **không bao giờ duyệt được** (409). |
-| **Duyệt lệnh** trên cài mới | Chưa được — cổng FR5 đóng → mọi lần duyệt trả 412 `gate_closed` (§4.8). | — |
-| **Duyệt lệnh** dry-fill | Nửa config đã arm + env tắt (trạng thái trung gian, §4.8) | Dry-fill ghi sổ mô phỏng, không chạm sàn. |
-| **Duyệt lệnh** LIVE | LLM key + cặp Binance phù hợp với URL đang chọn: `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET` cho Demo, hoặc `BINANCE_API_KEY`/`BINANCE_SECRET` cho production | URL Binance chỉ nhận host Demo hoặc production đã cho phép; lệnh qua ccxt tới đúng endpoint. Demo là live trên tài khoản Demo. |
+| Duyệt lệnh trên cài mới | Chưa được — quyền Lệnh thật đóng → approve trả 412 `gate_closed`. | — |
+| Duyệt lệnh LIVE | Credential LLM của tier + cặp Binance phù hợp với URL đang chọn: `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET` cho Demo, hoặc `BINANCE_API_KEY`/`BINANCE_SECRET` cho production | URL Binance chỉ nhận host Demo hoặc production đã cho phép; lệnh qua ccxt tới đúng endpoint. Demo là live trên tài khoản Demo. |
 
 ### 5.4 Chưa kiểm chứng / giới hạn đã biết
 

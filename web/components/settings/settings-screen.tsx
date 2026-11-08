@@ -13,10 +13,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { AutoloopCard } from "./autoloop-card";
-import { CredentialsCard } from "./credentials-card";
 import { DataSourceCard } from "./data-source-card";
 import { formatDateTimeVi } from "./format-time";
 import { GatesCard } from "./gates-card";
+import { LLM_SETTING_KEYS, LlmConfigCard } from "./llm-config-card";
 import { OperatorConfigCard } from "./operator-config-card";
 import { PathsCard } from "./paths-card";
 import { SaveBar } from "./save-bar";
@@ -144,19 +144,22 @@ export function SettingsScreen() {
         </Card>
       ) : (
         <div className="space-y-4">
-          {grouped.groups.map(({ group, rows }) =>
-            rows.length === 0 ? null : (
+          {grouped.groups.map(({ group, rows }) => {
+            const visibleRows = rows.filter((row) => !LLM_SETTING_KEYS.includes(row.key as (typeof LLM_SETTING_KEYS)[number]));
+            if (visibleRows.length === 0) return null;
+            return (
               <SettingsSection
                 key={group.id}
                 title={t.settings.groups[group.id].title}
                 description={t.settings.groups[group.id].description}
-                rows={rows}
+                rows={visibleRows}
                 values={controller.formValues}
                 errors={controller.fieldErrors}
                 onChange={controller.setValue}
               />
-            )
-          )}
+            );
+          })}
+          <LlmConfigCard controller={controller} />
           {grouped.otherRows.length > 0 ? (
             <SettingsSection
               title={c.otherTitle}
@@ -169,7 +172,6 @@ export function SettingsScreen() {
             />
           ) : null}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            <CredentialsCard credentials={payload.credentials} />
             <GatesCard
               gates={payload.gates_readonly}
               effectiveMode={payload.effective_exec_mode}

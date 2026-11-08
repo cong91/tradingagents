@@ -234,6 +234,12 @@ def test_plan_hold_and_review_stay_no_orders(tmp_path, monkeypatch):
     assert review.needs_review is True
 
 
+# The two executor-level soft-cap override plan tests moved to
+# tests/test_execution_derivatives_override.py: this module's autouse
+# _recovery_db fixture PostgreSQL-gates every test, and the override plan
+# path needs no database -- there they run instead of skipping.
+
+
 def test_plan_below_minimum_notional_is_refused(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
