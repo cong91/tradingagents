@@ -295,9 +295,14 @@ function ClusterRow({ group }: { group: ClusterGroup }) {
   const [open, setOpen] = useState(group.anomalous);
   // Refetch định kỳ có thể mang cluster bất thường mới về sau lần mount đầu:
   // key hàng không đổi nên React tái dùng instance — mở theo anomalous hiện tại.
-  useEffect(() => {
+  // Điều chỉnh state trong lúc render (react.dev/reference/react/useState#storing-
+  // information-from-previous-renders): theo dõi anomalous trước đó, chỉ mở lại
+  // ở cạnh false→true, không tự đóng và giữ lựa chọn bấm của người dùng.
+  const [wasAnomalous, setWasAnomalous] = useState(group.anomalous);
+  if (group.anomalous !== wasAnomalous) {
+    setWasAnomalous(group.anomalous);
     if (group.anomalous) setOpen(true);
-  }, [group.anomalous]);
+  }
   const { main, steps } = group;
   const Chevron = open ? ChevronDownIcon : ChevronRightIcon;
   const mainAction = main.action ?? steps.find((step) => step.action)?.action ?? "";

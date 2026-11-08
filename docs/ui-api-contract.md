@@ -180,7 +180,7 @@ Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
 
 ### Operator overrides — `GET /api/operator-config`, `PUT /api/operator-config`, `DELETE /api/operator-config/{key}`
 
-Nguồn: `server/operator_config.py`. Đây là các key mà `PUT /api/settings` **cố ý từ chối**: nửa cấu hình của ba cổng thực thi (`exec_live`, `exec_auto_confirm`, `exec_derivatives`) và ba trần rủi ro vận hành (`risk_max_derivatives_leverage`, `risk_max_derivatives_exposure_pct`, `risk_derivatives_scale_out_enabled`).
+Nguồn: `server/operator_config.py`. Đây là các key mà `PUT /api/settings` **cố ý từ chối**: nửa cấu hình của ba cổng thực thi (`exec_live`, `exec_auto_confirm`, `exec_derivatives`) và tám trần rủi ro vận hành (`risk_max_derivatives_leverage`, `risk_max_derivatives_exposure_pct`, `risk_max_derivatives_exposure_hard_pct`, `risk_derivatives_override_min_r`, `risk_derivatives_override_max_risk_fraction`, `risk_derivatives_override_max_per_day`, `risk_derivatives_scale_out_enabled`, `risk_max_open_heat_pct`).
 
 Lưu trữ: **PostgreSQL** — bảng `control_operator_settings` (`server/migrations/0003_operator_settings.sql`), đọc lại lúc startup bởi `server/main.py:_apply_operator_config`. Không còn file `operator_config.json`; `server/data/` đã rỗng và không được mount vào container.
 

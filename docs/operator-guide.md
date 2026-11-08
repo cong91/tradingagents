@@ -428,7 +428,8 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     đúng bằng phần phí đó. Vì vậy khi chạm `break_even_r`, policy đặt SL cao hơn entry một
     khoảng `round_trip_fee_rate` (long) hoặc thấp hơn tương ứng (short). `0` = không bù phí,
     SL hòa vốn đúng bằng entry như trước.
-  - Bốn khoá điều chỉnh ngưỡng và ba khoá chi phí/thời gian ở trên cũng sửa được qua
+  - Bốn khoá điều chỉnh ngưỡng, ba khoá chi phí/thời gian ở trên cùng năm khoá của cơ chế
+    vượt trần và trần heat dưới đây cũng sửa được qua
     `/api/operator-config` (nhóm **risk**, không phải cổng thực thi — không cần `confirm`):
 
     | Khoá | Mặc định | Ý nghĩa |
@@ -440,7 +441,30 @@ tích mới** (phiên đang chạy không thấy); lưu vào `.env` ngoài việ
     | `risk_derivatives_max_hold_hours` | 72.0 | Quá số giờ này mà chưa đạt mốc R tối thiểu thì đóng vị thế; `0` = tắt |
     | `risk_derivatives_time_stop_min_r` | 1.0 | Mốc R tối thiểu phải đạt trước hạn giữ tối đa |
     | `risk_derivatives_round_trip_fee_rate` | 0.001 | Phí khứ hồi dùng để nâng SL hòa vốn lên trên entry; `0` = không bù phí |
+    | `risk_max_derivatives_exposure_hard_pct` | 0 | Trần cứng cho cơ chế vượt trần phái sinh: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này; `0` = tắt |
+    | `risk_derivatives_override_min_r` | 2.0 | R tối thiểu (lời mục tiêu / rủi ro stop) của đề xuất để đủ điều kiện vượt trần |
+    | `risk_derivatives_override_max_risk_fraction` | 0.01 | Risk-at-stop tối đa cho lệnh vượt trần (0.01 = 1%), chặt hơn trần thường `risk_derivatives_max_risk_fraction` |
+    | `risk_derivatives_override_max_per_day` | 0 | Ngân sách lệnh vượt trần mỗi ngày UTC; `0` = không bao giờ vượt trần |
+    | `risk_max_open_heat_pct` | 0 | Trần tổng rủi ro đang mở (heat): tổng phần equity mất nếu mọi stop khớp cùng lúc; `0` = TẮT (khác các trần anh em), khuyến nghị 6 |
 
+  - **Hai nấc trần phơi nhiễm và cơ chế vượt trần (soft-cap override).** Trần *Phơi nhiễm phái
+    sinh tối đa* (`risk_max_derivatives_exposure_pct`, vận hành thường đặt 25%) vẫn là nấc mặc
+    định; khi đặt `risk_max_derivatives_exposure_hard_pct` > 0 (khuyến nghị 35), một lệnh phái
+    sinh bị từ chối vì vượt nấc thường có thể vẫn được duyệt nếu đáp ứng đủ **năm điều kiện tất
+    định** — mọi điều kiện do executor tự đo, không hỏi LLM: kịch bản có confirmation trên cả
+    hai khung 1h và 4h; R của đề xuất (lời mục tiêu / rủi ro stop) đạt
+    `risk_derivatives_override_min_r`; risk-at-stop của lệnh gắt hơn
+    `risk_derivatives_override_max_risk_fraction` (chặt hơn trần mỗi lệnh thường); funding
+    không bất lợi; còn ngân sách trong ngày — tối đa `risk_derivatives_override_max_per_day`
+    lệnh vượt trần mỗi ngày UTC. Lệnh được duyệt qua cơ chế này được đẩy tổng phơi nhiễm tới
+    tối đa nấc cứng, và mỗi lần dùng ghi một sự kiện audit `derivatives_override_used`.
+  - **Trần tổng rủi ro đang mở (heat).** `risk_max_open_heat_pct` chặn lệnh phái sinh mới khi
+    tổng phần equity mất nếu mọi stop đang mở khớp cùng lúc (heat) vượt trần. Lưu ý ngữ nghĩa
+    **khác các trần anh em**: `0` = **TẮT** (không phải chặn hết), > 0 = bật — khuyến nghị 6.
+    Mặc định các khoá mở soft-cap override đều `0` (`hard_pct`, `override_max_per_day`), nên
+    cơ chế tắt và hành vi không đổi so với trước; hai ngưỡng điều kiện `override_min_r` /
+    `override_max_risk_fraction` chỉ có tác dụng khi cổng đã mở. Trần heat độc lập cũng mặc
+    định `0` nên đang tắt.
   - Monitor chỉ mutate khi đọc được position mode và account đang **One-way**; Hedge Mode trả
     `hedge_mode_unsupported` vì Binance không nhận `reduceOnly` ở chế độ đó. Mark được đọc riêng
     từ endpoint mark price; mark cũ hơn `mark_max_age_seconds` (mặc định 120s) trả `mark_stale`
