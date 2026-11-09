@@ -44,10 +44,16 @@ from server import (
     runs as runs_mod,
     watchlist as watchlist_mod,
 )
+from server.auto_modes import AutoMode
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.agents.rating import parse_rating
-from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.execution.auto_authorization import (
+    AuthorizationSnapshot,
+    AutoAuthorizationError,
+    capture_process_config,
+    mode_update_lock,
+)
 
 router = APIRouter(prefix="/api", tags=["daily"])
 
@@ -139,14 +145,21 @@ def _touch_progress(job: DailyJobState, *, current_ticker: str | None = None) ->
     _persist(job)
 
 
-def _run_with_heartbeat(job: DailyJobState, coin: str, bridge, config: dict) -> dict:
+def _check_spot_authorization(authorization: AuthorizationSnapshot) -> None:
+    if not authorization.allows(AutoMode.SPOT, live=True):
+        raise AutoAuthorizationError("Auto Spot is disabled or authorization is stale")
+
+
+def _run_with_heartbeat(
+    job: DailyJobState, coin: str, bridge, config: dict, authorization: AuthorizationSnapshot,
+) -> dict:
     """Run one coin while refreshing the durable heartbeat during slow calls."""
     outcome: dict[str, dict] = {}
     failure: list[BaseException] = []
 
     def work() -> None:
         try:
-            outcome["result"] = _process_coin(job, bridge, coin, config)
+            outcome["result"] = _process_coin(job, bridge, coin, config, authorization)
         except BaseException as exc:  # re-raise in the worker thread below
             failure.append(exc)
 
@@ -257,19 +270,18 @@ class _StubVenue:
         return {"total": {"USDT": MOCK_CASH}, "free": {"USDT": MOCK_CASH}}
 
 
-def _build_bridge(config: dict, mock: bool):
-    """The venue for the job's plan path; tests monkeypatch this seam like
-    approvals._build_bridge. A mock job pins the bridge dry so its plan lines
-    and ``mode_at_plan`` always record "dry" — mock plans are demo data and can
-    never execute (contract §5, invariant 2)."""
+def _build_bridge(config: dict, mock: bool, authorization: AuthorizationSnapshot):
+    """Build a dry fixture bridge or a bridge bound to the job's authorization."""
     from tradingagents.execution.bridge import ExchangeBridge
 
     if mock:
         return ExchangeBridge(config={**config, "exec_live": False}, exchange_factory=_StubVenue)
-    return ExchangeBridge(config=config)
+    return ExchangeBridge(config=config, authorization=authorization)
 
 
-def _analyze(job: DailyJobState, coin: str, config: dict) -> tuple[str, str | None]:
+def _analyze(
+    job: DailyJobState, coin: str, config: dict, authorization: AuthorizationSnapshot,
+) -> tuple[str, str | None]:
     """One coin's analysis. Mock replays the runs.py machinery (no graph, no
     LLM, no vendor); live mirrors the engine's runner (execution/daily.py:
     147-164) — a fresh graph per attempt, because a failed propagate can leave
@@ -285,6 +297,7 @@ def _analyze(job: DailyJobState, coin: str, config: dict) -> tuple[str, str | No
 
     signal: str | None = None
     for attempt in range(_PROPAGATE_ATTEMPTS):
+        _check_spot_authorization(authorization)
         try:
             from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -294,8 +307,14 @@ def _analyze(job: DailyJobState, coin: str, config: dict) -> tuple[str, str | No
                 # runs.py _analysts_for (server/runs.py:79-86).
                 analysts = ("market", "social", "news", "fundamentals")
             graph = TradingAgentsGraph(config=config, selected_analysts=analysts)
-            _, signal = graph.propagate(coin, _today_iso(), asset_type=asset_type)
+            _check_spot_authorization(authorization)
+            _, signal = graph.propagate_with_telemetry(
+                coin, _today_iso(), asset_type=asset_type, telemetry=None,
+                check_cancelled=lambda: _check_spot_authorization(authorization),
+            )
             return signal, None
+        except AutoAuthorizationError:
+            raise
         except Exception as exc:
             if attempt == _PROPAGATE_ATTEMPTS - 1:
                 raise
@@ -365,7 +384,9 @@ def _plan_detail(plan) -> dict:
     }
 
 
-def _process_coin(job: DailyJobState, bridge, coin: str, config: dict) -> dict:
+def _process_coin(
+    job: DailyJobState, bridge, coin: str, config: dict, authorization: AuthorizationSnapshot,
+) -> dict:
     """Analyze → plan → enqueue one coin; a coin's failure never stops the loop
     (execution/daily.py:170-173). The plan is never executed here — an
     actionable one goes to the approval queue and waits (§5 invariant 1)."""
@@ -377,10 +398,12 @@ def _process_coin(job: DailyJobState, bridge, coin: str, config: dict) -> dict:
     if job.mode == "mock":
         result["mock_source"] = "synthetic"
     try:
-        signal, mock_source = _analyze(job, coin, config)
+        _check_spot_authorization(authorization)
+        signal, mock_source = _analyze(job, coin, config, authorization)
         result["signal"] = signal
         if mock_source is not None:
             result["mock_source"] = mock_source
+        _check_spot_authorization(authorization)
         if result["asset_type"] != "crypto":
             # Advisory-only: the ccxt bridge cannot plan for non-crypto
             # tickers (bridge.py:174-186), so a stock candidate's signal is
@@ -401,18 +424,24 @@ def _process_coin(job: DailyJobState, bridge, coin: str, config: dict) -> dict:
             )
             return result
         portfolio = bridge.sync_portfolio()
+        _check_spot_authorization(authorization)
         plan = bridge.plan_order(coin, signal, portfolio=portfolio)
+        _check_spot_authorization(authorization)
         if plan.side == "buy":
             plan = _attach_bracket(job, plan, coin)
         if plan.side is None:
             result["reason"] = plan.reason  # Hold/REVIEW, sizing refusal or risk rejection
             return result
-        item = approvals_mod.enqueue(_plan_item(job, plan))
+        with mode_update_lock((AutoMode.SPOT,)):
+            _check_spot_authorization(authorization)
+            item = approvals_mod.enqueue(_plan_item(job, plan))
         bridge.audit_plan(plan, action="awaiting_approval",
                           reason="UI daily job: plan awaits approval")
         result["reason"] = "awaiting approval"
         result["plan"] = _plan_detail(plan)
         result["approval_id"] = item["id"]
+    except AutoAuthorizationError:
+        raise
     except Exception as exc:
         result["reason"] = f"{type(exc).__name__}: {exc}"
     return result
@@ -440,7 +469,9 @@ def _screen_candidates(config: dict, top_n: int) -> dict:
     }
 
 
-def _run_coin_loop(job: DailyJobState, bridge, config: dict) -> None:
+def _run_coin_loop(
+    job: DailyJobState, bridge, config: dict, authorization: AuthorizationSnapshot,
+) -> None:
     """One coin at a time, stopping between coins if the operator cancelled.
 
     A coin already inside an LLM call runs to completion: Python cannot kill a
@@ -451,9 +482,10 @@ def _run_coin_loop(job: DailyJobState, bridge, config: dict) -> None:
     for coin in job.tickers:
         if job.status == "cancelled":
             break
+        _check_spot_authorization(authorization)
         _touch_progress(job, current_ticker=coin)
         try:
-            job.results.append(_run_with_heartbeat(job, coin, bridge, config))
+            job.results.append(_run_with_heartbeat(job, coin, bridge, config, authorization))
         finally:
             _touch_progress(job, current_ticker=None)
 
@@ -490,7 +522,7 @@ def _finish(job: DailyJobState, error: str | None = None) -> None:
                      mode=job.mode, tickers=list(job.tickers), error=job.error)
 
 
-def _execute_auto(job: DailyJobState, config: dict) -> None:
+def _execute_auto(job: DailyJobState, config: dict, authorization: AuthorizationSnapshot) -> None:
     """Screen first, then run the pipeline loop on the top candidates.
 
     The screening dict is attached to the job before the coin loop so the UI
@@ -502,6 +534,7 @@ def _execute_auto(job: DailyJobState, config: dict) -> None:
     _touch_progress(job)
     error: str | None = None
     try:
+        _check_spot_authorization(authorization)
         if job.mode == "mock":
             candidates = [dict(entry) for entry in MOCK_AUTO_CANDIDATES]
             job.screening = {
@@ -514,11 +547,13 @@ def _execute_auto(job: DailyJobState, config: dict) -> None:
         else:
             job.screening = _screen_candidates(config, job.auto_top_n or AUTO_DEFAULT_TOP_N)
             candidates = job.screening["candidates"]
+        _check_spot_authorization(authorization)
         job.tickers = [str(entry["ticker"]) for entry in candidates]
         job.asset_types = {str(entry["ticker"]): str(entry["asset_type"]) for entry in candidates}
         _touch_progress(job)  # the screen is what the UI watches first
         if job.tickers and job.status != "cancelled":
-            _run_coin_loop(job, _build_bridge(config, job.mode == "mock"), config)
+            bridge = _build_bridge(config, job.mode == "mock", authorization)
+            _run_coin_loop(job, bridge, config, authorization)
     except Exception as exc:  # outside the coin loop: the job itself failed
         error = f"{type(exc).__name__}: {exc}"
         audit_log.record("daily_job_failed", job_id=job.job_id, error=error)
@@ -526,13 +561,14 @@ def _execute_auto(job: DailyJobState, config: dict) -> None:
         _finish(job, error)
 
 
-def _execute(job: DailyJobState, config: dict) -> None:
+def _execute(job: DailyJobState, config: dict, authorization: AuthorizationSnapshot) -> None:
     job.status = "running"
     _touch_progress(job)
     error: str | None = None
     try:
-        bridge = _build_bridge(config, job.mode == "mock")
-        _run_coin_loop(job, bridge, config)
+        _check_spot_authorization(authorization)
+        bridge = _build_bridge(config, job.mode == "mock", authorization)
+        _run_coin_loop(job, bridge, config, authorization)
     except Exception as exc:  # outside the coin loop: the job itself failed
         error = f"{type(exc).__name__}: {exc}"
         audit_log.record("daily_job_failed", job_id=job.job_id, error=error)
@@ -572,7 +608,9 @@ async def create_daily_job(request: Request):
         raise ApiError(400, "validation_error",
                        "no tickers to run: the list is empty after normalization")
 
-    config = get_config()  # snapshot: later settings changes do not touch this job
+    config, authorization = capture_process_config()
+    if not authorization.allows(AutoMode.SPOT, live=True):
+        raise ApiError(409, "mode_closed", "UI daily jobs require Auto Spot to be enabled")
     with runs_mod._registry_lock:  # shared with POST /api/runs (contract §3, §5)
         active_run = runs_mod._active_run()
         if active_run is not None:
@@ -593,9 +631,11 @@ async def create_daily_job(request: Request):
 
     audit_log.record("daily_job_created", job_id=job.job_id, mode=mode, tickers=tickers,
                      auto=auto, top_n=top_n)
-    threading.Thread(target=_execute_auto if auto else _execute,
-                     args=(job, config), name=f"server-daily-{job.job_id}",
-                     daemon=True).start()
+    threading.Thread(
+        target=_execute_auto if auto else _execute,
+        args=(job, config, authorization), name=f"server-daily-{job.job_id}",
+        daemon=True,
+    ).start()
     return payload
 
 

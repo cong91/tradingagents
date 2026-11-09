@@ -1,9 +1,21 @@
 // Shape của GET/PUT /api/operator-config (server/operator_config.py).
-// Đây là các override vận hành lưu trong PostgreSQL: nửa cấu hình của các cổng
-// thực thi và vài trần rủi ro. Chúng KHÔNG thay thế /api/settings — mỗi key ở
-// đây đều nằm ngoài allowlist của settings vì settings cố ý không ghi được cổng.
+// Đây là các cấu hình vận hành lưu trong PostgreSQL: chế độ tự động và
+// các trần rủi ro. Chúng nằm ngoài allowlist của /api/settings.
 
 export type OperatorSettingType = "bool" | "float";
+
+export type OperatorGateKey = "auto_spot_enabled" | "auto_futures_enabled";
+
+export type OperatorGates = {
+  auto_spot: boolean;
+  auto_futures: boolean;
+  any_auto_enabled: boolean;
+};
+
+export const OPERATOR_GATE_KEYS: readonly OperatorGateKey[] = [
+  "auto_spot_enabled",
+  "auto_futures_enabled",
+];
 
 export type OperatorSettingRow = {
   key: string;
@@ -26,7 +38,7 @@ export type OperatorSettingRow = {
 export type OperatorConfigPayload = {
   generated_at: string;
   settings: OperatorSettingRow[];
-  gates: Record<string, boolean>;
+  gates: OperatorGates;
   effective_exec_mode: string;
   allowlist: string[];
   applied_at?: string;
@@ -40,6 +52,11 @@ export type OperatorDraft = Record<string, OperatorValue>;
 /** Key là cổng thực thi → cần confirm + reason khi ghi. */
 export function isGateKey(row: OperatorSettingRow): boolean {
   return row.gate;
+}
+
+/** True when the server row is one of the two market automation gates. */
+export function isOperatorGateKey(key: string): key is OperatorGateKey {
+  return key === OPERATOR_GATE_KEYS[0] || key === OPERATOR_GATE_KEYS[1];
 }
 
 /** Giá trị form ban đầu từ payload: dùng value đang hiệu lực. */

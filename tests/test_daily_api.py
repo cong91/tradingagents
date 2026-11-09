@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server import approvals as approvals_mod, daily as daily_mod, runs as runs_mod
+from tests.server_api_exchange import _FakeExchange
 from tests.server_api_fixtures import (
     _no_network as _no_network,
     _server_state as _server_state,
@@ -59,9 +60,31 @@ def _await_job(client: TestClient, job_id: str, timeout: float = 10.0) -> dict:
     raise AssertionError(f"daily job {job_id} did not finish within {timeout}s")
 
 
+@pytest.mark.parametrize("mode", ["mock", "live"])
+@pytest.mark.parametrize("auto", [False, True])
+def test_daily_requires_spot_mode_even_when_futures_enabled(client, monkeypatch, mode, auto):
+    set_config({"auto_spot_enabled": False, "auto_futures_enabled": True, "exec_live": True})
+
+    def unexpected_bridge(config, mock, authorization):
+        raise AssertionError("closed mode must not build a bridge")
+
+    monkeypatch.setattr(daily_mod, "_build_bridge", unexpected_bridge)
+    body = {"mode": mode, "auto": auto}
+    if not auto:
+        body["tickers"] = ["BTC-USD"]
+
+    response = client.post("/api/daily", json=body)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "mode_closed"
+    assert client.get("/api/daily").json()["items"] == []
+    assert client.get("/api/approvals").json()["pending_count"] == 0
+
+
 def test_daily_mock_replays_signal_and_enqueues_plan(client, tmp_path):
     state_log = _state_log(tmp_path, rating="Buy")
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
 
     created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})
@@ -109,8 +132,51 @@ def test_daily_mock_replays_signal_and_enqueues_plan(client, tmp_path):
     assert '"phase": "execute"' not in engine_log
 
 
+def test_daily_live_plan_uses_fake_venue_and_waits_for_approval(client, tmp_path, monkeypatch):
+    from tradingagents.execution.bridge import ExchangeBridge
+
+    set_config({
+        "auto_spot_enabled": True,
+        "exec_live": False,
+        "exec_log_path": str(tmp_path / "engine-audit.jsonl"),
+    })
+    class _CashOnlyVenue(_FakeExchange):
+        def fetch_balance(self, params=None):
+            assert params is None
+            return {"total": {"USDT": 9500.0}, "free": {"USDT": 9500.0}}
+
+    venue = _CashOnlyVenue()
+
+    def build(config, mock, authorization):
+        assert mock is False
+        return ExchangeBridge(
+            config=config, exchange_factory=lambda: venue, authorization=authorization,
+        )
+
+    monkeypatch.setattr(daily_mod, "_build_bridge", build)
+    monkeypatch.setattr(daily_mod, "_analyze", lambda job, coin, config, authorization: ("Buy", None))
+    monkeypatch.setattr(daily_mod, "_attach_bracket", lambda job, plan, coin: plan)
+
+    created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "live"})
+    assert created.status_code == 202
+    job = _await_job(client, created.json()["job_id"])
+
+    assert job["status"] == "completed"
+    (result,) = job["results"]
+    assert result["signal"] == "Buy"
+    assert result["plan"], result
+    assert result["plan"]["mode_at_plan"] == "live"
+    assert result["reason"] == "awaiting approval"
+    (item,) = client.get("/api/approvals").json()["items"]
+    assert item["id"] == result["approval_id"]
+    assert item["mock"] is False
+    assert item["status"] == "pending"
+    assert venue.orders == []
+
+
 def test_daily_mock_synthetic_hold_enqueues_nothing(client, tmp_path):
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
 
     created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})
@@ -125,7 +191,8 @@ def test_daily_mock_synthetic_hold_enqueues_nothing(client, tmp_path):
 
 
 def test_daily_defaults_to_watchlist_and_validates_input(client, tmp_path):
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
     client.delete("/api/watchlist/BTC-USD", headers=_JSON)
     client.delete("/api/watchlist/ETH-USD", headers=_JSON)
@@ -154,7 +221,8 @@ def test_daily_defaults_to_watchlist_and_validates_input(client, tmp_path):
 
 
 def test_daily_normalizes_tickers_at_the_boundary(client, tmp_path):
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
     created = client.post("/api/daily", json={"tickers": [" BTC-USD ", "BTC-USD", ""],
                                              "mode": "mock"})
@@ -164,6 +232,7 @@ def test_daily_normalizes_tickers_at_the_boundary(client, tmp_path):
 
 
 def test_daily_and_runs_share_one_worker_lock(client):
+    set_config({"auto_spot_enabled": True})
     active_run = runs_mod.RunState(
         run_id="r_active", ticker="BTC-USD", trade_date=_today(),
         asset_type="crypto", mode="mock", checkpoint=None, created_at=_today(),
@@ -195,7 +264,8 @@ def test_daily_and_runs_share_one_worker_lock(client):
 def test_daily_auto_mock_screens_then_replays_pipeline(client, tmp_path):
     """Auto mode (§5 rev 4): mock screens deterministically, then the pipeline
     runs on the screened candidates — one click, no watchlist, no network."""
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
 
     created = client.post("/api/daily", json={"auto": True, "mode": "mock", "top_n": 3})
@@ -239,7 +309,8 @@ def test_daily_auto_off_set_crypto_is_advisory(client, tmp_path, monkeypatch):
     """A crypto-universe ticker outside the closed executable set (QNT-USD)
     keeps the crypto analysts but cannot plan: its result is advisory, never a
     bridge ValueError."""
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
     monkeypatch.setattr(daily_mod, "MOCK_AUTO_CANDIDATES", (
         {"ticker": "QNT-USD", "asset_type": "crypto", "score": 3.0,
@@ -263,7 +334,8 @@ def test_daily_mock_buy_plan_carries_bracket_and_approval_keeps_it(client, tmp_p
     and the approval item + rebuilt plan both carry them so approve → execute
     can place the exchange-side bracket."""
     _state_log(tmp_path, rating="Buy")
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl")})
 
     created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})
@@ -287,7 +359,8 @@ def test_daily_mock_buy_plan_carries_bracket_and_approval_keeps_it(client, tmp_p
 
 def test_daily_mock_plan_cannot_be_approved(client, tmp_path):
     _state_log(tmp_path, rating="Buy")
-    set_config({"results_dir": str(tmp_path / "results"),
+    set_config({"auto_spot_enabled": True,
+                "results_dir": str(tmp_path / "results"),
                 "exec_log_path": str(tmp_path / "engine-audit.jsonl"),
                 "exec_live": True})  # even with the gate armed
     created = client.post("/api/daily", json={"tickers": ["BTC-USD"], "mode": "mock"})

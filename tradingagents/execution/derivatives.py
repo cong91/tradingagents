@@ -6,16 +6,15 @@ the derivatives-specific surface: unified symbols ``base/quote:settle``
 (e.g. ``BTC/USDT:USDT``), short semantics (side ``sell`` opens a short, no
 held position required), margin sizing with leverage, and the config gate:
 
-(a) the current process config ``exec_derivatives`` key must be a literal True;
+(a) new futures entries require the captured Auto Futures authorization;
 (b) every execution needs ``confirm=True`` -- INCLUDING dry-runs, unlike
     the L1 spot bridge, per FR-D2.
 
 Missing any layer refuses with an audit line and sends nothing.
 
-PRD principle, restated for the operator: the derivatives gate ships OFF.
-A sandbox or dry-run never proves the live path -- per-order confirm is
-required even in dry-run so the operator consciously re-arms every send,
-and the live path additionally needs the FR5 config gate plus a raised
+A sandbox or dry-run never proves the live path. Per-order confirm is required
+even in dry-run. Managed entries use the live path when Auto Futures authorizes
+them; standalone entries use ``exec_live`` and still need a raised
 ``risk_max_derivatives_exposure_pct`` (default 0 blocks all notional).
 
 Risk: the shared RiskGuard caps leverage at ``risk_max_derivatives_leverage``
@@ -33,18 +32,32 @@ from datetime import UTC, datetime
 from typing import Any
 
 from server import job_store, snapshot_observer
+from server.auto_modes import AutoMode
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
 from tradingagents.execution import futures_identity
-from tradingagents.execution.brackets import BracketManager
+from tradingagents.execution.auto_authorization import (
+    AuthorizationSnapshot,
+    AutoAuthorizationError,
+)
+from tradingagents.execution.bracket_legs import TERMINAL_STATUSES
+from tradingagents.execution.brackets import (
+    BracketManager,
+    stored_account_identity,
+)
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.exchange_client import venue_key
+from tradingagents.execution.futures_account import observe_futures_positions
 from tradingagents.execution.futures_entry_journal import (
     create_guarded_entry_intent,
     entry_journal_leg,
     update_guarded_entry_intent,
 )
-from tradingagents.execution.futures_operation_lock import OperationGuard, operation_lock
+from tradingagents.execution.futures_operation_lock import (
+    OperationGuard,
+    operation_lock,
+    require_operation_lock,
+)
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
     risk_limited_quantity,
@@ -57,9 +70,166 @@ from tradingagents.portfolio import PortfolioContext
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 
 
+def _verified_protection_task(
+    executor_or_bridge: Any, task_id: str, *, expected_symbol: str,
+) -> str | None:
+    """Require a fresh, bound bracket and one complete open venue position."""
+    bridge = getattr(executor_or_bridge, "_bridge", executor_or_bridge)
+    guard = require_operation_lock(expected_symbol)
+    guard.check()
+    task = job_store.load_bracket_recovery(task_id)
+    if task is None or task.get("task_id") != task_id:
+        return "task_unknown"
+    if task_id.startswith("entry-intent:"):
+        return "entry_reconciliation_required"
+    if task.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
+        return "manual_reconciliation_required"
+    symbol = task.get("symbol")
+    if not isinstance(symbol, str) or symbol != expected_symbol:
+        return "bracket_identity_mismatch"
+    entry_order_id = task.get("entry_order_id")
+    if not isinstance(entry_order_id, str) or not entry_order_id or entry_order_id == "unknown":
+        return "bracket_identity_mismatch"
+    if task_id != f"bracket:{symbol}:{entry_order_id}":
+        return "bracket_identity_mismatch"
+    if task.get("venue_key") != venue_key(bridge):
+        return "venue_mismatch"
+
+    legs = task.get("legs")
+    if not isinstance(legs, list) or not legs:
+        return "missing_bracket_legs"
+    names = []
+    for leg in legs:
+        if not isinstance(leg, dict) or not isinstance(leg.get("params"), dict):
+            return "missing_bracket_legs"
+        name = leg.get("name")
+        if not isinstance(name, str) or leg.get("status") not in {
+            "pending", "uncertain", "placed", "filled", "cancelled",
+        }:
+            return "missing_bracket_legs"
+        param = "stopLossPrice" if name == "stop-loss" else (
+            "takeProfitPrice" if name.startswith("take-profit") else None
+        )
+        if param is None or _positive_number(leg["params"].get(param)) is None:
+            return "missing_bracket_legs"
+        if leg.get("status") == "placed" and not leg.get("order_id"):
+            return "missing_bracket_legs"
+        if leg.get("status") == "pending" and not leg.get("client_order_id"):
+            return "missing_bracket_legs"
+        if leg.get("status") == "uncertain" and not leg.get("order_id") and not any(
+            leg.get(key) for key in (
+                "client_order_id", "repair_client_id", "replacement_client_id",
+            )
+        ):
+            return "missing_bracket_legs"
+        names.append(name)
+    if (
+        len(names) != len(set(names))
+        or "stop-loss" not in names
+        or not any(name.startswith("take-profit") for name in names)
+    ):
+        return "missing_bracket_legs"
+
+    task_identity = stored_account_identity(task)
+    if task_identity is None:
+        return "account_identity_unknown"
+    try:
+        client = bridge.client()
+        credentials = (getattr(client, "apiKey", None), getattr(client, "secret", None))
+        comparison = futures_identity.compare_futures_account_identity(bridge, task_identity)
+    except Exception:
+        return "account_identity_unknown"
+    if comparison is futures_identity.IdentityComparison.MISMATCH:
+        return "account_identity_mismatch"
+    if comparison is not futures_identity.IdentityComparison.MATCH:
+        return "account_identity_unknown"
+    if not _protection_client_stable(bridge, client, credentials, task):
+        return "account_identity_unknown"
+
+    states = [
+        state for state in job_store.active_position_states()
+        if state.get("bracket_task_id") == task_id
+    ]
+    if not states:
+        return "missing_position_link"
+    if len(states) != 1:
+        return "ambiguous_position_link"
+    state = states[0]
+    if stored_account_identity(state) != task_identity:
+        return "account_identity_unknown"
+    if state.get("venue_key") != task.get("venue_key"):
+        return "venue_mismatch"
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    parts = str(state.get("position_key") or "").rsplit(":", 2)
+    if len(parts) != 3 or parts[0] != symbol or parts[2] != entry_order_id:
+        return "bracket_identity_mismatch"
+    expected_side = "long" if parts[1] == "buy" else "short" if parts[1] == "sell" else None
+    if expected_side is None or snapshot.get("side") != expected_side:
+        return "bracket_identity_mismatch"
+    if state.get("entry_order_id") != entry_order_id:
+        return "bracket_identity_mismatch"
+    if task.get("close_side") != ("sell" if expected_side == "long" else "buy"):
+        return "bracket_identity_mismatch"
+
+    try:
+        observation = observe_futures_positions(bridge)
+    except Exception:
+        return "position_unknown"
+    if (
+        not observation.scope_complete
+        or observation.unknown_scope
+        or observation.unknown_symbols
+        or not _protection_client_stable(bridge, client, credentials, task)
+    ):
+        return "position_unknown"
+    symbol_positions = [position for position in observation.positions if position.symbol == symbol]
+    if len(symbol_positions) != 1:
+        return "position_unknown" if not symbol_positions else "ambiguous_net_position"
+    position = symbol_positions[0]
+    if not _valid_open_position(position, expected_side):
+        return "position_unknown"
+    guard.check()
+    return None
+
+
+def _valid_open_position(position: Any, expected_side: str) -> bool:
+    """Require a finite, non-flat current position on the durable side."""
+    try:
+        signed_quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    magnitude = abs(signed_quantity)
+    return (
+        getattr(position, "side", None) == expected_side
+        and math.isfinite(signed_quantity)
+        and math.isfinite(magnitude)
+        and magnitude > 0
+        and (
+            (expected_side == "long" and signed_quantity > 0)
+            or (expected_side == "short" and signed_quantity < 0)
+        )
+        and _positive_number(getattr(position, "contracts", None)) is not None
+        and _positive_number(getattr(position, "entry_price", None)) is not None
+        and _positive_number(getattr(position, "mark_price", None)) is not None
+    )
+
+
+def _protection_client_stable(bridge: Any, client: Any, credentials: tuple, task: dict) -> bool:
+    try:
+        return (
+            bridge.client() is client
+            and (getattr(client, "apiKey", None), getattr(client, "secret", None)) == credentials
+            and venue_key(bridge) == task.get("venue_key")
+        )
+    except Exception:
+        return False
+
+
 def _derivatives_gate_open(executor: DerivativesExecutor) -> bool:
-    """Read the current derivatives switch, including caller config overrides."""
-    return executor._bridge._runtime_gate("exec_derivatives")
+    """Whether new futures entries are authorized by Auto Futures."""
+    return executor._bridge.auto_mode_enabled(
+        AutoMode.FUTURES, live=executor._bridge.effective_mode() == "live",
+    )
 
 
 def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrder, exchange: Any) -> None:
@@ -110,6 +280,7 @@ class DerivativesExecutor:
         rules: SizingRules | None = None,
         exchange_id: str | None = None,
         risk_guard: Any = None,
+        authorization: AuthorizationSnapshot | None = None,
     ) -> None:
         self._bridge = ExchangeBridge(
             config=config,
@@ -117,6 +288,7 @@ class DerivativesExecutor:
             rules=rules,
             exchange_id=exchange_id,
             risk_guard=risk_guard,
+            authorization=authorization,
         )
         self.config = self._bridge.config
         self.rules = self._bridge.rules
@@ -169,7 +341,7 @@ class DerivativesExecutor:
         if not _derivatives_gate_open(self):
             raise self._refuse(
                 shell,
-                "exec_derivatives is not armed in current process config (literal True required); "
+                "Auto Futures is disabled; "
                 "nothing was planned",
                 phase="resolve",
             )
@@ -227,7 +399,7 @@ class DerivativesExecutor:
         if not _derivatives_gate_open(self):
             raise self._refuse(
                 shell,
-                "exec_derivatives is not armed in current process config (literal True required); "
+                "Auto Futures is disabled; "
                 "nothing was planned",
                 phase="plan",
             )
@@ -302,7 +474,7 @@ class DerivativesExecutor:
         risk guard's percentage caps (leverage, derivatives notional) would
         skip fail-open, so a None portfolio refuses before the guard runs.
         The risk guard re-checks immediately before anything is sent; live
-        sends need the FR5 double gate as well.
+        sends also require a valid Auto Futures authorization.
         """
         if order.market != "derivatives":
             raise ValueError("DerivativesExecutor executes derivatives orders only")
@@ -345,7 +517,7 @@ class DerivativesExecutor:
         if not _derivatives_gate_open(self):
             raise self._refuse(
                 order,
-                "exec_derivatives is not armed in current process config (literal True required); "
+                "Auto Futures is disabled; "
                 "nothing was sent",
                 phase="execute",
             )
@@ -685,19 +857,24 @@ class DerivativesExecutor:
                     int(order.leverage), order.ccxt_symbol,
                 ))[1],
             )
-            guard.check()
-            entry_sent = True
+            def create_entry() -> Any:
+                nonlocal entry_sent
+                entry_sent = True
+                return exchange.create_order(
+                    order.ccxt_symbol, "market", order.side, amount,
+                    params={"clientOrderId": entry_client_id},
+                )
+
             response = snapshot_observer.run(
                 self._bridge, exchange,
                 operation="create_futures_entry", symbol=order.ccxt_symbol,
-                call=lambda: (guard.check(), exchange.create_order(
-                    order.ccxt_symbol, "market", order.side, amount,
-                    params={"clientOrderId": entry_client_id},
-                ))[1],
+                call=lambda: self._bridge._auto_authorization.submit(
+                    AutoMode.FUTURES, create_entry, preflight=guard.check,
+                ),
             )
             guard.check()
             order_id = response.get("id") if isinstance(response, dict) else None
-        except (ccxt.NetworkError, ccxt.ExchangeError, RuntimeError, ValueError) as exc:
+        except (ccxt.NetworkError, ccxt.ExchangeError, AutoAuthorizationError, RuntimeError, ValueError) as exc:
             if not entry_sent:
                 try:
                     intent_leg["status"] = "cancelled"
@@ -707,6 +884,12 @@ class DerivativesExecutor:
                     )
                 except Exception:
                     pass
+            if isinstance(exc, AutoAuthorizationError):
+                self._bridge.audit_plan(
+                    order, action="derivatives_denied", reason=str(exc),
+                    confirmed=confirm, phase="execute",
+                )
+                raise
             if isinstance(exc, (ccxt.NetworkError, ccxt.ExchangeError)):
                 self._bridge.audit_plan(
                     order, action="rejected_at_execute",
@@ -919,23 +1102,41 @@ class DerivativesExecutor:
             return None
 
     def recover_bracket(self, task_id: str, *, confirm: bool = True) -> str:
-        """Repair protective exits only while live and derivatives gates are open."""
+        """Repair exits under live mode or verified protection recovery."""
         if confirm is not True:
             raise PermissionError("bracket recovery requires confirm=True")
-        if not _derivatives_gate_open(self):
-            raise PermissionError("bracket recovery requires derivatives execution gate")
-        if self.effective_mode() != "live":
-            raise PermissionError("bracket recovery requires live execution gates")
-        return BracketManager(self._bridge).reconcile(
-            task_id, repair_missing=True, allow_sibling_cancel=True,
-        )
+        task = job_store.load_bracket_recovery(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task_id.startswith("entry-intent:"):
+            return self.monitor_bracket(task_id)
+        if not task_id.startswith("bracket:"):
+            raise PermissionError("only regular bracket tasks may be repaired")
+        if not self._bridge._runtime_gate("exec_live") and self.config.get(
+            "risk_derivatives_profit_protection_enabled"
+        ) is not True:
+            raise PermissionError("bracket recovery requires profit protection")
+        with operation_lock(task["symbol"]) as guard:
+            guard.check()
+            current = job_store.load_bracket_recovery(task_id)
+            if current is None:
+                raise KeyError(task_id)
+            if current.get("symbol") != task.get("symbol"):
+                return "bracket_identity_mismatch"
+            if current.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
+                return "manual_reconciliation_required"
+            verdict = _verified_protection_task(
+                self, task_id, expected_symbol=current["symbol"],
+            )
+            if verdict is not None:
+                return verdict
+            guard.check()
+            return BracketManager(self._bridge).reconcile(
+                task_id, repair_missing=True, allow_sibling_cancel=True,
+            )
 
     def monitor_bracket(self, task_id: str) -> str:
         """Inspect protective exits; entry intents use read-only recovery first."""
-        allow_cancel = (
-            _derivatives_gate_open(self)
-            and self.effective_mode() == "live"
-        )
         task = job_store.load_bracket_recovery(task_id)
         if task is None:
             raise KeyError(task_id)
@@ -944,20 +1145,34 @@ class DerivativesExecutor:
             current = job_store.load_bracket_recovery(task_id)
             if current is None:
                 raise KeyError(task_id)
+            if current.get("symbol") != task.get("symbol"):
+                return "bracket_identity_mismatch"
             if current["task_id"].startswith("entry-intent:"):
                 from tradingagents.execution.futures_entry_recovery import reconcile_entry
 
                 return reconcile_entry(self._bridge, task_id)
+            if current.get("status") in TERMINAL_STATUSES:
+                return current["status"]
+            if current.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
+                return "manual_reconciliation_required"
+            allow_cancel = (
+                (
+                    self._bridge._runtime_gate("exec_live")
+                    or self.config.get("risk_derivatives_profit_protection_enabled") is True
+                )
+                and current["task_id"].startswith("bracket:")
+                and current.get("status") in {"pending", "submission_uncertain", "monitoring"}
+                and _verified_protection_task(
+                    self, task_id, expected_symbol=current["symbol"],
+                ) is None
+            )
+            guard.check()
             return BracketManager(self._bridge).reconcile(
                 task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
             )
 
     def effective_mode(self) -> str:
-        """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).
-
-        Delegated to the composed bridge so orchestrators (the daily runner,
-        the autoloop) see the same value the executor's own gate stack uses.
-        """
+        """Return the entry mode for orchestrators and execution audits."""
         return self._bridge.effective_mode()
 
     def audit_plan(self, order: PlannedOrder, **kwargs: Any) -> None:

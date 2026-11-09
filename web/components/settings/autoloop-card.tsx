@@ -22,10 +22,12 @@ import {
 import { autoloopApi, toAutoloopError } from "./autoloop-api";
 import {
   AUTOLOOP_DEFAULT_INTERVAL,
-  AUTOLOOP_GATE_ROWS,
+  AUTOLOOP_MODE_ROWS,
   AUTOLOOP_MAX_INTERVAL,
   AUTOLOOP_MIN_INTERVAL,
   type AutoloopLastCycle,
+  type AutoloopModeCycle,
+  type AutoloopModeKey,
   type AutoloopPayload,
 } from "./autoloop-types";
 import { formatDateTimeVi } from "./format-time";
@@ -75,14 +77,22 @@ function lastCycleSummary(t: Messages, cycle: AutoloopLastCycle): string {
   return `${when} · ${c.completed} · ${candidates} · ${c.executed(executed, cycle.results.length)}`;
 }
 
-function GateBadge({ open }: { open: boolean }) {
+function modeCycleSummary(t: Messages, cycle: AutoloopModeCycle | null | undefined): string {
+  const c = t.settings.autoloop;
+  if (!cycle?.status) return c.modeCycleUnavailable;
+  const status = c.modeCycleStatus[cycle.status] ?? cycle.status;
+  const when = cycle.finished_at ?? cycle.started_at;
+  return [status, when ? formatDateTimeVi(when) : null, cycle.error].filter(Boolean).join(" · ");
+}
+
+function ModeBadge({ open }: { open: boolean }) {
   const t = useT();
   return open ? (
     <Badge className="border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
-      {t.settings.autoloop.gateOpen}
+      {t.settings.autoloop.modeEnabled}
     </Badge>
   ) : (
-    <Badge variant="destructive">{t.settings.autoloop.gateClosed}</Badge>
+    <Badge variant="outline">{t.settings.autoloop.modeDisabled}</Badge>
   );
 }
 
@@ -170,8 +180,8 @@ export function AutoloopCard() {
         });
       } catch (err) {
         const error = toAutoloopError(err);
-        if (error.code === "gate_closed") {
-          setGateWarning(c.gateClosedWarning);
+        if (error.code === "mode_closed") {
+          setGateWarning(c.modeClosedWarning);
         } else {
           setFeedback({ role: "alert", text: error.message });
         }
@@ -264,7 +274,9 @@ export function AutoloopCard() {
     );
   }
 
-  const { enabled, gates, last_cycle: lastCycle } = payload;
+  const { modes, last_cycle: lastCycle } = payload;
+  const anyModeEnabled = modes.auto_spot || modes.auto_futures;
+  const enabled = anyModeEnabled;
   const cycleBusy = runningCycle || runPending;
 
   return (
@@ -280,54 +292,48 @@ export function AutoloopCard() {
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* (1) Bảng 6 hàng cổng an toàn — chỉ đọc, cùng nguồn với chính sách của engine. */}
-        <section aria-label={c.gatesAria}>
+        <section aria-label={c.modesAria}>
           <ul className="space-y-2">
-            {AUTOLOOP_GATE_ROWS.map((key) => ({ key, ...c.gateRows[key] })).map(({ key, label, hint }) => (
-              <li
-                key={key}
-                className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
-              >
-                <span className="text-sm">
-                  {label}
-                  {hint ? <span className="block text-xs text-muted-foreground">{hint}</span> : null}
-                </span>
-                <GateBadge open={gates[key]} />
-              </li>
-            ))}
+            {AUTOLOOP_MODE_ROWS.map((key: AutoloopModeKey) => {
+              const modeCycle = lastCycle?.modes?.[key];
+              const active = runningCycle && lastCycle?.status === "running" && (
+                (lastCycle.active_mode === key && (!modeCycle?.status || modeCycle.status === "running")) ||
+                (lastCycle.active_mode == null && modeCycle?.status === "running")
+              );
+              return (
+                <li
+                  key={key}
+                  className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
+                >
+                  <span className="min-w-0 text-sm">
+                    {c.modeRows[key]}
+                    <span className="block text-xs text-muted-foreground">
+                      {c.modeLastCycle(modeCycleSummary(t, modeCycle))}
+                    </span>
+                  </span>
+                  <span className="flex flex-wrap items-center gap-2">
+                    {active ? <Badge variant="secondary">{c.activeMode}</Badge> : null}
+                    <ModeBadge open={modes[key]} />
+                  </span>
+                </li>
+              );
+            })}
           </ul>
-          <p className="mt-2 text-xs text-muted-foreground">
-            {c.futuresNote}
-          </p>
           <p
             className={cn(
               "mt-2 text-sm font-medium",
-              gates.all_open ? "text-profit" : "text-amber-700 dark:text-amber-400",
+              modes.any_auto_enabled ? "text-profit" : "text-amber-700 dark:text-amber-400",
             )}
           >
-            {gates.all_open
-              ? c.allOpen
-              : c.notAllOpen}
+            {modes.any_auto_enabled ? c.modeAvailable : c.noModesEnabled}
           </p>
         </section>
 
-        {/* (2) Công tắc + khoảng cách phút. */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border p-3">
-          <label
-            htmlFor="autoloop-enabled"
-            className="inline-flex min-touch cursor-pointer items-center gap-2"
-          >
-            <input
-              id="autoloop-enabled"
-              type="checkbox"
-              checked={enabled}
-              disabled={savePending}
-              onChange={(event) => void save(event.target.checked)}
-              className="size-6 cursor-pointer accent-primary"
-            />
-            <span className="text-sm font-medium">{c.enableLabel}</span>
-          </label>
-          <span className="ml-auto flex flex-wrap items-center gap-2">
+          <span className="min-w-0 flex-1 text-sm text-muted-foreground">
+            {enabled ? c.enabledFeedback(payload.interval_minutes) : c.disabledFeedback}
+          </span>
+          <span className="flex flex-wrap items-center gap-2">
             <label htmlFor="autoloop-interval" className="text-sm text-muted-foreground">
               {c.intervalLabel}
             </label>
@@ -374,7 +380,7 @@ export function AutoloopCard() {
 
         {/* (3) Chạy thử một chu kỳ. */}
         <div className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
-          <Button className="min-touch" onClick={() => void runNow()} disabled={cycleBusy}>
+          <Button className="min-touch" onClick={() => void runNow()} disabled={cycleBusy || !anyModeEnabled}>
             {cycleBusy ? (
               <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
             ) : (

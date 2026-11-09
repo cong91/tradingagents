@@ -6,11 +6,12 @@ env vars only -- never from the config dict, never logged, never written to
 the audit trail (safety #5). ``exec_symbol_overrides`` maps a pipeline ticker
 to a full ccxt symbol and wins over the default ``base/quote`` mapping.
 
-Gate model (FR5): the effective mode is computed AT EXECUTE TIME and is
-authoritative -- live only when the process config ``exec_live`` key is a
-literal True (operator/config switch; deliberately not environment-controlled).
-``PlannedOrder.mode`` is informational and never grants execution rights.
-Dry-run never touches the exchange (simulated fill), so it needs no confirm;
+Managed entries use their captured Auto mode authorization to select live
+execution; standalone calls select live only when ``exec_live`` is a literal
+True. Every live entry also needs the matching current process Auto mode and
+an unexpired authorization snapshot. ``PlannedOrder.mode`` is informational
+and never grants execution rights. Dry-run never touches the exchange
+(simulated fill), so it needs no confirm;
 live execution requires an explicit ``confirm=True`` and never runs without
 credentials. Safety #4: every exception on the execution path is audited
 before it raises, and a live order that WAS placed but whose success-audit
@@ -41,10 +42,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 from server import snapshot_observer
+from server.auto_modes import AutoMode
 from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.config import config_key_revision, get_config
 from tradingagents.dataflows.symbols import crypto_base, futures_base
 from tradingagents.execution.audit import append_event
+from tradingagents.execution.auto_authorization import (
+    AuthorizationSnapshot,
+    AutoAuthorizationError,
+    capture_authorization,
+    mode_update_lock,
+)
 from tradingagents.execution.exchange_client import (
     _default_exchange_factory,
     credential_env_names,
@@ -85,6 +93,8 @@ class ExchangeBridge:
     resolves it to the ccxt class of the same (lowercase) name.
     ``risk_guard`` overrides the default guard built from the ``risk_*``
     config keys (tests inject a permissive or scripted guard here).
+    ``authorization`` binds managed work to a captured Auto mode generation;
+    managed entry execution uses the live path regardless of ``exec_live``.
     """
 
     def __init__(
@@ -94,15 +104,21 @@ class ExchangeBridge:
         rules: SizingRules | None = None,
         exchange_id: str | None = None,
         risk_guard: RiskGuard | None = None,
+        authorization: AuthorizationSnapshot | None = None,
     ) -> None:
-        base = get_config()
-        self.config: dict = {**base, **config} if config is not None else base
-        self._gate_config_override = config is not None and any(
-            key in config for key in _RUNTIME_GATE_KEYS
-        )
-        self._gate_config_revisions = {
-            key: config_key_revision(key) for key in _RUNTIME_GATE_KEYS
-        }
+        with mode_update_lock():
+            base = get_config()
+            self.config: dict = {**base, **config} if config is not None else base
+            self._auto_authorization = (
+                authorization if authorization is not None else capture_authorization(self.config)
+            )
+            self._managed_authorization = authorization is not None
+            self._gate_config_override = config is not None and any(
+                key in config for key in _RUNTIME_GATE_KEYS
+            )
+            self._gate_config_revisions = {
+                key: config_key_revision(key) for key in _RUNTIME_GATE_KEYS
+            }
         self.exchange_id = str(
             exchange_id if exchange_id is not None else self.config.get("exec_exchange_id")
         ).strip().lower()
@@ -332,7 +348,7 @@ class ExchangeBridge:
         confirm: bool = False,
         portfolio: PortfolioContext | None = None,
     ) -> str | None:
-        """Execute ``order``; live requires both gates open AND confirm=True.
+        """Execute ``order``; live requires Auto authorization and confirm=True.
 
         Dry mode simulates the fill without calling the exchange at all and
         returns None. Live mode returns the exchange order id (None if the
@@ -371,6 +387,11 @@ class ExchangeBridge:
                 f"not an executable order: side={order.side!r}, quantity={order.quantity!r}"
             )
         mode = self._effective_mode()
+        if self._managed_authorization and not self.auto_mode_enabled(AutoMode.SPOT, live=True):
+            self._audit_rejected(order, confirm, "Auto Spot is disabled or authorization is stale")
+            raise AutoAuthorizationError(
+                "Auto Spot is disabled or authorization is stale; nothing was sent"
+            )
         # fail_closed=True: a send is being decided, so an unreadable audit
         # log (locked by a backup/AV scan, permissions) must refuse -- the
         # halt and loss-streak state it carries cannot be verified.
@@ -531,9 +552,15 @@ class ExchangeBridge:
             response = snapshot_observer.run(
                 self, exchange,
                 operation="create_spot_order", symbol=order.ccxt_symbol,
-                call=lambda: exchange.create_order(order.ccxt_symbol, "market", order.side, amount),
+                call=lambda: self._auto_authorization.submit(
+                    AutoMode.SPOT,
+                    lambda: exchange.create_order(order.ccxt_symbol, "market", order.side, amount),
+                ),
             )
             order_id = response.get("id") if isinstance(response, dict) else None
+        except AutoAuthorizationError as exc:
+            self._audit_rejected(order, confirm, str(exc))
+            raise
         except PreTradeRejection:
             raise  # business rejections above are already audited
         except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
@@ -666,6 +693,10 @@ class ExchangeBridge:
                 f"the audit log failed: {exc}"
             ) from exc
 
+    def auto_mode_enabled(self, mode: AutoMode, *, live: bool = False) -> bool:
+        """Whether this bridge's captured mode authorization is still valid."""
+        return self._auto_authorization.allows(mode, live=live)
+
     def _runtime_gate(self, key: str) -> bool:
         """Read an execution switch, honoring later process-level closures.
 
@@ -681,14 +712,13 @@ class ExchangeBridge:
         return get_config().get(key) is True
 
     def _effective_mode(self) -> str:
-        # ``is True`` on purpose: strings and other truthy values fail closed.
-        return "live" if self._runtime_gate("exec_live") else "dry"
+        # A stale managed token must refuse, never turn a live entry into a dry fill.
+        return "live" if self._managed_authorization or self._runtime_gate("exec_live") else "dry"
 
     def effective_mode(self) -> str:
-        """The gate-decided mode right now: ``"live"`` or ``"dry"`` (FR5).
+        """Return the entry mode: managed work is live, standalone uses exec_live.
 
-        Public because orchestrators (the daily runner) need the same value
-        the bridge will use, without reaching into private state.
+        An invalid managed authorization is refused separately, not simulated.
         """
         return self._effective_mode()
 

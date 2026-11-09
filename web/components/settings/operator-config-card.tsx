@@ -6,7 +6,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -22,7 +21,7 @@ import {
 import {
   changedKeys,
   draftFrom,
-
+  isOperatorGateKey,
   type OperatorConfigPayload,
   type OperatorDraft,
   type OperatorSettingRow,
@@ -42,29 +41,48 @@ function formatValue(
 
 function RowField({
   row,
+  rowLabel,
   value,
   disabled,
+  switchControl,
   onChange,
 }: {
   row: OperatorSettingRow;
+  rowLabel: string;
   value: string | boolean;
   disabled: boolean;
+  switchControl: boolean;
   onChange: (next: string | boolean) => void;
 }) {
   const t = useT();
   const id = `operator-${row.key}`;
   if (row.type === "bool") {
+    const switchClassName = switchControl
+      ? "peer sr-only"
+      : "size-6 cursor-pointer accent-primary disabled:cursor-not-allowed";
     return (
       <label htmlFor={id} className="inline-flex min-touch cursor-pointer items-center gap-2">
         <input
           id={id}
           type="checkbox"
+          role={switchControl ? "switch" : undefined}
+          aria-label={switchControl ? t.settings.operator.draftSwitchAria(rowLabel) : undefined}
+          aria-describedby={switchControl ? `${id}-status` : undefined}
           checked={value === true}
           disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
-          className="size-6 cursor-pointer accent-primary disabled:cursor-not-allowed"
+          className={switchClassName}
         />
-        <span className="text-sm text-muted-foreground">{value === true ? t.common.on : t.common.off}</span>
+        {switchControl ? (
+          <span
+            aria-hidden="true"
+            className="relative h-6 w-11 shrink-0 rounded-full border border-input bg-muted transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-background after:transition-transform peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring peer-disabled:cursor-not-allowed peer-disabled:opacity-60"
+          />
+        ) : null}
+        <span className="text-sm text-muted-foreground">
+          {switchControl ? `${t.settings.operator.draft}: ` : ""}
+          {value === true ? t.common.on : t.common.off}
+        </span>
       </label>
     );
   }
@@ -123,6 +141,9 @@ export function OperatorConfigCard() {
     [payload, changed]
   );
   const needsConfirm = gateChanges.length > 0;
+  const gateChangeLabels = gateChanges
+    .map((key) => t.settings.gateLabels[key] ?? key)
+    .join(", ");
 
   const groups = useMemo(() => {
     if (!payload) return [];
@@ -217,16 +238,13 @@ export function OperatorConfigCard() {
   }
 
   return (
-    <Card>
+    <Card id="operator-config">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldAlertIcon className="size-4" aria-hidden="true" />
           {c.titleFull}
         </CardTitle>
         <CardDescription>{c.description}</CardDescription>
-        <CardAction>
-          <Badge variant="outline">{c.mode(payload.effective_exec_mode)}</Badge>
-        </CardAction>
       </CardHeader>
       <CardContent className="space-y-5">
         {groups.map(({ id, rows }) => {
@@ -243,10 +261,16 @@ export function OperatorConfigCard() {
                 {rows.map((row) => {
                   const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : row.label;
                   const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : row.hint;
+                  const switchControl = row.gate && isOperatorGateKey(row.key);
+                  const pending = changed.includes(row.key);
                   return (
                     <li
                       key={row.key}
-                      className="grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+                      className={
+                        switchControl
+                          ? "grid gap-2 border-t bg-primary/5 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+                          : "grid gap-2 border-t p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+                      }
                     >
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
@@ -259,6 +283,12 @@ export function OperatorConfigCard() {
                           {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
                         </div>
                         <p className="mt-0.5 text-xs text-muted-foreground">{rowHint}</p>
+                        {switchControl ? (
+                          <div id={`operator-${row.key}-status`} className="mt-1 flex flex-wrap gap-2">
+                            <Badge variant="outline">{c.currentState(formatValue(t, row, row.value))}</Badge>
+                            {pending ? <Badge variant="secondary">{c.pendingSave}</Badge> : null}
+                          </div>
+                        ) : null}
                         <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
                           {c.rowMeta(
                             row.key,
@@ -272,14 +302,16 @@ export function OperatorConfigCard() {
                         <span className="min-w-0 flex-1">
                           <RowField
                             row={row}
+                            rowLabel={rowLabel}
                             value={draft[row.key] ?? ""}
                             disabled={saving}
+                            switchControl={switchControl}
                             onChange={(next) =>
                               setDraft((current) => ({ ...current, [row.key]: next }))
                             }
                           />
                         </span>
-                        {row.override ? (
+                        {row.override && !isOperatorGateKey(row.key) ? (
                           <Button
                             variant="ghost"
                             size="sm"
@@ -303,7 +335,7 @@ export function OperatorConfigCard() {
         {needsConfirm ? (
           <div className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
             <p className="text-sm font-medium">
-              {c.gateChanges(gateChanges.join(", "))}
+              {c.gateChanges(gateChangeLabels)}
             </p>
             <p className="text-xs text-muted-foreground">{c.gateWarning}</p>
             <label className="flex min-touch items-center gap-2 text-sm">

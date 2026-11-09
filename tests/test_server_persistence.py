@@ -26,8 +26,13 @@ from server import (
     run_store,
     runs as runs_mod,
 )
+from server.auto_modes import AutoMode
 from server.main import app
 from tradingagents.dataflows.config import set_config
+from tradingagents.execution.auto_authorization import (
+    capture_process_config,
+    mode_update_lock,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -90,6 +95,8 @@ def _server_state(tmp_path, monkeypatch, postgres_schema):
 @pytest.fixture()
 def client(_server_state):
     with TestClient(app) as test_client:
+        with mode_update_lock((AutoMode.SPOT,)):
+            set_config({"auto_spot_enabled": True})
         yield test_client
 
 
@@ -305,7 +312,10 @@ def test_running_job_heartbeat_refreshes_during_slow_coin(client, monkeypatch):
         return {"ticker": "BTC-USD", "asset_type": "crypto", "signal": "Hold"}
 
     monkeypatch.setattr(daily_mod, "_process_coin", slow_process)
-    daily_mod._run_coin_loop(job, object(), {})
+    with mode_update_lock((AutoMode.SPOT,)):
+        set_config({"auto_spot_enabled": True})
+    _, authorization = capture_process_config()
+    daily_mod._run_coin_loop(job, object(), {}, authorization)
 
     assert time.monotonic() - started >= 0.04
     stored = client.get(f"/api/daily/{job.job_id}").json()

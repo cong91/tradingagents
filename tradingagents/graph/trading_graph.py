@@ -2,12 +2,16 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from contextvars import copy_context
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+from langgraph.runtime import RunControl
 
 import tradingagents
 from tradingagents.agents.context import build_instrument_context, resolve_instrument_identity
@@ -197,19 +201,27 @@ class TradingAgentsGraph:
 
     def propagate_with_telemetry(
         self, company_name, trade_date, asset_type="stock", *, telemetry,
-        portfolio=None, execution_context="",
+        portfolio=None, execution_context="", check_cancelled: Callable[[], None] | None = None,
     ):
-        """Run the graph while reporting node timings to an observer."""
+        """Run the graph while reporting node timings to an observer.
+
+        ``check_cancelled`` runs at graph boundaries and must raise to cancel.
+        Already-running provider calls are allowed to finish. The callback sees
+        the caller's context, not the graph's run-scoped config snapshot.
+        """
         return self._propagate(
             company_name, trade_date, asset_type, portfolio, execution_context,
-            telemetry=telemetry,
+            telemetry=telemetry, check_cancelled=check_cancelled,
         )
 
     def _propagate(
         self, company_name, trade_date, asset_type, portfolio,
-        execution_context="", telemetry=None,
+        execution_context="", telemetry=None, check_cancelled: Callable[[], None] | None = None,
     ):
         trade_date = _validate_trade_date(trade_date)
+        if check_cancelled is not None:
+            check_cancelled = partial(copy_context().run, check_cancelled)
+            check_cancelled()
         if telemetry is None:
             with run_config(self.config), \
                     self.checkpoint_scope(
@@ -219,6 +231,7 @@ class TradingAgentsGraph:
                     company_name, trade_date, asset_type=asset_type,
                     checkpoint_thread_id=thread_id_value, portfolio=portfolio,
                     execution_context=execution_context,
+                    **({"check_cancelled": check_cancelled} if check_cancelled is not None else {}),
                 )
 
         with diagnostic_scope(telemetry), run_config(self.config), \
@@ -229,7 +242,7 @@ class TradingAgentsGraph:
                 company_name, trade_date, asset_type=asset_type,
                 checkpoint_thread_id=thread_id_value, portfolio=portfolio,
                 execution_context=execution_context,
-                telemetry=telemetry,
+                telemetry=telemetry, check_cancelled=check_cancelled,
             )
 
     def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock", portfolio=None,
@@ -426,8 +439,11 @@ class TradingAgentsGraph:
         self, company_name, trade_date, asset_type: str = "stock",
         checkpoint_thread_id: str | None = None, portfolio=None,
         execution_context: str = "", telemetry=None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> tuple[dict, str]:
         """Execute the graph and write the resulting state to disk and memory log."""
+        if check_cancelled is not None:
+            check_cancelled()
         prepare_span = (
             telemetry.span("prepare_state", company_name)
             if telemetry is not None and callable(getattr(telemetry, "span", None))
@@ -447,27 +463,54 @@ class TradingAgentsGraph:
             # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
             graph_input = self.checkpoint_input(init_agent_state)
 
-        if telemetry is not None:
+        if check_cancelled is not None:
+            check_cancelled()
+        if telemetry is not None or check_cancelled is not None:
             args["stream_mode"] = ["values", "debug"]
             if isinstance(telemetry, BaseCallbackHandler):
                 callbacks = args.setdefault("config", {}).setdefault("callbacks", [])
                 if telemetry not in callbacks:
                     callbacks.append(telemetry)
+            if check_cancelled is not None:
+                control = RunControl()
+                args.update(control=control, subgraphs=True)
             final_state = {}
-            for mode, chunk in self.graph.stream(graph_input, **args):
-                if mode == "values":
-                    final_state = chunk
-                elif mode == "debug":
-                    details = chunk.get("payload") if isinstance(chunk, dict) else None
-                    if (
-                        chunk.get("type") in {"task", "task_result"}
-                        and isinstance(details, dict)
-                        and isinstance(details.get("name"), str)
-                    ):
-                        telemetry.graph_event(chunk, company_name)
+            stream = self.graph.stream(graph_input, **args)
+            try:
+                while True:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    try:
+                        event = next(stream)
+                    except StopIteration:
+                        break
+                    if check_cancelled is not None:
+                        check_cancelled()
+                        namespace, mode, chunk = event
+                        if namespace:
+                            continue
+                    else:
+                        mode, chunk = event
+                    if mode == "values":
+                        final_state = chunk
+                    elif mode == "debug" and telemetry is not None:
+                        details = chunk.get("payload") if isinstance(chunk, dict) else None
+                        if (
+                            isinstance(chunk, dict)
+                            and chunk.get("type") in {"task", "task_result"}
+                            and isinstance(details, dict)
+                            and isinstance(details.get("name"), str)
+                        ):
+                            telemetry.graph_event(chunk, company_name)
+            finally:
+                if check_cancelled is not None:
+                    control.request_drain("graph stream closed")
+                stream.close()
+            if check_cancelled is not None:
+                check_cancelled()
             finalize_span = (
                 telemetry.span("finalize_state", company_name)
-                if callable(getattr(telemetry, "span", None))
+                if telemetry is not None and callable(getattr(telemetry, "span", None))
                 else nullcontext()
             )
             with finalize_span:

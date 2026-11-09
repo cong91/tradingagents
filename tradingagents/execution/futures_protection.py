@@ -234,6 +234,43 @@ def _manage_one_with_lease(
         return {"position_key": position_key, "status": "position_unknown"}
     if task.get("symbol") != symbol or task.get("close_side") != ("sell" if side == "long" else "buy"):
         return {"position_key": position_key, "status": "bracket_identity_mismatch"}
+    task_status = str(task.get("status") or "")
+    if task_status in {
+        "emergency_close_failed", "emergency_cleanup_pending",
+        "replacement_cleanup_pending", "position_cleanup_pending",
+        "time_stop_submission_uncertain", "time_stop_unknown_position", "time_stop_failed",
+    }:
+        return {"position_key": position_key, "status": "manual_reconciliation_required"}
+    if task_status not in {"pending", "monitoring", "submission_uncertain"}:
+        return {"position_key": position_key, "status": "manual_reconciliation_required"}
+    task_needs_verified_recovery = task_status == "submission_uncertain" or any(
+        leg.get("status") == "uncertain"
+        for leg in task.get("legs", [])
+        if isinstance(leg, dict)
+    )
+    if allow_mutation and task_needs_verified_recovery:
+        from tradingagents.execution.derivatives import _verified_protection_task
+
+        verdict = _verified_protection_task(
+            bridge, bracket_task_id, expected_symbol=symbol,
+        )
+        if verdict is not None:
+            return {"position_key": position_key, "status": verdict}
+        reconciliation_status = BracketManager(bridge).reconcile(
+            bracket_task_id, repair_missing=False, allow_sibling_cancel=False,
+        )
+        if reconciliation_status not in {"pending", "monitoring"}:
+            return {"position_key": position_key, "status": reconciliation_status}
+        refreshed_task = job_store.load_bracket_recovery(bracket_task_id)
+        if refreshed_task is None:
+            return {"position_key": position_key, "status": "missing_bracket_task"}
+        if refreshed_task.get("status") not in {"pending", "monitoring"} or any(
+            leg.get("status") == "uncertain"
+            for leg in refreshed_task.get("legs", [])
+            if isinstance(leg, dict)
+        ):
+            return {"position_key": position_key, "status": "reconcile_incomplete"}
+        task = refreshed_task
     venue_position = position_map.get((symbol, side))
     if venue_position is None:
         return {"position_key": position_key, "status": "position_unknown"}
@@ -321,15 +358,25 @@ def _advance_for_verified_account(
     current_stop = float(stop_leg["params"]["stopLossPrice"])
     current_target = None if ladder else float(target_legs[0]["params"]["takeProfitPrice"])
     max_hold_hours = _positive_or_none(config.get("risk_derivatives_max_hold_hours", 72.0))
-    if max_hold_hours is not None and snapshot.get("time_stop_review_status") == "hold":
-        held_until = _parse_opened_at(snapshot.get("time_stop_review_until"))
-        if held_until is not None and held_until > observed_at:
-            # The reviewer granted a hold: the deadline moves to the granted
-            # time. Each new hold re-extends from the review moment, so the
-            # position is re-examined one interval at a time, never parked.
-            extension = max(0.0, (held_until - opened_at).total_seconds() / 3600.0)
-            max_hold_hours = max(max_hold_hours, extension)
-    if snapshot.get("time_stop_review_status") == "close":
+    review_status = snapshot.get("time_stop_review_status")
+    review_until = _parse_opened_at(snapshot.get("time_stop_review_until"))
+    grace_enabled = (
+        config.get("risk_derivatives_time_stop_review_enabled") is True
+        and _positive_or_none(
+            config.get("risk_derivatives_time_stop_review_interval_hours", 24.0),
+        ) is not None
+        and review_hook is not None
+    )
+    review_waiting = (
+        max_hold_hours is not None
+        and (review_status == "hold" or (review_status == "unavailable" and grace_enabled))
+        and review_until is not None
+        and observed_at < review_until
+    )
+    if review_waiting:
+        extension = (review_until - opened_at).total_seconds() / 3600.0
+        max_hold_hours = max(max_hold_hours, extension)
+    if review_status == "close":
         # The position review decided to exit. Its verdict overrides every
         # mechanical hold — the funding rescue included — because the review
         # ran on fresher evidence than any standing rule.
@@ -391,6 +438,7 @@ def _advance_for_verified_account(
             client, symbol, side, observed_at, config, postponed_for,
         )
         if postpone:
+            same_settlement = postponed_for == postponed_settlement
             snapshot = {
                 **snapshot,
                 "phase": "time_stop_postponed_funding",
@@ -404,7 +452,7 @@ def _advance_for_verified_account(
             ):
                 return {"position_key": position_key, "status": "revision_conflict"}
             audit = getattr(bridge, "audit_plan", None)
-            if callable(audit):
+            if callable(audit) and not same_settlement:
                 audit(
                     PlannedOrder(
                         ticker=symbol, ccxt_symbol=symbol, signal="time_stop",
@@ -499,6 +547,8 @@ def _advance_for_verified_account(
         {**state, "snapshot": snapshot},
     ):
         return {"position_key": position_key, "status": "revision_conflict"}
+    if review_waiting and review_status == "unavailable":
+        return {"position_key": position_key, "status": "time_stop_review_grace"}
     if boundary_tripped:
         # Funding held the effective R above the minimum past the deadline.
         return {"position_key": position_key, "status": "time_stop_blocked_by_funding"}

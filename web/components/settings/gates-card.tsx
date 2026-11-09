@@ -11,27 +11,19 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { useT } from "@/lib/i18n";
+import { type SettingsPayload } from "./types";
 
-// Gate status is read-only on this summary card; changes are made in the
-// operator configuration card with confirmation and an audit reason.
+const AUTOMATION_MODE_KEYS = ["auto_spot", "auto_futures"] as const;
+
+// Automation mode status is read-only here; changes live in operator config.
 export function GatesCard({
   gates,
-  effectiveMode,
 }: {
-  gates: Record<string, boolean>;
-  effectiveMode: string;
+  gates: Pick<SettingsPayload, "gates_readonly">["gates_readonly"];
 }) {
-  const live = effectiveMode === "live";
+  const anyAutoEnabled = gates.auto_spot === true || gates.auto_futures === true;
   const t = useT();
   const c = t.settings.gates;
-  // Giải thích theo trạng thái đọc được của cổng «Lệnh thật»; giá trị ngoài
-  // contract live|dry (server lạ / chưa đọc được) rơi về nhắc Làm mới.
-  const explain =
-    effectiveMode === "live"
-      ? c.explainLive
-      : effectiveMode === "dry"
-        ? c.explainSafe
-        : c.explainChecking;
   return (
     // id là đích của chip trạng thái cổng trong sidebar (/settings#exec-gates).
     <Card id="exec-gates">
@@ -47,26 +39,24 @@ export function GatesCard({
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
-          <span className="text-sm font-medium">{c.effectiveMode}</span>
-          {live ? (
-            <Badge variant="destructive">{c.live}</Badge>
+          <span className="text-sm font-medium">{c.anyAuto}</span>
+          {anyAutoEnabled ? (
+            <Badge variant="default">{c.open}</Badge>
           ) : (
-            <Badge variant="secondary">{c.dry}</Badge>
+            <Badge variant="outline">{c.closed}</Badge>
           )}
         </div>
-        <p className="text-sm text-muted-foreground">{explain}</p>
         <ul className="space-y-2">
-          {Object.entries(gates).map(([name, open]) => (
+          {AUTOMATION_MODE_KEYS.map((name) => (
             <li
               key={name}
               className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
             >
               <span className="text-sm">{t.settings.gateLabels[name] ?? name}</span>
-              {open ? (
-                <Badge variant="destructive">{c.open}</Badge>
+              {gates[name] ? (
+                <Badge variant="default">{c.open}</Badge>
               ) : (
                 <Badge variant="outline">{c.closed}</Badge>
-
               )}
             </li>
           ))}

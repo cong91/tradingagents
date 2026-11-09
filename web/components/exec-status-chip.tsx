@@ -10,17 +10,20 @@ import { useT } from "@/lib/i18n";
 export type ModeState =
   | { status: "loading" }
   | { status: "error" }
-  | { status: "ready"; live: boolean };
+  | { status: "ready"; enabled: boolean };
 
 type SettingsPayload = {
-  effective_exec_mode?: unknown;
+  gates_readonly?: {
+    auto_spot?: unknown;
+    auto_futures?: unknown;
+  } | null;
 };
 
-type ChipTone = "live" | "dry" | "loading" | "error";
+type ChipTone = "enabled" | "disabled" | "loading" | "error";
 
 const TONE_CLASS: Record<ChipTone, string> = {
-  live: "border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950 dark:text-red-100",
-  dry: "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-800 dark:bg-blue-950 dark:text-blue-100",
+  enabled: "border-amber-500/60 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100",
+  disabled: "border-border bg-muted text-foreground",
   loading: "border-border bg-muted text-foreground",
   error:
     "border-amber-500/60 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100",
@@ -37,13 +40,13 @@ export function ExecStatusChipView({
 }) {
   const t = useT();
   const tone = TONE_CLASS[
-    state.status === "ready" ? (state.live ? "live" : "dry") : state.status
+    state.status === "ready" ? (state.enabled ? "enabled" : "disabled") : state.status
   ];
   const label = (() => {
     const c = t.common.execStatus;
     switch (state.status) {
       case "ready":
-        return state.live ? c.chipLive : c.chipSafe;
+        return state.enabled ? c.chipEnabled : c.chipDisabled;
       case "loading":
         return c.chipChecking;
       case "error":
@@ -80,21 +83,27 @@ export function ExecStatusChipView({
   );
 }
 
-// Chip trạng thái quyền «Lệnh thật», luôn hiển thị trong sidebar. Nhãn đo
-// effective_exec_mode: "live" khi công tắc exec_live đang mở.
-// Không polling theo đồng hồ. Giá trị đổi qua operator-config và tín hiệu SSE;
-// fallback là refetch khi tab quay lại hiển thị hoặc mạng hồi.
+// The chip reflects automation modes, not the configured venue or account profile.
+// Settings events trigger a refetch; visibility and network events are fallbacks.
 export function ExecStatusChip() {
   const [state, setState] = useState<ModeState>({ status: "loading" });
   const lastFetchAt = useRef(0);
+  const fetchSequence = useRef(0);
 
   // Thuần: fetch rồi trả trạng thái; setState chỉ chạy trong callback promise.
   const fetchMode = useCallback(async (): Promise<ModeState> => {
     try {
       const res = await fetch("/api/settings", { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as SettingsPayload;
-      return { status: "ready", live: data.effective_exec_mode === "live" };
+      const data = (await res.json()) as SettingsPayload | null;
+      const gates = data?.gates_readonly;
+      if (gates?.auto_spot === true || gates?.auto_futures === true) {
+        return { status: "ready", enabled: true };
+      }
+      if (gates?.auto_spot === false && gates?.auto_futures === false) {
+        return { status: "ready", enabled: false };
+      }
+      return { status: "error" };
     } catch {
       return { status: "error" };
     }
@@ -102,7 +111,10 @@ export function ExecStatusChip() {
 
   const refresh = useCallback(() => {
     lastFetchAt.current = Date.now();
-    void fetchMode().then(setState);
+    const sequence = ++fetchSequence.current;
+    void fetchMode().then((next) => {
+      if (sequence === fetchSequence.current) setState(next);
+    });
   }, [fetchMode]);
 
   // Kết nối SSE luôn phát "reset" lúc mở — bỏ qua nếu vừa fetch để mỗi lần
@@ -115,9 +127,8 @@ export function ExecStatusChip() {
     refresh();
     if (typeof EventSource === "undefined") return;
     const source = new EventSource("/api/settings/events");
-    const onChanged = () => refreshIfQuiet();
-    source.addEventListener("reset", onChanged);
-    source.addEventListener("changed", onChanged);
+    source.addEventListener("reset", refreshIfQuiet);
+    source.addEventListener("changed", refresh);
     return () => source.close();
   }, [refresh, refreshIfQuiet]);
 

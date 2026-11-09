@@ -89,6 +89,12 @@ export function SettingsScreen() {
 
   const payload = controller.payload;
   if (!payload || !grouped) return null;
+  const automationGates = {
+    auto_spot: payload.gates_readonly.auto_spot === true,
+    auto_futures: payload.gates_readonly.auto_futures === true,
+    any_auto_enabled:
+      payload.gates_readonly.auto_spot === true || payload.gates_readonly.auto_futures === true,
+  };
 
   return (
     <div>
@@ -172,10 +178,7 @@ export function SettingsScreen() {
             />
           ) : null}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            <GatesCard
-              gates={payload.gates_readonly}
-              effectiveMode={payload.effective_exec_mode}
-            />
+            <GatesCard gates={automationGates} />
           </div>
           {/* Cookie Reddit/X: đọc/ghi PostgreSQL, mã hoá; độc lập với payload /api/settings. */}
           <DataSourceCard />

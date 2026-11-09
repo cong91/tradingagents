@@ -12,6 +12,7 @@ from tests.execution_derivatives_support import (
     _live_bracket_order,
     _recovery_db as _recovery_db,
     bind_identity,
+    enable_auto_futures as enable_auto_futures,
     live_config,
     live_env,
     make_executor,
@@ -22,7 +23,7 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def entry_setup(tmp_path, monkeypatch):
+def entry_setup(tmp_path, monkeypatch, enable_auto_futures):
     exchange = FakeDerivExchange()
     bind_identity(monkeypatch, VERIFIED_IDENTITY)
     executor = make_executor(

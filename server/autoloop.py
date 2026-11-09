@@ -43,11 +43,14 @@ from fastapi import APIRouter, Request
 
 from server import (
     audit as audit_log,
+    auto_modes,
     control_store,
     daily as daily_mod,
     job_store,
     runs as runs_mod,
 )
+from server.auto_modes import AutoMode
+from server.autoloop_cycles import ModeDispatch, dispatch_modes
 from server.autoloop_telemetry import CycleTelemetry
 from server.contract import ApiError, json_body, utc_now_iso
 from server.futures_cycle_telemetry import (
@@ -69,6 +72,11 @@ from tradingagents.agents.rating import RATINGS_5_TIER, parse_rating
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.market_data import fetch_closed_candles
 from tradingagents.execution.audit import append_event
+from tradingagents.execution.auto_authorization import (
+    AuthorizationSnapshot,
+    AutoAuthorizationError,
+    capture_process_config,
+)
 from tradingagents.execution.daily import DailyResult, _handle_plan
 from tradingagents.execution.futures_account import read_futures_account
 from tradingagents.execution.futures_scheduler import closed_candle_pair
@@ -137,6 +145,8 @@ _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 _cycle_lock = threading.Lock()
 _execution_lock = threading.Lock()
 _screening_worker_lock = threading.Lock()
+_state_lock = threading.Lock()
+_scheduler_start_lock = threading.Lock()
 _cycle_thread: threading.Thread | None = None  # last spawned cycle worker
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop = threading.Event()
@@ -185,12 +195,16 @@ def _execute_with_deadline(
     deadline: float | None,
     cancelled: threading.Event | None,
     execution_lock: threading.Lock | None,
+    mode: AutoMode | None = None,
+    authorization: AuthorizationSnapshot | None = None,
 ) -> Any:
     if execution_lock is None:
         _raise_if_execution_closed(deadline, cancelled, "order submission")
+        _raise_if_mode_disabled(mode, "execution", authorization)
         return execute()
     with execution_lock:
         _raise_if_execution_closed(deadline, cancelled, "order submission")
+        _raise_if_mode_disabled(mode, "execution", authorization)
         return execute()
 
 
@@ -230,6 +244,9 @@ def _screen_with_timeout(
     universe_limit: int | None = None,
     screen_pool: int | None = None,
     timeout_seconds: float | None = None,
+    futures_mode: bool | None = None,
+    mode: AutoMode | None = None,
+    authorization: AuthorizationSnapshot | None = None,
 ) -> tuple[list[str], list[str], list[dict]]:
     """Run external screening off-cycle so a vendor stall cannot block forever.
 
@@ -238,6 +255,8 @@ def _screen_with_timeout(
     futures mode, ``AUTO_SCREEN_POOL`` in spot mode). ``timeout_seconds`` caps
     this call so a refill round can never outlive the cycle's own budget.
     """
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise TimeoutError("screening deadline expired before worker start")
     result_queue: queue.Queue = queue.Queue(maxsize=1)
     telemetry = telemetry or CycleTelemetry()
     cancel_screening = threading.Event()
@@ -246,31 +265,40 @@ def _screen_with_timeout(
 
     def worker() -> None:
         try:
-            futures_mode = config.get("exec_derivatives") is True
+            futures_mode_active = (
+                config.get("auto_futures_enabled") is True
+                if futures_mode is None
+                else futures_mode
+            )
             crypto_limit = (
                 universe_limit
                 if universe_limit is not None
-                else (AUTO_FUTURES_SCREEN_POOL if futures_mode else AUTO_UNIVERSE_PER_ASSET)
+                else (AUTO_FUTURES_SCREEN_POOL if futures_mode_active else AUTO_UNIVERSE_PER_ASSET)
             )
+            _raise_if_mode_disabled(mode, "crypto universe", authorization)
             with telemetry.span("screening:crypto_universe"):
-                crypto = _call_crypto_universe(crypto_universe, config, crypto_limit, futures_mode)
+                crypto = _call_crypto_universe(
+                    crypto_universe, config, crypto_limit, futures_mode_active,
+                )
             if cancel_screening.is_set():
                 return
-            if futures_mode:
+            if futures_mode_active:
                 # Futures candidates must come from the crypto universe only.
                 stocks = []
             else:
+                _raise_if_mode_disabled(mode, "stock universe", authorization)
                 with telemetry.span("screening:stock_universe"):
                     stocks = stock_universe(config, AUTO_UNIVERSE_PER_ASSET)
             if cancel_screening.is_set():
                 return
+            _raise_if_mode_disabled(mode, "screening metrics", authorization)
             with telemetry.span("screening:metrics"):
                 pool_limit = (
                     screen_pool
                     if screen_pool is not None
                     else (
                         AUTO_FUTURES_SCREEN_POOL
-                        if futures_mode
+                        if futures_mode_active
                         else AUTO_SCREEN_POOL
                     )
                 )
@@ -299,7 +327,7 @@ def _screen_with_timeout(
 
     threading.Thread(target=worker, name="server-autoloop-screen", daemon=True).start()
     budget = SCREENING_TIMEOUT_SECONDS if timeout_seconds is None else min(
-        SCREENING_TIMEOUT_SECONDS, max(0.01, timeout_seconds)
+        SCREENING_TIMEOUT_SECONDS, timeout_seconds
     )
     try:
         outcome = result_queue.get(timeout=budget)
@@ -320,35 +348,71 @@ def _screen_with_timeout(
 
 
 def gates() -> dict:
-    """The config-only execution gate state as GET /api/autoloop reports it."""
-    config = get_config()
-    auto_confirm_config = config.get("exec_auto_confirm") is True
-    return {
-        "auto_confirm_config": auto_confirm_config,
-        "exec_live_config": config.get("exec_live") is True,
-        "exec_derivatives_config": config.get("exec_derivatives") is True,
-        "all_open": auto_confirm_config,
+    """Current market-specific automation modes."""
+    enabled = auto_modes.enabled_modes(get_config())
+    modes = {
+        "auto_spot": AutoMode.SPOT in enabled,
+        "auto_futures": AutoMode.FUTURES in enabled,
     }
+    return {**modes, "any_auto_enabled": any(modes.values())}
 
 
 # --- state file ---------------------------------------------------------------
 
 
-def _load_state() -> dict:
-    """The persisted {enabled, interval_minutes, updated_at}; defaults when the
-    record is absent — a fresh install has the loop OFF, not an error."""
+def _load_persisted_state() -> dict | None:
     try:
         data = control_store.load_autoloop_state()
     except Exception:  # an unreadable store must not arm the loop
         logger.warning("autoloop state unreadable; treating as disabled", exc_info=True)
+        return None
+    return data if isinstance(data, dict) else {}
+
+
+def _load_state() -> dict:
+    """Return persisted scheduler settings with mode-derived enablement.
+
+    Auto Spot/Auto Futures are the source of truth for whether the scheduler
+    may run. The persisted bit is normalized on read so stale state cannot arm
+    the loop after both modes are closed.
+    """
+    data = _load_persisted_state()
+    if data is None:
         return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
-    if not isinstance(data, dict) or not data:
-        return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
-    return data
+    normalized = dict(data)
+    normalized["enabled"] = bool(auto_modes.enabled_modes(get_config()))
+    normalized.setdefault("interval_minutes", DEFAULT_INTERVAL_MINUTES)
+    return normalized
 
 
 def _save_state(state: dict) -> None:
     control_store.save_autoloop_state(state)
+
+
+def sync_mode_state() -> dict:
+    """Persist mode-derived scheduler state and wake the scheduler.
+
+    Operator mode writes call this after applying their config. A mode change
+    always wakes the scheduler so a closed mode is observed promptly; the
+    durable ``enabled``/``updated_at`` pair changes only when the derived
+    scheduler state changes.
+    """
+    with _state_lock:
+        persisted = control_store.load_autoloop_state()
+        persisted = persisted if isinstance(persisted, dict) else {}
+        derived_enabled = bool(auto_modes.enabled_modes(get_config()))
+        if persisted.get("enabled") is not derived_enabled:
+            persisted = {
+                **persisted,
+                "enabled": derived_enabled,
+                "interval_minutes": _interval_from(persisted),
+                "updated_at": utc_now_iso(),
+            }
+            _save_state(persisted)
+    if derived_enabled:
+        ensure_started()
+    _wakeup.set()
+    return {**persisted, "enabled": derived_enabled}
 
 
 def _interval_from(state: dict) -> int:
@@ -384,13 +448,14 @@ def _last_cycle_snapshot() -> dict | None:
 def ensure_started() -> None:
     """Start the scheduler daemon once; idempotent — every enable calls it."""
     global _scheduler_thread
-    if _scheduler_thread is not None and _scheduler_thread.is_alive():
-        return
-    _scheduler_stop.clear()
-    _scheduler_thread = threading.Thread(
-        target=_scheduler_loop, name="server-autoloop-scheduler", daemon=True
-    )
-    _scheduler_thread.start()
+    with _scheduler_start_lock:
+        if _scheduler_thread is not None and _scheduler_thread.is_alive():
+            return
+        _scheduler_stop.clear()
+        _scheduler_thread = threading.Thread(
+            target=_scheduler_loop, name="server-autoloop-scheduler", daemon=True
+        )
+        _scheduler_thread.start()
 
 
 def stop() -> None:
@@ -611,6 +676,8 @@ def _refill_futures_candidates(
     inspected: int,
     deadline: float | None = None,
     telemetry: CycleTelemetry | None = None,
+    mode: AutoMode | None = None,
+    authorization: AuthorizationSnapshot | None = None,
 ) -> tuple[list[str], list[str], list[dict], list[dict], dict | None]:
     """Widen discovery until ``limit`` executable futures exist, or the pool ends.
 
@@ -681,6 +748,7 @@ def _refill_futures_candidates(
             remaining *= AUTO_REFILL_BUDGET_SHARE
             if remaining <= 0:
                 break
+        _raise_if_mode_disabled(mode, "screening refill", authorization)
         try:
             round_crypto, stocks, candidates = _screen_with_timeout(
                 crypto_universe,
@@ -692,13 +760,18 @@ def _refill_futures_candidates(
                 universe_limit=widened,
                 screen_pool=widened,
                 timeout_seconds=remaining,
+                mode=mode,
+                authorization=authorization,
             )
+            _raise_if_mode_disabled(mode, "candidate preflight", authorization)
             round_vetted, round_skipped, metadata_available = (
                 _preflight_candidates_with_metadata(
                     candidates, derivatives, telemetry=telemetry,
                     rejections_recorded=rejections_recorded,
                 )
             )
+        except _AutoModeDisabled:
+            raise
         except Exception as exc:
             # A refill round is optional: report it and keep what round 1
             # vetted instead of failing the whole cycle (or discarding it).
@@ -758,6 +831,8 @@ def _run_candidate_with_timeout(
     cancelled: threading.Event,
     execution_lock: threading.Lock,
     telemetry: CycleTelemetry,
+    mode: AutoMode | None = None,
+    authorization: AuthorizationSnapshot | None = None,
 ) -> DailyResult:
     """Run one candidate off-cycle so an LLM stall cannot hold the lock."""
     result_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -767,7 +842,8 @@ def _run_candidate_with_timeout(
             result_queue.put(_process_candidate(
                 bridge, candidate, config, build_graph, derivatives,
                 deadline=deadline, cancelled=cancelled,
-                execution_lock=execution_lock, telemetry=telemetry,
+                execution_lock=execution_lock, telemetry=telemetry, mode=mode,
+                authorization=authorization,
             ))
         except BaseException as exc:
             result_queue.put(exc)
@@ -795,12 +871,7 @@ def _run_candidate_with_timeout(
 
 
 def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
-    """One auto cycle: screen the universe, run the pipeline per candidate,
-    hand every plan to the engine's confirm policy. Returns one DailyResult
-    per candidate. A cycle requested while a run/job is active is skipped and
-    audited (set_config is process-wide — trading_graph.py:65 — so the cycle
-    must not fight another worker over config); a candidate's failure never
-    stops the cycle (execution/daily.py:170-173)."""
+    """Dispatch the enabled markets sequentially under one cycle deadline."""
     started_at = utc_now_iso()
     deadline = time.monotonic() + CYCLE_TIMEOUT_SECONDS
     build_graph = graph_builder if graph_builder is not None else _default_graph_builder
@@ -813,25 +884,107 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
         _set_last_cycle({
             "started_at": started_at, "finished_at": utc_now_iso(),
             "status": "skipped_busy", "reason": occupied,
-            "candidates": [], "results": [], "error": None,
+            "candidates": [], "results": [], "modes": {}, "error": None,
         })
         return []
 
     audit_log.record("autoloop_cycle_started")
-    config = get_config()  # snapshot: later settings changes do not touch this cycle
+    config, authorization = capture_process_config()
+    enabled = auto_modes.enabled_modes(config)
     summary: dict = {
         "started_at": started_at, "finished_at": None, "status": "running",
-        "candidates": [], "results": [], "error": None,
+        "candidates": [], "results": [], "modes": {}, "error": None,
     }
+    for mode in AutoMode:
+        summary["modes"][_mode_key(mode)] = {
+            "mode": mode.value,
+            "status": "pending" if mode in enabled else "disabled",
+            "candidates": [], "results": [],
+            "started_at": None, "finished_at": None,
+            "telemetry": None,
+        }
+    results: list[DailyResult] = []
+
+    def run_mode(mode: AutoMode, shared_deadline: float) -> ModeDispatch:
+        mode_config = dict(config)
+        mode_config["auto_spot_enabled"] = mode is AutoMode.SPOT
+        mode_config["auto_futures_enabled"] = mode is AutoMode.FUTURES
+        return _run_mode_cycle(
+            mode, mode_config, build_graph, shared_deadline, threading.Event(),
+            summary=summary, results=results, authorization=authorization,
+        )
+
+    try:
+        dispatch_modes(
+            enabled,
+            deadline=deadline,
+            is_enabled=lambda mode: _mode_is_enabled(mode, authorization),
+            run_mode=run_mode,
+        )
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        audit_log.record("autoloop_cycle_failed", error=summary["error"])
+
+    for mode in AutoMode:
+        mode_summary = summary["modes"][_mode_key(mode)]
+        if mode_summary["status"] == "pending":
+            if _mode_is_enabled(mode, authorization) and time.monotonic() >= deadline:
+                mode_summary["status"] = "timeout"
+                mode_summary["error"] = "cycle deadline expired before screening"
+                summary["error"] = summary["error"] or mode_summary["error"]
+            else:
+                mode_summary["status"] = "disabled"
+            mode_summary["finished_at"] = utc_now_iso()
+    mode_statuses = {item["status"] for item in summary["modes"].values()}
+    if summary["status"] == "running":
+        if "timeout" in mode_statuses or time.monotonic() >= deadline:
+            summary["status"] = "timeout"
+        elif "failed" in mode_statuses:
+            summary["status"] = "failed"
+        else:
+            summary["status"] = "completed"
+    summary["finished_at"] = utc_now_iso()
+    _set_last_cycle(summary)
+    if summary["status"] == "completed":
+        audit_log.record(
+            "autoloop_cycle_completed",
+            candidates=summary["candidates"], results=summary["results"],
+            modes=summary["modes"],
+        )
+    elif summary["status"] == "timeout":
+        audit_log.record("autoloop_cycle_timeout", error=summary.get("error"))
+    elif summary["status"] == "failed" and summary.get("error") is None:
+        audit_log.record("autoloop_cycle_failed", modes=summary["modes"])
+    return results
+
+
+def _run_mode_cycle(
+    mode: AutoMode,
+    config: dict,
+    build_graph: Callable,
+    deadline: float,
+    cancelled: threading.Event,
+    *,
+    summary: dict,
+    results: list[DailyResult],
+    authorization: AuthorizationSnapshot,
+) -> ModeDispatch:
+    """Screen and run one market without extending the enclosing deadline."""
+    mode_name = _mode_key(mode)
+    mode_summary = summary["modes"][mode_name]
+    mode_summary["status"] = "running"
+    mode_summary["started_at"] = utc_now_iso()
 
     def publish_telemetry(snapshot: dict) -> None:
+        mode_summary["telemetry"] = snapshot
         summary["telemetry"] = snapshot
+        summary["active_mode"] = mode_name
         _set_last_cycle(dict(summary, results=list(summary["results"])), telemetry)
 
     telemetry = CycleTelemetry(on_change=publish_telemetry)
     publish_telemetry(telemetry.snapshot())
-    results: list[DailyResult] = []
-    cancelled = threading.Event()
+    mode_results: list[DailyResult] = []
     try:
         from tradingagents.dataflows.screening import (
             MAX_PRICE_MISMATCH,
@@ -841,120 +994,148 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
             stock_universe,
         )
 
-        # Futures mode builds the universe FROM the venue — the settle assets
-        # the futures wallet holds, then the contracts settled in them — so the
-        # derivatives executor exists before screening. The spot bridge is
-        # still built only after a successful screen.
+        futures_mode = mode is AutoMode.FUTURES
         derivatives = None
-        if config.get("exec_derivatives") is True:
+        _raise_if_mode_disabled(mode, "venue setup", authorization)
+        if futures_mode:
             _cycle_timeout(deadline, "venue setup")
             with telemetry.span("venue_setup"):
-                derivatives = _build_derivatives_executor(config)
+                derivatives = _call_authorized_builder(
+                    _build_derivatives_executor, config, authorization,
+                )
 
         crypto_fn: Callable = crypto_universe
         screen_fn: Callable = screen_universe
         mismatched: dict[str, dict] = {}
         if derivatives is not None:
             contracts: dict[str, dict] = {}
-            crypto_fn = _futures_crypto_universe(derivatives, contracts, summary)
+            crypto_fn = _futures_crypto_universe(derivatives, contracts, mode_summary)
             screen_fn = _pinning_screen(
                 screen_universe, derivatives, contracts, mismatched,
                 max_mismatch=MAX_PRICE_MISMATCH, price_mismatch=price_mismatch,
             )
 
         with telemetry.span("screening"):
+            _raise_if_mode_disabled(mode, "screening", authorization)
+            _cycle_timeout(deadline, "screening")
+            remaining = deadline - time.monotonic()
             crypto, stocks, candidates = _screen_with_timeout(
                 crypto_fn, stock_universe, screen_fn, config, _today_iso(),
-                telemetry=telemetry,
+                telemetry=telemetry, futures_mode=futures_mode,
+                timeout_seconds=remaining, mode=mode, authorization=authorization,
             )
             _cycle_timeout(deadline, "screening")
+        _raise_if_mode_disabled(mode, "venue setup", authorization)
         _cycle_timeout(deadline, "venue setup")
         with telemetry.span("venue_setup"):
-            bridge = _build_bridge(config)
+            bridge = _call_authorized_builder(_build_bridge, config, authorization)
 
-        # Drop candidates that cannot end in an order before spending LLM time
-        # on them (futures mode: stocks and symbols without a live contract).
+        _raise_if_mode_disabled(mode, "candidate preflight", authorization)
         _cycle_timeout(deadline, "candidate preflight")
         candidates, skipped, candidate_selection = _select_cycle_candidates(
-            candidates,
-            derivatives,
-            limit=AUTO_TOP_N,
-            telemetry=telemetry,
+            candidates, derivatives, limit=AUTO_TOP_N, telemetry=telemetry,
         )
-        if derivatives is not None:
-            # The broad pool's top can be all contractless pairs. Widen
-            # discovery until the cycle is full so lower-ranked contracts are
-            # reachable, and report whatever remains short instead of silently
-            # running fewer candidates. Spot/daily selection is untouched.
-            # A failed round is reported inside ``candidate_selection`` and
-            # keeps the vetted candidates, so no timeout is re-raised here: the
-            # refill reserves the candidates' budget itself.
+        if futures_mode:
             with telemetry.span("screening:refill"):
                 crypto, stocks, candidates, skipped, candidate_selection = (
                     _refill_futures_candidates(
-                        crypto_fn,
-                        stock_universe,
-                        screen_fn,
-                        config,
-                        _today_iso(),
-                        derivatives,
-                        limit=AUTO_TOP_N,
-                        selected=candidates,
-                        skipped=skipped,
-                        selection=candidate_selection,
-                        crypto=crypto,
-                        inspected=AUTO_FUTURES_SCREEN_POOL,
-                        deadline=deadline,
-                        telemetry=telemetry,
+                        crypto_fn, stock_universe, screen_fn, config, _today_iso(),
+                        derivatives, limit=AUTO_TOP_N, selected=candidates,
+                        skipped=skipped, selection=candidate_selection, crypto=crypto,
+                        inspected=AUTO_FUTURES_SCREEN_POOL, deadline=deadline,
+                        telemetry=telemetry, mode=mode, authorization=authorization,
                     )
                 )
-        summary["universe"] = {"crypto": len(crypto), "stock": len(stocks)}
+
+        universe = {"crypto": len(crypto), "stock": len(stocks)}
         if candidate_selection is not None and candidate_selection.get("discovery_inspected"):
-            # The cycle inspected the union of every round, not just the last
-            # snapshot (screening.py:138-167 refetches the venue per call), so
-            # reporting the last round's count would under-state the discovery.
-            summary["universe"]["crypto"] = int(candidate_selection["discovery_inspected"])
+            universe["crypto"] = int(candidate_selection["discovery_inspected"])
+        mode_summary["universe"] = universe
+        aggregate_universe = summary.setdefault("universe", {"crypto": 0, "stock": 0})
+        for asset, count in universe.items():
+            aggregate_universe[asset] += count
         if mismatched:
-            # Price-mismatch drops happen inside screening (every round), so
-            # they never reach preflight; report them with the other skips.
             skipped = list(mismatched.values()) + skipped
         if skipped:
-            summary["skipped"] = skipped
-            audit_log.record("autoloop_candidates_skipped", skipped=skipped)
+            mode_summary["skipped"] = skipped
+            summary.setdefault("skipped", []).extend(skipped)
+            audit_log.record("autoloop_candidates_skipped", mode=mode.value, skipped=skipped)
         if candidate_selection is not None:
+            mode_summary["candidate_selection"] = candidate_selection
             summary["candidate_selection"] = candidate_selection
 
-        summary["candidates"] = [str(entry["ticker"]) for entry in candidates]
+        ticker_list = [str(entry["ticker"]) for entry in candidates]
+        mode_summary["candidates"] = ticker_list
+        summary["candidates"].extend(ticker_list)
         for candidate in candidates:
+            if not _mode_is_enabled(mode, authorization):
+                mode_summary["status"] = "disabled"
+                break
             _cycle_timeout(deadline, f"candidate {candidate.get('ticker')}")
-            result = _run_candidate_with_timeout(
-                bridge, candidate, config, build_graph, derivatives, deadline, cancelled,
-                _execution_lock, telemetry,
-            )
+            try:
+                result = _run_candidate_with_timeout(
+                    bridge, candidate, config, build_graph, derivatives, deadline, cancelled,
+                    _execution_lock, telemetry, mode=mode, authorization=authorization,
+                )
+            except _AutoModeDisabled:
+                mode_summary["status"] = "disabled"
+                break
+            mode_results.append(result)
             results.append(result)
-            summary["results"].append(_result_summary(result))
-        summary["status"] = "completed"
+            result_summary = _result_summary(result)
+            mode_summary["results"].append(result_summary)
+            summary["results"].append(result_summary)
+        if mode_summary["status"] == "running":
+            mode_summary["status"] = "completed"
+    except _AutoModeDisabled as exc:
+        mode_summary["status"] = "disabled"
+        mode_summary["error"] = str(exc)
     except TimeoutError as exc:
         cancelled.set()
         telemetry.close()
-        summary["status"] = "timeout"
-        summary["error"] = f"{type(exc).__name__}: {exc}"
-        summary["telemetry"] = telemetry.snapshot()
-        audit_log.record("autoloop_cycle_timeout", error=summary["error"], telemetry=summary["telemetry"])
+        mode_summary["status"] = "timeout"
+        mode_summary["error"] = f"{type(exc).__name__}: {exc}"
+        summary["error"] = mode_summary["error"]
+        audit_log.record(
+            "autoloop_cycle_timeout", mode=mode.value,
+            error=mode_summary["error"], telemetry=telemetry.snapshot(),
+        )
     except Exception as exc:
-        # outside the candidate loop: the screen or the bridge itself failed.
-        # The scheduler thread must survive to try the next interval.
-        summary["status"] = "failed"
-        summary["error"] = f"{type(exc).__name__}: {exc}"
-        audit_log.record("autoloop_cycle_failed", error=summary["error"])
-    telemetry.close()
-    summary["telemetry"] = telemetry.snapshot()
-    summary["finished_at"] = utc_now_iso()
-    _set_last_cycle(summary)
-    if summary["status"] == "completed":
-        audit_log.record("autoloop_cycle_completed", candidates=summary["candidates"],
-                         results=summary["results"])
-    return results
+        mode_summary["status"] = "failed"
+        mode_summary["error"] = f"{type(exc).__name__}: {exc}"
+        summary["error"] = mode_summary["error"]
+        audit_log.record("autoloop_cycle_failed", mode=mode.value, error=mode_summary["error"])
+    finally:
+        telemetry.close()
+        mode_summary["telemetry"] = telemetry.snapshot()
+        mode_summary["finished_at"] = utc_now_iso()
+        publish_telemetry(mode_summary["telemetry"])
+    return ModeDispatch(mode, mode_results, dict(mode_summary))
+
+
+def _mode_key(mode: AutoMode) -> str:
+    return "auto_spot" if mode is AutoMode.SPOT else "auto_futures"
+
+
+def _mode_is_enabled(
+    mode: AutoMode, authorization: AuthorizationSnapshot | None = None,
+) -> bool:
+    if authorization is not None:
+        return authorization.allows(mode, live=True)
+    return mode in auto_modes.enabled_modes(get_config())
+
+
+class _AutoModeDisabled(Exception):
+    """Raised when an operator closes a mode before a new entry boundary."""
+
+
+def _raise_if_mode_disabled(
+    mode: AutoMode | None,
+    stage: str,
+    authorization: AuthorizationSnapshot | None = None,
+) -> None:
+    if mode is not None and not _mode_is_enabled(mode, authorization):
+        raise _AutoModeDisabled(f"{mode.value} automation disabled before {stage}")
 
 
 def _process_candidate(
@@ -963,6 +1144,8 @@ def _process_candidate(
     cancelled: threading.Event | None = None,
     execution_lock: threading.Lock | None = None,
     telemetry: CycleTelemetry | None = None,
+    mode: AutoMode | None = None,
+    authorization: AuthorizationSnapshot | None = None,
 ) -> DailyResult:
     """Analyze → plan → the engine's confirm policy for one candidate.
 
@@ -989,6 +1172,7 @@ def _process_candidate(
     # it: a row must only ever carry the decisions made FOR this candidate.
     guard_baseline = len(getattr(derivatives, "risk_guard_decisions", None) or [])
     try:
+        _raise_if_mode_disabled(mode, "candidate start", authorization)
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} start")
         futures_context = None
@@ -996,11 +1180,14 @@ def _process_candidate(
         futures_portfolio = None
         execution_context = ""
         if asset_type == "crypto" and derivatives is not None:
+            _raise_if_mode_disabled(mode, "futures market context", authorization)
             if deadline is not None:
                 _cycle_timeout(deadline, f"candidate {ticker} market context")
             try:
                 with telemetry.span("futures_market_context", ticker):
                     futures_context = _closed_futures_context(derivatives, ticker)
+            except AutoAuthorizationError as exc:
+                raise _AutoModeDisabled(str(exc)) from exc
             except PermissionError as exc:
                 result.reason = f"{type(exc).__name__}: {exc}"
                 _record_futures_cycle_rejection(
@@ -1094,20 +1281,29 @@ def _process_candidate(
                 futures_cycle_id, phase="context", payload=futures_cycle_payload,
                 timestamp=futures_cycle_timestamps["decision_context_finished_at"],
             )
+        _raise_if_mode_disabled(mode, "analysis", authorization)
         with telemetry.span("graph_build", ticker):
             graph = build_graph(config, _ANALYSTS_CRYPTO if asset_type == "crypto" else _ANALYSTS_STOCK)
+        _raise_if_mode_disabled(mode, "analysis", authorization)
         with telemetry.span("graph_analysis", ticker):
             propagate = getattr(graph, "propagate_with_telemetry", graph.propagate)
             kwargs: dict = {"asset_type": asset_type}
             parameters = inspect.signature(propagate).parameters
             if "telemetry" in parameters:
                 kwargs["telemetry"] = telemetry
+            if "check_cancelled" in parameters:
+                def check_cancelled() -> None:
+                    _raise_if_mode_disabled(mode, "analysis", authorization)
+                    _raise_if_execution_closed(deadline, cancelled, "analysis")
+
+                kwargs["check_cancelled"] = check_cancelled
             if execution_context and _accepts_execution_context(propagate):
                 kwargs["execution_context"] = execution_context
             state, signal = propagate(ticker, _today_iso(), **kwargs)
             if deadline is not None:
                 _cycle_timeout(deadline, f"candidate {ticker} analysis")
         result.signal = signal
+        _raise_if_mode_disabled(mode, "planning", authorization)
         pm_decision = state.get("final_trade_decision") if isinstance(state, dict) else None
         agent_note = (str(pm_decision).strip() or None) if pm_decision else None
         if derivatives is not None and asset_type == "crypto":
@@ -1150,6 +1346,7 @@ def _process_candidate(
                 "bridge only executes crypto, so no order plan"
             )
             return result
+        _raise_if_mode_disabled(mode, "planning", authorization)
         if derivatives is not None:
             proposal = (
                 state.get("futures_execution_proposal")
@@ -1198,14 +1395,20 @@ def _process_candidate(
                     cycle_payload=futures_cycle_payload,
                     phase_timestamps=futures_cycle_timestamps,
                     guard_baseline=guard_baseline,
+                    mode=mode,
+                    authorization=authorization,
                 )
             return result
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} planning")
         with telemetry.span("portfolio_sync", ticker):
             portfolio = bridge.sync_portfolio()
+        _raise_if_mode_disabled(mode, "planning", authorization)
+        _raise_if_execution_closed(deadline, cancelled, "planning")
         with telemetry.span("planning", ticker):
             plan = bridge.plan_order(ticker, signal, portfolio=portfolio)
+        _raise_if_mode_disabled(mode, "planning", authorization)
+        _raise_if_execution_closed(deadline, cancelled, "planning")
         if plan.side == "buy":
             with telemetry.span("protective_bracket", ticker):
                 plan = _attach_bracket(plan, ticker)
@@ -1217,9 +1420,27 @@ def _process_candidate(
                 portfolio,
                 result,
                 execute_guard=lambda execute: _execute_with_deadline(
-                    execute, deadline, cancelled, execution_lock
+                    execute, deadline, cancelled, execution_lock, mode, authorization
                 ),
             )
+    except (_AutoModeDisabled, AutoAuthorizationError) as exc:
+        if futures_cycle_id is not None and _cycle_writes_allowed(deadline, cancelled):
+            persist_futures_cycle_progress(
+                futures_cycle_id,
+                status="rejected",
+                phase="execution" if result.plan is not None else "analysis",
+                payload={
+                    **futures_cycle_payload,
+                    "execution_status": "not_executed",
+                    "execution_reason": str(exc),
+                    "executed": False,
+                    "phase_timestamps": futures_cycle_timestamps,
+                },
+                terminal=True,
+            )
+        if isinstance(exc, AutoAuthorizationError):
+            raise _AutoModeDisabled(str(exc)) from exc
+        raise
     except TimeoutError:
         raise
     except Exception as exc:  # one candidate's failure never stops the cycle
@@ -1697,11 +1918,13 @@ def _process_futures_candidate(
     execution_lock: threading.Lock | None = None,
     telemetry: CycleTelemetry | None = None,
     agent_note: str | None = None,
+    authorization: AuthorizationSnapshot | None = None,
     cycle_id: str | None = None,
     decision_data: dict | None = None,
     cycle_payload: dict | None = None,
     phase_timestamps: dict | None = None,
     guard_baseline: int | None = None,
+    mode: AutoMode | None = None,
 ) -> None:
     """Run futures candidates through a prevalidated closed candle pair.
 
@@ -1948,6 +2171,7 @@ def _process_futures_candidate(
         strategy="autoloop", strategy_version="1",
     )
     try:
+        _raise_if_mode_disabled(mode, "futures planning", authorization)
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} futures planning")
         phase_timestamps["planning_started_at"] = utc_now_iso()
@@ -1958,6 +2182,8 @@ def _process_futures_candidate(
         )
         with telemetry.span("portfolio_sync", ticker):
             book = portfolio if portfolio is not None else derivatives._bridge.sync_portfolio()
+        _raise_if_mode_disabled(mode, "futures planning", authorization)
+        _raise_if_execution_closed(deadline, cancelled, "futures planning")
         with telemetry.span("planning", ticker):
             plan = derivatives.plan_order(
                 ticker, signal, portfolio=book, price=mark,
@@ -1994,6 +2220,7 @@ def _process_futures_candidate(
             payload={**cycle_payload, "phase_timestamps": phase_timestamps},
             timestamp=phase_timestamps["planning_finished_at"],
         )
+        _raise_if_mode_disabled(mode, "futures execution", authorization)
         if deadline is not None:
             _cycle_timeout(deadline, f"candidate {ticker} execution")
         phase_timestamps["execution_started_at"] = utc_now_iso()
@@ -2010,7 +2237,7 @@ def _process_futures_candidate(
                 book,
                 result,
                 execute_guard=lambda execute: _execute_with_deadline(
-                    execute, deadline, cancelled, execution_lock
+                    execute, deadline, cancelled, execution_lock, mode, authorization
                 ),
             )
         # Terminal outcome vocabulary (audit truth): only a venue-confirmed
@@ -2055,6 +2282,8 @@ def _process_futures_candidate(
             payload=redact_futures_payload(cycle_payload),
             terminal=True,
         )
+    except (_AutoModeDisabled, AutoAuthorizationError):
+        raise
     except Exception as exc:
         # This terminal write must carry the complete audit trail: the row is
         # locked once it lands terminal (job_store._FUTURES_TERMINAL_STATUSES),
@@ -2122,21 +2351,40 @@ def _default_graph_builder(config: dict, analysts: tuple[str, ...]) -> Any:
     return TradingAgentsGraph(config=config, selected_analysts=analysts)
 
 
-def _build_bridge(config: dict) -> Any:
-    """The venue for the cycle's plan path; tests monkeypatch this seam like
-    approvals._build_bridge (engine seam bridge.py:126-129)."""
+def _call_authorized_builder(
+    builder: Callable, config: dict, authorization: AuthorizationSnapshot,
+) -> Any:
+    """Pass the cycle token to builders that accept it, including test doubles."""
+    try:
+        parameters = inspect.signature(builder).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    parameter = parameters.get("authorization")
+    if parameter is not None and parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+        return builder(config, authorization)
+    if parameter is not None or any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    ):
+        return builder(config, authorization=authorization)
+    return builder(config)
+
+
+def _build_bridge(
+    config: dict, *, authorization: AuthorizationSnapshot | None = None,
+) -> Any:
+    """Build the spot venue with the cycle's entry authorization."""
     from tradingagents.execution.bridge import ExchangeBridge
 
-    return ExchangeBridge(config=config)
+    return ExchangeBridge(config=config, authorization=authorization)
 
 
-def _build_derivatives_executor(config: dict) -> Any:
-    """The futures venue for the cycle's derivatives path (lazy import — the
-    executor composes the same bridge, so RiskGuard/audit/redaction keep
-    working unchanged). Tests monkeypatch this seam to inject a fake."""
+def _build_derivatives_executor(
+    config: dict, *, authorization: AuthorizationSnapshot | None = None,
+) -> Any:
+    """Build the futures executor with the cycle's entry authorization."""
     from tradingagents.execution.derivatives import DerivativesExecutor
 
-    return DerivativesExecutor(config=config)
+    return DerivativesExecutor(config=config, authorization=authorization)
 
 
 def _direction(signal: str) -> str:
@@ -2196,12 +2444,14 @@ _CYCLE_SUMMARY_BUCKETS = (
 
 def _payload() -> dict:
     state = _load_state()
+    mode_gates = gates()
     return {
         "generated_at": utc_now_iso(),
-        "enabled": bool(state.get("enabled", False)),
+        "enabled": bool(state["enabled"]) and mode_gates["any_auto_enabled"],
         "interval_minutes": _interval_from(state),
         "running_cycle": _cycle_lock.locked(),
-        "gates": gates(),
+        "modes": mode_gates,
+        "gates": mode_gates,
         "last_cycle": _last_cycle_snapshot(),
         "cycles": job_store.list_futures_cycles(limit=20),
     }
@@ -2247,6 +2497,7 @@ def get_autoloop_cycles(limit: int = 20, symbol: str | None = None):
         "enabled": bool(_load_state().get("enabled", False)),
         "interval_minutes": _interval_from(_load_state()),
         "running_cycle": _cycle_lock.locked(),
+        "modes": gates(),
         "last_cycle": _last_cycle_snapshot(),
     }
 
@@ -2272,15 +2523,16 @@ async def set_autoloop(request: Request):
             400, "validation_error",
             f'"interval_minutes" must be an integer between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES}',
         )
-    state = gates()
-    if enabled and not state["all_open"]:
-        raise ApiError(
-            409, "gate_closed",
-            "enabling the autoloop requires exec_auto_confirm=True in the "
-            "current process config; the engine's own policy stays fail-closed",
-            {"gates": state},
-        )
-    _save_state({"enabled": enabled, "interval_minutes": interval, "updated_at": utc_now_iso()})
+    with _state_lock:
+        state = gates()
+        if enabled and not state["any_auto_enabled"]:
+            raise ApiError(
+                409, "mode_closed",
+                "enabling the autoloop requires Auto Spot or Auto Futures to be enabled",
+                {"gates": state},
+            )
+        enabled = state["any_auto_enabled"]
+        _save_state({"enabled": enabled, "interval_minutes": interval, "updated_at": utc_now_iso()})
     audit_log.record("autoloop_updated", enabled=enabled, interval_minutes=interval)
     if enabled:
         ensure_started()
@@ -2290,10 +2542,10 @@ async def set_autoloop(request: Request):
 
 @router.post("/autoloop/run-now", status_code=202)
 async def run_autoloop_now(request: Request):
-    """Run one cycle now on a worker thread. ``skipped_busy`` is the
-    best-effort hint read before the spawn; the cycle itself re-checks and
-    writes the ``autoloop_cycle_skipped`` trail if a run/job is active."""
+    """Run one cycle now on a worker thread if at least one auto mode is on."""
     await json_body(request)  # CSRF §0: application/json required, body may be {}
+    if not gates()["any_auto_enabled"]:
+        raise ApiError(409, "mode_closed", "enable Auto Spot or Auto Futures before running a cycle")
     if _cycle_lock.locked():
         status = "already_running"
     else:

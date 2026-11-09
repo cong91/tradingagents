@@ -1,15 +1,13 @@
 // Shape của GET/POST /api/autoloop, POST /api/autoloop/run-now, POST /api/halt,
-// POST /api/halt/reset (server/autoloop.py) — server-configured gate contract.
-// Thứ tự ba hàng cổng an toàn sống ở đây vì ánh xạ 1-1 theo key máy chủ trả.
+// POST /api/halt/reset (server/autoloop.py) — server-configured automation modes.
 
-export type AutoloopGates = {
-  auto_confirm_config: boolean;
-  exec_live_config: boolean;
-  exec_derivatives_config: boolean;
-  all_open: boolean;
+export type AutoloopModes = {
+  auto_spot: boolean;
+  auto_futures: boolean;
+  any_auto_enabled: boolean;
 };
 
-export type AutoloopGateKey = Exclude<keyof AutoloopGates, "all_open">;
+export type AutoloopModeKey = Exclude<keyof AutoloopModes, "any_auto_enabled">;
 
 export type AutoloopLastCycleResult = {
   ticker: string;
@@ -50,6 +48,17 @@ export type AutoloopTelemetry = {
   dropped_events: number;
 };
 
+export type AutoloopModeCycle = {
+  mode?: string;
+  status?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  candidates?: string[];
+  results?: AutoloopLastCycleResult[];
+  error?: string | null;
+  telemetry?: AutoloopTelemetry | null;
+};
+
 export type AutoloopLastCycle = {
   started_at: string;
   finished_at: string | null;
@@ -60,6 +69,8 @@ export type AutoloopLastCycle = {
   results: AutoloopLastCycleResult[];
   universe?: { crypto: number; stock: number };
   telemetry?: AutoloopTelemetry;
+  modes?: Partial<Record<AutoloopModeKey, AutoloopModeCycle | null>> | null;
+  active_mode?: string | null;
 };
 
 export type AutoloopPayload = {
@@ -67,7 +78,7 @@ export type AutoloopPayload = {
   enabled: boolean;
   interval_minutes: number;
   running_cycle: boolean;
-  gates: AutoloopGates;
+  modes: AutoloopModes;
   last_cycle: AutoloopLastCycle | null;
 };
 
@@ -86,9 +97,8 @@ export const AUTOLOOP_MIN_INTERVAL = 15;
 export const AUTOLOOP_MAX_INTERVAL = 1440;
 export const AUTOLOOP_DEFAULT_INTERVAL = 1440;
 
-/** Thứ tự hiển thị của ba hàng cổng an toàn (server-configured gates). */
-export const AUTOLOOP_GATE_ROWS: readonly AutoloopGateKey[] = [
-  "auto_confirm_config",
-  "exec_live_config",
-  "exec_derivatives_config",
+/** Thứ tự hiển thị của các chế độ tự động do server trả về. */
+export const AUTOLOOP_MODE_ROWS: readonly AutoloopModeKey[] = [
+  "auto_spot",
+  "auto_futures",
 ];

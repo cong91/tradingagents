@@ -14,7 +14,7 @@ import os
 
 from fastapi import APIRouter, Request
 
-from server import control_store
+from server import auto_modes, control_store
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import (
@@ -134,6 +134,7 @@ def _settings_payload() -> dict:
     rows.sort(key=lambda row: row["key"])
 
     config = get_config()
+    modes = auto_modes.mode_config(config)
     exchange_id = str(config.get("exec_exchange_id", "binance"))
     credential_vars = ["OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"]
     credential_vars.extend(credential_env_names(exchange_id, config.get("exec_base_url")))
@@ -152,9 +153,9 @@ def _settings_payload() -> dict:
         "settings": rows,
         "credentials": credentials,
         "gates_readonly": {
-            "exec_live_config": get_config().get("exec_live") is True,
-            "exec_auto_confirm_config": get_config().get("exec_auto_confirm") is True,
-            "exec_derivatives_config": get_config().get("exec_derivatives") is True,
+            "auto_spot": modes["spot"],
+            "auto_futures": modes["futures"],
+            "any_auto_enabled": any(modes.values()),
         },
         "effective_exec_mode": effective_exec_mode(),
     }

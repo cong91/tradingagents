@@ -125,14 +125,14 @@ export const vi = {
     exec_log_path: "Nhật ký audit thực thi",
   } as Record<string, string>,
   gateLabels: {
-    exec_live_config: "Lệnh thật",
-    exec_auto_confirm_config: "Tự duyệt",
-    exec_derivatives_config: "Futures",
+    auto_spot_enabled: "Auto Spot",
+    auto_futures_enabled: "Auto Futures",
+    auto_spot: "Auto Spot",
+    auto_futures: "Auto Futures",
   } as Record<string, string>,
   gateHints: {
-    exec_live_config: "Trạng thái cổng Lệnh thật trong cấu hình máy chủ.",
-    exec_auto_confirm_config: "Trạng thái cổng Tự duyệt trong cấu hình máy chủ.",
-    exec_derivatives_config: "Trạng thái cổng Futures trong cấu hình máy chủ.",
+    auto_spot_enabled: "Trạng thái tự động giao dịch Spot.",
+    auto_futures_enabled: "Trạng thái tự động giao dịch Futures.",
   } as Record<string, string>,
   groups: {
     llm: {
@@ -148,7 +148,7 @@ export const vi = {
     exec: {
       title: "Thực thi & Sàn",
       description:
-        "Sàn, đồng tiền báo giá và venue URL. Binance mặc định dùng Demo; chuyển sang production phải đổi URL cùng cặp key/secret trong .env. Công tắc LIVE là cổng riêng, chỉ-đọc ở đây.",
+        "Sàn, đồng tiền báo giá và thông tin môi trường venue. Binance mặc định dùng Demo; môi trường Demo/production được xác định bởi URL và cặp key/secret trong .env.",
     },
   },
   screen: {
@@ -249,20 +249,14 @@ export const vi = {
     notConfigured: "Chưa cấu hình",
   },
   gates: {
-    title: "Trạng thái quyền chạy",
+    title: "Trạng thái chế độ tự động",
     description:
-      "Các quyền chạy lấy từ cấu hình vận hành hiện tại. Thay đổi gate được xác nhận và ghi vào nhật ký thao tác.",
-    explainLive:
-      "Quyền «Lệnh thật» đang mở. Lệnh được duyệt có thể gửi lên sàn nếu credential, xác nhận và RiskGuard đều hợp lệ.",
-    explainSafe:
-      "Quyền «Lệnh thật» đang đóng. Lệnh được duyệt chỉ chạy mô phỏng — không có lệnh nào được gửi lên sàn.",
-    explainChecking: "Chưa đọc được trạng thái quyền — bấm Làm mới.",
-    effectiveMode: "Chế độ thực thi hiệu lực",
-    live: "LIVE — LỆNH THẬT",
-    dry: "Mô phỏng (dry)",
-    open: "MỞ",
-    closed: "ĐÓNG",
+      "Trạng thái Auto Spot và Auto Futures theo cấu hình vận hành. Thay đổi tại phần cấu hình vận hành cần xác nhận và lý do, được ghi vào nhật ký thao tác.",
+    anyAuto: "Có chế độ tự động",
+    open: "BẬT",
+    closed: "TẮT",
   },
+
   paths: {
     title: "Đường dẫn hệ thống",
     description: "Chỉ đọc — đặt qua biến môi trường tương ứng, không ghi được qua API.",
@@ -273,33 +267,25 @@ export const vi = {
     loading: "Đang tải trạng thái vòng tự động…",
     loadFailed: "Không tải được trạng thái vòng tự động.",
     description:
-      "Vòng quét + giao dịch theo lịch chạy trên máy chủ: sàng universe, phân tích ứng viên rồi tự duyệt theo cổng an toàn của bot. Bật chỉ được khi cổng «Tự duyệt» mở.",
-    enabled: "Đang bật",
-    disabled: "Đang tắt",
-    gatesAria: "Cổng an toàn",
-    gateOpen: "Mở",
-    gateClosed: "Đóng",
-    gateRows: {
-      auto_confirm_config: { label: "Tự duyệt" },
-      exec_live_config: { label: "Lệnh thật" },
-      exec_derivatives_config: {
-        label: "Futures",
-        hint: "Chỉ quan sát, không điều kiện bật vòng tự động",
-      },
-    } as Record<string, { label: string; hint?: string }>,
-    futuresNote:
-      "Giao dịch Futures được điều khiển bởi cổng Futures và chính sách rủi ro của bot; không có công tắc riêng trên màn này. Khi cổng mở, bot có thể vào lệnh long/short có đòn bẩy cho coin: đòn bẩy tối đa 3× và tổng mức tiền đang chiến (exposure) bị bộ bảo vệ rủi ro của bot chặn lại.",
-    allOpen: "Đủ điều kiện tự động",
-    notAllOpen: "Chưa đủ điều kiện — vòng tự động không thể bật",
-    enableLabel: "Bật vòng tự động",
+      "Vòng quét + giao dịch theo lịch chạy trên máy chủ theo các chế độ Auto Spot và Auto Futures đã bật trong cấu hình vận hành.",
+    enabled: "Có chế độ tự động",
+    disabled: "Chưa bật chế độ tự động",
+    modesAria: "Trạng thái chế độ tự động",
+    modeEnabled: "Bật",
+    modeDisabled: "Tắt",
+    modeRows: {
+      auto_spot: "Auto Spot",
+      auto_futures: "Auto Futures",
+    } as Record<string, string>,
+    modeAvailable: "Có ít nhất một chế độ tự động đang bật",
+    noModesEnabled: "Bật Auto Spot hoặc Auto Futures trong cấu hình vận hành để chạy chu kỳ",
     intervalLabel: "Khoảng cách (phút)",
     apply: "Áp dụng",
     intervalError: (min: number, max: number) =>
       `Khoảng cách phải là số nguyên từ ${min} đến ${max} phút.`,
-    enabledFeedback: (minutes: number) =>
-      `Đã bật vòng tự động — chu kỳ chạy mỗi ${minutes} phút.`,
-    disabledFeedback: "Đã tắt vòng tự động.",
-    gateClosedWarning: "Cổng an toàn chưa mở — vòng tự động từ chối bật (thiết kế fail-closed).",
+    enabledFeedback: (minutes: number) => `Đã bật vòng tự động — chu kỳ chạy mỗi ${minutes} phút.`,
+    disabledFeedback: "Vòng tự động đang tắt.",
+    modeClosedWarning: "Bật Auto Spot hoặc Auto Futures trước khi chạy chu kỳ.",
     runStatus: {
       started: "Đã gửi yêu cầu — chu kỳ đang bắt đầu.",
       already_running: "Một chu kỳ đang chạy — bỏ qua yêu cầu mới.",
@@ -319,6 +305,18 @@ export const vi = {
     resetHalt: "Gỡ dừng hôm nay",
     haltAll: "DỪNG TẤT CẢ GIAO DỊCH HÔM NAY",
     lastCycle: "Chu kỳ gần nhất: ",
+    modeLastCycle: (status: string) => `Chu kỳ gần nhất: ${status}`,
+    modeCycleUnavailable: "Không có dữ liệu theo chế độ",
+    activeMode: "Đang xử lý",
+    modeCycleStatus: {
+      pending: "Đang chờ",
+      disabled: "Đã tắt",
+      running: "Đang chạy",
+      completed: "Hoàn tất",
+      timeout: "Hết thời gian",
+      failed: "Thất bại",
+      skipped_busy: "Bỏ qua — đang bận",
+    } as Record<string, string>,
     skipped: (reason: string | null) => `Bỏ qua — ${reason ?? "worker khác đang bận"}`,
     failed: (error: string | null) => `Thất bại — ${error ?? "lỗi không xác định"}`,
     ticker: (ticker: string) => `Mã: ${ticker}`,
@@ -338,12 +336,11 @@ export const vi = {
     loadFailed: "Không tải được override vận hành",
     description:
       "Các cổng vận hành và trần rủi ro được lưu trong PostgreSQL, tồn tại qua restart và hiển thị theo trạng thái hiệu lực. Không còn file JSON nào phải sửa tay.",
-    mode: (mode: string) => `Chế độ: ${mode}`,
     groups: {
       gates: {
-        title: "Cổng thực thi",
+        title: "Chế độ tự động",
         description:
-          "Các cổng được hiển thị theo trạng thái cấu hình máy chủ. Ghi thay đổi cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
+          "Trạng thái Auto Spot và Auto Futures phản ánh cấu hình máy chủ. Thay đổi cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
       },
       risk: {
         title: "Trần rủi ro vận hành",
@@ -354,12 +351,16 @@ export const vi = {
     overridden: "đã đặt",
     default: "mặc định",
     gate: "cổng",
+    draft: "Bản nháp",
+    draftSwitchAria: (label: string) => `Bản nháp ${label}`,
+    currentState: (value: string) => `Máy chủ hiện tại: ${value}`,
+    pendingSave: "Chưa lưu",
     rowMeta: (key: string, value: string, def: string, updated: string | null) =>
       `${key} · hiệu lực: ${value} · mặc định: ${def}${updated ? ` · cập nhật ${updated}` : ""}`,
     resetAria: (label: string) => `Xoá override ${label}`,
-    gateChanges: (keys: string) => `Thay đổi cổng thực thi: ${keys}`,
+    gateChanges: (keys: string) => `Thay đổi chế độ tự động: ${keys}`,
     gateWarning:
-      "Các cổng này có thể cho phép lệnh thật hoặc tự duyệt khi trạng thái hiệu lực mở. Cần xác nhận và lý do — cả hai được ghi vào nhật ký thao tác.",
+      "Các chế độ này cho phép bot tạo vị thế Spot hoặc Futures mới. Cần xác nhận và lý do; cả hai được ghi vào nhật ký thao tác.",
     confirm: "Tôi hiểu và xác nhận thay đổi cổng",
     reasonPlaceholder: "Lý do (bắt buộc, ví dụ: chạy demo theo yêu cầu vận hành)",
     saved: (n: number) => `Đã lưu ${n} thay đổi vào PostgreSQL. Áp dụng cho phiên phân tích mới.`,
@@ -379,14 +380,14 @@ export const en: typeof vi = {
     exec_log_path: "Execution audit log",
   },
   gateLabels: {
-    exec_live_config: "Real orders",
-    exec_auto_confirm_config: "Auto-approve",
-    exec_derivatives_config: "Futures",
+    auto_spot_enabled: "Auto Spot",
+    auto_futures_enabled: "Auto Futures",
+    auto_spot: "Auto Spot",
+    auto_futures: "Auto Futures",
   },
   gateHints: {
-    exec_live_config: "Real-orders gate status from server configuration.",
-    exec_auto_confirm_config: "Auto-approve gate status from server configuration.",
-    exec_derivatives_config: "Futures gate status from server configuration.",
+    auto_spot_enabled: "Auto Spot automation status from server configuration.",
+    auto_futures_enabled: "Auto Futures automation status from server configuration.",
   },
   groups: {
     llm: {
@@ -402,7 +403,7 @@ export const en: typeof vi = {
     exec: {
       title: "Execution & Exchange",
       description:
-        "Exchange, quote currency and venue URL. Binance defaults to Demo; switching to production requires changing the URL and the key/secret pair in .env. The LIVE switch is a separate gate, read-only here.",
+        "Exchange, quote currency and venue environment details. Binance defaults to Demo; the Demo/production environment is determined by the URL and matching key/secret pair in .env.",
     },
   },
   screen: {
@@ -503,20 +504,14 @@ export const en: typeof vi = {
     notConfigured: "Not configured",
   },
   gates: {
-    title: "Execution permission status",
+    title: "Automation mode status",
     description:
-      "Execution permissions come from the current operator configuration. Gate changes require confirmation and are recorded in the operator log.",
-    explainLive:
-      "The Real orders permission is open. An approved order may reach the exchange when credentials, confirmation and RiskGuard checks all pass.",
-    explainSafe:
-      "The Real orders permission is closed. Approved orders run in simulation only — nothing is sent to the exchange.",
-    explainChecking: "Execution permission status is not available yet — press Refresh.",
-    effectiveMode: "Effective execution mode",
-    live: "LIVE — REAL ORDERS",
-    dry: "Simulated (dry)",
-    open: "OPEN",
-    closed: "CLOSED",
+      "Auto Spot and Auto Futures status from operator configuration. Changes in operator configuration require confirmation and a reason and are recorded in the operator log.",
+    anyAuto: "Automation mode enabled",
+    open: "ON",
+    closed: "OFF",
   },
+
   paths: {
     title: "System paths",
     description: "Read-only — set via the matching environment variables, not writable through the API.",
@@ -527,31 +522,24 @@ export const en: typeof vi = {
     loading: "Loading autoloop status from GET /api/autoloop…",
     loadFailed: "Could not load autoloop status.",
     description:
-      "The scheduled scan + trade loop runs on the server: screens the universe, analyzes candidates, then auto-approves under the bot's safety gates. It can only be enabled when the Auto-approve gate is open.",
-    enabled: "Enabled",
-    disabled: "Disabled",
-    gatesAria: "Safety gates",
-    gateOpen: "Open",
-    gateClosed: "Closed",
-    gateRows: {
-      auto_confirm_config: { label: "Auto-approve" },
-      exec_live_config: { label: "Real orders" },
-      exec_derivatives_config: {
-        label: "Futures",
-        hint: "Informational only, not required to enable autoloop",
-      },
+      "The scheduled scan + trade loop runs according to the Auto Spot and Auto Futures modes enabled in operator configuration.",
+    enabled: "Automation mode enabled",
+    disabled: "No automation mode enabled",
+    modesAria: "Automation mode status",
+    modeEnabled: "Enabled",
+    modeDisabled: "Disabled",
+    modeRows: {
+      auto_spot: "Auto Spot",
+      auto_futures: "Auto Futures",
     },
-    futuresNote:
-      "To enable Futures, use the Futures gate and the bot's risk policy; there is no separate switch on this screen. While the gate is open the bot may open leveraged long/short positions on coins: max leverage 3× and total exposure is capped by the bot's risk guard.",
-    allOpen: "Ready for automation",
-    notAllOpen: "Requirements not met — autoloop cannot be enabled",
-    enableLabel: "Enable autoloop",
+    modeAvailable: "At least one automation mode is enabled",
+    noModesEnabled: "Enable Auto Spot or Auto Futures in operator configuration to run a cycle",
     intervalLabel: "Interval (minutes)",
     apply: "Apply",
     intervalError: (min, max) => `Interval must be an integer between ${min} and ${max} minutes.`,
     enabledFeedback: (minutes) => `Autoloop enabled — a cycle runs every ${minutes} minutes.`,
-    disabledFeedback: "Autoloop disabled.",
-    gateClosedWarning: "Safety gates are not open — autoloop refused to enable (fail-closed design).",
+    disabledFeedback: "Autoloop is disabled.",
+    modeClosedWarning: "Enable Auto Spot or Auto Futures before running a cycle.",
     runStatus: {
       started: "Request sent — the cycle is starting.",
       already_running: "A cycle is already running — new request ignored.",
@@ -571,6 +559,18 @@ export const en: typeof vi = {
     resetHalt: "Clear today's halt",
     haltAll: "HALT ALL TRADING TODAY",
     lastCycle: "Last cycle: ",
+    modeLastCycle: (status) => `Last cycle: ${status}`,
+    modeCycleUnavailable: "No per-mode data",
+    activeMode: "Currently processing",
+    modeCycleStatus: {
+      pending: "Pending",
+      disabled: "Disabled",
+      running: "Running",
+      completed: "Completed",
+      timeout: "Timed out",
+      failed: "Failed",
+      skipped_busy: "Skipped - busy",
+    },
     skipped: (reason) => `Skipped — ${reason ?? "another worker is busy"}`,
     failed: (error) => `Failed — ${error ?? "unknown error"}`,
     ticker: (ticker) => `Ticker: ${ticker}`,
@@ -590,12 +590,11 @@ export const en: typeof vi = {
     loadFailed: "Could not load operator overrides",
     description:
       "Operational gates and risk caps are stored in PostgreSQL, survive restarts, and are shown by effective status. There is no JSON file to edit by hand anymore.",
-    mode: (mode) => `Mode: ${mode}`,
     groups: {
       gates: {
-        title: "Execution gates",
+        title: "Automation modes",
         description:
-          "Gates are shown by server configuration status. Changes require a confirmation and a reason; every change is recorded in the operator log.",
+          "Auto Spot and Auto Futures reflect server configuration. Changes require a confirmation and a reason; every change is recorded in the operator log.",
       },
       risk: {
         title: "Operational risk caps",
@@ -606,12 +605,16 @@ export const en: typeof vi = {
     overridden: "overridden",
     default: "default",
     gate: "gate",
+    draft: "Draft",
+    draftSwitchAria: (label) => `${label} draft`,
+    currentState: (value) => `Current server state: ${value}`,
+    pendingSave: "Pending save",
     rowMeta: (key, value, def, updated) =>
       `${key} · effective: ${value} · default: ${def}${updated ? ` · updated ${updated}` : ""}`,
     resetAria: (label) => `Remove override ${label}`,
-    gateChanges: (keys) => `Execution gate changes: ${keys}`,
+    gateChanges: (keys) => `Automation mode changes: ${keys}`,
     gateWarning:
-      "These gate settings can permit real orders or auto-approval when effective status is open. A confirmation and a reason are required — both are recorded in the operator log.",
+      "These modes allow the bot to create new Spot or Futures positions. A confirmation and reason are required and recorded in the operator log.",
     confirm: "I understand and confirm the gate change",
     reasonPlaceholder: "Reason (required, e.g. demo run requested by operations)",
     saved: (n) => `Saved ${n} ${n === 1 ? "change" : "changes"} to PostgreSQL. Applies to new analysis runs.`,
