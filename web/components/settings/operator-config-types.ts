@@ -49,6 +49,35 @@ export type OperatorValue = string | boolean;
 
 export type OperatorDraft = Record<string, OperatorValue>;
 
+export type OperatorSection = "modes" | "risk";
+export type OperatorRiskGroup = "general" | "futures" | "protection" | "advanced";
+
+/** Each operator row belongs to exactly one editable section. */
+export function operatorSection(row: OperatorSettingRow): OperatorSection {
+  return row.gate ? "modes" : "risk";
+}
+
+/** Classify known tasks without hiding new keys returned by the server. */
+export function operatorRiskGroup(key: string): OperatorRiskGroup {
+  if (key === "risk_max_open_heat_pct") return "general";
+  if (
+    key === "risk_max_derivatives_leverage" ||
+    key === "risk_max_derivatives_exposure_pct"
+  ) return "futures";
+  if (key === "risk_max_derivatives_exposure_hard_pct" || key.startsWith("risk_derivatives_override_")) {
+    return "advanced";
+  }
+  if (key.startsWith("risk_derivatives_")) return "protection";
+  return "advanced";
+}
+
+/** Convert form text to the finite, non-negative number required by the API. */
+export function parseOperatorNumber(value: OperatorValue | undefined): number | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const number = Number(value.trim().replace(",", "."));
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
 /** Key là cổng thực thi → cần confirm + reason khi ghi. */
 export function isGateKey(row: OperatorSettingRow): boolean {
   return row.gate;

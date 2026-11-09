@@ -26,7 +26,7 @@ export const vi = {
   settings: {
     title: "Cấu hình",
     description:
-      "Cấu hình mô hình phân tích, giới hạn rủi ro và xem trạng thái các cổng an toàn. Thay đổi áp dụng cho phiên phân tích mới; khóa API và cổng «Lệnh thật» chỉ xem, không bật được từ đây.",
+      "Quản lý tự động giao dịch, mô hình AI, rủi ro và kết nối theo từng nhóm.",
   },
 } satisfies Record<string, PageCopy>;
 
@@ -54,7 +54,7 @@ export const en: typeof vi = {
   settings: {
     title: "Settings",
     description:
-      "Configure the analysis models, risk limits and view the safety gates. Changes apply to new analysis runs; API keys and the \"Real orders\" gate are read-only here.",
+      "Manage automation, AI models, risk and connections by task.",
   },
 };
 

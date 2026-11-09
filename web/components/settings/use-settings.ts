@@ -31,9 +31,10 @@ export function isNullableType(type: string): boolean {
 
 export type SaveState =
   | { kind: "idle" }
-  | { kind: "saving" }
-  | { kind: "saved"; appliedAt: string }
-  | { kind: "failed"; message: string };
+  | { kind: "saving"; scope: string }
+  | { kind: "saved"; appliedAt: string; scope: string }
+  | { kind: "failed"; message: string; scope: string }
+  | { kind: "uncertain"; scope: string };
 
 type Phase = "loading" | "error" | "ready";
 
@@ -72,6 +73,86 @@ function valuesFromPayload(data: SettingsPayload): Record<string, SettingValue> 
           : String(row.value);
   }
   return out;
+}
+
+function changedValueMap(
+  values: Record<string, number | string | boolean | null>,
+  rows: SettingsPayload["settings"],
+): Record<string, SettingValue> {
+  const byKey = new Map(rows.map((row) => [row.key, row]));
+  const converted: Record<string, SettingValue> = {};
+  for (const [key, value] of Object.entries(values)) {
+    const row = byKey.get(key);
+    converted[key] = row && fieldTypeOf(row.type) === "bool"
+      ? value === true
+      : value === null ? "" : String(value);
+  }
+  return converted;
+}
+
+function hasDirtyValues(
+  formValues: Record<string, SettingValue>,
+  savedValues: Record<string, SettingValue>,
+): boolean {
+  const keys = new Set([...Object.keys(formValues), ...Object.keys(savedValues)]);
+  return [...keys].some((key) => formValues[key] !== savedValues[key]);
+}
+
+type MergeSnapshot = {
+  formValues: Record<string, SettingValue>;
+  conflictKeys: string[];
+};
+
+function mergeFreshValues({
+  baseline,
+  currentDraft,
+  fresh,
+  sentKeys,
+  sentDraft,
+  expectedSent,
+}: {
+  baseline: Record<string, SettingValue>;
+  currentDraft: Record<string, SettingValue>;
+  fresh: Record<string, SettingValue>;
+  sentKeys: readonly string[];
+  sentDraft: Record<string, SettingValue>;
+  expectedSent: Record<string, SettingValue>;
+}): MergeSnapshot {
+  const next = { ...currentDraft };
+  const conflicts = new Set<string>();
+  const sent = new Set(sentKeys);
+  const keys = new Set([
+    ...Object.keys(baseline),
+    ...Object.keys(currentDraft),
+    ...Object.keys(fresh),
+  ]);
+
+  for (const key of keys) {
+    const baselineValue = baseline[key];
+    const currentValue = currentDraft[key];
+    const freshValue = fresh[key];
+
+    if (sent.has(key)) {
+      if (freshValue !== expectedSent[key]) {
+        conflicts.add(key);
+        continue;
+      }
+      if (currentValue === baselineValue || currentValue === sentDraft[key]) {
+        if (key in fresh) next[key] = freshValue;
+        else delete next[key];
+      }
+      continue;
+    }
+
+    if (currentValue === baselineValue) {
+      if (key in fresh) next[key] = freshValue;
+      else delete next[key];
+      continue;
+    }
+    if (freshValue !== baselineValue && freshValue !== currentValue) conflicts.add(key);
+  }
+
+  return { formValues: next, conflictKeys: [...conflicts] };
 }
 
 type ChangeSet = {
@@ -136,41 +217,68 @@ export function useSettings() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saveState, setSaveState] = useState<SaveState>({ kind: "idle" });
   const [serverAhead, setServerAhead] = useState(false);
+  const [conflictKeys, setConflictKeys] = useState<string[]>([]);
+  const [serverValues, setServerValues] = useState<Record<string, SettingValue>>({});
+  const [reviewing, setReviewing] = useState(false);
   // Stale là state (không tính Date.now() lúc render — hàm impure): interval
   // dưới cập nhật theo fetchedAtRef mỗi STALE_TICK_MS.
   const [isStale, setIsStale] = useState(false);
 
   const hasDataRef = useRef(false);
   const dirtyRef = useRef(false);
-  const editCounterRef = useRef(0);
+  const savingRef = useRef(false);
+  const reviewingRef = useRef(false);
+  const serverAheadRef = useRef(false);
+  const retryBlockedRef = useRef(false);
+  const payloadRef = useRef<SettingsPayload | null>(null);
+  const formValuesRef = useRef<Record<string, SettingValue>>({});
+  const savedValuesRef = useRef<Record<string, SettingValue>>({});
+  const fetchSequenceRef = useRef(0);
   const fetchedAtRef = useRef(0);
 
   const applyFetch = useCallback((data: SettingsPayload) => {
+    payloadRef.current = data;
     setPayload(data);
     fetchedAtRef.current = Date.now();
     setIsStale(false);
     // Không tự ghi đè form khi user đang tương tác (hợp đồng §0.2 stale rule):
     // có thay đổi chưa lưu → chỉ báo máy chủ có dữ liệu mới, giữ nguyên form.
-    if (!hasDataRef.current || !dirtyRef.current) {
-      const values = valuesFromPayload(data);
+    const values = valuesFromPayload(data);
+    setServerValues(values);
+    if (!hasDataRef.current || (!dirtyRef.current && !serverAheadRef.current && !retryBlockedRef.current)) {
+      formValuesRef.current = values;
+      savedValuesRef.current = values;
       setFormValues(values);
       setSavedValues(values);
       setFieldErrors({});
+      serverAheadRef.current = false;
       setServerAhead(false);
       dirtyRef.current = false;
       hasDataRef.current = true;
     } else {
-      setServerAhead(true);
+      const baseline = savedValuesRef.current;
+      const changedKeys = [...new Set([...Object.keys(values), ...Object.keys(baseline)])]
+        .filter((key) => values[key] !== baseline[key]);
+      const ahead = serverAheadRef.current || changedKeys.length > 0;
+      if (changedKeys.length > 0) {
+        setConflictKeys((previous) => [...new Set([...previous, ...changedKeys])]);
+      }
+      serverAheadRef.current = ahead;
+      setServerAhead(ahead);
     }
     setPhase("ready");
   }, []);
 
   const load = useCallback(async () => {
+    if (savingRef.current || reviewingRef.current) return;
+    const sequence = ++fetchSequenceRef.current;
     try {
       const res = await fetch("/api/settings", { cache: "no-store" });
       if (!res.ok) throw await readError(res);
-      applyFetch((await res.json()) as SettingsPayload);
+      const data = (await res.json()) as SettingsPayload;
+      if (sequence === fetchSequenceRef.current) applyFetch(data);
     } catch (err) {
+      if (sequence !== fetchSequenceRef.current) return;
       setErrorMessage(
         err instanceof SettingsHttpError ? err.message : networkHint()
       );
@@ -209,43 +317,58 @@ export function useSettings() {
   );
 
   const setValue = useCallback((key: string, value: SettingValue) => {
-    dirtyRef.current = true;
-    editCounterRef.current += 1;
-    setFormValues((prev) => ({ ...prev, [key]: value }));
+    const next = { ...formValuesRef.current, [key]: value };
+    formValuesRef.current = next;
+    dirtyRef.current = Object.keys(next).some((name) => next[name] !== savedValuesRef.current[name]);
+    setFormValues(next);
     setFieldErrors((prev) => {
       if (!(key in prev)) return prev;
-      const next = { ...prev };
-      delete next[key];
-      return next;
+      const updated = { ...prev };
+      delete updated[key];
+      return updated;
     });
-    setSaveState((state) => (state.kind === "saved" ? { kind: "idle" } : state));
+    setSaveState((state) => (state.kind === "saving" || state.kind === "uncertain" ? state : { kind: "idle" }));
   }, []);
 
-  const resetChanges = useCallback(() => {
-    setFormValues(savedValues);
-    setFieldErrors({});
-    dirtyRef.current = false;
-    setSaveState((state) => (state.kind === "failed" ? { kind: "idle" } : state));
-  }, [savedValues]);
+  const resetChanges = useCallback((keys?: readonly string[]) => {
+    const selected = keys ?? Object.keys(savedValuesRef.current);
+    const next = { ...formValuesRef.current };
+    for (const key of selected) {
+      if (key in savedValuesRef.current) next[key] = savedValuesRef.current[key];
+    }
+    formValuesRef.current = next;
+    dirtyRef.current = Object.keys(next).some((key) => next[key] !== savedValuesRef.current[key]);
+    setFormValues(next);
+    setFieldErrors((prev) => Object.fromEntries(
+      Object.entries(prev).filter(([key]) => !selected.includes(key))
+    ));
+    setSaveState((state) => (state.kind === "saving" || state.kind === "uncertain" ? state : { kind: "idle" }));
+  }, []);
 
-  const save = useCallback(async () => {
-    if (!payload || saveState.kind === "saving") return;
-    const { values, errors } = buildChangeSet(formValues, savedValues, payload.settings);
+  const save = useCallback(async (keys?: readonly string[], scope = "settings") => {
+    const currentPayload = payloadRef.current;
+    if (!currentPayload || savingRef.current || reviewingRef.current || serverAheadRef.current || retryBlockedRef.current) return;
+    const baselineBefore = { ...savedValuesRef.current };
+    const draftBefore = { ...formValuesRef.current };
+    const allowed = keys ? new Set(keys) : null;
+    const selectedValues = allowed
+      ? Object.fromEntries(Object.entries(draftBefore).filter(([key]) => allowed.has(key)))
+      : draftBefore;
+    const { values, errors } = buildChangeSet(selectedValues, baselineBefore, currentPayload.settings);
     if (Object.keys(errors).length > 0) {
-      setFieldErrors(errors);
-      setSaveState({
-        kind: "failed",
-        message: saveCopy().invalidFields,
-      });
+      setFieldErrors((prev) => ({ ...prev, ...errors }));
+      setSaveState({ kind: "failed", message: saveCopy().invalidFields, scope });
       return;
     }
     const sentKeys = Object.keys(values);
     if (sentKeys.length === 0) return;
 
-    const editsBefore = editCounterRef.current;
-    setSaveState({ kind: "saving" });
+    const sentDraft = { ...selectedValues };
+    const expectedSent = changedValueMap(values, currentPayload.settings);
+    savingRef.current = true;
+    ++fetchSequenceRef.current;
+    setSaveState({ kind: "saving", scope });
     try {
-      // CSRF hợp đồng §0: PUT bắt buộc Content-Type application/json.
       const res = await fetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -254,55 +377,197 @@ export function useSettings() {
       if (!res.ok) {
         const err = await readError(res);
         if (err.code === "coercion_error") {
-          // Hợp đồng §1: 422 kèm details.env_var — map về key để tô đúng ô.
           const details = (err.details ?? {}) as { env_var?: string; message?: string };
-          const row = payload.settings.find((candidate) => candidate.env_var === details.env_var);
+          const row = currentPayload.settings.find((candidate) => candidate.env_var === details.env_var);
           if (row) {
             setFieldErrors((prev) => ({
               ...prev,
               [row.key]: saveCopy().serverRejected(details.message ?? err.message),
             }));
-            setSaveState({
-              kind: "failed",
-              message: saveCopy().serverRejectedSummary,
-            });
+            setSaveState({ kind: "failed", message: saveCopy().serverRejectedSummary, scope });
             return;
           }
         }
-        const memoryNote =
-          err.code === "internal_error"
-            ? saveCopy().memoryNote
-            : "";
-        setSaveState({ kind: "failed", message: saveCopy().failed(`${err.message}${memoryNote}`) });
+        const memoryNote = err.code === "internal_error" ? saveCopy().memoryNote : "";
+        setSaveState({ kind: "failed", message: saveCopy().failed(`${err.message}${memoryNote}`), scope });
         return;
       }
       const data = (await res.json()) as SettingsPayload;
+      ++fetchSequenceRef.current;
+      const fresh = valuesFromPayload(data);
+      const merged = mergeFreshValues({
+        baseline: baselineBefore,
+        currentDraft: formValuesRef.current,
+        fresh,
+        sentKeys,
+        sentDraft,
+        expectedSent,
+      });
+      payloadRef.current = data;
       setPayload(data);
       fetchedAtRef.current = Date.now();
       setIsStale(false);
-      const fresh = valuesFromPayload(data);
+      savedValuesRef.current = fresh;
       setSavedValues(fresh);
-      setFormValues((prev) => {
-        const next = { ...prev };
-        for (const key of sentKeys) {
-          if (key in fresh) next[key] = fresh[key];
-        }
-        return next;
-      });
-      setFieldErrors({});
-      setServerAhead(false);
-      // Edit trong lúc await → vẫn còn thay đổi chưa lưu, không ghi đè bởi poll.
-      dirtyRef.current = editCounterRef.current !== editsBefore;
-      setSaveState({ kind: "saved", appliedAt: data.applied_at ?? data.generated_at });
+      formValuesRef.current = merged.formValues;
+      setFormValues(merged.formValues);
+      setFieldErrors((prev) => Object.fromEntries(
+        Object.entries(prev).filter(([key]) => !sentKeys.includes(key))
+      ));
+      const ahead = merged.conflictKeys.length > 0;
+      setServerValues(fresh);
+      setConflictKeys(merged.conflictKeys);
+      serverAheadRef.current = ahead;
+      setServerAhead(ahead);
+      dirtyRef.current = hasDirtyValues(merged.formValues, fresh);
+      retryBlockedRef.current = false;
+      setSaveState({ kind: "saved", appliedAt: data.applied_at ?? data.generated_at, scope });
     } catch {
-      dirtyRef.current = true;
-      setSaveState({
-        kind: "failed",
-        message: saveCopy().networkFailed(networkHint()),
-
-      });
+      try {
+        const readback = await fetch("/api/settings", { cache: "no-store" });
+        if (!readback.ok) throw await readError(readback);
+        const data = (await readback.json()) as SettingsPayload;
+        ++fetchSequenceRef.current;
+        const fresh = valuesFromPayload(data);
+        const merged = mergeFreshValues({
+          baseline: baselineBefore,
+          currentDraft: formValuesRef.current,
+          fresh,
+          sentKeys,
+          sentDraft,
+          expectedSent,
+        });
+        payloadRef.current = data;
+        setPayload(data);
+        savedValuesRef.current = fresh;
+        setSavedValues(fresh);
+        formValuesRef.current = merged.formValues;
+        setFormValues(merged.formValues);
+        setFieldErrors((prev) => Object.fromEntries(
+          Object.entries(prev).filter(([key]) => !sentKeys.includes(key))
+        ));
+        fetchedAtRef.current = Date.now();
+        setIsStale(false);
+        const ahead = merged.conflictKeys.length > 0;
+        setServerValues(fresh);
+        setConflictKeys(merged.conflictKeys);
+        serverAheadRef.current = ahead;
+        setServerAhead(ahead);
+        dirtyRef.current = hasDirtyValues(merged.formValues, fresh);
+        const verified = sentKeys.every((key) => fresh[key] === expectedSent[key]);
+        retryBlockedRef.current = !verified;
+        setSaveState(verified
+          ? { kind: "saved", appliedAt: data.applied_at ?? data.generated_at, scope }
+          : { kind: "uncertain", scope });
+      } catch {
+        retryBlockedRef.current = true;
+        setSaveState({ kind: "uncertain", scope });
+      }
+    } finally {
+      savingRef.current = false;
     }
-  }, [formValues, payload, saveState.kind, savedValues]);
+  }, []);
+
+  const reviewLatest = useCallback(async () => {
+    if (savingRef.current || reviewingRef.current) return;
+    reviewingRef.current = true;
+    setReviewing(true);
+    const sequence = ++fetchSequenceRef.current;
+    const baselineBefore = { ...savedValuesRef.current };
+    try {
+      const res = await fetch("/api/settings", { cache: "no-store" });
+      if (!res.ok) throw await readError(res);
+      const data = (await res.json()) as SettingsPayload;
+      if (sequence !== fetchSequenceRef.current) return;
+      const fresh = valuesFromPayload(data);
+      const merged = mergeFreshValues({
+        baseline: baselineBefore,
+        currentDraft: formValuesRef.current,
+        fresh,
+        sentKeys: [],
+        sentDraft: {},
+        expectedSent: {},
+      });
+      payloadRef.current = data;
+      setPayload(data);
+      savedValuesRef.current = fresh;
+      setSavedValues(fresh);
+      formValuesRef.current = merged.formValues;
+      setFormValues(merged.formValues);
+      setFieldErrors({});
+      fetchedAtRef.current = Date.now();
+      setIsStale(false);
+      setServerValues(fresh);
+      setConflictKeys([]);
+      serverAheadRef.current = false;
+      setServerAhead(false);
+      retryBlockedRef.current = false;
+      dirtyRef.current = hasDirtyValues(merged.formValues, fresh);
+      setSaveState({ kind: "idle" });
+    } catch {
+      if (sequence !== fetchSequenceRef.current) return;
+      retryBlockedRef.current = true;
+      setSaveState((state) => ({
+        kind: "uncertain",
+        scope: state.kind === "idle" ? "settings" : state.scope,
+      }));
+    } finally {
+      reviewingRef.current = false;
+      setReviewing(false);
+    }
+  }, []);
+
+  const discardAndReload = useCallback(async (): Promise<boolean> => {
+    if (savingRef.current || reviewingRef.current) return false;
+    reviewingRef.current = true;
+    setReviewing(true);
+    const sequence = ++fetchSequenceRef.current;
+    try {
+      const res = await fetch("/api/settings", { cache: "no-store" });
+      if (!res.ok) throw await readError(res);
+      const data = (await res.json()) as SettingsPayload;
+      if (sequence !== fetchSequenceRef.current) return false;
+      const values = valuesFromPayload(data);
+      payloadRef.current = data;
+      formValuesRef.current = values;
+      savedValuesRef.current = values;
+      setPayload(data);
+      setFormValues(values);
+      setSavedValues(values);
+      setServerValues(values);
+      setConflictKeys([]);
+      setFieldErrors({});
+      fetchedAtRef.current = Date.now();
+      setIsStale(false);
+      serverAheadRef.current = false;
+      setServerAhead(false);
+      retryBlockedRef.current = false;
+      dirtyRef.current = false;
+      hasDataRef.current = true;
+      setPhase("ready");
+      setSaveState({ kind: "idle" });
+      return true;
+    } catch {
+      if (sequence !== fetchSequenceRef.current) return false;
+      retryBlockedRef.current = true;
+      setSaveState((state) => ({
+        kind: "uncertain",
+        scope: state.kind === "idle" ? "settings" : state.scope,
+      }));
+      return false;
+    } finally {
+      reviewingRef.current = false;
+      setReviewing(false);
+    }
+  }, []);
+
+  const conflictValues = useMemo<Record<string, { server: SettingValue | undefined; draft: SettingValue | undefined }>>(
+    () => Object.fromEntries(conflictKeys.map((key) => [
+      key,
+      { server: serverValues[key], draft: formValues[key] },
+    ])),
+    [conflictKeys, serverValues, formValues]
+  );
 
   return {
     phase,
@@ -311,12 +576,17 @@ export function useSettings() {
     formValues,
     fieldErrors,
     dirtyCount: dirtyKeys.length,
+    dirtyKeys,
     saveState,
     serverAhead,
+    conflictValues,
+    reviewing,
     isStale,
     setValue,
     resetChanges,
     save,
+    reviewLatest,
+    discardAndReload,
     reload: load,
   };
 }

@@ -16,11 +16,13 @@ export function SettingField({
   value,
   error,
   onChange,
+  showTechnicalDetails = false,
 }: {
   row: SettingRow;
   value: SettingValue;
   error?: string;
   onChange: (value: SettingValue) => void;
+  showTechnicalDetails?: boolean;
 }) {
   const t = useT();
   const meta = t.settings.settingMeta[row.key];
@@ -42,9 +44,11 @@ export function SettingField({
         {meta?.hint ? (
           <p className="mt-0.5 text-xs text-muted-foreground">{meta.hint}</p>
         ) : null}
-        <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-          {row.env_var} · {t.settings.field.defaultLabel(formatDefault(t, row))}
-        </p>
+        {showTechnicalDetails ? (
+          <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
+            {row.env_var} · {t.settings.field.defaultLabel(formatDefault(t, row))}
+          </p>
+        ) : null}
       </div>
       <div className="flex items-center gap-2">
         {!row.editable ? (

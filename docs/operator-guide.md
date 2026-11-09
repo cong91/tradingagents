@@ -1,6 +1,6 @@
 ---
 title: Sổ tay vận hành Control Panel — TradingAgents
-updated: 2026-10-01 (rev 2 — sửa theo góp ý đọc thử; changelog cuối tài liệu)
+updated: 2026-11-09 (rev 3 — cập nhật hướng dẫn màn Cấu hình; changelog cuối tài liệu)
 audience: người điều hành (operator) chưa từng dùng hệ thống
 nguồn: docs/ui-api-contract.md (rev 3.1), docs/ui-implementation.md, web/README.md, server/, web/components/
 ---
@@ -46,9 +46,10 @@ thực thi tự động riêng, như mô tả bên dưới.
   phân tích và lập kế hoạch Spot, nhưng không tự đặt lệnh; kế hoạch có thể giao dịch
   được đưa vào hàng đợi để người điều hành duyệt hoặc từ chối.
 - **Auto Spot** (`auto_spot_enabled`) và **Auto Futures** (`auto_futures_enabled`) là
-  hai công tắc độc lập trong **Cấu hình → Override vận hành**, mặc định tắt trên cài
-  mới. Thay đổi qua PUT cần xác nhận + lý do và được ghi audit; reset một công tắc
-  đưa nó về mặc định tắt. Tắt một thị trường chặn công việc phân tích, lập kế hoạch
+  hai công tắc độc lập trong **Cấu hình → Tự động → Chế độ tự động**, mặc định tắt trên cài
+  mới. Thay đổi qua PUT cần xác nhận + lý do và được ghi audit; reset qua API đưa một
+  công tắc về mặc định tắt. Trên màn, đổi công tắc rồi lưu kèm xác nhận + lý do.
+  Tắt một thị trường chặn công việc phân tích, lập kế hoạch
   và vào lệnh mới của chế độ tự động đó; không tắt thị trường còn lại. Với autoloop
   và job quét, một call đang chạy không bị huỷ tức thời: backend kiểm tra lại trước
   các bước tiếp theo. Pipeline phân tích riêng `POST /api/runs` không bị hai công tắc
@@ -149,8 +150,8 @@ engine — `server/watchlist.py:47-51`).
 
 ### 2.2 API key — cài ở đâu?
 
-LLM API key được cấu hình ngay trên màn **Cấu hình → LLM provider & models**:
-chọn **Tầng nhanh** hoặc **Tầng sâu**, chọn provider, rồi nhập key vào ô write-only.
+LLM API key được cấu hình trên màn **Cấu hình → Mô hình AI → Nhà cung cấp & mô hình LLM**:
+chọn **Nhanh** hoặc **Sâu**, chọn provider, rồi nhập key vào ô write-only và bấm **Lưu khóa**.
 Key được mã hóa bằng vault trước khi lưu PostgreSQL; API chỉ trả trạng thái và 4 ký tự
 cuối. Có thể lưu key khác nhau cho cùng provider ở hai tầng.
 
@@ -169,7 +170,7 @@ Credential sàn vẫn là deployment secret trong `.env`:
 Chuyển Demo sang production chỉ đổi `TRADINGAGENTS_EXEC_BASE_URL` cùng cặp API key/secret
 phù hợp rồi restart backend. Việc này không tự bật **Auto Spot** hay **Auto Futures**;
 nhưng nếu một mode đã bật, lệnh managed sau restart có thể được gửi tới venue mới.
-Hai mode được đổi trong **Override vận hành** với xác nhận + lý do.
+Hai mode được đổi trong **Cấu hình → Tự động → Chế độ tự động** với xác nhận + lý do.
 
 Key nào cần khi nào? Pipeline Live cần credential LLM của tier đang dùng; thực thi cần
 thêm đúng cặp credential sàn.
@@ -184,7 +185,7 @@ Sidebar có chỉ báo trạng thái tự động dẫn tới màn Cấu hình (
 
 Sidebar đọc `gates_readonly` từ `GET /api/settings`: hiện **Tự động đang bật** nếu Auto
 Spot hoặc Auto Futures bật, **Tự động đang tắt** nếu cả hai tắt; khi tải/lỗi, UI hiển
-thị trạng thái riêng và cho phép thử lại. Chip liên kết tới cấu hình mode.
+thị trạng thái riêng và cho phép thử lại. Chip dẫn tới nhóm **Tự động**, phần cấu hình mode.
 
 Chip không xác định venue/account profile. Trường API `effective_exec_mode` hiện được
 tính bằng bridge **không có managed authorization**, nên phản ánh `exec_live` của đường
@@ -334,6 +335,9 @@ có thể thực thi tự động theo chế độ thị trường, không đi q
   reset" (`gate-banner.tsx:67-84`).
 - Vàng khi không đọc được health.
 
+Lưu ý: banner nói thao tác mở lại ở phía server và màn Duyệt lệnh không có nút reset;
+điều khiển gỡ dừng nằm ở **Cấu hình → Tự động** (§4.4).
+
 **Đọc một thẻ lệnh đang chờ** (`approval-card.tsx`):
 - Tiêu đề: **ticker + chip MUA (xanh)/BÁN (đỏ)** + *Tín hiệu* + badge "Kế hoạch mô
   phỏng (mock)" nếu là plan demo. (Hợp đồng còn định nghĩa badge "Quá hạn duyệt"
@@ -386,7 +390,7 @@ sẽ nằm mãi trong hàng đợi, đợi job quét sau sinh kế hoạch mới
 |---|---|---|
 | `412 mode_closed` | **Auto Spot tắt hoặc authorization của yêu cầu đã cũ.** Item vẫn "Chờ duyệt". | Kiểm tra Auto Spot và venue; chỉ bật lại với xác nhận + lý do khi đã sẵn sàng, hoặc từ chối item. |
 | `409 unsupported_market` | Chỉ hỗ trợ approve Spot; item thị trường khác vẫn chờ. | Không thử gửi lại qua approve; từ chối item nếu phù hợp. |
-| `403 risk_halted` | RiskGuard đã dừng giao dịch hôm nay (kèm lý do). | Xem §4.4 — halt tự hết khi sang ngày UTC mới; mở lại sớm là hành động phía server (lệnh ở §4.4). |
+| `403 risk_halted` | RiskGuard đã dừng giao dịch hôm nay (kèm lý do). | Xem §4.4 — halt tự hết khi sang ngày UTC mới; cân nhắc rủi ro trước khi chủ động gỡ sớm. |
 | `409 conflict` | Item đã được xử lý nơi khác (tab khác đã duyệt/từ chối) hoặc không dựng được kế hoạch. | Danh sách tự làm mới. |
 | `409 mock_not_executable` | Kế hoạch sinh từ job mock — dữ liệu tổng hợp không thể thành lệnh thật. | Từ chối kế hoạch này. |
 | `410 expired` | Quá hạn duyệt 24 giờ. | Item này không duyệt được **và cũng không từ chối được** — đợi job quét sau sinh kế hoạch mới. |
@@ -402,16 +406,48 @@ trả 410 (`server/approvals.py:103-105`), nên nó không bao giờ lọt xuố
 
 ### 3.5 Cấu hình (`/settings`)
 
-Đọc/ghi cài đặt engine qua `GET/PUT /api/settings`. Giá trị được áp in-memory và lưu
-PostgreSQL cho lần khởi động sau; `.env` không bị ghi lúc runtime. Hai công tắc tự
-động được quản lý riêng qua `/api/operator-config`.
+Chọn một trong năm nhóm trên màn; phần đang chọn hiển thị các điều khiển tương ứng:
 
-**Ba nhóm cài đặt có thể sửa** (`web/components/settings/types.ts:91-137`):
+- **Tự động** — Auto Spot/Futures, STOP khẩn cấp, lịch và trạng thái autoloop.
+  **Chạy ngay** có thể gửi lệnh tới venue đã cấu hình, không phải chạy thử mô phỏng.
+  STOP chặn lệnh mới trong ngày UTC hiện tại; không đóng vị thế hoặc huỷ lệnh hiện hữu.
+- **Mô hình AI** — provider và model cho tầng nhanh/sâu; mở **Cài đặt nâng cao** để
+  chỉnh các tham số ít dùng như số vòng tranh luận, temperature, giới hạn token và ngôn
+  ngữ đầu ra. Nhiều vòng tranh luận hơn có thể làm phiên chậm và tốn token hơn.
+- **Rủi ro** — trần vận hành, bảo vệ vị thế và các giới hạn bổ sung. Mở các mục thu
+  gọn để xem thêm các ngưỡng bảo vệ và nâng cao.
+- **Sàn & nguồn dữ liệu** — ID sàn, đồng tiền báo giá, URL venue chỉ đọc, sandbox cho
+  sàn khác Binance và cookie Reddit/X. Binance mặc định Demo; URL và cặp credential
+  quyết định Demo/production.
+- **Giao diện & nâng cao** — ngôn ngữ, chủ đề, các thông số ít dùng và **Đường dẫn
+  hệ thống** chỉ đọc cho kết quả, cache và nhật ký. Ngôn ngữ/chủ đề được lưu trên
+  trình duyệt này.
 
-- **LLM & Mô hình** — nhà cung cấp (`llm_provider`: openai/google/anthropic hoặc
-  endpoint tương thích), mô hình suy luận sâu/nhanh, số vòng tranh luận nghiên cứu/rủi
-  ro (nhiều vòng = chậm + tốn token), temperature, giới hạn token, ngôn ngữ đầu ra…
-- **Giới hạn rủi ro** — các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
+**Lưu theo từng phần**, không có một nút lưu chung cho cả màn:
+
+- Các ô engine dùng `GET/PUT /api/settings`, lưu bằng **Lưu cài đặt** trong nhóm
+  tương ứng. Thay đổi được áp in-memory và lưu PostgreSQL cho lần khởi động sau;
+  `.env` không bị ghi lúc runtime. Chỉ các ô đã sửa trong nhóm đó được gửi đi;
+  lỗi dữ liệu có thể được đánh dấu tại ô và nút lưu.
+- Mode và trần rủi ro vận hành dùng `/api/operator-config`, với nút **Lưu** riêng
+  cho mode và rủi ro. Đổi mode cần xác nhận và lý do. Trường rủi ro có trong cả hai
+  nguồn chỉ được sửa qua operator; các giới hạn bổ sung khác dùng nút lưu engine riêng.
+  Nếu không tải được cấu hình operator, thử lại trước khi chỉnh rủi ro.
+- Khoảng cách autoloop dùng **Áp dụng** riêng; key LLM dùng **Lưu khóa** riêng qua
+  `/api/llm-credentials`, cookie nguồn dữ liệu dùng **Lưu cookie** riêng qua
+  `/api/data-sources`. Lưu cài đặt engine không lưu key hoặc cookie.
+- Giá trị mặc định có thể được hiển thị làm gợi ý cho ô nhập, không phải nút tự đặt lại.
+  Với override rủi ro đã đặt, nút xoá override đưa giá trị về mặc định engine; cần lưu
+  hoặc hoàn tác các thay đổi operator chưa lưu trước khi xoá override. Đừng nhầm thao
+  tác này với **Huỷ thay đổi**, vốn chỉ bỏ bản nháp chưa lưu.
+- Khi đổi nhóm, kiểm tra và lưu hoặc hoàn tác bản nháp ở đúng phần. Nếu màn báo
+  **Dữ liệu cũ**, làm mới và kiểm tra trạng thái trước khi thao tác. Nếu máy chủ có dữ
+  liệu mới hơn, đọc cảnh báo trước khi nạp lại: **Nạp dữ liệu máy chủ** có thể bỏ các
+  thay đổi engine chưa lưu và sẽ hỏi trước; phần operator có lựa chọn nạp dữ liệu mới
+  và giữ bản nháp. Nếu chưa xác định được kết quả lưu, kiểm tra dữ liệu trước khi thử lại.
+
+Các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
+
   - *Lỗ tối đa trong ngày* (`risk_max_daily_loss_pct`): chạm ngưỡng → dừng giao dịch
     cả ngày (halt).
   - *Tỷ trọng vị thế tối đa mỗi tài sản* (`risk_max_position_pct_per_asset`): kế hoạch
@@ -446,20 +482,20 @@ PostgreSQL cho lần khởi động sau; `.env` không bị ghi lúc runtime. Ha
     (mặc định 0.1R) bỏ qua các bước dời SL quá nhỏ để không huỷ/tạo conditional order mỗi
     vòng poll. Ba ngưỡng đầu **phải tăng dần** (`break_even_r` < `lock_profit_r` <
     `trail_start_r`); policy từ chối cấu hình vi phạm.
-  - *Time stop* (`risk_derivatives_max_hold_hours`, mặc định 72 giờ; `0` = tắt): vị thế giữ
-    quá số giờ này mà lợi nhuận **chưa đạt** `risk_derivatives_time_stop_min_r` (mặc định
-    1R) sẽ bị đóng và bracket của nó bị huỷ. Mục đích là cắt vùng chết 0–1R: vốn không được
-    để nằm hàng tuần ở một vị thế chưa từng tiến gần mức khóa lợi nhuận. Vị thế đã đạt mốc R
-    tối thiểu thì time stop không can thiệp — nó tiếp tục do break-even/trailing quản lý.
-    Thiếu `held_hours` (không xác định được thời điểm mở) thì time stop không kích hoạt.
+  - *Time stop* (`risk_derivatives_max_hold_hours`, mặc định 72 giờ; `0` = tắt): vị thế quá
+    hạn mà chưa đạt ngưỡng `risk_derivatives_time_stop_min_r` (mặc định 1R) được xem xét
+    đóng theo policy. Kết quả còn phụ thuộc funding, phí, điều kiện hoãn và phân tích vị thế;
+    không nên giả định vị thế đã đóng chỉ vì hết hạn. Khi policy quyết định đóng, hệ thống
+    xử lý đóng vị thế và huỷ các leg của bracket; cần đối soát trên venue. Thiếu `held_hours`
+    (không xác định được thời điểm mở) thì time stop không kích hoạt.
   - *Hòa vốn dịch theo phí khứ hồi* (`risk_derivatives_round_trip_fee_rate`, mặc định
     0.001 = 0.1%): mỗi vị thế trả phí vào **và** ra, nên dời SL đúng về `entry` vẫn lỗ ròng
     đúng bằng phần phí đó. Vì vậy khi chạm `break_even_r`, policy đặt SL cao hơn entry một
     khoảng `round_trip_fee_rate` (long) hoặc thấp hơn tương ứng (short). `0` = không bù phí,
     SL hòa vốn đúng bằng entry như trước.
   - Bốn khoá điều chỉnh ngưỡng, ba khoá chi phí/thời gian ở trên cùng năm khoá của cơ chế
-    vượt trần và trần heat dưới đây cũng sửa được qua
-    `/api/operator-config` (nhóm **risk**, không phải cổng thực thi — không cần `confirm`):
+    vượt trần và trần heat dưới đây nằm trong **Rủi ro → Trần rủi ro vận hành**, lưu qua
+    `/api/operator-config` (không phải cổng thực thi — không cần `confirm`):
 
     | Khoá | Mặc định | Ý nghĩa |
     |---|---|---|
@@ -467,8 +503,8 @@ PostgreSQL cho lần khởi động sau; `.env` không bị ghi lúc runtime. Ha
     | `risk_derivatives_lock_profit_r` | 1.0 | Đạt mốc R này thì SL khóa tối thiểu 1R |
     | `risk_derivatives_trail_start_r` | 1.5 | Từ mốc R này SL bắt đầu bám mark |
     | `risk_derivatives_trail_distance_r` | 0.75 | SL cách mark bao nhiêu R khi đang trailing |
-    | `risk_derivatives_max_hold_hours` | 72.0 | Quá số giờ này mà chưa đạt mốc R tối thiểu thì đóng vị thế; `0` = tắt |
-    | `risk_derivatives_time_stop_min_r` | 1.0 | Mốc R tối thiểu phải đạt trước hạn giữ tối đa |
+    | `risk_derivatives_max_hold_hours` | 72.0 | Hạn giữ để xem xét time stop; `0` = tắt |
+    | `risk_derivatives_time_stop_min_r` | 1.0 | Ngưỡng R tối thiểu dùng khi xét time stop |
     | `risk_derivatives_round_trip_fee_rate` | 0.001 | Phí khứ hồi dùng để nâng SL hòa vốn lên trên entry; `0` = không bù phí |
     | `risk_max_derivatives_exposure_hard_pct` | 0 | Trần cứng cho cơ chế vượt trần phái sinh: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này; `0` = tắt |
     | `risk_derivatives_override_min_r` | 2.0 | R tối thiểu (lời mục tiêu / rủi ro stop) của đề xuất để đủ điều kiện vượt trần |
@@ -513,27 +549,8 @@ PostgreSQL cho lần khởi động sau; `.env` không bị ghi lúc runtime. Ha
   - Đây là cơ chế khóa lợi nhuận có điều kiện, không phải bảo đảm lợi nhuận: gap, slippage,
     liquidation, mất mạng/API hoặc venue outage vẫn có thể khiến fill khác mức stop.
   - Lưu ý: giá trị mới chỉ áp cho guard/monitor được dựng sau khi lưu (`types.ts:120`).
-- **Thực thi & Sàn** — `exec_exchange_id`, `exec_quote_currency`, URL Binance read-only (`exec_base_url`) và `exec_sandbox` cho các sàn khác. Binance mặc định Demo; URL + credential pair quyết định Demo/production.
-
-**Các thẻ chính:**
-- *LLM provider & models* — chọn tầng nhanh/sâu, provider, model, URL và reasoning; API key nhập write-only theo từng tier/provider.
-- *Quyền chạy* — xem trạng thái Auto Spot và Auto Futures; đổi hai công tắc ở
-  Override vận hành. Chỉ báo sidebar chỉ cho biết có mode nào bật, không cho biết
-  profile venue; trường API dry/live standalone không quyết định đường managed.
-- *Đường dẫn* — nơi engine đọc/ghi (thư mục kết quả, cache, nhật ký quyết định, nhật ký audit thực thi).
-
-**Cách lưu:** sửa vài ô → thanh **Save bar** xuất hiện, chỉ gửi các key bạn đã sửa →
-lỗi 422 (kiểu dữ liệu sai) được map về đúng ô. Có badge "Dữ liệu cũ" khi poll lỗi;
-nếu server có dữ liệu mới hơn bản đang xem, hiện banner vàng với nút "Nạp dữ liệu máy
-chủ" — thay đổi chưa lưu của bạn không bị ghi đè.
-
-> Đã biết (cosmetic): **toàn bộ chuỗi tiếng Việt do `web/components/settings/
-> settings-screen.tsx` tự render đang bị lỗi mã hoá (mojibake)** — không chỉ tiêu
-> đề/mô tả mà cả các nút và nhãn mà chính mục này gọi tên: badge "Dữ liệu cũ" hiện
-> thành `Dá»¯ liá»‡u cÅ©`, nút "Làm mới" thành `LÃ m má»›i`, nút "Nạp dữ liệu máy chủ"
-> thành `Náº¡p dá»¯ liá»‡u mÃ¡y chá»§` (đã kiểm byte trên đĩa). Chức năng không ảnh
-> hưởng; khi đọc hướng dẫn, khớp các affordance theo vị trí + hình nút chứ không theo
-> chữ trên màn.
+Chỉ báo sidebar chỉ cho biết có mode nào bật, không cho biết profile venue; trường API
+dry/live standalone không quyết định đường managed (§3.0).
 
 ### 3.6 Lịch sử & Audit (`/audit`)
 
@@ -552,8 +569,9 @@ nút làm riêng (`web/components/audit/`):
    (badge + `#order_id`), Khối lượng, Giá ước tính, Chế độ (badge "LIVE — lệnh thật" /
    "Mô phỏng (dry)" + Đã xác nhận/Chưa xác nhận), Lý do. Dòng điều khiển đặc biệt hiển
    thị vàng: **"HALT — dừng giao dịch trong ngày"** / "Mở lại giao dịch (halt_reset)".
-   Banner đỏ khi halted hôm nay, kèm nhắc: "Việc mở lại halt chỉ thực hiện được trên
-   máy chủ — cố ý không có nút reset trên UI".
+   Banner đỏ khi halted hôm nay. Thông điệp trên màn nói việc mở lại chỉ thực hiện
+   được trên máy chủ và không có nút reset trên UI; thông điệp này đã cũ. Xem điều khiển
+   gỡ dừng ở **Cấu hình → Tự động** (§4.4).
 3. **Backtest** (`GET /api/backtest`, stale 60s): tổng kết các lần sweep backtest —
    quyết định quá khứ chấm điểm theo giá sau đó: *Số quyết định, Tỉ lệ trúng (hit rate),
    Alpha trung bình* theo từng rating. Bấm "Xem chi tiết" để bung entry thật của run.
@@ -602,18 +620,16 @@ Banner đỏ xuất hiện ở Tổng quan, Duyệt lệnh, và Nhật ký audit
 
 1. **Tự hết khi sang ngày UTC mới** — halt gắn với ngày: sang ngày kế tiếp không cần
    làm gì, giao dịch mở lại tự động (`tradingagents/execution/risk.py:24-25`).
-2. **Mở lại sớm (reset)**: v1 **không có lệnh CLI và không có endpoint API nào** —
-   seam duy nhất là một method Python chạy trên máy chủ (`risk.py:591-596`), ghi thêm
-   dòng `halt_reset` vào audit log (append-only, không xoá gì):
+2. **Mở lại sớm (reset)**: chỉ operator thực hiện sau khi kiểm tra nguyên nhân dừng,
+   venue và rủi ro; việc gỡ có thể cho phép lệnh mới theo cấu hình hiện tại và các kiểm
+   tra rủi ro. Vào **Cấu hình → Tự động → STOP khẩn cấp**, kiểm tra trạng thái dừng,
+   chọn **Gỡ dừng hôm nay** và xác nhận. Nếu không xác định được trạng thái, thử lại
+   và xác minh trước khi gỡ. Màn Duyệt lệnh không có nút reset riêng. Backend ghi thêm
+   dòng `halt_reset` vào audit log (append-only, không xoá gì).
 
-   ```powershell
-   .venv\Scripts\python.exe -c "from tradingagents.execution.risk import RiskGuard; RiskGuard().reset_halt(r'C:\Users\<ten_ban>\.tradingagents\execution\audit.jsonl')"
-   ```
-
-   Đường dẫn chính xác xem ở màn **Cấu hình → thẻ Đường dẫn → "Nhật ký audit thực thi"**
-   (mặc định `~/.tradingagents/execution/audit.jsonl` — `default_config.py:207`).
-   Chỉ chủ tài khoản thực hiện; snippet ở trên đã được kiểm chứng ở mức import
-   (chưa chạy reset thật — việc đó ghi vào audit log thật của bạn).
+   Đường dẫn audit chính xác xem ở **Cấu hình → Giao diện & nâng cao → Đường dẫn hệ
+   thống → "Nhật ký audit thực thi"** (mặc định `~/.tradingagents/execution/audit.jsonl`
+   — `default_config.py:207`).
 
 ### 4.5 Dữ liệu cũ (stale)
 
@@ -634,8 +650,8 @@ hiển thị dữ liệu cũ"** — không bao giờ xoá trắng màn hình. Đ
 ### 4.7 Run Live thất bại vì thiếu LLM key
 
 Run live dựng graph xong mới gọi LLM — thiếu key → phiên kết thúc `run_failed` với lỗi
-trong thẻ kết quả. Màn Cấu hình (thẻ Khóa API) và `/api/health` cho biết key đã cấu
-hình chưa. Phân tích Mock không bao giờ dính lỗi này.
+trong thẻ kết quả. **Cấu hình → Mô hình AI** cho biết trạng thái key theo tầng/provider;
+`/api/health` cũng cung cấp trạng thái key. Phân tích Mock không bao giờ dính lỗi này.
 
 ### 4.8 Duyệt trả 412 `mode_closed` — Auto Spot đang tắt
 
@@ -644,7 +660,7 @@ hình chưa. Phân tích Mock không bao giờ dính lỗi này.
 **Hướng dẫn hiện hành:** approve Spot cần Auto Spot, không cần bật riêng `exec_live`.
 Nếu approve trả `412 mode_closed`, item vẫn "Chờ duyệt":
 
-1. Kiểm tra Auto Spot trong **Cấu hình → Override vận hành**. Chỉ bật lại với xác nhận
+1. Kiểm tra Auto Spot trong **Cấu hình → Tự động → Chế độ tự động**. Chỉ bật lại với xác nhận
    + lý do sau khi đã kiểm tra venue Demo/production, credentials và rủi ro.
 2. Duyệt lại hoặc từ chối item. Backend kiểm tra authorization, halt, venue preflight
    và RiskGuard; lệnh managed không được chuyển thành dry-fill khi authorization tắt.
@@ -667,7 +683,8 @@ trước khi cho phép lệnh).
 
 **Quy trình hồi phục:**
 
-1. Xác định đường dẫn file: màn **Cấu hình → thẻ Đường dẫn → "Nhật ký audit thực thi"**
+1. Xác định đường dẫn file: màn **Cấu hình → Giao diện & nâng cao → Đường dẫn hệ thống →
+   "Nhật ký audit thực thi"**
    (mặc định `~/.tradingagents/execution/audit.jsonl` — `default_config.py:207`).
 2. Kiểm tra file: còn tồn tại không, tiến trình nào đang khoá nó (trên Windows: một
    editor/backup tool giữ file mở là đủ lỗi), quyền đọc của process backend.
@@ -719,7 +736,7 @@ Các lệnh dưới đây **đã chạy trên chính máy này**, kết quả ng
   "another run is already active", `details.run_id` đúng phiên đang chạy (kịch bản §4.2).
 - `GET /api/approvals` → 200, hàng đợi rỗng; `GET /api/portfolio` → **200** (chế độ dry).
 - Đọc file `web/components/settings/settings-screen.tsx` + kiểm byte trên đĩa →
-  xác nhận **mojibake** thực có (chuỗi tiếng Việt double-encoded) — ghi ở §3.5.
+  từng ghi nhận **mojibake** trong phiên đó; không phải kết quả kiểm chứng phiên hiện tại.
 
 Backend đã được tắt sạch sau khi kiểm chứng.
 
@@ -747,8 +764,8 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
   thật theo báo cáo triển khai (§5.3 của báo cáo đó).
 - **Nút "Quét ngay" chưa có lựa chọn mock** trên UI — luôn chạy live; muốn demo không
   tốn LLM phải gọi API trực tiếp.
-- **Không có cách huỷ run/job** và **không có nút reset halt** trên UI — đều là chủ đích
-  thiết kế v1.
+- **Không có cách huỷ run/job** trên UI. Màn Duyệt lệnh không có nút reset halt;
+  thao tác gỡ dừng ở **Cấu hình → Tự động** được mô tả trong §4.4.
 - **Live execution trên Binance Demo đã được kiểm tra end-to-end** bằng `python demo_flow_check.py`: spot fill + OCO bracket và futures fill + reduceOnly conditional legs; script dừng nếu API host không phải Binance Demo và dọn vị thế/orders sau test. Không chạy flow này với URL production.
 
 - **Bảo mật:** CSRF guard ≠ xác thực — mọi endpoint tin tưởng localhost; server bind
@@ -770,6 +787,10 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
 
 > Các ghi chú rev 2 dưới đây ghi lại hành vi tại thời điểm viết; mô tả nửa env và
 > gate cũ không còn là hướng dẫn vận hành hiện tại. Xem §1.2 và §4.8.
+
+- **rev 3 (2026-11-09)** — cập nhật đường dẫn theo năm nhóm Cấu hình, phân biệt các
+  phần lưu riêng và chỉ dẫn STOP/gỡ dừng; chỉnh mô tả time stop theo chính sách hiện có.
+  Chưa kiểm chứng runtime trong lần sửa này.
 
 - **rev 2 (2026-10-01)** — sửa theo góp ý đọc thử:
   - Sửa chỉ dẫn sai về 412 `gate_closed`: `exec_live` không đặt được qua `.env` (vắng

@@ -60,7 +60,7 @@ export function ExecStatusChipView({
     // bao giờ là tín hiệu duy nhất (WCAG 1.4.1).
     <div role="status" aria-live="polite" className="flex flex-wrap items-center gap-1.5">
       <Link
-        href="/settings#exec-gates"
+        href="/settings#operator-config"
         className={cn(
           "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium",
           tone
