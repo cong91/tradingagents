@@ -9,6 +9,72 @@ from typing import Any
 from tradingagents.execution.futures_operation_lock import OperationGuard
 from tradingagents.execution.sizing import PlannedOrder
 
+_MANAGED_PROVENANCE_VERSION = 1
+
+
+def managed_live_provenance(
+    order: PlannedOrder,
+    client_order_id: str,
+    *,
+    identity: Any,
+    venue: str,
+) -> dict[str, Any]:
+    """Create the immutable marker for one explicitly managed live attempt."""
+    return {
+        "version": _MANAGED_PROVENANCE_VERSION,
+        "kind": "managed_live_entry",
+        "intent_id": f"entry-intent:{order.ccxt_symbol}:{client_order_id}",
+        "client_order_id": client_order_id,
+        "symbol": order.ccxt_symbol,
+        "side": order.side,
+        "venue_key": venue,
+        "account_identity": {
+            "exchange": identity.exchange,
+            "profile": identity.profile,
+            "type": identity.account_type,
+            "hash": identity.identity_hash,
+        },
+    }
+
+
+def record_entry_provenance(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Read a marker only when every persisted copy agrees exactly."""
+    candidates: list[Any] = []
+    direct = record.get("entry_provenance")
+    if direct is not None:
+        candidates.append(direct)
+    legs = record.get("legs")
+    if isinstance(legs, list):
+        candidates.extend(
+            leg.get("entry_provenance")
+            for leg in legs
+            if isinstance(leg, dict) and leg.get("entry_provenance") is not None
+        )
+    if not candidates or any(not isinstance(item, dict) for item in candidates):
+        return None
+    first = candidates[0]
+    return first if all(item == first for item in candidates[1:]) else None
+
+
+def valid_managed_live_provenance(marker: Any) -> bool:
+    """Validate marker shape before any caller considers it for authorization."""
+    if not isinstance(marker, dict):
+        return False
+    identity = marker.get("account_identity")
+    return (
+        marker.get("version") == _MANAGED_PROVENANCE_VERSION
+        and marker.get("kind") == "managed_live_entry"
+        and all(isinstance(marker.get(key), str) and marker.get(key) for key in (
+            "intent_id", "client_order_id", "symbol", "side", "venue_key",
+        ))
+        and marker.get("side") in {"buy", "sell"}
+        and isinstance(identity, dict)
+        and all(isinstance(identity.get(key), str) and identity.get(key) for key in (
+            "exchange", "profile", "type", "hash",
+        ))
+    )
+
+
 _ACTIVE_STATUSES = (
     "pending", "monitoring", "submission_uncertain", "emergency_close_failed",
     "emergency_cleanup_pending", "replacement_cleanup_pending", "position_cleanup_pending",

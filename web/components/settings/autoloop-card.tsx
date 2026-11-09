@@ -19,25 +19,39 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { autoloopApi, toAutoloopError } from "./autoloop-api";
 import {
   AUTOLOOP_DEFAULT_INTERVAL,
-  AUTOLOOP_GATE_ROWS,
+  AUTOLOOP_MODE_ROWS,
   AUTOLOOP_MAX_INTERVAL,
   AUTOLOOP_MIN_INTERVAL,
   type AutoloopLastCycle,
+  type AutoloopModeCycle,
+  type AutoloopModeKey,
   type AutoloopPayload,
 } from "./autoloop-types";
 import { formatDateTimeVi } from "./format-time";
 import { useT, type Messages } from "@/lib/i18n";
 
-// Poll chậm khi rảnh, nhanh khi một chu kỳ đang chạy để spinner "Chạy thử"
-// tự tắt đúng lúc; cùng nhịp stale 30s mà màn Cấu hình dùng cho /api/settings.
+// Poll chậm khi rảnh, nhanh khi một chu kỳ đang chạy.
 const POLL_IDLE_MS = 30_000;
 const POLL_RUNNING_MS = 5_000;
 
 type Feedback = { role: "status" | "alert"; text: string };
+type HaltState = "loading" | "unknown" | "active" | "inactive";
 
+type AutoloopCardProps = {
+  hideHalt?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+};
 
 /** Khoảng cách phút hợp lệ: số nguyên trong [15, 1440] — cùng ràng buộc server. */
 function parseInterval(raw: string): number | null {
@@ -75,37 +89,37 @@ function lastCycleSummary(t: Messages, cycle: AutoloopLastCycle): string {
   return `${when} · ${c.completed} · ${candidates} · ${c.executed(executed, cycle.results.length)}`;
 }
 
-function GateBadge({ open }: { open: boolean }) {
+function modeCycleSummary(t: Messages, cycle: AutoloopModeCycle | null | undefined): string {
+  const c = t.settings.autoloop;
+  if (!cycle?.status) return c.modeCycleUnavailable;
+  const status = c.modeCycleStatus[cycle.status] ?? cycle.status;
+  const when = cycle.finished_at ?? cycle.started_at;
+  return [status, when ? formatDateTimeVi(when) : null, cycle.error].filter(Boolean).join(" · ");
+}
+
+function ModeBadge({ open }: { open: boolean }) {
   const t = useT();
   return open ? (
     <Badge className="border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
-      {t.settings.autoloop.gateOpen}
+      {t.settings.autoloop.modeEnabled}
     </Badge>
   ) : (
-    <Badge variant="destructive">{t.settings.autoloop.gateClosed}</Badge>
+    <Badge variant="outline">{t.settings.autoloop.modeDisabled}</Badge>
   );
 }
 
-export function AutoloopCard() {
+export function AutoloopHaltControl() {
   const t = useT();
   const c = t.settings.autoloop;
-  const [phase, setPhase] = useState<"loading" | "error" | "ready">("loading");
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [payload, setPayload] = useState<AutoloopPayload | null>(null);
-  // Bản nháp khoảng cách phút: poll không ghi đè khi user đang sửa (§0.2 stale rule).
-  const [intervalDraft, setIntervalDraft] = useState(String(AUTOLOOP_DEFAULT_INTERVAL));
-  const [intervalError, setIntervalError] = useState<string | null>(null);
-  const [gateWarning, setGateWarning] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [savePending, setSavePending] = useState(false);
-  const [runPending, setRunPending] = useState(false);
   const [haltPending, setHaltPending] = useState(false);
-  // Halt state KHÔNG đọc từ GET /api/autoloop — chỉ phản hồi kết quả POST ngay
-  // tại chỗ; trạng thái halt toàn cục xem ở banner health của màn.
-  const [halted, setHalted] = useState<boolean | null>(null);
-
-  const hasDataRef = useRef(false);
-  const draftDirtyRef = useRef(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [verifyingReset, setVerifyingReset] = useState(false);
+  const [haltState, setHaltState] = useState<HaltState>("loading");
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const haltStateRef = useRef<HaltState>("loading");
+  const haltPendingRef = useRef(false);
+  const verifyingResetRef = useRef(false);
+  const healthSequenceRef = useRef(0);
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -115,23 +129,193 @@ export function AutoloopCard() {
     };
   }, []);
 
+  const loadHealth = useCallback(async () => {
+    const sequence = ++healthSequenceRef.current;
+    setConfirmReset(false);
+    if (haltStateRef.current !== "loading") {
+      haltStateRef.current = "loading";
+      setHaltState("loading");
+    }
+    let next: HaltState = "unknown";
+    try {
+      const halted = await autoloopApi.getHaltState();
+      if (halted !== null) next = halted ? "active" : "inactive";
+    } catch {
+      // An unavailable health response is never proof that trading is unhalted.
+    }
+    if (!aliveRef.current || sequence !== healthSequenceRef.current) return null;
+    haltStateRef.current = next;
+    setHaltState(next);
+    return next;
+  }, []);
+
+  useEffect(() => {
+    const initialId = setTimeout(() => void loadHealth(), 0);
+    const pollId = setInterval(() => {
+      if (!haltPendingRef.current && !verifyingResetRef.current) void loadHealth();
+    }, POLL_IDLE_MS);
+    return () => {
+      clearTimeout(initialId);
+      clearInterval(pollId);
+      healthSequenceRef.current += 1;
+    };
+  }, [loadHealth]);
+
+  const changeHalt = useCallback(async (reset: boolean) => {
+    if (haltPendingRef.current || (reset && haltStateRef.current !== "active")) return;
+    haltPendingRef.current = true;
+    setConfirmReset(false);
+    healthSequenceRef.current += 1;
+    haltStateRef.current = "loading";
+    setHaltState("loading");
+    setHaltPending(true);
+    setFeedback(null);
+    try {
+      await (reset ? autoloopApi.resetHalt() : autoloopApi.halt());
+    } catch (err) {
+      if (aliveRef.current) setFeedback({ role: "alert", text: toAutoloopError(err).message });
+    } finally {
+      haltPendingRef.current = false;
+      if (aliveRef.current) {
+        setHaltPending(false);
+        void loadHealth();
+      }
+    }
+  }, [loadHealth]);
+
+  const confirmClearHalt = useCallback(async () => {
+    if (verifyingResetRef.current || haltPendingRef.current || haltStateRef.current !== "active") return;
+    verifyingResetRef.current = true;
+    setVerifyingReset(true);
+    setConfirmReset(false);
+    try {
+      const state = await loadHealth();
+      if (state === "active" && !haltPendingRef.current) await changeHalt(true);
+    } finally {
+      verifyingResetRef.current = false;
+      if (aliveRef.current) setVerifyingReset(false);
+    }
+  }, [changeHalt, loadHealth]);
+
+  return (
+    <div className="rounded-lg border-2 border-destructive/60 bg-destructive/5 p-3">
+      <p className="flex items-center gap-2 text-sm font-semibold text-destructive">
+        <OctagonXIcon className="size-4" aria-hidden="true" />
+        {c.stopTitle}
+      </p>
+      <p className="mt-1 text-sm text-muted-foreground">{c.stopDescription}</p>
+      <p role="status" className="mt-2 text-sm">
+        {haltState === "loading" ? c.haltLoading :
+          haltState === "unknown" ? c.haltUnknown :
+            haltState === "active" ? c.haltActive : c.haltInactive}
+      </p>
+      {haltState === "unknown" ? (
+        <Button variant="outline" className="mt-2 min-touch" onClick={() => void loadHealth()} disabled={haltPending}>
+          {t.common.retry}
+        </Button>
+      ) : null}
+      <div className="mt-3">
+        {haltState === "active" ? (
+          <Button variant="outline" className="min-touch" onClick={() => setConfirmReset(true)} disabled={haltPending || verifyingReset}>
+            {c.resetHalt}
+          </Button>
+        ) : (
+          <Button variant="destructive" className="min-touch" onClick={() => void changeHalt(false)} disabled={haltPending}>
+            {haltPending ? <LoaderCircleIcon className="animate-spin" aria-hidden="true" /> : <OctagonXIcon aria-hidden="true" />}
+            {c.haltAll}
+          </Button>
+        )}
+      </div>
+      <Dialog open={confirmReset && haltState === "active"} onOpenChange={setConfirmReset}>
+        {confirmReset && haltState === "active" ? (
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{c.clearHaltConfirmTitle}</DialogTitle>
+              <DialogDescription>{c.clearHaltConfirmDescription}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" className="min-touch" onClick={() => setConfirmReset(false)}>
+                {t.common.cancel}
+              </Button>
+              <Button className="min-touch" onClick={() => void confirmClearHalt()} disabled={haltPending || verifyingReset}>
+                {c.clearHaltConfirmAction}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+      {feedback ? (
+        <p role={feedback.role} className={cn("mt-2 text-sm", feedback.role === "alert" ? "text-destructive" : "text-profit")}>
+          {feedback.text}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardProps) {
+  const t = useT();
+  const c = t.settings.autoloop;
+  const [phase, setPhase] = useState<"loading" | "error" | "ready" | "stale">("loading");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [payload, setPayload] = useState<AutoloopPayload | null>(null);
+  // Bản nháp khoảng cách phút: poll không ghi đè khi user đang sửa (§0.2 stale rule).
+  const [intervalDraft, setIntervalDraft] = useState(String(AUTOLOOP_DEFAULT_INTERVAL));
+  const [intervalError, setIntervalError] = useState<string | null>(null);
+  const [gateWarning, setGateWarning] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [savePending, setSavePending] = useState(false);
+  const [runPending, setRunPending] = useState(false);
+
+  const hasDataRef = useRef(false);
+  const draftDirtyRef = useRef(false);
+  const intervalDraftRef = useRef(String(AUTOLOOP_DEFAULT_INTERVAL));
+  const savedIntervalRef = useRef<string | null>(null);
+  const loadSequenceRef = useRef(0);
+  const savePendingRef = useRef(false);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+
+  const setDirty = useCallback((dirty: boolean) => {
+    if (draftDirtyRef.current === dirty) return;
+    draftDirtyRef.current = dirty;
+    onDirtyChange?.(dirty);
+  }, [onDirtyChange]);
+
   const applyPayload = useCallback((data: AutoloopPayload) => {
+    savedIntervalRef.current = String(data.interval_minutes);
     setPayload(data);
-    if (!draftDirtyRef.current) setIntervalDraft(String(data.interval_minutes));
+    if (!draftDirtyRef.current) {
+      intervalDraftRef.current = savedIntervalRef.current;
+      setIntervalDraft(savedIntervalRef.current);
+    }
   }, []);
 
   const load = useCallback(async () => {
+    if (savePendingRef.current) return;
+    const sequence = ++loadSequenceRef.current;
     try {
       const data = await autoloopApi.get();
+      if (!aliveRef.current || sequence !== loadSequenceRef.current) return;
+      if (draftDirtyRef.current && intervalDraftRef.current === String(data.interval_minutes)) {
+        setDirty(false);
+      }
       applyPayload(data);
       hasDataRef.current = true;
       setPhase("ready");
     } catch (err) {
+      if (!aliveRef.current || sequence !== loadSequenceRef.current) return;
       setErrorMessage(toAutoloopError(err).message);
-      // Đã có dữ liệu: giữ nguyên UI thay vì sập cả card xuống trạng thái lỗi.
-      if (!hasDataRef.current) setPhase("error");
+      setFeedback(null);
+      setPhase(hasDataRef.current ? "stale" : "error");
     }
-  }, [applyPayload]);
+  }, [applyPayload, setDirty]);
 
   // Nạp lần đầu trong callback (không setState đồng bộ trong effect body),
   // rồi poll theo trạng thái running_cycle.
@@ -142,8 +326,8 @@ export function AutoloopCard() {
 
   const runningCycle = payload?.running_cycle ?? false;
   useEffect(() => {
-    if (phase !== "ready") return;
-    const pollId = setInterval(() => void load(), runningCycle ? POLL_RUNNING_MS : POLL_IDLE_MS);
+    if (phase !== "ready" && phase !== "stale") return;
+    const pollId = setInterval(() => void load(), phase === "ready" && runningCycle ? POLL_RUNNING_MS : POLL_IDLE_MS);
     return () => clearInterval(pollId);
   }, [load, phase, runningCycle]);
 
@@ -151,43 +335,45 @@ export function AutoloopCard() {
     async (enabled: boolean) => {
       const interval = parseInterval(intervalDraft);
       if (interval === null) {
-        draftDirtyRef.current = true;
         setIntervalError(c.intervalError(AUTOLOOP_MIN_INTERVAL, AUTOLOOP_MAX_INTERVAL));
         return;
       }
+      if (savePendingRef.current || phase !== "ready" || (enabled !== true && payload?.modes.any_auto_enabled)) return;
+      savePendingRef.current = true;
+      loadSequenceRef.current += 1;
       setIntervalError(null);
       setGateWarning(null);
       setSavePending(true);
       try {
         const data = await autoloopApi.set(enabled, interval);
-        draftDirtyRef.current = false;
+        setDirty(false);
         applyPayload(data);
-        setFeedback({
-          role: "status",
-          text: enabled
-            ? c.enabledFeedback(data.interval_minutes)
-            : c.disabledFeedback,
-        });
+        setFeedback({ role: "status", text: c.intervalSaved });
       } catch (err) {
         const error = toAutoloopError(err);
-        if (error.code === "gate_closed") {
-          setGateWarning(c.gateClosedWarning);
+        if (error.code === "mode_closed") {
+          setGateWarning(c.modeClosedWarning);
         } else {
           setFeedback({ role: "alert", text: error.message });
         }
       } finally {
-        setSavePending(false);
+        savePendingRef.current = false;
+        if (aliveRef.current) setSavePending(false);
       }
     },
-    [applyPayload, intervalDraft, c],
+    [applyPayload, intervalDraft, c, payload, phase, setDirty],
   );
 
   const runNow = useCallback(async () => {
+    if (phase !== "ready" || !payload?.modes.any_auto_enabled || payload.running_cycle || runPending) return;
     setRunPending(true);
     setFeedback(null);
     try {
       const res = await autoloopApi.runNow();
-      setFeedback({ role: "status", text: c.runStatus[res.status] ?? c.serverResponse(res.status) });
+      setFeedback({
+        role: "status",
+        text: res.status === "started" ? c.runStarted : c.runStatus[res.status] ?? c.serverResponse(res.status),
+      });
       // GET lại sau 1s để running_cycle kịp phản ánh worker vừa được spawn.
       setTimeout(() => {
         if (aliveRef.current) void load();
@@ -197,75 +383,14 @@ export function AutoloopCard() {
     } finally {
       setRunPending(false);
     }
-  }, [load, c]);
+  }, [load, c, phase, payload, runPending]);
 
-  const doHalt = useCallback(async () => {
-    setHaltPending(true);
-    try {
-      const res = await autoloopApi.halt();
-      setHalted(res.halted === true);
-      setFeedback({
-        role: "status",
-        text: c.haltedFeedback,
-      });
-    } catch (err) {
-      setFeedback({ role: "alert", text: toAutoloopError(err).message });
-    } finally {
-      setHaltPending(false);
-    }
-  }, [c]);
-
-  const doResetHalt = useCallback(async () => {
-    setHaltPending(true);
-    try {
-      const res = await autoloopApi.resetHalt();
-      setHalted(res.halted);
-      setFeedback({ role: "status", text: c.resetFeedback });
-    } catch (err) {
-      setFeedback({ role: "alert", text: toAutoloopError(err).message });
-    } finally {
-      setHaltPending(false);
-    }
-  }, [c]);
-
-  if (phase === "loading") {
-    return (
-      <Card aria-busy="true" aria-live="polite">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <TimerIcon className="size-4" aria-hidden="true" />
-            {c.title}
-          </CardTitle>
-          <CardDescription>{c.loading}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="h-20 animate-pulse rounded-lg bg-muted" />
-        </CardContent>
-      </Card>
-    );
-  }
-
-  if (phase === "error" || !payload) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <TriangleAlertIcon className="size-4 shrink-0 text-destructive" aria-hidden="true" />
-            {c.title}
-          </CardTitle>
-          <CardDescription>{errorMessage ?? c.loadFailed}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button variant="outline" className="min-touch" onClick={() => void load()}>
-            {t.common.retry}
-          </Button>
-        </CardContent>
-      </Card>
-    );
-  }
-
-  const { enabled, gates, last_cycle: lastCycle } = payload;
-  const cycleBusy = runningCycle || runPending;
+  const modes = payload?.modes;
+  const lastCycle = payload?.last_cycle;
+  const anyModeEnabled = Boolean(modes?.auto_spot || modes?.auto_futures);
+  const enabled = payload?.enabled === true;
+  const schedulerUnknown = Boolean(payload && !enabled && anyModeEnabled);
+  const cycleBusy = (phase === "ready" && runningCycle) || runPending;
 
   return (
     <Card>
@@ -274,60 +399,86 @@ export function AutoloopCard() {
           <TimerIcon className="size-4" aria-hidden="true" />
           {c.title}
         </CardTitle>
-        <CardDescription>{c.description}</CardDescription>
-        <CardAction>
-          {enabled ? <Badge variant="default">{c.enabled}</Badge> : <Badge variant="outline">{c.disabled}</Badge>}
-        </CardAction>
+        <CardDescription>{c.schedulerDescription}</CardDescription>
+        {phase === "ready" && payload ? (
+          <CardAction>
+            {anyModeEnabled ? <Badge variant="default">{c.enabled}</Badge> : <Badge variant="outline">{c.disabled}</Badge>}
+          </CardAction>
+        ) : null}
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* (1) Bảng 6 hàng cổng an toàn — chỉ đọc, cùng nguồn với chính sách của engine. */}
-        <section aria-label={c.gatesAria}>
+        {phase === "loading" && !payload ? (
+          <p role="status" className="text-sm text-muted-foreground">{c.loading}</p>
+        ) : null}
+        {phase === "error" && !payload ? (
+          <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-destructive">
+            <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
+            <span>{errorMessage ?? c.loadFailed}</span>
+            <Button variant="outline" className="min-touch" onClick={() => void load()}>
+              {t.common.retry}
+            </Button>
+          </div>
+        ) : null}
+        {phase === "stale" ? (
+          <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-destructive">
+            <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
+            <span>{c.statusStale}</span>
+            <Button variant="outline" className="min-touch" onClick={() => void load()}>
+              {t.common.retry}
+            </Button>
+          </div>
+        ) : null}
+        {payload && modes ? (
+          <>
+        {phase === "ready" ? <section aria-label={c.modesAria}>
           <ul className="space-y-2">
-            {AUTOLOOP_GATE_ROWS.map((key) => ({ key, ...c.gateRows[key] })).map(({ key, label, hint }) => (
-              <li
-                key={key}
-                className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
-              >
-                <span className="text-sm">
-                  {label}
-                  {hint ? <span className="block text-xs text-muted-foreground">{hint}</span> : null}
-                </span>
-                <GateBadge open={gates[key]} />
-              </li>
-            ))}
+            {AUTOLOOP_MODE_ROWS.map((key: AutoloopModeKey) => {
+              const modeCycle = lastCycle?.modes?.[key];
+              const active = runningCycle && lastCycle?.status === "running" && (
+                (lastCycle.active_mode === key && (!modeCycle?.status || modeCycle.status === "running")) ||
+                (lastCycle.active_mode == null && modeCycle?.status === "running")
+              );
+              return (
+                <li
+                  key={key}
+                  className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
+                >
+                  <span className="min-w-0 text-sm">
+                    {c.modeRows[key]}
+                    <span className="block text-xs text-muted-foreground">
+                      {c.modeLastCycle(modeCycleSummary(t, modeCycle))}
+                    </span>
+                  </span>
+                  <span className="flex flex-wrap items-center gap-2">
+                    {active ? <Badge variant="secondary">{c.activeMode}</Badge> : null}
+                    <ModeBadge open={modes[key]} />
+                  </span>
+                </li>
+              );
+            })}
           </ul>
-          <p className="mt-2 text-xs text-muted-foreground">
-            {c.futuresNote}
-          </p>
           <p
             className={cn(
               "mt-2 text-sm font-medium",
-              gates.all_open ? "text-profit" : "text-amber-700 dark:text-amber-400",
+              modes.any_auto_enabled ? "text-profit" : "text-amber-700 dark:text-amber-400",
             )}
           >
-            {gates.all_open
-              ? c.allOpen
-              : c.notAllOpen}
+            {modes.any_auto_enabled ? c.modeAvailable : c.noModesEnabled}
           </p>
-        </section>
+        </section> : null}
 
-        {/* (2) Công tắc + khoảng cách phút. */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border p-3">
-          <label
-            htmlFor="autoloop-enabled"
-            className="inline-flex min-touch cursor-pointer items-center gap-2"
-          >
-            <input
-              id="autoloop-enabled"
-              type="checkbox"
-              checked={enabled}
-              disabled={savePending}
-              onChange={(event) => void save(event.target.checked)}
-              className="size-6 cursor-pointer accent-primary"
-            />
-            <span className="text-sm font-medium">{c.enableLabel}</span>
-          </label>
-          <span className="ml-auto flex flex-wrap items-center gap-2">
+          {phase === "ready" ? (
+            <span className="min-w-0 flex-1 text-sm text-muted-foreground">
+              {enabled ? c.schedulerEnabled : c.schedulerInactive}
+            </span>
+          ) : null}
+          {phase === "ready" && schedulerUnknown ? (
+            <Button variant="outline" className="min-touch" onClick={() => void load()}>
+              {t.common.retry}
+            </Button>
+          ) : null}
+          <span className="flex flex-wrap items-center gap-2">
             <label htmlFor="autoloop-interval" className="text-sm text-muted-foreground">
               {c.intervalLabel}
             </label>
@@ -337,8 +488,10 @@ export function AutoloopCard() {
               inputMode="numeric"
               value={intervalDraft}
               onChange={(event) => {
-                draftDirtyRef.current = true;
-                setIntervalDraft(event.target.value);
+                const nextDraft = event.target.value;
+                intervalDraftRef.current = nextDraft;
+                setDirty(phase !== "ready" || nextDraft !== savedIntervalRef.current);
+                setIntervalDraft(nextDraft);
                 setIntervalError(null);
               }}
               disabled={savePending}
@@ -351,7 +504,7 @@ export function AutoloopCard() {
               size="sm"
               className="min-touch"
               onClick={() => void save(enabled)}
-              disabled={savePending}
+              disabled={savePending || phase !== "ready" || schedulerUnknown}
             >
               {c.apply}
             </Button>
@@ -372,77 +525,35 @@ export function AutoloopCard() {
           </div>
         ) : null}
 
-        {/* (3) Chạy thử một chu kỳ. */}
         <div className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
-          <Button className="min-touch" onClick={() => void runNow()} disabled={cycleBusy}>
+          <Button className="min-touch" onClick={() => void runNow()} disabled={phase !== "ready" || cycleBusy || !anyModeEnabled}>
             {cycleBusy ? (
               <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
             ) : (
               <PlayIcon aria-hidden="true" />
             )}
-            {cycleBusy ? c.cycleRunning : c.runOnce}
+            {cycleBusy ? c.cycleRunning : c.runNow}
           </Button>
           <span className="min-w-0 flex-1 text-sm text-muted-foreground">
-            {c.runOnceHint}
+            {c.runNowHint}
           </span>
         </div>
 
-        {/* (4) STOP khẩn cấp — không gate, luôn gửi được. */}
-        <div className="rounded-lg border-2 border-destructive/60 bg-destructive/5 p-3">
-          <p className="flex items-center gap-2 text-sm font-semibold text-destructive">
-            <OctagonXIcon className="size-4" aria-hidden="true" />
-            {c.stopTitle}
-          </p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {c.stopBody}
-          </p>
-          <div className="mt-3">
-            {halted === true ? (
-              <div className="flex flex-wrap items-center gap-3">
-                <Badge variant="destructive">{c.haltActive}</Badge>
-                <Button
-                  variant="outline"
-                  className="min-touch"
-                  onClick={() => void doResetHalt()}
-                  disabled={haltPending}
-                >
-                  {haltPending ? (
-                    <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-                  ) : null}
-                  {c.resetHalt}
-                </Button>
-              </div>
-            ) : (
-              <Button
-                variant="destructive"
-                className="min-touch"
-                onClick={() => void doHalt()}
-                disabled={haltPending}
-              >
-                {haltPending ? (
-                  <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-                ) : (
-                  <OctagonXIcon aria-hidden="true" />
-                )}
-                {c.haltAll}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        {/* (5) Chu kỳ gần nhất — một dòng. */}
-        {lastCycle ? (
+        {phase === "ready" && lastCycle ? (
           <p
             className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground"
             title={lastCycleSummary(t, lastCycle)}
           >
             <span className="font-medium text-foreground">{c.lastCycle}</span>
             {lastCycleSummary(t, lastCycle)}
-
           </p>
         ) : null}
+          </>
+        ) : null}
 
-        {feedback ? (
+        {!hideHalt ? <AutoloopHaltControl /> : null}
+
+        {feedback && phase === "ready" ? (
           <p
             role={feedback.role}
             className={cn("text-sm", feedback.role === "alert" ? "text-destructive" : "text-profit")}

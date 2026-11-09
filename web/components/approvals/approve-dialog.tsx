@@ -15,7 +15,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { cn } from "cn";
 
 import { describeActionError, type ActionError } from "./errors";
 import { formatDateTime, formatOrderAmount, formatPrice, formatQuantity } from "./format";
@@ -25,14 +24,12 @@ import { useT } from "@/lib/i18n";
 
 export function ApproveDialog({
   item,
-  execMode,
   submitting,
   error,
   onOpenChange,
   onConfirm,
 }: {
   item: ApprovalItem | null;
-  execMode: "live" | "dry" | null;
   submitting: boolean;
   error: ActionError | null;
   onOpenChange: (open: boolean) => void;
@@ -46,9 +43,7 @@ export function ApproveDialog({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{c.title(item.id)}</DialogTitle>
-            <DialogDescription>
-              {execMode === "live" ? c.liveDescription : c.dryDescription}
-            </DialogDescription>
+            <DialogDescription>{c.liveDescription}</DialogDescription>
           </DialogHeader>
 
           <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
@@ -86,12 +81,10 @@ export function ApproveDialog({
             </div>
           </dl>
 
-          {execMode === "live" && (
-            <p className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 p-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950 dark:text-red-100">
-              <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-              {c.liveWarning}
-            </p>
-          )}
+          <p className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 p-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950 dark:text-red-100">
+            <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            {c.liveWarning}
+          </p>
 
           {error && (
             <p
@@ -112,7 +105,7 @@ export function ApproveDialog({
               {c.cancel}
             </Button>
             <Button
-              className={cn("min-touch", execMode === "live" && "bg-loss text-white hover:bg-loss/85")}
+              className="min-touch bg-loss text-white hover:bg-loss/85"
               disabled={submitting}
               onClick={onConfirm}
             >

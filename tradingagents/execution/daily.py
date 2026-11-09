@@ -4,20 +4,16 @@
 process per invocation, one coin at a time, a failing coin never stops the
 rest. Each coin runs the full crypto pipeline (LLM in the loop), syncs the
 venue balance, plans through the bridge (which applies the RiskGuard), and
-then decides the confirm policy:
+then applies the market-specific automation policy:
 
-- default (``exec_auto_confirm`` not a literal True): the plan is audited
-  and LEFT FOR HUMAN APPROVAL -- nothing is ever sent;
-- auto-confirm DRY: executes the dry fill automatically when the current
-  process config ``exec_auto_confirm`` key is a literal True;
-- auto-confirm LIVE: additionally requires the current process config
-  ``exec_live`` literal True. Anything missing falls back to waiting for
-  approval, with the reason audited.
+- Auto Spot authorizes unattended spot plan execution;
+- Auto Futures authorizes unattended futures plan execution;
+- a closed mode leaves an actionable plan waiting for approval;
+- managed sends require the bridge's explicit confirmation/RiskGuard checks;
+- standalone runs choose dry or live using ``exec_live``.
 
-WARNING: combining an unattended scheduler with auto-confirm LIVE means
-real money moves without a human in the loop. That combination is
-deliberately gated by configuration and should stay off until a dry-run
-schedule has run clean for long enough that you trust the whole chain.
+WARNING: enabling Auto Spot or Auto Futures for managed work allows real orders
+without a human in the loop. A sandbox or dry-run does not prove the live path.
 
 Scheduling examples (one process per run; no long-lived daemon here):
 
@@ -42,6 +38,7 @@ contract applies unchanged.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -50,6 +47,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from server.auto_modes import AutoMode, enabled_modes
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.portfolio import PortfolioContext
 
@@ -61,12 +59,22 @@ _PROPAGATE_RETRY_WAIT = 20.0
 logger = logging.getLogger(__name__)
 
 
-def _gate_enabled(bridge: ExchangeBridge, key: str) -> bool:
-    """Read a runtime gate through the bridge seam, with a test-double fallback."""
-    reader = getattr(bridge, "_runtime_gate", None)
+def _mode_enabled(bridge: ExchangeBridge, mode: AutoMode) -> bool:
+    reader = getattr(bridge, "auto_mode_enabled", None)
+    if not callable(reader):
+        reader = getattr(getattr(bridge, "_bridge", None), "auto_mode_enabled", None)
     if callable(reader):
-        return reader(key)
-    return getattr(bridge, "config", {}).get(key) is True
+        return reader(mode, live=bridge.effective_mode() == "live")
+    return mode in enabled_modes(getattr(bridge, "config", None))
+
+
+class _SpotModeCancelled(Exception):
+    """The run's captured Auto Spot authorization is no longer valid."""
+
+
+def _check_spot_mode(bridge: ExchangeBridge) -> None:
+    if not _mode_enabled(bridge, AutoMode.SPOT):
+        raise _SpotModeCancelled("auto spot is disabled or authorization is stale")
 
 
 class DailyResult(BaseModel):
@@ -120,12 +128,16 @@ def run_daily(
     bridge = ExchangeBridge(config=config)
     raw = watchlist if watchlist is not None else bridge.config.get("exec_watchlist")
     coins = _normalize_watchlist(raw)
+    results: list[DailyResult] = []
+    if not _mode_enabled(bridge, AutoMode.SPOT):
+        for coin in coins:
+            results.append(DailyResult(ticker=coin, reason="auto spot is disabled"))
+        return results
     today = _today_iso()
     # Lazy import (like ccxt in bridge.py): importing tradingagents.execution
     # stays cheap and tests can mock the graph class wholesale.
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-    results: list[DailyResult] = []
     for coin in coins:
         result = DailyResult(ticker=coin)
         try:
@@ -138,14 +150,27 @@ def run_daily(
             # propagate can leave LangGraph checkpoint state mid-pipeline.
             signal = None
             for attempt in range(3):
+                _check_spot_mode(bridge)
                 try:
                     graph = TradingAgentsGraph(
                         config=bridge.config,
                         selected_analysts=("market", "social", "news"),
                     )
-                    _, signal = graph.propagate(coin, today, asset_type="crypto")
+                    _check_spot_mode(bridge)
+                    propagate = getattr(graph, "propagate_with_telemetry", None)
+                    if callable(propagate) and "check_cancelled" in inspect.signature(propagate).parameters:
+                        _, signal = propagate(
+                            coin, today, asset_type="crypto", telemetry=None,
+                            check_cancelled=lambda: _check_spot_mode(bridge),
+                        )
+                    else:
+                        _, signal = graph.propagate(coin, today, asset_type="crypto")
+                    _check_spot_mode(bridge)
                     break
+                except _SpotModeCancelled:
+                    raise
                 except Exception as exc:
+                    _check_spot_mode(bridge)
                     if attempt == 2:
                         raise
                     wait = _PROPAGATE_RETRY_WAIT * (attempt + 1)
@@ -156,10 +181,15 @@ def run_daily(
                     )
                     time.sleep(wait)
             result.signal = signal
+            _check_spot_mode(bridge)
             portfolio = bridge.sync_portfolio()
+            _check_spot_mode(bridge)
             plan = bridge.plan_order(coin, signal, portfolio=portfolio)
             result.plan = plan
+            _check_spot_mode(bridge)
             _handle_plan(bridge, plan, portfolio, result)
+        except _SpotModeCancelled as exc:
+            result.reason = str(exc)
         except Exception as exc:  # one coin's failure never stops the watchlist
             logger.exception("run_daily: %s failed", coin)
             result.reason = f"{type(exc).__name__}: {exc}"
@@ -185,21 +215,10 @@ def _handle_plan(
         result.reason = plan.reason  # Hold, REVIEW, sizing refusal or risk rejection
         return
 
-    if not _gate_enabled(bridge, "exec_auto_confirm"):
-        _wait_for_approval(bridge, plan, "exec_auto_confirm is not enabled; plan awaits approval")
+    mode = AutoMode.FUTURES if getattr(plan, "market", "spot") == "derivatives" else AutoMode.SPOT
+    if not _mode_enabled(bridge, mode):
+        _wait_for_approval(bridge, plan, f"Auto {mode.name.title()} is disabled; plan awaits approval")
         result.reason = "awaiting approval"
-        return
-    if bridge.effective_mode() == "dry":
-        result.order_id = execute_once()
-        result.executed = True
-        return
-    if not _gate_enabled(bridge, "exec_live"):
-        _wait_for_approval(
-            bridge,
-            plan,
-            "auto-confirm on a live venue requires exec_live=True; plan awaits approval",
-        )
-        result.reason = "awaiting approval (live auto-confirm gate closed)"
         return
     result.order_id = execute_once()
     result.executed = True

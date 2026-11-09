@@ -353,7 +353,6 @@ export function ApprovalsScreen() {
       <ApproveDialog
         key={approveTarget?.id ?? "approve-none"}
         item={approveTarget}
-        execMode={gate.status === "ready" ? gate.execMode : null}
         submitting={submitting}
         error={dialogError}
         onOpenChange={(open) => {

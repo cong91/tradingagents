@@ -8,7 +8,11 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture
 def monitor_state(tmp_path, monkeypatch, postgres_schema):
-    set_config({"exec_derivatives": False, "exec_live": False})
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
     monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
@@ -40,7 +44,7 @@ def test_no_states_does_not_construct_executor(monitor_state, monkeypatch):
     assert position_monitor.poll_active_positions() == []
 
 
-def test_mutation_requires_both_derivatives_and_live_gates(monitor_state, monkeypatch):
+def test_mutation_ignores_legacy_entry_gates(monitor_state, monkeypatch):
     _state("BTC/USDT:USDT:buy:entry-1")
     calls = []
 
@@ -49,15 +53,68 @@ def test_mutation_requires_both_derivatives_and_live_gates(monitor_state, monkey
             calls.append(("init", config))
             self._bridge = object()
 
+    def fake_manage(bridge, *, allow_mutation, config, review_hook=None):
+        calls.append((allow_mutation, config["exec_live"], config["exec_derivatives"]))
+        return [{"position_key": "BTC/USDT:USDT:buy:entry-1", "status": "updated"}]
+
     monkeypatch.setattr(position_monitor, "_build_executor", FakeExecutor)
-    set_config({"exec_derivatives": True, "exec_live": True,
-                "risk_derivatives_profit_protection_enabled": True})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "false")
+    monkeypatch.setattr(position_monitor, "manage_active_positions", fake_manage)
+    set_config({
+        "exec_derivatives": True,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": True,
+    })
 
     results = position_monitor.poll_active_positions()
 
-    assert results == [{"position_key": "BTC/USDT:USDT:buy:entry-1", "status": "mutation_gated"}]
+    assert results == [{"position_key": "BTC/USDT:USDT:buy:entry-1", "status": "updated"}]
+    assert calls[-1] == (True, False, True)
+
+
+def test_position_protection_fails_closed_without_current_venue_evidence(
+    monitor_state, monkeypatch,
+):
+    _state("BTC/USDT:USDT:buy:entry-1")
+    calls = []
+
+    class FakeExecutor:
+        def __init__(self, config):
+            calls.append(config)
+            self._bridge = object()
+
+    monkeypatch.setattr(position_monitor, "_build_executor", FakeExecutor)
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": True,
+    })
+
+    results = position_monitor.poll_active_positions()
+
+    assert results == [{
+        "position_key": "BTC/USDT:USDT:buy:entry-1",
+        "status": "positions_unavailable:AttributeError",
+    }]
+    assert len(calls) == 1
+
+
+def test_position_protection_still_requires_protection_policy(monitor_state, monkeypatch):
+    _state("BTC/USDT:USDT:buy:entry-1")
+    calls = []
+    monkeypatch.setattr(
+        position_monitor,
+        "_build_executor",
+        lambda _config: calls.append("executor") or pytest.fail("must remain gated"),
+    )
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
+
+    assert position_monitor.poll_active_positions() == [
+        {"position_key": "BTC/USDT:USDT:buy:entry-1", "status": "mutation_gated"},
+    ]
     assert calls == []
 
 

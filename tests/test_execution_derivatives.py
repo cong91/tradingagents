@@ -3,8 +3,8 @@
 The exchange is a fake injected through ``exchange_factory``; no real client
 is built and no socket is opened (conftest ``_no_network`` would fail the test
 anyway). The risk guard's clock is frozen. Every test pins the FR-D contract:
-all three gate layers ship closed, and ANY default path (dry or live, with or
-without confirm) is refused with an audit line and nothing sent.
+Auto Futures and live mode ship closed; an entry additionally requires explicit
+intent, per-order confirmation, and risk approval.
 """
 
 import ccxt
@@ -12,6 +12,7 @@ import pytest
 
 import tradingagents.execution.risk as risk_module
 from server import job_store
+from server.auto_modes import AutoMode
 from tests.execution_derivatives_support import (
     VERIFIED_IDENTITY,
     FakeDerivExchange,
@@ -19,13 +20,16 @@ from tests.execution_derivatives_support import (
     _recovery_db as _recovery_db,
     bind_identity,
     bracket_kwargs,
+    enable_auto_futures as enable_auto_futures,
     gates_config,
     live_config,
     live_env,
     make_executor,
     read_audit,
 )
+from tradingagents.dataflows.config import set_config
 from tradingagents.default_config import DEFAULT_CONFIG, _apply_env_overrides
+from tradingagents.execution.auto_authorization import AutoAuthorizationError, mode_update_lock
 from tradingagents.execution.derivatives import DerivativesExecutor
 from tradingagents.portfolio import PortfolioContext
 
@@ -33,82 +37,89 @@ pytestmark = pytest.mark.unit
 
 
 def test_every_default_path_is_refused(tmp_path, monkeypatch):
-    """PRD requirement: with the gates at defaults, no path plans or sends."""
+    """With Auto Futures disabled by default, no path plans or sends."""
     book = PortfolioContext(cash=1_000.0)
 
-    # dry plan, no gates: refused on the config layer
+    # dry plan with mode closed: refused before metadata resolution
     executor = make_executor(tmp_path, monkeypatch)
-    with pytest.raises(PermissionError, match="exec_derivatives"):
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
         executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
     assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
 
-    # live plan, env flag true but the config layer closed: refused again
+    # live mode cannot open Auto Futures
     executor = make_executor(
         tmp_path, monkeypatch,
         config={"exec_live": True},
         env=live_env(),
     )
-    with pytest.raises(PermissionError, match="exec_derivatives"):
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
         executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
     assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
 
-    # dry execute (crafted order, no confirm): refused on the confirm layer
+    # A legacy derivatives env flag cannot open the new mode.
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
+    )
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
+        executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
+
+
+def test_auto_futures_env_is_ignored(tmp_path, monkeypatch):
+    """Neither the new mode key nor the removed gate is env-overridable."""
+    monkeypatch.setenv("TRADINGAGENTS_AUTO_FUTURES_ENABLED", "true")
+    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
+    config = _apply_env_overrides(dict(DEFAULT_CONFIG))
+    assert config.get("auto_futures_enabled") is not True
+
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        env={
+            "TRADINGAGENTS_AUTO_FUTURES_ENABLED": "true",
+            "TRADINGAGENTS_EXEC_DERIVATIVES": "true",
+        },
+    )
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
+        executor.plan_order(
+            "BTC-USD", "Buy", PortfolioContext(cash=1_000.0),
+            price=50_000.0, **bracket_kwargs(),
+        )
+
+
+def test_config_gate_never_opens_on_truthy_strings(tmp_path, monkeypatch):
+    """Auto Futures only opens when its config value is the boolean True."""
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config={"auto_futures_enabled": "true"},
+    )
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
+        executor.plan_order(
+            "BTC-USD", "Buy", PortfolioContext(cash=1_000.0),
+            price=50_000.0, **bracket_kwargs(),
+        )
+
+
+def test_execute_requires_explicit_confirmation_when_auto_futures_is_open(
+    tmp_path, monkeypatch,
+):
     from tradingagents.execution.sizing import PlannedOrder
 
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
-    crafted = PlannedOrder(
+    order = PlannedOrder(
         ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", side="buy",
         quantity=0.005, estimated_price=50_000.0, cost=250.0, market="derivatives",
         stop_loss=48_000.0, take_profit=55_000.0,
         futures_execution_intent="enter",
     )
+
     with pytest.raises(PermissionError, match="confirm=True"):
-        executor.execute_order(crafted, portfolio=PortfolioContext(cash=1_000.0))
+        executor.execute_order(order, portfolio=PortfolioContext(cash=1_000.0))
+
     assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
-
-    # live execute with confirm but derivatives config gate closed: refused
-    executor = make_executor(
-        tmp_path, monkeypatch,
-        config={"exec_live": True},
-        env={"TRADINGAGENTS_EXEC_LIVE": "true", "TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
-    )
-    with pytest.raises(PermissionError, match="exec_derivatives"):
-        executor.execute_order(crafted, confirm=True)
-    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
-
-
-def test_env_gate_read_fail_closed(tmp_path, monkeypatch):
-    """Config armed but the env flag missing/garbage keeps everything closed."""
-    book = PortfolioContext(cash=1_000.0)
-    for env_value in (None, "false", "0", "garbage"):
-        executor = make_executor(
-            tmp_path, monkeypatch, config=gates_config(),
-            env={"TRADINGAGENTS_EXEC_DERIVATIVES": env_value} if env_value else {},
-        )
-        with pytest.raises(PermissionError, match="TRADINGAGENTS_EXEC_DERIVATIVES"):
-            executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
-
-
-def test_config_gate_never_opens_on_truthy_strings(tmp_path, monkeypatch):
-    """The config gate only opens on a real boolean, like exec_live."""
-    book = PortfolioContext(cash=1_000.0)
-    executor = make_executor(
-        tmp_path, monkeypatch,
-        config=gates_config(exec_derivatives="true"),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
-    )
-    with pytest.raises(PermissionError, match="exec_derivatives"):
-        executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
-
-
-def test_config_gate_env_var_is_not_a_config_override(monkeypatch):
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
-    config = _apply_env_overrides(dict(DEFAULT_CONFIG))
-    assert config["exec_derivatives"] is False
 
 
 def test_tradeable_rating_without_explicit_intent_is_refused_before_market_resolution(
@@ -117,7 +128,6 @@ def test_tradeable_rating_without_explicit_intent_is_refused_before_market_resol
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     monkeypatch.setattr(
         executor,
@@ -144,7 +154,6 @@ def test_crafted_derivatives_order_without_intent_is_refused_before_risk_or_send
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
         factory=lambda: exchange,
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     from tradingagents.execution.sizing import PlannedOrder
 
@@ -168,7 +177,6 @@ def test_gated_dry_plan_long(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
@@ -190,7 +198,6 @@ def test_gated_plan_bearish_rating_opens_a_short_only_with_explicit_entry_intent
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", signal, PortfolioContext(cash=1_000.0), price=50_000.0,
@@ -211,7 +218,6 @@ def test_gated_plan_leverage_scales_notional_not_margin(tmp_path, monkeypatch):
             risk_max_total_exposure_pct=200.0,
             risk_max_position_pct_per_asset=200.0,  # per-asset sees notional 125%
         ),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=5.0,
@@ -226,7 +232,6 @@ def test_gated_plan_leverage_scales_notional_not_margin(tmp_path, monkeypatch):
 def test_plan_hold_and_review_stay_no_orders(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     hold = executor.plan_order("BTC-USD", "Hold", PortfolioContext(cash=1_000.0), price=50_000.0)
     assert hold.side is None and hold.needs_review is False
@@ -243,7 +248,6 @@ def test_plan_hold_and_review_stay_no_orders(tmp_path, monkeypatch):
 def test_plan_below_minimum_notional_is_refused(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=20.0), price=50_000.0,
@@ -274,7 +278,6 @@ def test_plan_order_resolves_off_whitelist_override_through_metadata(tmp_path, m
             risk_max_derivatives_exposure_pct=100.0,
         ),
         factory=lambda: exchange,
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "NEAR-USD", "Buy", PortfolioContext(cash=1_000.0), price=5.0,
@@ -289,12 +292,10 @@ def test_symbol_for_builds_unified_form_and_honors_overrides(tmp_path, monkeypat
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(exec_symbol_overrides={"BTC-USD": "BTC/USDC:USDC"}),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     assert executor.symbol_for("BTC-USD") == "BTC/USDC:USDC"
     plain = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     assert plain.symbol_for("ETH-USD") == "ETH/USDT:USDT"
 
@@ -305,7 +306,6 @@ def test_symbol_for_builds_unified_form_and_honors_overrides(tmp_path, monkeypat
 def test_plan_leverage_above_default_cap_returns_no_order_plan(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )  # default risk_max_derivatives_leverage = 1.0
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
@@ -321,7 +321,6 @@ def test_plan_notional_above_zero_default_exposure_cap_is_rejected(tmp_path, mon
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_leverage=5.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )  # default risk_max_derivatives_exposure_pct = 0.0 blocks all notional
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
@@ -342,7 +341,6 @@ def test_plan_within_raised_caps_passes(tmp_path, monkeypatch):
             # 750 = 75% of equity 1000, so it must be raised above 75%
             risk_max_position_pct_per_asset=100.0,
         ),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=3.0,
@@ -363,7 +361,6 @@ def test_dry_execute_with_confirm_sends_nothing(tmp_path, monkeypatch):
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
         factory=lambda: exchange,
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
@@ -378,6 +375,72 @@ def test_dry_execute_with_confirm_sends_nothing(tmp_path, monkeypatch):
     assert event["venue_key"] == "binance|https://demo-api.binance.com|False"
 
 
+def test_live_caller_config_cannot_enable_futures_when_process_mode_closed(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
+        executor.plan_order(
+            "BTC-USD", "Buy", PortfolioContext(cash=1_000.0),
+            price=50_000.0, **bracket_kwargs(),
+        )
+
+    assert exchange.calls == []
+    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_live_entry_is_refused_if_process_mode_closes_after_plan(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+    with mode_update_lock((AutoMode.FUTURES,)):
+        set_config({"auto_futures_enabled": False})
+
+    with pytest.raises(PermissionError, match="Auto Futures is disabled"):
+        executor.execute_order(order, confirm=True, portfolio=book)
+
+    assert exchange.calls == [("load_markets",)]
+    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_live_entry_rechecks_process_mode_at_submission(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+    original_set_leverage = exchange.set_leverage
+
+    def disable_before_submission(leverage, symbol, params=None):
+        original_set_leverage(leverage, symbol, params)
+        with mode_update_lock((AutoMode.FUTURES,)):
+            set_config({"auto_futures_enabled": False})
+
+    monkeypatch.setattr(exchange, "set_leverage", disable_before_submission)
+    with pytest.raises(AutoAuthorizationError, match="Auto Futures is disabled or authorization is stale"):
+        executor.execute_order(order, confirm=True, portfolio=book)
+
+    assert ("set_leverage", 1, "BTC/USDT:USDT") in exchange.calls
+    assert not [call for call in exchange.calls if call[0] == "create_order"]
+    assert read_audit(tmp_path)[-1]["action"] == "derivatives_denied"
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execute_places_market_order(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     executor = make_executor(
@@ -415,6 +478,7 @@ def test_live_execute_places_market_order(tmp_path, monkeypatch):
     assert events[-1]["order_id"].count("deriv-") == 2
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_entry_without_verified_account_is_refused(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     # No readable venue account: the fresh-account gate refuses before any
@@ -431,6 +495,7 @@ def test_live_entry_without_verified_account_is_refused(tmp_path, monkeypatch):
     assert not [call for call in exchange.calls if call[0] == "create_order"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execute_rechecks_fresh_venue_book(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     executor = make_executor(
@@ -447,6 +512,7 @@ def test_live_execute_rechecks_fresh_venue_book(tmp_path, monkeypatch):
     assert not [call for call in exchange.calls if call[0] == "create_order"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_risk_guard_rejects_position_added_after_analysis(tmp_path, monkeypatch):
     from dataclasses import replace
 
@@ -471,6 +537,7 @@ def test_live_risk_guard_rejects_position_added_after_analysis(tmp_path, monkeyp
     assert not [call for call in exchange.calls if call[0] == "create_order"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 @pytest.mark.parametrize(("equity", "expected_reason"), [
     (500, "derivatives notional would reach 50.00%"),
     (499, "derivatives notional would reach 50.10%"),
@@ -506,6 +573,7 @@ def test_fresh_equity_drives_execute_exposure_cap(tmp_path, monkeypatch, equity,
     assert not [call for call in exchange.calls if call[0] == "create_order"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execute_rejects_unreadable_fresh_book(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     executor = make_executor(
@@ -520,6 +588,7 @@ def test_live_execute_rejects_unreadable_fresh_book(tmp_path, monkeypatch):
     assert not [call for call in exchange.calls if call[0] == "create_order"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_fresh_book_refusal_names_the_underlying_cause(tmp_path, monkeypatch):
     """The refusal must carry the cause, not only its type: five distinct
     ValueErrors and every venue error share this branch, and a bare type name
@@ -545,6 +614,7 @@ def test_fresh_book_refusal_names_the_underlying_cause(tmp_path, monkeypatch):
     assert denied[-1]["reason"] == message
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_entry_in_hedge_mode_is_refused_before_any_send(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(hedged=True)
     executor = make_executor(
@@ -563,6 +633,7 @@ def test_live_entry_in_hedge_mode_is_refused_before_any_send(tmp_path, monkeypat
     assert read_audit(tmp_path)[-1]["action"] == "rejected_at_execute"
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_margin_mode_already_set_does_not_block_the_entry(tmp_path, monkeypatch):
     """Binance answers -4046 when the symbol already has that margin type:
     the desired end state, not a reason to refuse a protective entry."""
@@ -590,6 +661,7 @@ def test_margin_mode_already_set_does_not_block_the_entry(tmp_path, monkeypatch)
     assert [call for call in exchange.calls if call[0] == "create_order" and call[5]]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execute_sets_leverage_before_create_order(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     executor = make_executor(
@@ -628,7 +700,6 @@ def test_agent_terms_drive_sizing_and_margin_mode(tmp_path, monkeypatch):
             risk_derivatives_risk_fraction=0.01,
             risk_derivatives_margin_fraction=0.25,
         ),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
@@ -654,7 +725,6 @@ def test_agent_terms_above_the_hard_caps_are_refused(tmp_path, monkeypatch):
             risk_derivatives_max_risk_fraction=0.02,
             risk_derivatives_max_margin_fraction=0.5,
         ),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     book = PortfolioContext(cash=1_000.0)
 
@@ -686,6 +756,7 @@ def test_agent_terms_above_the_hard_caps_are_refused(tmp_path, monkeypatch):
     assert "margin_mode" in (bad_mode.reason or "")
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execution_sets_margin_mode_before_leverage_and_entry(tmp_path, monkeypatch):
     """Margin type can only change while flat, so it must precede the entry;
     it is pinned explicitly instead of trusting the venue's per-symbol preset."""
@@ -719,6 +790,7 @@ def test_live_execution_sets_margin_mode_before_leverage_and_entry(tmp_path, mon
     assert kinds.index("set_leverage") < kinds.index("create_order")
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_execution_skips_margin_mode_when_the_plan_has_none(tmp_path, monkeypatch):
     exchange = FakeDerivExchange()
     exchange.set_margin_mode = lambda *args, **kwargs: exchange.calls.append(
@@ -739,6 +811,7 @@ def test_live_execution_skips_margin_mode_when_the_plan_has_none(tmp_path, monke
     assert not [call for call in exchange.calls if call[0] == "set_margin_mode"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_without_credentials_is_denied(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(api_key="", secret="")
     executor = make_executor(
@@ -754,6 +827,7 @@ def test_live_without_credentials_is_denied(tmp_path, monkeypatch):
     assert not any(call[0] == "create_order" for call in exchange.calls)
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_exchange_error_is_audited_then_chained(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(create_order_error=ccxt.NetworkError("connection reset"))
     executor = make_executor(
@@ -775,7 +849,6 @@ def test_execute_refuses_spot_orders(tmp_path, monkeypatch):
 
     executor = make_executor(
         tmp_path, monkeypatch, config=gates_config(),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     spot = PlannedOrder(
         ticker="BTC-USD", ccxt_symbol="BTC/USDT", signal="Buy", side="buy",
@@ -794,7 +867,6 @@ def test_execute_without_portfolio_is_refused_fail_closed(tmp_path, monkeypatch)
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
@@ -810,7 +882,6 @@ def test_execute_with_unmarkable_portfolio_is_refused_fail_closed(tmp_path, monk
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
@@ -828,7 +899,6 @@ def test_execute_fails_closed_when_audit_log_unreadable(tmp_path, monkeypatch):
         tmp_path, monkeypatch,
         config=gates_config(risk_max_derivatives_exposure_pct=100.0),
         factory=lambda: exchange,
-        env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
@@ -841,6 +911,7 @@ def test_execute_fails_closed_when_audit_log_unreadable(tmp_path, monkeypatch):
     assert "unreadable" in event["reason"]
 
 
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_no_secrets_in_any_audit_line(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(api_key="sentinel-key-123", secret="sentinel-secret-456")
     executor = make_executor(

@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from server import (
     approvals,
     audit,
+    auto_modes,
     autoloop,
     bracket_monitor,
     control_store,
@@ -94,10 +95,9 @@ def _apply_engine_settings() -> None:
 def _apply_operator_config() -> None:
     """Apply the operator's stored overrides from PostgreSQL.
 
-    The shipped engine defaults stay fail-closed (tests pin them); an operator
-    opens gates like ``exec_auto_confirm`` by storing an override through
-    ``PUT /api/operator-config`` (or the Cấu hình screen), which writes
-    ``control_operator_settings``. Called after migrations so the table exists.
+    The shipped engine defaults stay fail-closed (tests pin them); operator
+    modes and risk overrides are loaded from ``control_operator_settings``.
+    Called after migrations so the table exists.
 
     Only the allowlisted keys in ``server/operator_config.py`` are applied; a
     stored row for an unknown key is ignored rather than injected into config.
@@ -107,6 +107,13 @@ def _apply_operator_config() -> None:
 
     stored = control_store.load_operator_settings()
     applied = {key: value for key, value in stored.items() if key in _ALLOWED}
+    # Existing monitors and execution paths still read the legacy switches.
+    # Keep stored values internal until those paths are migrated separately.
+    applied.update({
+        key: stored[key] is True
+        for key in ("exec_live", *auto_modes.LEGACY_KEYS)
+        if key in stored
+    })
     if applied:
         set_config(applied)
         logger.info("applied %d operator override(s) from PostgreSQL", len(applied))
@@ -138,6 +145,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # into the process config.
     _open_state_db()
     _apply_engine_settings()
+    auto_modes.ensure_modes_migrated()
     _apply_operator_config()
     watchlist.ensure_seeded()
     # Session cookies for the sentiment vendors live encrypted in PostgreSQL;

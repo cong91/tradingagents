@@ -27,11 +27,7 @@ def poll_active_positions() -> list[dict]:
     if not states:
         return []
     config = get_config()
-    allow_mutation = (
-        config.get("exec_derivatives") is True
-        and config.get("exec_live") is True
-        and config.get("risk_derivatives_profit_protection_enabled") is True
-    )
+    allow_mutation = config.get("risk_derivatives_profit_protection_enabled") is True
     if not allow_mutation:
         return [
             {"position_key": state["position_key"], "status": "mutation_gated"}

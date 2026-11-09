@@ -20,6 +20,7 @@ export function SettingsSection({
   errors,
   onChange,
   action,
+  showTechnicalDetails = false,
 }: {
   title: string;
   description: string;
@@ -28,6 +29,7 @@ export function SettingsSection({
   errors: Record<string, string>;
   onChange: (key: string, value: SettingValue) => void;
   action?: ReactNode;
+  showTechnicalDetails?: boolean;
 }) {
   return (
     <Card>
@@ -43,6 +45,7 @@ export function SettingsSection({
             row={row}
             value={values[row.key] ?? ""}
             error={errors[row.key]}
+            showTechnicalDetails={showTechnicalDetails}
             onChange={(value) => onChange(row.key, value)}
           />
         ))}

@@ -1,4 +1,4 @@
-"""Operator overrides: the deliberate config a human sets, stored in PostgreSQL.
+"""Operator overrides: deliberate config a human sets, stored in PostgreSQL.
 
 This replaces ``server/data/operator_config.json``. The values live in
 ``control_operator_settings`` (``0003_operator_settings.sql``) so they survive a
@@ -6,14 +6,12 @@ restart and are visible/auditable instead of being a file only a shell can see.
 
 Two rules shape this surface:
 
-* **Explicit allowlist.** Only the keys in ``_ALLOWED`` may be written. They are
-  the knobs that ``PUT /api/settings`` deliberately refuses (the operator
-  execution gates) plus a few operational limits an operator may want to force
-  regardless of ``.env``. Everything else belongs to ``/api/settings``.
-* **Gates are config-only runtime switches.** The three execution keys are
-  applied in-process and persisted in PostgreSQL. Arming a gate here requires
-  an explicit ``confirm`` flag plus a written reason, and every change records
-  its old and new value in the server action trail.
+* **Explicit allowlist.** Only the market automation modes and operational risk
+  limits in ``_ALLOWED`` may be written. Deployment/runtime safety gates such as
+  ``exec_live`` and legacy execution switches are never user controls here.
+* **Modes are deliberate runtime switches.** Enabling either mode requires an
+  explicit ``confirm`` flag plus a written reason, and every change records its
+  old and new value in the server action trail.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ import math
 
 from fastapi import APIRouter, Request
 
-from server import audit as audit_log, control_store, settings_events
+from server import audit as audit_log, auto_modes, control_store, settings_events
 from server.contract import ApiError, json_body, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -31,33 +29,21 @@ router = APIRouter(prefix="/api", tags=["operator-config"])
 
 # key -> (json type, is an execution gate, group, Vietnamese label, hint)
 _ALLOWED: dict[str, dict] = {
-    "exec_live": {
+    "auto_spot_enabled": {
         "type": "bool",
         "gate": True,
         "group": "gates",
-        "label": "Cổng LIVE (exec_live)",
-        "hint": (
-            "Bật/tắt quyền live bằng công tắc cấu hình hiện tại. Tắt cổng này là đóng ngay."
-        ),
+        "label": "Auto Spot",
+        "hint": "Cho phép hệ thống tự sàng lọc, phân tích và tạo lệnh Spot mới.",
     },
-    "exec_auto_confirm": {
+    "auto_futures_enabled": {
         "type": "bool",
         "gate": True,
         "group": "gates",
-        "label": "Tự động xác nhận (exec_auto_confirm)",
+        "label": "Auto Futures",
         "hint": (
-            "Công tắc cho autoloop tự động xác nhận kế hoạch; việc gửi live vẫn "
-            "cần exec_live và confirm/RiskGuard."
-        ),
-    },
-    "exec_derivatives": {
-        "type": "bool",
-        "gate": True,
-        "group": "gates",
-        "label": "Phái sinh (exec_derivatives)",
-        "hint": (
-            "Công tắc cho futures. Executor vẫn đòi explicit futures intent, "
-            "confirm=True và RiskGuard."
+            "Cho phép hệ thống tự sàng lọc, phân tích và tạo vị thế Futures mới. "
+            "Tắt không dừng bảo vệ vị thế đang mở."
         ),
     },
     "risk_max_derivatives_leverage": {
@@ -284,7 +270,7 @@ def _row(key: str, stored: dict[str, dict]) -> dict:
         "hint": meta["hint"],
         "gate": meta["gate"],
         "value": get_config().get(key),
-        "default": DEFAULT_CONFIG.get(key),
+        "default": auto_modes.MODE_DEFAULTS.get(key, DEFAULT_CONFIG.get(key)),
         "override": override is not None,
         "stored_value": override["value"] if override else None,
         "updated_at": override["updated_at"] if override else None,
@@ -300,13 +286,15 @@ def _payload() -> dict:
     from server.settings import effective_exec_mode
 
     config = get_config()
+    modes = auto_modes.mode_config(config)
     return {
         "generated_at": utc_now_iso(),
         "settings": rows,
+        "modes": modes,
         "gates": {
-            "exec_live_config": config.get("exec_live") is True,
-            "exec_auto_confirm_config": config.get("exec_auto_confirm") is True,
-            "exec_derivatives_config": config.get("exec_derivatives") is True,
+            "auto_spot": modes["spot"],
+            "auto_futures": modes["futures"],
+            "any_auto_enabled": any(modes.values()),
         },
         "effective_exec_mode": effective_exec_mode(),
         "allowlist": sorted(_ALLOWED),
@@ -361,12 +349,18 @@ async def put_operator_config(request: Request):
     actor = body.get("actor")
     actor = actor.strip()[:120] if isinstance(actor, str) and actor.strip() else None
 
-    config = get_config()
-    previous = {key: config.get(key) for key in validated}
-    for key, value in validated.items():
-        control_store.set_operator_setting(key, value, updated_by=actor)
+    from tradingagents.execution.auto_authorization import mode_update_lock
 
-    set_config(validated)  # in-memory: effective for runs created after this call
+    affected_modes = [mode for mode, key in auto_modes.MODE_KEYS.items() if key in gate_changes]
+    with mode_update_lock(affected_modes):
+        config = get_config()
+        previous = {key: config.get(key) for key in validated}
+        control_store.set_operator_settings(validated, updated_by=actor)
+        set_config(validated)  # apply only after the entire batch commits
+    if gate_changes:
+        from server import autoloop
+
+        autoloop.sync_mode_state()
     settings_events.publish_change("operator_config_updated")
 
     audit_log.record(
@@ -389,11 +383,23 @@ async def delete_operator_config(key: str, request: Request):
     if key not in _ALLOWED:
         raise ApiError(403, "forbidden_key", f"{key!r} is not an operator override key")
 
-    if not control_store.delete_operator_setting(key):
-        raise ApiError(404, "not_found", f"{key!r} has no stored override")
+    from tradingagents.execution.auto_authorization import mode_update_lock
 
-    default = DEFAULT_CONFIG.get(key)
-    set_config({key: default})  # restore the shipped default in this process
+    default = auto_modes.MODE_DEFAULTS.get(key, DEFAULT_CONFIG.get(key))
+    affected_modes = [mode for mode, mode_key in auto_modes.MODE_KEYS.items() if mode_key == key]
+    with mode_update_lock(affected_modes):
+        if key in auto_modes.MODE_DEFAULTS:
+            reset = control_store.reset_operator_setting(key, default)
+        else:
+            reset = control_store.delete_operator_setting(key)
+        if not reset:
+            raise ApiError(404, "not_found", f"{key!r} has no stored override")
+
+        set_config({key: default})  # restore the shipped default in this process
+    if key in auto_modes.MODE_DEFAULTS:
+        from server import autoloop
+
+        autoloop.sync_mode_state()
     settings_events.publish_change("operator_config_reset")
 
     audit_log.record(

@@ -13,7 +13,11 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture
 def monitor_state(tmp_path, monkeypatch, postgres_schema):
-    set_config({"exec_derivatives": False, "exec_live": False})
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
     monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
 
@@ -81,17 +85,74 @@ def test_no_active_tasks_does_not_construct_executor(monitor_state, monkeypatch)
     assert bracket_monitor.poll_active_brackets() == []
 
 
+def test_pending_protected_bracket_is_recovered_without_entry_gates(
+    monitor_state, monkeypatch,
+):
+    _create_task("pending")
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": True,
+    })
+    monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
+    calls = _install_executor(monkeypatch)
+
+    results = bracket_monitor.poll_active_brackets()
+
+    assert results == [{"task_id": "pending", "status": "recovered:pending"}]
+    assert calls["recover"] == [("pending", True)]
+    assert calls["monitor"] == []
+
+
+def test_pending_entry_intent_stays_read_only_when_protection_is_enabled(
+    monitor_state, monkeypatch,
+):
+    intent_id = "entry-intent:BTC/USDT:USDT:entry-pending"
+    _create_task(intent_id)
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": True,
+    })
+    calls = _install_executor(monkeypatch)
+
+    results = bracket_monitor.poll_active_brackets()
+
+    assert results == [{"task_id": intent_id, "status": f"monitored:{intent_id}"}]
+    assert calls["recover"] == []
+    assert calls["monitor"] == [intent_id]
+
+
+def test_monitoring_bracket_is_polled_when_protection_is_disabled(
+    monitor_state, monkeypatch,
+):
+    _create_task("monitoring", status="monitoring")
+    set_config({
+        "exec_derivatives": False,
+        "exec_live": False,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
+    calls = _install_executor(monkeypatch)
+
+    results = bracket_monitor.poll_active_brackets()
+
+    assert results == [{"task_id": "monitoring", "status": "monitored:monitoring"}]
+    assert calls["recover"] == []
+    assert calls["monitor"] == ["monitoring"]
+
+
 @pytest.mark.parametrize(
     ("config_gate", "derivatives_env", "live_config", "live_env", "expected"),
     [
         (True, "true", True, "true", "recover"),
-        (False, "true", True, "true", "monitor"),
-        (True, "false", True, "true", "monitor"),
+        (False, "true", True, "true", "recover"),
+        (True, "false", True, "true", "recover"),
         (True, "true", False, "true", "monitor"),
         (True, "true", True, "false", "monitor"),
+
     ],
 )
-def test_pending_recovery_requires_all_live_and_derivatives_gates(
+def test_pending_recovery_ignores_legacy_derivatives_gate(
     monitor_state,
     monkeypatch,
     config_gate,
@@ -101,7 +162,11 @@ def test_pending_recovery_requires_all_live_and_derivatives_gates(
     expected,
 ):
     _create_task("pending")
-    set_config({"exec_derivatives": config_gate, "exec_live": live_config})
+    set_config({
+        "exec_derivatives": config_gate,
+        "exec_live": live_config,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
     monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", derivatives_env)
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", live_env)
     calls = _install_executor(monkeypatch)
@@ -122,7 +187,11 @@ def test_pending_recovery_requires_all_live_and_derivatives_gates(
 def test_pending_entry_intent_uses_read_only_monitor_even_when_live(monitor_state, monkeypatch):
     intent_id = "entry-intent:BTC/USDT:USDT:entry-pending"
     _create_task(intent_id)
-    set_config({"exec_derivatives": True, "exec_live": True})
+    set_config({
+        "exec_derivatives": True,
+        "exec_live": True,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
     monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     calls = _install_executor(monkeypatch)
@@ -139,7 +208,11 @@ def test_monitoring_tasks_dispatch_to_monitor_when_live_gates_are_open(
 ):
     _create_task("pending")
     _create_task("already-monitoring", status="monitoring")
-    set_config({"exec_derivatives": True, "exec_live": True})
+    set_config({
+        "exec_derivatives": True,
+        "exec_live": True,
+        "risk_derivatives_profit_protection_enabled": False,
+    })
     monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     calls = _install_executor(monkeypatch)
@@ -315,6 +388,7 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
 
     calls = []
     monkeypatch.setattr(main, "_apply_engine_settings", lambda: calls.append("engine-settings"))
+    monkeypatch.setattr(main.auto_modes, "ensure_modes_migrated", lambda: calls.append("auto-modes"))
     monkeypatch.setattr(main, "_apply_operator_config", lambda: calls.append("config"))
     monkeypatch.setattr(main, "_open_state_db", lambda: calls.append("database"))
     monkeypatch.setattr(main.watchlist, "ensure_seeded", lambda: calls.append("watchlist"))
@@ -344,6 +418,7 @@ def test_lifespan_starts_and_stops_monitor_with_other_lifecycle_hooks(monkeypatc
         # overrides, so a deliberate operator override still wins.
         "database",
         "engine-settings",
+        "auto-modes",
         "config",
         "watchlist",
         "autoloop",

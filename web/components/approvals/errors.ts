@@ -13,9 +13,9 @@ export type ActionError = {
 export function describeActionError(error: ActionError): string {
   const m = getMessages().approvals.errors;
   switch (error.code) {
+    case "mode_closed":
+      return m.mode_closed;
     case "gate_closed":
-      // server/approvals.py:150-152 — chính sách bản dựng này: duyệt chỉ được
-      // khi cổng FR5 (exec_live) là True trong config; cổng không chỉnh được qua UI.
       return m.gate_closed;
     case "risk_halted": {
       const reason =

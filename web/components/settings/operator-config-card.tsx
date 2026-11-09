@@ -1,34 +1,28 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useRef } from "react";
 import { LoaderCircleIcon, RotateCcwIcon, SaveIcon, ShieldAlertIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { formatDateTimeVi } from "./format-time";
 import { useT, type Messages } from "@/lib/i18n";
+import { formatDateTimeVi } from "./format-time";
+import { useOperatorConfig, type OperatorConfigController } from "./operator-config-controller";
 import {
-  operatorConfigApi,
-  OperatorConfigApiError,
-  toOperatorError,
-} from "./operator-config-api";
-import {
-  changedKeys,
-  draftFrom,
-
-  type OperatorConfigPayload,
-  type OperatorDraft,
+  isOperatorGateKey,
+  operatorRiskGroup,
+  operatorSection,
+  type OperatorRiskGroup,
+  type OperatorSection,
   type OperatorSettingRow,
+  type OperatorValue,
 } from "./operator-config-types";
-
-type Feedback = { role: "status" | "alert"; text: string };
 
 function formatValue(
   t: Messages,
@@ -42,14 +36,24 @@ function formatValue(
 
 function RowField({
   row,
+  rowLabel,
   value,
   disabled,
+  switchControl,
+  invalid,
+  unit,
+  describedBy,
   onChange,
 }: {
   row: OperatorSettingRow;
-  value: string | boolean;
+  rowLabel: string;
+  value: OperatorValue;
   disabled: boolean;
-  onChange: (next: string | boolean) => void;
+  switchControl: boolean;
+  invalid: boolean;
+  unit?: string;
+  describedBy?: string;
+  onChange: (next: OperatorValue) => void;
 }) {
   const t = useT();
   const id = `operator-${row.key}`;
@@ -59,145 +63,188 @@ function RowField({
         <input
           id={id}
           type="checkbox"
+          role={switchControl ? "switch" : undefined}
+          aria-label={t.settings.operator.draftSwitchAria(rowLabel)}
+          aria-describedby={describedBy}
           checked={value === true}
           disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
-          className="size-6 cursor-pointer accent-primary disabled:cursor-not-allowed"
+          className={switchControl ? "peer sr-only" : "size-6 cursor-pointer accent-primary disabled:cursor-not-allowed"}
         />
-        <span className="text-sm text-muted-foreground">{value === true ? t.common.on : t.common.off}</span>
+        {switchControl ? (
+          <span
+            aria-hidden="true"
+            className="relative h-6 w-11 shrink-0 rounded-full border border-input bg-muted transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-background after:transition-transform peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring peer-disabled:cursor-not-allowed peer-disabled:opacity-60"
+          />
+        ) : null}
+        <span className="text-sm text-muted-foreground">
+          {switchControl ? `${t.settings.operator.draft}: ` : ""}
+          {value === true ? t.common.on : t.common.off}
+        </span>
       </label>
     );
   }
   return (
-    <input
-      id={id}
-      type="text"
-      inputMode="decimal"
-      value={typeof value === "string" ? value : ""}
-      disabled={disabled}
-      onChange={(event) => onChange(event.target.value)}
-      placeholder={formatValue(t, row, row.default)}
-      className="h-11 w-full min-w-0 rounded-lg border border-input bg-background px-3 text-sm tabular-nums outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
-    />
+    <div className="flex min-w-0 items-center gap-2">
+      <input
+        id={id}
+        type="text"
+        inputMode="decimal"
+        value={typeof value === "string" ? value : ""}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        aria-invalid={invalid || undefined}
+        aria-describedby={describedBy}
+        placeholder={formatValue(t, row, row.default)}
+        className="h-11 w-full min-w-0 rounded-lg border border-input bg-background px-3 text-sm tabular-nums outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60 aria-[invalid=true]:border-destructive"
+      />
+      {unit ? <span id={`${id}-unit`} className="shrink-0 text-sm text-muted-foreground">{unit}</span> : null}
+    </div>
   );
 }
 
-export function OperatorConfigCard() {
+function OperatorRow({ row, controller }: { row: OperatorSettingRow; controller: OperatorConfigController }) {
   const t = useT();
   const c = t.settings.operator;
-  const [payload, setPayload] = useState<OperatorConfigPayload | null>(null);
-  const [draft, setDraft] = useState<OperatorDraft>({});
-  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
-  const [errorMessage, setErrorMessage] = useState("");
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [confirmGate, setConfirmGate] = useState(false);
-  const [reason, setReason] = useState("");
+  const meta = t.settings.settingMeta[row.key];
+  const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : meta?.label ?? row.label;
+  const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : meta?.hint ?? row.hint;
+  const switchControl = row.gate && isOperatorGateKey(row.key);
+  const pending = controller.changed.includes(row.key);
+  const invalid = controller.invalidKeys.includes(row.key);
+  const id = `operator-${row.key}`;
+  const unit = !row.gate && row.type !== "bool" ? meta?.unit : undefined;
+  const describedBy = [
+    !row.gate && rowHint ? `${id}-hint` : null,
+    switchControl ? `${id}-status` : null,
+    unit ? `${id}-unit` : null,
+    invalid && row.type !== "bool" ? `${id}-error` : null,
+  ].filter(Boolean).join(" ") || undefined;
+  return (
+    <li className={
+      switchControl
+        ? "grid gap-2 bg-primary/5 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+        : "grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
+    }>
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <label htmlFor={id} className="text-sm font-medium">{rowLabel}</label>
+          <Badge variant={row.override ? "secondary" : "outline"}>
+            {row.override ? c.overridden : c.noOverride}
+          </Badge>
+          {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
+        </div>
+        <p id={!row.gate && rowHint ? `${id}-hint` : undefined} className="mt-0.5 text-xs text-muted-foreground">{rowHint}</p>
+        {switchControl ? (
+          <div id={`${id}-status`} className="mt-1 flex flex-wrap gap-2">
+            <Badge variant="outline">{c.currentState(formatValue(t, row, row.value))}</Badge>
+            {pending ? <Badge variant="secondary">{c.pendingSave}</Badge> : null}
+          </div>
+        ) : null}
+        <p className="mt-0.5 text-xs text-muted-foreground/80">
+          {c.effectiveDefault(formatValue(t, row, row.value), formatValue(t, row, row.default))}
+        </p>
+      </div>
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <RowField
+            row={row}
+            rowLabel={rowLabel}
+            value={controller.draft[row.key] ?? ""}
+            disabled={controller.saving}
+            switchControl={switchControl}
+            invalid={invalid}
+            unit={unit}
+            describedBy={describedBy}
+            onChange={(next) => controller.setValue(row.key, next)}
+          />
+          {invalid ? (
+            <p id={`${id}-error`} role="alert" className="mt-1 text-xs text-destructive">
+              {controller.invalidMessages[row.key] ?? c.invalidNumber}
+            </p>
+          ) : null}
+        </div>
+        {row.override && !row.gate && !isOperatorGateKey(row.key) ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="min-touch shrink-0"
+            disabled={controller.saving || controller.refreshing || controller.serverAhead || controller.refreshFailed || controller.dirtyCount > 0}
+            onClick={() => void controller.reset(row.key)}
+            aria-label={c.resetAria(rowLabel)}
+            title={controller.dirtyCount > 0 ? c.resetDraftWarning : c.resetAria(rowLabel)}
+          >
+            <RotateCcwIcon aria-hidden="true" />
+          </Button>
+        ) : null}
+      </div>
+    </li>
+  );
+}
 
-  const load = useCallback(async () => {
-    try {
-      const next = await operatorConfigApi.get();
-      setPayload(next);
-      setDraft(draftFrom(next));
-      setPhase("ready");
-      setErrorMessage("");
-    } catch (err) {
-      setPhase("error");
-      setErrorMessage(toOperatorError(err).message);
-    }
-  }, []);
+const riskOrder: readonly OperatorRiskGroup[] = ["general", "futures", "protection", "advanced"];
 
+function OperatorRowsGroup({
+  title,
+  rows,
+  collapsible,
+  controller,
+}: {
+  title: string;
+  rows: OperatorSettingRow[];
+  collapsible: boolean;
+  controller: OperatorConfigController;
+}) {
+  const details = useRef<HTMLDetailsElement>(null);
+  const hasChanges = rows.some((row) => controller.changed.includes(row.key));
+  const lastChanges = useRef(false);
   useEffect(() => {
-    // Deferred like autoloop-card: the first fetch must not set state during
-    // the effect body itself (react-hooks/set-state-in-effect).
-    const initialId = setTimeout(() => void load(), 0);
-    return () => clearTimeout(initialId);
-  }, [load]);
-
-  const changed = useMemo(
-    () => (payload ? changedKeys(payload, draft) : []),
-    [payload, draft]
+    if (hasChanges && !lastChanges.current && details.current) details.current.open = true;
+    lastChanges.current = hasChanges;
+  }, [hasChanges]);
+  const list = (
+    <ul className="divide-y rounded-lg border">
+      {rows.map((row) => <OperatorRow key={row.key} row={row} controller={controller} />)}
+    </ul>
   );
-  const gateChanges = useMemo(
-    () => (payload ? changed.filter((key) => payload.settings.find((r) => r.key === key)?.gate) : []),
-    [payload, changed]
+  if (collapsible) {
+    return (
+      <details ref={details} className="space-y-2">
+        <summary className="min-touch cursor-pointer text-sm font-semibold">{title}</summary>
+        {list}
+      </details>
+    );
+  }
+  return (
+    <section className="space-y-2">
+      {title ? <h3 className="text-sm font-semibold">{title}</h3> : null}
+      {list}
+    </section>
   );
-  const needsConfirm = gateChanges.length > 0;
+}
 
-  const groups = useMemo(() => {
-    if (!payload) return [];
-    const order: string[] = [];
-    const byGroup = new Map<string, OperatorSettingRow[]>();
-    for (const row of payload.settings) {
-      if (!byGroup.has(row.group)) {
-        byGroup.set(row.group, []);
-        order.push(row.group);
-      }
-      byGroup.get(row.group)!.push(row);
-    }
-    return order.map((id) => ({ id, rows: byGroup.get(id)! }));
-  }, [payload]);
-
-  const save = async () => {
-    if (!payload || changed.length === 0) return;
-    const settings: Record<string, string | boolean> = {};
-    for (const key of changed) {
-      const row = payload.settings.find((item) => item.key === key);
-      const value = draft[key];
-      if (!row) continue;
-      settings[key] = row.type === "bool" ? value === true : String(value).trim();
-    }
-    setSaving(true);
-    setFeedback(null);
-    try {
-      const next = await operatorConfigApi.update(settings, {
-        confirm: needsConfirm ? confirmGate : undefined,
-        reason: needsConfirm ? reason.trim() : undefined,
-      });
-      setPayload(next);
-      setDraft(draftFrom(next));
-      setConfirmGate(false);
-      setReason("");
-      setFeedback({
-        role: "status",
-        text: c.saved(changed.length),
-      });
-    } catch (err) {
-      const apiError = err instanceof OperatorConfigApiError ? err : toOperatorError(err);
-      setFeedback({ role: "alert", text: apiError.message });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const reset = async (key: string) => {
-    setSaving(true);
-    setFeedback(null);
-    try {
-      const next = await operatorConfigApi.reset(key);
-      setPayload(next);
-      setDraft(draftFrom(next));
-      setFeedback({ role: "status", text: c.resetDone(key) });
-    } catch (err) {
-      const apiError = err instanceof OperatorConfigApiError ? err : toOperatorError(err);
-      setFeedback({ role: "alert", text: apiError.message });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  if (phase === "loading") {
+function OperatorSectionView({
+  section,
+  controller,
+}: {
+  section: OperatorSection;
+  controller: OperatorConfigController;
+}) {
+  const t = useT();
+  const c = t.settings.operator;
+  const title = c.groups[section === "modes" ? "gates" : "risk"];
+  const { payload } = controller;
+  if (controller.phase === "loading") {
     return (
       <Card aria-busy="true">
         <CardHeader>
-          <CardTitle>{c.title}</CardTitle>
+          <CardTitle>{title.title}</CardTitle>
           <CardDescription>{c.loading}</CardDescription>
         </CardHeader>
       </Card>
     );
   }
-
-  if (phase === "error" || !payload) {
+  if (controller.phase === "error" || !payload) {
     return (
       <Card>
         <CardHeader>
@@ -205,168 +252,137 @@ export function OperatorConfigCard() {
             <ShieldAlertIcon className="size-5 shrink-0 text-destructive" aria-hidden="true" />
             {c.loadFailed}
           </CardTitle>
-          <CardDescription>{errorMessage}</CardDescription>
+          <CardDescription>{controller.errorMessage}</CardDescription>
         </CardHeader>
         <CardContent>
-          <Button className="min-touch" onClick={() => void load()}>
-            {t.common.retry}
-          </Button>
+          <Button className="min-touch" onClick={() => void controller.reload()}>{t.common.retry}</Button>
         </CardContent>
       </Card>
     );
   }
 
+  const rows = payload.settings.filter((row) => operatorSection(row) === section);
+  const changes = controller.sectionChanges[section];
+  const groups = section === "modes"
+    ? [{ id: "gates", title: "", rows }]
+    : riskOrder.map((id) => ({
+        id,
+        title: c.riskGroups[id],
+        rows: rows.filter((row) => operatorRiskGroup(row.key) === id),
+      })).filter((group) => group.rows.length > 0);
+  const labels = changes.map((key) => t.settings.gateLabels[key] ?? key).join(", ");
+  const feedback = controller.feedback[section];
+  const hasInvalid = changes.some((key) => controller.invalidKeys.includes(key));
   return (
-    <Card>
+    <Card id={section === "modes" ? "operator-config" : "operator-risk"}>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldAlertIcon className="size-4" aria-hidden="true" />
-          {c.titleFull}
+          {title.title}
         </CardTitle>
-        <CardDescription>{c.description}</CardDescription>
-        <CardAction>
-          <Badge variant="outline">{c.mode(payload.effective_exec_mode)}</Badge>
-        </CardAction>
+        <CardDescription>{title.description}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        {groups.map(({ id, rows }) => {
-          const meta = c.groups[id];
-          return (
-            <section key={id} className="space-y-2">
-              <div>
-                <h3 className="text-sm font-semibold">{meta?.title ?? id}</h3>
-                {meta?.description ? (
-                  <p className="mt-0.5 text-xs text-muted-foreground">{meta.description}</p>
-                ) : null}
-              </div>
-              <ul className="divide-y rounded-lg border">
-                {rows.map((row) => {
-                  const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : row.label;
-                  const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : row.hint;
-                  return (
-                    <li
-                      key={row.key}
-                      className="grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)] sm:items-center sm:gap-4"
-                    >
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-sm font-medium">{rowLabel}</span>
-                          {row.override ? (
-                            <Badge variant="secondary">{c.overridden}</Badge>
-                          ) : (
-                            <Badge variant="outline">{c.default}</Badge>
-                          )}
-                          {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
-                        </div>
-                        <p className="mt-0.5 text-xs text-muted-foreground">{rowHint}</p>
-                        <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-                          {c.rowMeta(
-                            row.key,
-                            formatValue(t, row, row.value),
-                            formatValue(t, row, row.default),
-                            row.updated_at ? formatDateTimeVi(row.updated_at) : null
-                          )}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="min-w-0 flex-1">
-                          <RowField
-                            row={row}
-                            value={draft[row.key] ?? ""}
-                            disabled={saving}
-                            onChange={(next) =>
-                              setDraft((current) => ({ ...current, [row.key]: next }))
-                            }
-                          />
-                        </span>
-                        {row.override ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="min-touch shrink-0"
-                            disabled={saving}
-                            onClick={() => void reset(row.key)}
-                            aria-label={c.resetAria(rowLabel)}
-                          >
-                            <RotateCcwIcon aria-hidden="true" />
-                          </Button>
-                        ) : null}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
-          );
-        })}
-
-        {needsConfirm ? (
+        {controller.refreshFailed ? (
+          <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 p-3 text-sm">
+            <span className="min-w-0 flex-1">{c.refreshFailed}</span>
+            <Button variant="outline" size="sm" disabled={controller.refreshing || controller.saving} onClick={() => void controller.reload()}>
+              {t.common.retry}
+            </Button>
+          </div>
+        ) : null}
+        {controller.serverAhead ? (
+          <div role="status" className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/50 p-3 text-sm">
+            <span className="min-w-0 flex-1">{c.serverAhead}</span>
+            <Button variant="outline" size="sm" disabled={controller.refreshing || controller.refreshFailed || controller.saving} onClick={controller.reviewLatest}>
+              {c.reviewLatest}
+            </Button>
+          </div>
+        ) : null}
+        {groups.map((group) => (
+          <OperatorRowsGroup
+            key={group.id}
+            title={group.title}
+            rows={group.rows}
+            collapsible={group.id === "protection" || group.id === "advanced"}
+            controller={controller}
+          />
+        ))}
+        {section === "modes" && changes.length > 0 ? (
           <div className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
-            <p className="text-sm font-medium">
-              {c.gateChanges(gateChanges.join(", "))}
-            </p>
+            <p className="text-sm font-medium">{c.gateChanges(labels)}</p>
             <p className="text-xs text-muted-foreground">{c.gateWarning}</p>
             <label className="flex min-touch items-center gap-2 text-sm">
               <input
                 type="checkbox"
-                checked={confirmGate}
-                onChange={(event) => setConfirmGate(event.target.checked)}
+                checked={controller.confirmGate}
+                disabled={controller.saving}
+                onChange={(event) => controller.setConfirmation(event.target.checked)}
                 className="size-5 accent-destructive"
               />
               {c.confirm}
             </label>
+            <label htmlFor="operator-gate-reason" className="text-sm font-medium">{c.reasonLabel}</label>
             <input
+              id="operator-gate-reason"
               type="text"
-              value={reason}
-              onChange={(event) => setReason(event.target.value)}
+              value={controller.reason}
+              disabled={controller.saving}
+              onChange={(event) => controller.setGateReason(event.target.value)}
               placeholder={c.reasonPlaceholder}
-              className="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              className="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-60"
             />
           </div>
         ) : null}
-
+        {section === "risk" && controller.dirtyCount > 0 && rows.some((row) => row.override) ? (
+          <p className="text-xs text-muted-foreground">{c.resetDraftWarning}</p>
+        ) : null}
         {feedback ? (
-          <p
-            role={feedback.role === "alert" ? "alert" : "status"}
-            className={
-              feedback.role === "alert" ? "text-sm text-destructive" : "text-sm text-muted-foreground"
-            }
-          >
+          <p role={feedback.role} className={feedback.role === "alert" ? "text-sm text-destructive" : "text-sm text-muted-foreground"}>
             {feedback.text}
           </p>
         ) : null}
-
         <div className="flex flex-wrap items-center gap-3">
           <Button
             className="min-touch"
             disabled={
-              saving ||
-              changed.length === 0 ||
-              (needsConfirm && (!confirmGate || reason.trim().length === 0))
+              controller.saving || controller.refreshing || controller.serverAhead || controller.refreshFailed || changes.length === 0 || hasInvalid ||
+              (section === "modes" && (!controller.confirmGate || !controller.reason.trim()))
             }
-            onClick={() => void save()}
+            onClick={() => void controller.save(section)}
           >
-            {saving ? (
-              <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-            ) : (
-              <SaveIcon aria-hidden="true" />
-            )}
-            {c.save(changed.length)}
+            {controller.saving ? <LoaderCircleIcon className="animate-spin" aria-hidden="true" /> : <SaveIcon aria-hidden="true" />}
+            {c.save(changes.length)}
           </Button>
           <Button
             variant="ghost"
             className="min-touch"
-            disabled={saving || changed.length === 0}
-            onClick={() => setDraft(draftFrom(payload))}
+            disabled={controller.saving || changes.length === 0}
+            onClick={() => controller.undo(section)}
           >
             {c.undo}
           </Button>
-          <span className="text-xs text-muted-foreground">
-            {c.updatedAt(formatDateTimeVi(payload.generated_at))}
-
-          </span>
+          <span className="text-xs text-muted-foreground">{c.updatedAt(formatDateTimeVi(payload.generated_at))}</span>
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+export function OperatorModes({ controller }: { controller: OperatorConfigController }) {
+  return <OperatorSectionView section="modes" controller={controller} />;
+}
+
+export function OperatorRisk({ controller }: { controller: OperatorConfigController }) {
+  return <OperatorSectionView section="risk" controller={controller} />;
+}
+
+export function OperatorConfigCard() {
+  const controller = useOperatorConfig();
+  return (
+    <div className="space-y-4">
+      <OperatorModes controller={controller} />
+      <OperatorRisk controller={controller} />
+    </div>
   );
 }

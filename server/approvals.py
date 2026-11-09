@@ -23,8 +23,14 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Query, Request
 
 from server import audit as audit_log, control_store
+from server.auto_modes import AutoMode
 from server.contract import ApiError, json_body, utc_now_iso
-from tradingagents.dataflows.config import get_config
+from tradingagents.execution.auto_authorization import (
+    AuthorizationSnapshot,
+    AutoAuthorizationError,
+    capture_process_config,
+    mode_update_lock,
+)
 from tradingagents.execution.bridge import PreTradeRejection
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -120,12 +126,14 @@ def pending_count() -> int:
         return sum(1 for item in _load_items() if item["status"] == "pending")
 
 
-def _build_bridge(config: dict) -> "ExchangeBridge":
+def _build_bridge(
+    config: dict, authorization: AuthorizationSnapshot,
+) -> "ExchangeBridge":
     """The venue for the approve pipeline; tests monkeypatch this seam to inject
     a fake exchange factory (contract §4; engine seam bridge.py:126-129)."""
     from tradingagents.execution.bridge import ExchangeBridge
 
-    return ExchangeBridge(config=config)
+    return ExchangeBridge(config=config, authorization=authorization)
 
 
 def _rebuildable(item: dict) -> bool:
@@ -231,39 +239,52 @@ def list_approvals(
 @router.post("/approvals/{approval_id}/approve")
 async def approve_approval(approval_id: str, request: Request):
     await json_body(request)  # CSRF rule §0: application/json required, body may be {}
-    config = get_config()
-    if config.get("exec_live") is not True:
+    config, authorization = capture_process_config()
+    with _store_lock:
+        items = _load_items()
+        item_snapshot = _pending_item(items, approval_id)
+    if item_snapshot.get("market", "spot") != "spot":
         raise ApiError(
-            412, "gate_closed",
-            "approving requires exec_live=True in config; the FR5 gate is closed — "
-            "plans stay pending. Arm the gate (operator action outside this API) and retry.",
+            409, "unsupported_market",
+            f"approval market {item_snapshot.get('market')!r} is unsupported; "
+            "only Spot plans can be approved, and this plan stays pending.",
+        )
+    item_mode = AutoMode.SPOT
+    if not authorization.allows(item_mode, live=True):
+        raise ApiError(
+            412, "mode_closed",
+            "approving requires Auto Spot to be enabled; the plan stays pending.",
         )
     halted, halt_reason = audit_log.halt_state()  # 503 when the audit log is unreadable
     if halted:
         raise ApiError(403, "risk_halted", "risk guard is halted today", {"reason": halt_reason})
 
-    # Claim under the store lock; the refusals before the flip leave the item
-    # pending, so it stays resolvable (reject or a later approve).
-    with _store_lock:
-        items = _load_items()
-        item = _pending_item(items, approval_id)  # 404 / 409 not-pending / 410 expired
-        if item.get("mock") is True:
+    with mode_update_lock((item_mode,)):
+        if not authorization.allows(item_mode, live=True):
             raise ApiError(
-                409, "mock_not_executable",
-                f"approval {approval_id} was planned by a mock daily job; synthetic plans "
-                "cannot become real orders — reject it instead",
-                {"mock": True},
+                412, "mode_closed",
+                "approving requires Auto Spot to be enabled; the plan stays pending.",
             )
-        if not _rebuildable(item):
-            raise ApiError(
-                409, "conflict", f"approval {approval_id} carries no executable plan to rebuild"
-            )
-        item["status"] = "approved"  # claim: the idempotency fence (contract §4 step 3)
-        control_store.save_approval(item)
+        with _store_lock:
+            items = _load_items()
+            item = _pending_item(items, approval_id)  # 404 / 409 not-pending / 410 expired
+            if item.get("mock") is True:
+                raise ApiError(
+                    409, "mock_not_executable",
+                    f"approval {approval_id} was planned by a mock daily job; synthetic plans "
+                    "cannot become real orders — reject it instead",
+                    {"mock": True},
+                )
+            if not _rebuildable(item):
+                raise ApiError(
+                    409, "conflict", f"approval {approval_id} carries no executable plan to rebuild"
+                )
+            item["status"] = "approved"  # claim: the idempotency fence (contract §4 step 3)
+            control_store.save_approval(item)
 
     warning: str | None = None
     try:
-        bridge = _build_bridge(config)
+        bridge = _build_bridge(config, authorization)
     except Exception as exc:  # no usable venue: nothing can be rebuilt into an order
         _fail_execute(approval_id, f"venue not available: {exc}")
         raise ApiError(502, "execute_failed", f"venue not available: {exc}") from exc
@@ -281,8 +302,15 @@ async def approve_approval(approval_id: str, request: Request):
 
     order = _rebuild_plan(item)  # (a) rebuild the plan from the item
     mode = bridge.effective_mode()
+    if not authorization.allows(item_mode, live=True):
+        reason = "Auto Spot was disabled before execution"
+        _release_claim(approval_id, reason)
+        raise ApiError(412, "mode_closed", f"{reason}; the plan stays pending.")
     try:
         order_id = bridge.execute_order(order, confirm=True, portfolio=portfolio)  # (b)+(c)
+    except AutoAuthorizationError as exc:
+        _release_claim(approval_id, str(exc))
+        raise ApiError(412, "mode_closed", f"{exc}; the plan stays pending.") from exc
     except PermissionError as exc:
         _fail_execute(approval_id, str(exc))
         raise ApiError(403, "risk_halted", "risk guard refused execution",

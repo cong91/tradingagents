@@ -71,9 +71,8 @@ def poll_active_brackets() -> list[dict]:
     config = get_config()
     executor = DerivativesExecutor(config=config)
     can_recover = (
-        config.get("exec_derivatives") is True
-        and config.get("exec_live") is True
-        and executor.effective_mode() == "live"
+        config.get("risk_derivatives_profit_protection_enabled") is True
+        or executor.effective_mode() == "live"
     )
     outcomes = []
     deferred_counts: dict[str, int] = {}

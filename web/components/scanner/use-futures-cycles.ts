@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { getMessages } from "@/lib/i18n/messages";
+import type { AutoloopLastCycle, AutoloopModes } from "@/components/settings/autoloop-types";
 import { scannerApi } from "./scanner-api";
 import type { FuturesCycle, FuturesCycleSummary, FuturesCycleSymbolRollup } from "./scanner-types";
 
@@ -31,12 +32,28 @@ export function useFuturesCycles(): FuturesCycleState {
 
   const load = useCallback(() => {
     scannerApi.futuresCycles().then(
-      (body) => {
+      (body: Awaited<ReturnType<typeof scannerApi.futuresCycles>> & {
+        modes?: Partial<AutoloopModes> | null;
+        last_cycle?: (Partial<AutoloopLastCycle> & Record<string, unknown>) | null;
+      }) => {
+        const lastCycle = body.last_cycle;
+        const futuresCycle = lastCycle?.modes?.auto_futures;
+        const activeMode = lastCycle?.active_mode;
+        const modeStatus = futuresCycle?.status;
+        const futuresRunning = body.modes?.auto_futures === false && modeStatus !== "running"
+          ? false
+          : lastCycle?.status != null && lastCycle.status !== "running"
+            ? false
+            : activeMode != null
+              ? activeMode === "auto_futures" && (!modeStatus || modeStatus === "running")
+              : modeStatus != null
+                ? modeStatus === "running"
+                : lastCycle?.modes == null && (body.running_cycle ?? false);
         setCycles(body.items);
         setSummary(body.summary ?? null);
         setSymbols(body.symbols ?? []);
-        setRunningCycle(body.running_cycle ?? false);
-        setEnabled(body.enabled ?? false);
+        setRunningCycle(Boolean(body.running_cycle && futuresRunning));
+        setEnabled((body.enabled ?? false) && (body.modes?.auto_futures ?? true));
         setIntervalMinutes(body.interval_minutes ?? null);
         setError(null);
       },

@@ -18,8 +18,10 @@ export const vi = {
   mockPlan: "Kế hoạch mô phỏng (mock)",
   expiredBadge: "Quá hạn duyệt",
   errors: {
+    mode_closed:
+      "Auto Spot is disabled or this approval is no longer authorized. Enable Auto Spot in Settings, then try again.",
     gate_closed:
-      "Chế độ \"Lệnh thật\" chưa mở nên máy chủ từ chối duyệt. Mở nó ở phía máy chủ: đặt biến TRADINGAGENTS_EXEC_LIVE=true trong file .env rồi khởi động lại (màn Cấu hình chỉ xem, không bật được). Xong hãy duyệt lại.",
+      "The standalone venue profile is unavailable for this operation. Check the venue URL and credentials, then try again.",
     risk_halted: (reason: string | null) =>
       `Bot đã dừng giao dịch hôm nay — không thể duyệt.${reason ? ` Lý do: ${reason}` : ""}`,
     conflict:
@@ -143,8 +145,10 @@ export const en: typeof vi = {
   mockPlan: "Simulated plan (mock)",
   expiredBadge: "Approval window expired",
   errors: {
+    mode_closed:
+      "Auto Spot is disabled or this approval is no longer authorized. Enable Auto Spot in Settings, then try again.",
     gate_closed:
-      "The \"Real orders\" mode is not open, so the server refused the approval. Open it on the server side: set TRADINGAGENTS_EXEC_LIVE=true in the .env file and restart (Settings is read-only for this). Then approve again.",
+      "The standalone venue profile is unavailable for this operation. Check the venue URL and credentials, then try again.",
     risk_halted: (reason) =>
       `The bot has halted trading for today — approval is not possible.${reason ? ` Reason: ${reason}` : ""}`,
     conflict:

@@ -417,8 +417,14 @@ def _cases():
             )),
         },
         "history_fills": {"component": "history", "props": {"history": history}},
-        "chip_live": {"component": "chip", "props": {"state": {"status": "ready", "live": True}}},
-        "chip_dry": {"component": "chip", "props": {"state": {"status": "ready", "live": False}}},
+        "chip_live": {
+            "component": "chip",
+            "props": {"state": {"status": "ready", "enabled": True}},
+        },
+        "chip_dry": {
+            "component": "chip",
+            "props": {"state": {"status": "ready", "enabled": False}},
+        },
         "chip_loading": {"component": "chip", "props": {"state": {"status": "loading"}}},
         "chip_error": {"component": "chip", "props": {"state": {"status": "error"}}},
         "funnel_running": {
@@ -759,9 +765,9 @@ def test_venue_uni_fills_are_historical_newest_first_and_preserve_unknown_values
 
 
 def test_exec_status_chip_renders_all_four_gate_states(rendered):
-    # Chấm trạng thái là span aria-hidden (trang trí) — text không còn "●".
-    assert "LIVE — lệnh thật" in rendered["chip_live"].text
-    assert "An toàn — lệnh thử" in rendered["chip_dry"].text
+    # The chip now reports Auto mode state, not the legacy standalone LIVE profile.
+    assert "Tự động đang bật" in rendered["chip_live"].text
+    assert "Tự động đang tắt" in rendered["chip_dry"].text
     assert "Đang kiểm tra…" in rendered["chip_loading"].text
     assert "Không kiểm tra được" in rendered["chip_error"].text
     assert "Thử lại" in rendered["chip_error"].text

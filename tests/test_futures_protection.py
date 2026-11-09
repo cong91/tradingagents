@@ -344,6 +344,59 @@ def test_unproven_flat_never_cancels_or_deletes(rows):
     assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
 
 
+def test_emergency_bracket_state_is_manual_only(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    job_store.update_bracket_recovery(
+        task_id, status="emergency_close_failed", placed_ids=[], attempts=1,
+        last_error="manual test state", now="2026-10-20T00:00:00+00:00",
+    )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 100.0,
+    }])
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    assert result == [{
+        "position_key": position_key,
+        "status": "manual_reconciliation_required",
+    }]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "emergency_close_failed"
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_submission_uncertain_uses_verified_venue_reconciliation(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    task = job_store.load_bracket_recovery(task_id)
+    state = job_store.load_position_state(position_key)
+    state["venue_key"] = task["venue_key"]
+    assert job_store.save_position_state(position_key, state["revision"], state)
+    job_store.update_bracket_recovery(
+        task_id, status="submission_uncertain", placed_ids=["old-stop", "old-target"],
+        attempts=0, last_error="test uncertainty", now="2026-10-20T00:00:00+00:00",
+        legs=task["legs"],
+    )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 100.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    assert result == [{"position_key": position_key, "status": "unchanged"}]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "monitoring"
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
 def test_malformed_position_key_does_not_prevent_other_states():
     position_key, _task_id = _linked_position()
     job_store.persist_futures_entry_state(
@@ -359,7 +412,7 @@ def test_malformed_position_key_does_not_prevent_other_states():
         config={"risk_derivatives_profit_protection_enabled": True},
     )
     statuses = {item["position_key"]: item["status"] for item in results}
-    assert statuses[position_key] == "account_identity_unknown"
+    assert statuses[position_key] in {"account_identity_unknown", "leg_state_unknown"}
     assert statuses["malformed"].startswith("error:ValueError:")
     assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
 
@@ -780,6 +833,19 @@ def test_earning_short_inside_the_settlement_window_postpones_the_time_stop(monk
     )
     assert [event["action"] for event in bridge.audit] == ["time_stop_postponed"]
 
+    second = manage_active_positions(bridge, allow_mutation=True, config=_TIME_STOP_CONFIG)
+
+    assert second == [{
+        "position_key": position_key,
+        "status": "time_stop_postponed_funding",
+    }]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert datetime.fromisoformat(snapshot["time_stop_postponed_for"]) == (
+        datetime.fromtimestamp(settlement_ms / 1000, tz=UTC)
+    )
+    assert [event["action"] for event in bridge.audit] == ["time_stop_postponed"]
+
 
 def test_a_second_settlement_inside_the_window_closes_instead_of_deferring(monkeypatch):
     bind_identity(monkeypatch, VERIFIED_IDENTITY)
@@ -1119,6 +1185,76 @@ def test_unavailable_grace_blocks_the_close(monkeypatch):
     assert job_store.load_position_state(position_key) is not None
 
 
+@pytest.mark.parametrize(
+    ("config_override", "has_hook", "reason"),
+    [
+        ({"risk_derivatives_time_stop_review_enabled": False}, True, "position review disabled"),
+        ({"risk_derivatives_time_stop_review_interval_hours": 0}, True, "review interval misconfigured"),
+        ({}, False, "position review unavailable"),
+    ],
+)
+def test_unavailable_grace_respects_review_configuration(
+    monkeypatch, config_override, has_hook, reason,
+):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="unavailable",
+        time_stop_review_until=(datetime.now(UTC) + timedelta(hours=3)).isoformat(),
+    )
+    exchange = _stale_review_exchange()
+    bridge = _ProtectionBridge(exchange)
+    hook = _recording_hook()[0] if has_hook else None
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config={**_REVIEW_CONFIG, **config_override},
+        review_hook=hook,
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert job_store.load_position_state(position_key) is None
+    assert [event["action"] for event in bridge.audit] == ["time_stop_closed"]
+    assert reason in bridge.audit[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("config_override", "has_hook"),
+    [
+        ({"risk_derivatives_time_stop_review_enabled": False}, True),
+        ({"risk_derivatives_time_stop_review_interval_hours": 0}, True),
+        ({}, False),
+    ],
+)
+def test_granted_hold_survives_review_becoming_unavailable(monkeypatch, config_override, has_hook):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, _task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    review_until = (datetime.now(UTC) + timedelta(hours=3)).isoformat()
+    _set_review_fields(
+        position_key,
+        time_stop_review_status="hold",
+        time_stop_review_until=review_until,
+    )
+    exchange = _stale_review_exchange()
+    bridge = _ProtectionBridge(exchange)
+    hook, requests = _recording_hook()
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True, config={**_REVIEW_CONFIG, **config_override},
+        review_hook=hook if has_hook else None,
+    )
+
+    assert result == [{"position_key": position_key, "status": "unchanged"}]
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == "hold"
+    assert snapshot["time_stop_review_until"] == review_until
+    assert requests == []
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert bridge.audit == []
+
+
 def test_unavailable_grace_expiry_closes_mechanically(monkeypatch):
     bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
@@ -1169,28 +1305,83 @@ def test_review_close_verdict_closes_with_the_reason_audited(monkeypatch):
     assert "review verdict close: thesis broken" in bridge.audit[0]["reason"]
 
 
-def test_review_hold_verdict_extends_the_deadline(monkeypatch):
+@pytest.mark.parametrize("review_status", ["hold", "unavailable"])
+def test_future_review_deadline_skips_time_stop_checks(monkeypatch, review_status):
     bind_identity(monkeypatch, VERIFIED_IDENTITY)
     position_key, _task_id = _linked_position()
     _set_opened_hours_ago(position_key, 80.0)
+    review_until = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
     _set_review_fields(
         position_key,
-        time_stop_review_status="hold",
-        time_stop_review_until=(datetime.now(UTC) + timedelta(hours=24)).isoformat(),
+        time_stop_review_status=review_status,
+        time_stop_review_until=review_until,
         time_stop_review_count=1,
     )
-    exchange = _stale_review_exchange()
+    exchange = _FundingExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 105.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+    hook, requests = _recording_hook()
+
+    for _ in range(2):
+        result = manage_active_positions(
+            bridge, allow_mutation=True, config=_REVIEW_CONFIG, review_hook=hook,
+        )
+        expected = "unchanged" if review_status == "hold" else "time_stop_review_grace"
+        assert result == [{"position_key": position_key, "status": expected}]
+
+    snapshot = job_store.load_position_state(position_key)["snapshot"]
+    assert snapshot["time_stop_review_status"] == review_status
+    assert snapshot["time_stop_review_until"] == review_until
+    assert snapshot["time_stop_review_count"] == 1
+    assert exchange.funding_calls == []
+    assert requests == []
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert bridge.audit == []
+
+
+@pytest.mark.parametrize("review_status", ["hold", "unavailable"])
+def test_future_review_deadline_keeps_stop_protection_active(monkeypatch, review_status):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    _set_opened_hours_ago(position_key, 80.0)
+    review_until = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+    _set_review_fields(
+        position_key,
+        time_stop_review_status=review_status,
+        time_stop_review_until=review_until,
+        time_stop_review_count=1,
+    )
+    exchange = _FundingExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 110.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+    hook, requests = _recording_hook()
 
     result = manage_active_positions(
-        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
-        review_hook=_recording_hook()[0],
+        bridge, allow_mutation=True, config=_REVIEW_CONFIG, review_hook=hook,
     )
 
-    assert result == [{"position_key": position_key, "status": "unchanged"}]
-    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    expected = "updated" if review_status == "hold" else "time_stop_review_grace"
+    assert result == [{"position_key": position_key, "status": expected}]
     snapshot = job_store.load_position_state(position_key)["snapshot"]
-    assert snapshot["time_stop_review_status"] == "hold"
-    assert snapshot["time_stop_review_count"] == 1
+    assert snapshot["time_stop_review_status"] == review_status
+    assert snapshot["time_stop_review_until"] == review_until
+    assert snapshot["stop"] == pytest.approx(100.1)
+    task = job_store.load_bracket_recovery(task_id)
+    stop = next(leg for leg in task["legs"] if leg["name"] == "stop-loss")
+    assert float(stop["params"]["stopLossPrice"]) == pytest.approx(100.1)
+    assert exchange.funding_calls == []
+    assert requests == []
+    assert not [
+        call for call in exchange.calls
+        if call[0] == "create" and str(call[4].get("clientOrderId", "")).startswith("timestop-")
+    ]
+    assert bridge.audit == []
 
 
 def test_expired_hold_rerequests_the_review(monkeypatch):
@@ -1215,6 +1406,15 @@ def test_expired_hold_rerequests_the_review(monkeypatch):
     assert len(requests) == 1
     snapshot = job_store.load_position_state(position_key)["snapshot"]
     assert snapshot["time_stop_review_status"] == "pending"
+
+    second = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True, config=_REVIEW_CONFIG,
+        review_hook=hook,
+    )
+
+    assert second == [{"position_key": position_key, "status": "time_stop_review_pending"}]
+    assert len(requests) == 1
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
 
 
 def test_review_disabled_keeps_the_mechanical_close(monkeypatch):

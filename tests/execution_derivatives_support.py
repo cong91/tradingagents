@@ -7,7 +7,10 @@ import ccxt
 import pytest
 
 import tradingagents.execution.risk as risk_module
+from server.auto_modes import AutoMode
+from tradingagents.dataflows.config import set_config
 from tradingagents.execution import futures_identity
+from tradingagents.execution.auto_authorization import mode_update_lock
 from tradingagents.execution.derivatives import DerivativesExecutor
 
 FROZEN_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
@@ -203,6 +206,7 @@ def make_executor(tmp_path, monkeypatch, *, config=None, factory=None, env=None)
     """An executor with tmp audit log, frozen risk clock, scrubbed env."""
     monkeypatch.delenv("TRADINGAGENTS_EXEC_LIVE", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
+    monkeypatch.delenv("TRADINGAGENTS_AUTO_FUTURES_ENABLED", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", raising=False)
     monkeypatch.delenv("BINANCE_API_KEY", raising=False)
     monkeypatch.delenv("BINANCE_SECRET", raising=False)
@@ -222,8 +226,8 @@ def read_audit(tmp_path):
 
 
 def gates_config(**extra):
-    """Both derivatives gates armed in config (env stays a separate layer)."""
-    return {"exec_derivatives": True, **extra}
+    """Enable Auto Futures for an executor test."""
+    return {"auto_futures_enabled": True, **extra}
 
 
 def live_config(**extra):
@@ -231,7 +235,7 @@ def live_config(**extra):
 
 
 def live_env(**extra):
-    return {"TRADINGAGENTS_EXEC_LIVE": "true", "TRADINGAGENTS_EXEC_DERIVATIVES": "true", **extra}
+    return {"TRADINGAGENTS_EXEC_LIVE": "true", **extra}
 
 
 def bracket_kwargs(signal="Buy"):
@@ -249,6 +253,13 @@ def bracket_kwargs(signal="Buy"):
 def _live_bracket_order(executor, book):
     order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
     return order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 55_000.0})
+
+
+@pytest.fixture
+def enable_auto_futures():
+    """Authorize new futures entries in the process config before capture."""
+    with mode_update_lock((AutoMode.FUTURES,)):
+        set_config({"auto_futures_enabled": True})
 
 
 @pytest.fixture(autouse=True)

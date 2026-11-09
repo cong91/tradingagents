@@ -37,8 +37,8 @@ export const vi = {
     closeMenu: "Đóng điều hướng chính",
   },
   execStatus: {
-    chipLive: "LIVE — lệnh thật",
-    chipSafe: "An toàn — lệnh thử",
+    chipEnabled: "Tự động đang bật",
+    chipDisabled: "Tự động đang tắt",
     chipChecking: "Đang kiểm tra…",
     chipUnknown: "Không kiểm tra được",
   },
@@ -90,8 +90,8 @@ export const en: typeof vi = {
     closeMenu: "Close main navigation",
   },
   execStatus: {
-    chipLive: "LIVE — real orders",
-    chipSafe: "Safe — practice orders",
+    chipEnabled: "Automation enabled",
+    chipDisabled: "Automation disabled",
     chipChecking: "Checking…",
     chipUnknown: "Status unknown",
   },

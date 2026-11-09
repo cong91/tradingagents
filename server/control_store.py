@@ -152,17 +152,59 @@ def load_operator_settings() -> dict:
     return {row["key"]: row["value"] for row in load_operator_setting_rows()}
 
 
-def set_operator_setting(key: str, value, *, updated_by: str | None = None) -> None:
+def set_operator_settings(updates: dict, *, updated_by: str | None = None) -> None:
+    """Upsert a batch of operator settings in one transaction."""
+    if not updates:
+        return
+    now = _now()
     with db.session() as conn:
-        conn.execute(
-            """INSERT INTO control_operator_settings (key, value, updated_at, updated_by)
-               VALUES (%s, %s::jsonb, %s, %s)
-               ON CONFLICT (key) DO UPDATE SET
-                   value = excluded.value,
-                   updated_at = excluded.updated_at,
-                   updated_by = excluded.updated_by""",
-            (key, _json(value), _now(), updated_by),
+        for key, value in updates.items():
+            conn.execute(
+                """INSERT INTO control_operator_settings (key, value, updated_at, updated_by)
+                   VALUES (%s, %s::jsonb, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET
+                       value = excluded.value,
+                       updated_at = excluded.updated_at,
+                       updated_by = excluded.updated_by""",
+                (key, _json(value), now, updated_by),
+            )
+
+
+def insert_operator_settings_if_absent(
+    updates: dict, *, updated_by: str | None = None
+) -> set[str]:
+    """Initialize operator settings without replacing existing values."""
+    if not updates:
+        return set()
+    now = _now()
+    inserted: set[str] = set()
+    with db.session() as conn:
+        for key, value in updates.items():
+            cursor = conn.execute(
+                """INSERT INTO control_operator_settings (key, value, updated_at, updated_by)
+                   VALUES (%s, %s::jsonb, %s, %s)
+                   ON CONFLICT (key) DO NOTHING""",
+                (key, _json(value), now, updated_by),
+            )
+            if cursor.rowcount == 1:
+                inserted.add(key)
+    return inserted
+
+
+def set_operator_setting(key: str, value, *, updated_by: str | None = None) -> None:
+    """Upsert one operator setting through the atomic batch writer."""
+    set_operator_settings({key: value}, updated_by=updated_by)
+
+
+def reset_operator_setting(key: str, value, *, updated_by: str | None = None) -> bool:
+    """Reset a stored value without deleting the migration marker."""
+    with db.session() as conn:
+        cursor = conn.execute(
+            "UPDATE control_operator_settings "
+            "SET value = %s::jsonb, updated_at = %s, updated_by = %s WHERE key = %s",
+            (_json(value), _now(), updated_by, key),
         )
+    return cursor.rowcount == 1
 
 
 def delete_operator_setting(key: str) -> bool:

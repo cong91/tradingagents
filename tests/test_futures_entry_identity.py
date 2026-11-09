@@ -11,6 +11,7 @@ from tests.execution_derivatives_support import (
     _recovery_db as _recovery_db,
     bind_identity,
     bracket_kwargs,
+    enable_auto_futures as enable_auto_futures,
     live_config,
     live_env,
     make_executor,
@@ -19,7 +20,7 @@ from tests.execution_derivatives_support import (
 from tradingagents.execution.futures_account import observe_futures_positions
 from tradingagents.portfolio import PortfolioContext
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("enable_auto_futures")]
 
 
 def test_live_entry_binds_identity_to_intent_position_and_bracket(tmp_path, monkeypatch):

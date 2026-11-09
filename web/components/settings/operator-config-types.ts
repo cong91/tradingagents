@@ -1,9 +1,21 @@
 // Shape của GET/PUT /api/operator-config (server/operator_config.py).
-// Đây là các override vận hành lưu trong PostgreSQL: nửa cấu hình của các cổng
-// thực thi và vài trần rủi ro. Chúng KHÔNG thay thế /api/settings — mỗi key ở
-// đây đều nằm ngoài allowlist của settings vì settings cố ý không ghi được cổng.
+// Đây là các cấu hình vận hành lưu trong PostgreSQL: chế độ tự động và
+// các trần rủi ro. Chúng nằm ngoài allowlist của /api/settings.
 
 export type OperatorSettingType = "bool" | "float";
+
+export type OperatorGateKey = "auto_spot_enabled" | "auto_futures_enabled";
+
+export type OperatorGates = {
+  auto_spot: boolean;
+  auto_futures: boolean;
+  any_auto_enabled: boolean;
+};
+
+export const OPERATOR_GATE_KEYS: readonly OperatorGateKey[] = [
+  "auto_spot_enabled",
+  "auto_futures_enabled",
+];
 
 export type OperatorSettingRow = {
   key: string;
@@ -26,7 +38,7 @@ export type OperatorSettingRow = {
 export type OperatorConfigPayload = {
   generated_at: string;
   settings: OperatorSettingRow[];
-  gates: Record<string, boolean>;
+  gates: OperatorGates;
   effective_exec_mode: string;
   allowlist: string[];
   applied_at?: string;
@@ -37,9 +49,43 @@ export type OperatorValue = string | boolean;
 
 export type OperatorDraft = Record<string, OperatorValue>;
 
+export type OperatorSection = "modes" | "risk";
+export type OperatorRiskGroup = "general" | "futures" | "protection" | "advanced";
+
+/** Each operator row belongs to exactly one editable section. */
+export function operatorSection(row: OperatorSettingRow): OperatorSection {
+  return row.gate ? "modes" : "risk";
+}
+
+/** Classify known tasks without hiding new keys returned by the server. */
+export function operatorRiskGroup(key: string): OperatorRiskGroup {
+  if (key === "risk_max_open_heat_pct") return "general";
+  if (
+    key === "risk_max_derivatives_leverage" ||
+    key === "risk_max_derivatives_exposure_pct"
+  ) return "futures";
+  if (key === "risk_max_derivatives_exposure_hard_pct" || key.startsWith("risk_derivatives_override_")) {
+    return "advanced";
+  }
+  if (key.startsWith("risk_derivatives_")) return "protection";
+  return "advanced";
+}
+
+/** Convert form text to the finite, non-negative number required by the API. */
+export function parseOperatorNumber(value: OperatorValue | undefined): number | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const number = Number(value.trim().replace(",", "."));
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
 /** Key là cổng thực thi → cần confirm + reason khi ghi. */
 export function isGateKey(row: OperatorSettingRow): boolean {
   return row.gate;
+}
+
+/** True when the server row is one of the two market automation gates. */
+export function isOperatorGateKey(key: string): key is OperatorGateKey {
+  return key === OPERATOR_GATE_KEYS[0] || key === OPERATOR_GATE_KEYS[1];
 }
 
 /** Giá trị form ban đầu từ payload: dùng value đang hiệu lực. */

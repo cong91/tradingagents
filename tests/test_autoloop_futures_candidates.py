@@ -9,6 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 from server import autoloop
+from server.auto_modes import AutoMode
+from tradingagents.dataflows.config import set_config
+from tradingagents.execution.auto_authorization import mode_update_lock
 
 pytestmark = pytest.mark.unit
 
@@ -139,12 +142,12 @@ def test_screening_pool_expands_for_futures_but_not_spot():
         screen_calls.append((crypto, stocks, top_n))
         return []
 
-    for derivatives_enabled in (True, False):
+    for futures_enabled in (True, False):
         autoloop._screen_with_timeout(
             crypto_universe,
             stock_universe,
             screen,
-            {"exec_derivatives": derivatives_enabled},
+            {"auto_futures_enabled": futures_enabled},
             "2026-10-07",
         )
 
@@ -191,7 +194,7 @@ def test_discovery_pool_refills_executable_futures_after_unusable_candidates(mon
         crypto_universe,
         stock_universe,
         screen,
-        {"exec_derivatives": True},
+        {"auto_futures_enabled": True},
         "2026-10-07",
     )
     selected, skipped, selection = autoloop._select_cycle_candidates(
@@ -320,7 +323,7 @@ def _refill(
         pool,
         lambda *_args: pytest.fail("futures discovery must not query the stock universe"),
         screen,
-        {"exec_derivatives": True},
+        {"auto_futures_enabled": True},
         "2026-10-07",
     )
     selected, skipped, selection = autoloop._select_cycle_candidates(
@@ -330,7 +333,7 @@ def _refill(
         pool,
         lambda *_args: pytest.fail("futures refill must not query the stock universe"),
         screen,
-        {"exec_derivatives": True},
+        {"auto_futures_enabled": True},
         "2026-10-07",
         derivatives,
         limit=limit,
@@ -647,6 +650,11 @@ def test_refill_leaves_spot_selection_unchanged():
     ) == (["BTC-USD"], [], candidates, [], None)
 
 
+def _set_futures_mode(enabled):
+    with mode_update_lock((AutoMode.FUTURES,)):
+        set_config({"auto_futures_enabled": enabled})
+
+
 def _install_futures_discovery(monkeypatch, pool):
     """Route futures-mode discovery to ``pool``.
 
@@ -668,7 +676,7 @@ def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
     monkeypatch.setattr(autoloop.runs_mod, "active_run_id", lambda: None)
     monkeypatch.setattr(autoloop.daily_mod, "active_job_id", lambda: None)
     monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
-    monkeypatch.setattr(autoloop, "get_config", lambda: {"exec_derivatives": True})
+    _set_futures_mode(True)
 
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH"), "SOL/USDT:USDT": _contract("SOL")})
     monkeypatch.setattr(autoloop, "_build_bridge", lambda *_args: bridge)
@@ -713,16 +721,16 @@ def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
     assert autoloop._last_cycle["universe"]["crypto"] == 62
 
 
-def _wire_cycle(monkeypatch, pool, screen, bridge):
+def _wire_cycle(monkeypatch, pool, screen, bridge, *, after_candidate=None):
     """Install the fakes ``_run_cycle`` needs and return the executed tickers."""
     from tradingagents.dataflows import screening as screening_mod
     from tradingagents.execution.daily import DailyResult
 
+    _set_futures_mode(True)
     monkeypatch.setattr(autoloop.audit_log, "record", lambda *args, **kwargs: None)
     monkeypatch.setattr(autoloop.runs_mod, "active_run_id", lambda: None)
     monkeypatch.setattr(autoloop.daily_mod, "active_job_id", lambda: None)
     monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
-    monkeypatch.setattr(autoloop, "get_config", lambda: {"exec_derivatives": True})
     monkeypatch.setattr(autoloop, "_build_bridge", lambda *_args: bridge)
     monkeypatch.setattr(autoloop, "_build_derivatives_executor", lambda *_args: _Derivatives(bridge))
     _install_futures_discovery(monkeypatch, pool)
@@ -733,11 +741,84 @@ def _wire_cycle(monkeypatch, pool, screen, bridge):
 
     def fake_run_candidate(_bridge, candidate, *_args, **_kwargs):
         ran.append(candidate["ticker"])
+        if after_candidate is not None:
+            after_candidate(candidate)
         return DailyResult(ticker=candidate["ticker"])
 
     monkeypatch.setattr(autoloop, "_run_candidate_with_timeout", fake_run_candidate)
     autoloop._run_cycle(lambda *_args: pytest.fail("no graph should be built for the stub"))
     return ran
+
+
+def test_cycle_stops_before_candidates_when_futures_disabled_during_screening(monkeypatch):
+    bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
+    pool = _RefillPool(["ETH-USD"])
+
+    def screen(crypto, stocks, _date, _top_n, cancel_event=None):
+        assert stocks == []
+        _set_futures_mode(False)
+        return [_candidate(ticker) for ticker in crypto]
+
+    ran = _wire_cycle(monkeypatch, pool, screen, bridge)
+
+    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL]
+    assert ran == []
+    futures = autoloop._last_cycle["modes"]["auto_futures"]
+    assert futures["status"] == "disabled"
+    assert futures["error"] == "futures automation disabled before venue setup"
+    assert bridge.calls == []
+    assert autoloop._last_cycle["results"] == []
+    assert autoloop._last_cycle["candidates"] == []
+
+
+def test_cycle_stops_when_futures_disabled_during_refill(monkeypatch):
+    bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
+    contractless = [f"NOC{index:03d}-USD" for index in range(59)]
+    pool = _RefillPool(["ETH-USD"] + contractless)
+    screen_calls = []
+
+    def screen(crypto, stocks, _date, _top_n, cancel_event=None):
+        assert stocks == []
+        screen_calls.append(len(crypto))
+        if len(screen_calls) == 2:
+            _set_futures_mode(False)
+        return [_candidate(ticker) for ticker in crypto]
+
+    ran = _wire_cycle(monkeypatch, pool, screen, bridge)
+
+    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert screen_calls == [60, 60]
+    assert ran == []
+    futures = autoloop._last_cycle["modes"]["auto_futures"]
+    assert futures["status"] == "disabled"
+    assert futures["error"] == "futures automation disabled before candidate preflight"
+    assert autoloop._last_cycle["results"] == []
+
+
+def test_cycle_stops_remaining_candidates_when_futures_disabled(monkeypatch):
+    bridge = _MarketsBridge({
+        "ETH/USDT:USDT": _contract("ETH"),
+        "SOL/USDT:USDT": _contract("SOL"),
+    })
+    pool = _RefillPool(["ETH-USD", "SOL-USD"])
+
+    def screen(crypto, stocks, _date, _top_n, cancel_event=None):
+        assert stocks == []
+        return [_candidate(ticker) for ticker in crypto]
+
+    def disable_after_candidate(_candidate):
+        _set_futures_mode(False)
+
+    ran = _wire_cycle(
+        monkeypatch, pool, screen, bridge,
+        after_candidate=disable_after_candidate,
+    )
+
+    assert ran == ["ETH-USD"]
+    futures = autoloop._last_cycle["modes"]["auto_futures"]
+    assert futures["status"] == "disabled"
+    assert futures["candidates"] == ["ETH-USD", "SOL-USD"]
+    assert [result["ticker"] for result in futures["results"]] == ["ETH-USD"]
 
 
 def test_cycle_runs_a_contract_the_wider_snapshot_dropped(monkeypatch):

@@ -26,6 +26,8 @@ from server import (
 )
 from server.contract import install_error_handlers, utc_now_iso
 from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.execution.auto_authorization import capture_authorization
+from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.futures_account import FuturesAccountSnapshot
 from tradingagents.portfolio import PortfolioContext
 
@@ -91,9 +93,15 @@ def _server_state(tmp_path, monkeypatch, postgres_schema):
     monkeypatch.setattr(autoloop_mod, "_cycle_thread", None)
     monkeypatch.setattr(autoloop_mod, "_scheduler_thread", None)
     autoloop_mod._wakeup.clear()
+
+    def refuse_real_exchange(*_args, **_kwargs):
+        raise AssertionError("autoloop tests must inject a fake exchange")
+
+    monkeypatch.setattr("tradingagents.execution.bridge._default_exchange_factory", refuse_real_exchange)
     # A run/job planted anywhere must never leak into a cycle's busy check.
     monkeypatch.setattr(runs_mod, "_runs", {})
     monkeypatch.setattr(daily_mod, "_jobs", {})
+    set_config({"auto_spot_enabled": False, "auto_futures_enabled": False})
     yield
     scheduler_stop.set()
     wakeup_set = getattr(autoloop_mod._wakeup, "set", None)
@@ -123,63 +131,56 @@ def client(_server_state):
 
 
 def test_get_autoloop_defaults(client):
-    # Pin the gate-closed state explicitly: the operator's default_config may
-    # legitimately arm auto_confirm (the sanctioned arming path), so the
-    # fail-closed contract is asserted against an explicit closed config.
-    set_config({"exec_auto_confirm": False})
     body = client.get("/api/autoloop").json()
     assert body["generated_at"].endswith("Z")
     assert body["enabled"] is False
     assert body["interval_minutes"] == 1440
     assert body["running_cycle"] is False
-    # conftest blanks every TRADINGAGENTS_* env var and the config defaults
-    # keep every gate closed: the fail-closed default is the loop can't arm.
     assert body["gates"] == {
-        "auto_confirm_config": False, "auto_confirm_env": False,
-        "exec_live_config": False, "exec_live_env": False,
-        "exec_derivatives_config": False, "exec_derivatives_env": False, "all_open": False,
+        "auto_spot": False, "auto_futures": False, "any_auto_enabled": False,
     }
+    assert body["modes"] == body["gates"]
     assert body["last_cycle"] is None
 
 
 # --- POST /api/autoloop: the enable gate + state file --------------------------
 
 
-def test_enable_gate_closed_is_409_and_armes_nothing(client, tmp_path, monkeypatch):
+def test_enable_modes_closed_is_409_and_arms_nothing(client, tmp_path, monkeypatch):
     started: list[bool] = []
     monkeypatch.setattr(autoloop_mod, "ensure_started", lambda: started.append(True))
     monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: "started")
-    set_config({"exec_auto_confirm": False})  # pin the gate-closed state
 
     response = client.post("/api/autoloop", json={"enabled": True})
     assert response.status_code == 409
     error = response.json()["error"]
-    assert error["code"] == "gate_closed"
-    assert error["details"]["gates"]["all_open"] is False
-    assert error["details"]["gates"]["auto_confirm_config"] is False
+    assert error["code"] == "mode_closed"
+    assert error["details"]["gates"] == {
+        "auto_spot": False, "auto_futures": False, "any_auto_enabled": False,
+    }
 
     assert control_store.load_autoloop_state() == {}  # a refused enable persists nothing
     assert client.get("/api/autoloop").json()["enabled"] is False
     assert started == []  # the scheduler was never armed by a refused enable
 
 
-def test_enable_with_gates_open_persists_state_and_arms_scheduler(client, tmp_path, monkeypatch):
+@pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
+def test_enable_with_mode_open_persists_state_and_arms_scheduler(
+    client, tmp_path, monkeypatch, spot, futures,
+):
     started: list[bool] = []
     monkeypatch.setattr(autoloop_mod, "ensure_started", lambda: started.append(True))
     monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: "started")
 
-    # exec_live stays closed on purpose: enabling needs only the two
-    # auto-confirm halves, exactly like _handle_plan's first two checks.
-    set_config({"exec_auto_confirm": True})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    # Execution authorization is separate from scheduler enablement.
+    set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures, "exec_live": False})
     response = client.post("/api/autoloop", json={"enabled": True, "interval_minutes": 30})
     assert response.status_code == 200
     body = response.json()
     assert body["enabled"] is True
     assert body["interval_minutes"] == 30
-    assert body["gates"]["all_open"] is True
-    assert body["gates"]["exec_live_config"] is False  # reported, never required to enable
-    assert body["gates"]["exec_derivatives_config"] is False  # futures: observability only, never required
+    expected = {"auto_spot": spot, "auto_futures": futures, "any_auto_enabled": True}
+    assert body["gates"] == body["modes"] == expected
 
     state = control_store.load_autoloop_state()
     assert state == {"enabled": True, "interval_minutes": 30, "updated_at": state["updated_at"]}
@@ -189,12 +190,62 @@ def test_enable_with_gates_open_persists_state_and_arms_scheduler(client, tmp_pa
 
 
 def test_disable_is_never_gated_and_omitted_interval_defaults(client, tmp_path):
-    # gates closed: turning the loop OFF must still work (the safe direction)
+    # Both modes closed: turning the loop OFF must still work.
     response = client.post("/api/autoloop", json={"enabled": False})
     assert response.status_code == 200
     state = control_store.load_autoloop_state()
     assert state["enabled"] is False
     assert state["interval_minutes"] == 1440  # default when omitted
+
+
+@pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
+def test_scheduler_request_cannot_disable_an_enabled_mode(client, monkeypatch, spot, futures):
+    started: list[bool] = []
+    monkeypatch.setattr(autoloop_mod, "ensure_started", lambda: started.append(True))
+    set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
+
+    response = client.post("/api/autoloop", json={"enabled": False, "interval_minutes": 30})
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+    assert response.json()["modes"] == {
+        "auto_spot": spot, "auto_futures": futures, "any_auto_enabled": True,
+    }
+    assert control_store.load_autoloop_state()["enabled"] is True
+    assert started == [True]
+
+
+@pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
+def test_scheduler_read_derives_enabled_from_modes_even_with_stale_state(client, spot, futures):
+    autoloop_mod._save_state({"enabled": False, "interval_minutes": 30, "updated_at": "stale"})
+    set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
+
+    body = client.get("/api/autoloop").json()
+
+    assert body["enabled"] is True
+    assert body["interval_minutes"] == 30
+    assert control_store.load_autoloop_state()["enabled"] is False
+
+
+@pytest.mark.parametrize("remaining", ["auto_spot_enabled", "auto_futures_enabled", None])
+def test_scheduler_state_rechecks_modes_after_one_or_both_are_disabled(client, remaining):
+    set_config({"auto_spot_enabled": True, "auto_futures_enabled": True})
+    autoloop_mod._save_state({"enabled": True, "interval_minutes": 30, "updated_at": "armed"})
+    set_config({
+        "auto_spot_enabled": remaining == "auto_spot_enabled",
+        "auto_futures_enabled": remaining == "auto_futures_enabled",
+    })
+
+    body = client.get("/api/autoloop").json()
+
+    assert body["enabled"] is (remaining is not None)
+    assert body["modes"] == {
+        "auto_spot": remaining == "auto_spot_enabled",
+        "auto_futures": remaining == "auto_futures_enabled",
+        "any_auto_enabled": remaining is not None,
+    }
+    assert body["gates"] == body["modes"]
+    assert control_store.load_autoloop_state()["enabled"] is True
 
 
 def test_autoloop_validates_body(client, tmp_path):
@@ -547,12 +598,14 @@ def test_scheduler_stop_during_state_read_launches_no_new_cycle(monkeypatch):
 
 
 def test_scheduler_loop_runs_enabled_state_immediately(monkeypatch, tmp_path):
+    set_config({"auto_spot_enabled": True})
     autoloop_mod._save_state({"enabled": True, "interval_minutes": 1440, "updated_at": utc_now_iso()})
     calls: list[int] = []
     stop = threading.Event()
 
     def spawn(*args, **kwargs):
         calls.append(1)
+        set_config({"auto_spot_enabled": False})
         autoloop_mod._save_state({"enabled": False, "interval_minutes": 1440})
         return "started"
 
@@ -573,6 +626,7 @@ def test_scheduler_loop_runs_enabled_state_immediately(monkeypatch, tmp_path):
 
 
 def test_scheduler_runs_again_after_interval_timeout(monkeypatch, tmp_path):
+    set_config({"auto_spot_enabled": True})
     autoloop_mod._save_state({
         "enabled": True,
         "interval_minutes": 15,
@@ -613,6 +667,7 @@ def test_scheduler_runs_again_after_interval_timeout(monkeypatch, tmp_path):
 
 
 def test_scheduler_ignores_pending_enable_wakeup_but_runs_changed_state(monkeypatch, tmp_path):
+    set_config({"auto_spot_enabled": True})
     autoloop_mod._save_state({
         "enabled": True,
         "interval_minutes": 15,
@@ -647,6 +702,7 @@ def test_scheduler_ignores_pending_enable_wakeup_but_runs_changed_state(monkeypa
     def spawn(*_args, **_kwargs):
         calls.append(1)
         if len(calls) == 2:
+            set_config({"auto_spot_enabled": False})
             autoloop_mod._save_state({
                 "enabled": False,
                 "interval_minutes": 30,
@@ -678,7 +734,9 @@ def test_scheduler_ignores_pending_enable_wakeup_but_runs_changed_state(monkeypa
 # --- POST /api/autoloop/run-now -------------------------------------------------
 
 
-def test_run_now_spawns_a_cycle_and_reports_already_running(client, monkeypatch):
+@pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
+def test_run_now_spawns_a_cycle_and_reports_already_running(client, monkeypatch, spot, futures):
+    set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
     calls: list[int] = []
     monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: calls.append(1) or "started")
 
@@ -694,7 +752,19 @@ def test_run_now_spawns_a_cycle_and_reports_already_running(client, monkeypatch)
     assert calls == [1]  # the busy probe spawned nothing
 
 
+def test_run_now_rejects_when_both_modes_are_disabled(client, monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(autoloop_mod, "_spawn_cycle", lambda *args, **kwargs: calls.append(1))
+
+    response = client.post("/api/autoloop/run-now", json={})
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "mode_closed"
+    assert calls == []
+
+
 def test_run_now_skipped_busy_records_the_skip_trail(client, tmp_path):
+    set_config({"auto_spot_enabled": True})
     active = runs_mod.RunState(
         run_id="r_active", ticker="BTC-USD", trade_date=_today(),
         asset_type="crypto", mode="mock", checkpoint=None, created_at=_today(),
@@ -841,12 +911,9 @@ class _FakeGraph:
 
 
 def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
-    """Auto-confirm dry: the third gate fully open (config literal + env flag,
-    exec_live closed) — the cycle's Buy plan executes as a dry fill with the
-    ATR bracket attached, exactly what _handle_plan alone decides."""
+    """Auto Spot executes a dry Buy with the protective bracket attached."""
     engine_audit = tmp_path / "engine-audit.jsonl"
-    set_config({"exec_auto_confirm": True, "exec_live": False, "exec_log_path": str(engine_audit)})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")  # the env half
+    set_config({"auto_spot_enabled": True, "exec_live": False, "exec_log_path": str(engine_audit)})
 
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda config, top_n: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: ["NVDA"])
@@ -857,10 +924,11 @@ def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
     monkeypatch.setattr(screening_mod, "atr_targets_signed",
                         lambda ticker, date, direction: (_STOP, _TAKE))
 
+    # Do not forward managed authorization: this case explicitly exercises dry fills.
     def build(config):
-        from tradingagents.execution.bridge import ExchangeBridge
-
-        return ExchangeBridge(config=config, exchange_factory=_StubVenue)
+        bridge = ExchangeBridge(config=config, exchange_factory=_StubVenue)
+        assert bridge.effective_mode() == "dry"
+        return bridge
 
     monkeypatch.setattr(autoloop_mod, "_build_bridge", build)
 
@@ -904,11 +972,57 @@ def test_run_cycle_auto_confirms_dry_buy_with_bracket(tmp_path, monkeypatch):
     assert last["results"][1]["executed"] is False
 
 
+def test_managed_spot_cycle_submits_only_to_fake_venue(tmp_path, monkeypatch):
+    class RecordingVenue(_StubVenue):
+        apiKey = "test-key"
+        secret = "test-secret"
+
+        def __init__(self):
+            self.orders = []
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{float(amount):.6f}"
+
+        def create_order(self, symbol, order_type, side, amount):
+            self.orders.append((symbol, order_type, side, amount))
+            return {"id": "fake-spot-order"}
+
+        def market_id(self, symbol):
+            return symbol.replace("/", "")
+
+    venue = RecordingVenue()
+    audit_file = tmp_path / "engine-audit.jsonl"
+    set_config({"auto_spot_enabled": True, "exec_live": False, "exec_log_path": str(audit_file)})
+    monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
+    monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
+    monkeypatch.setattr(screening_mod, "screen_universe", lambda *_args: [
+        {"ticker": "BTC-USD", "asset_type": "crypto"},
+    ])
+    monkeypatch.setattr(autoloop_mod, "_bracket_prices", lambda *_args: (None, None))
+    bridges = []
+
+    def build(config, *, authorization):
+        bridge = ExchangeBridge(config=config, exchange_factory=lambda: venue, authorization=authorization)
+        bridges.append(bridge)
+        return bridge
+
+    monkeypatch.setattr(autoloop_mod, "_build_bridge", build)
+
+    (result,) = autoloop_mod._run_cycle(lambda *_args: _FakeGraph("Buy"))
+
+    assert bridges[0].effective_mode() == "live"
+    assert result.executed is True
+    assert result.order_id == "fake-spot-order"
+    assert len(venue.orders) == 1
+    assert venue.orders[0][:3] == ("BTC/USDT", "market", "buy")
+    events = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines()]
+    assert any(event.get("phase") == "execute" and event.get("mode") == "live" for event in events)
+
+
 def test_run_cycle_skips_each_failing_candidate_but_completes(tmp_path, monkeypatch):
     """One candidate's failure never stops the cycle (execution/daily.py:170-173)."""
     engine_audit = tmp_path / "engine-audit.jsonl"
-    set_config({"exec_auto_confirm": True, "exec_live": False, "exec_log_path": str(engine_audit)})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    set_config({"auto_spot_enabled": True, "exec_live": False, "exec_log_path": str(engine_audit)})
 
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda config, top_n: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
@@ -940,8 +1054,7 @@ def test_run_cycle_skips_each_failing_candidate_but_completes(tmp_path, monkeypa
 
 def test_cycle_screening_timeout_is_terminal_and_does_not_build_venue(tmp_path, monkeypatch):
     engine_audit = tmp_path / "engine-audit.jsonl"
-    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    set_config({"auto_spot_enabled": True, "exec_live": True, "exec_log_path": str(engine_audit)})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     monkeypatch.setattr(autoloop_mod, "SCREENING_TIMEOUT_SECONDS", 0.01)
 
@@ -973,7 +1086,7 @@ def test_cycle_runs_crypto_candidates_before_advisory_stocks(tmp_path, monkeypat
     """The venue only executes crypto, so crypto must be processed first: a
     cycle that runs out of time on the stock tail has still seen every
     executable candidate."""
-    set_config({"exec_auto_confirm": False, "exec_live": False})
+    set_config({"auto_spot_enabled": True, "exec_live": False})
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
     # Screen score order puts stocks first — exactly the real-world pattern
@@ -1054,8 +1167,7 @@ def test_preflight_keeps_everything_when_market_metadata_is_unavailable(tmp_path
 
 def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monkeypatch):
     engine_audit = tmp_path / "engine-audit.jsonl"
-    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    set_config({"auto_spot_enabled": True, "exec_live": True, "exec_log_path": str(engine_audit)})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
@@ -1100,7 +1212,7 @@ def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monk
 def test_cycle_publishes_active_graph_stage_while_candidate_is_running(tmp_path, monkeypatch):
     import time
 
-    set_config({"exec_auto_confirm": False, "exec_live": False})
+    set_config({"auto_spot_enabled": True, "exec_live": False})
     monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 2.0)
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda *_args: [])
@@ -1154,8 +1266,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
     from tradingagents.portfolio import PortfolioContext
 
     engine_audit = tmp_path / "engine-audit.jsonl"
-    set_config({"exec_auto_confirm": True, "exec_live": True, "exec_log_path": str(engine_audit)})
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
+    set_config({"auto_spot_enabled": True, "exec_live": True, "exec_log_path": str(engine_audit)})
     monkeypatch.setenv("TRADINGAGENTS_EXEC_LIVE", "true")
     monkeypatch.setattr(autoloop_mod, "CYCLE_TIMEOUT_SECONDS", 5.0)
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda *_args: ["BTC-USD"])
@@ -1173,7 +1284,7 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
     submitted: list[object] = []
 
     class SlowBridge:
-        config = {"exec_auto_confirm": True, "exec_live": True}
+        config = {"auto_spot_enabled": True, "exec_live": True}
 
         def sync_portfolio(self):
             sync_entered.set()
@@ -1257,10 +1368,7 @@ class _StubDerivVenue(_StubVenue):
 
 
 def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_direction="bullish"):
-    """Gates + screening fakes for a derivatives-path cycle: the FR-D gates
-    armed in config AND env (planning refuses otherwise), exec_live closed so
-    _handle_plan can only ever dry-run, and the executor seam replaced by a
-    factory over the stub venue."""
+    """Enable Auto Futures with fake venues and an explicit standalone dry executor."""
     engine_audit = tmp_path / "engine-audit.jsonl"
     # Fully stub the account read: the derivatives cycle needs a complete
     # equity picture, not a venue round-trip, and a real read would now demand
@@ -1277,8 +1385,7 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
         ),
     )
     set_config({
-        "exec_auto_confirm": True, "exec_live": False,
-        "exec_derivatives": True,
+        "auto_spot_enabled": False, "auto_futures_enabled": True, "exec_live": False,
         # Risk caps sized for the 3x plan the cycle requests: margin = 25% of
         # cash 9500 = 2375, notional at 3x = 7125 = 75% of equity — so every
         # percentage cap must sit at/above 75% and the leverage cap at 3x.
@@ -1289,8 +1396,6 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
         "exec_log_path": str(engine_audit),
         **(config_extra or {}),
     })
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_AUTO_CONFIRM", "true")
-    monkeypatch.setenv("TRADINGAGENTS_EXEC_DERIVATIVES", "true")
 
     monkeypatch.setattr(screening_mod, "crypto_universe", lambda config, top_n: ["BTC-USD"])
     monkeypatch.setattr(screening_mod, "stock_universe", lambda config, top_n: [])
@@ -1303,11 +1408,13 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
 
     monkeypatch.setattr(screening_mod, "_public_futures_ranking_client", lambda config: _FakeRankingClient())
 
+    # This fixture deliberately does not forward the managed authorization: its
+    # existing audit and bracket cases exercise the standalone dry-run path.
     def build(config):
         from tradingagents.execution.derivatives import DerivativesExecutor
         from tradingagents.execution.risk import RiskGuard, RiskLimits
 
-        return DerivativesExecutor(
+        executor = DerivativesExecutor(
             config=config, exchange_factory=_StubDerivVenue,
             risk_guard=RiskGuard(
                 limits=RiskLimits(
@@ -1316,11 +1423,17 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
                     max_position_pct_per_asset=100.0,
                     max_total_exposure_pct=100.0,
                 ),
-                price_of=lambda ticker: 50_000.0,
+                price_of=lambda ticker: _STUB_PRICE,
             ),
         )
+        assert executor.effective_mode() == "dry"
+        return executor
 
     monkeypatch.setattr(autoloop_mod, "_build_derivatives_executor", build)
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
     monkeypatch.setattr(_StubDerivVenue, "candle_direction", candle_direction)
     monkeypatch.setattr(autoloop_mod, "_bracket_prices",
                         lambda ticker, direction="long": (
@@ -1332,8 +1445,123 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     return engine_audit
 
 
+@pytest.mark.parametrize(
+    "spot,futures,expected_markets",
+    [
+        (True, False, ["spot"]),
+        (False, True, ["derivatives"]),
+        (True, True, ["spot", "derivatives"]),
+        (False, False, []),
+    ],
+    ids=["spot-only", "futures-only", "both", "both-off"],
+)
+def test_cycle_dispatches_only_enabled_markets(tmp_path, monkeypatch, spot, futures, expected_markets):
+    from tradingagents.execution.bridge import ExchangeBridge
+
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
+    graph_modes = []
+
+    def graph_builder(config, analysts):
+        graph_modes.append((config["auto_spot_enabled"], config["auto_futures_enabled"]))
+        return _FakeGraph("Buy")
+
+    results = autoloop_mod._run_cycle(graph_builder)
+
+    assert all(result.plan is not None for result in results), results
+    assert [result.plan.market for result in results] == expected_markets
+    assert all(result.executed for result in results)
+    assert graph_modes == [
+        (market == "spot", market == "derivatives") for market in expected_markets
+    ]
+    modes = autoloop_mod._last_cycle["modes"]
+    assert modes["auto_spot"]["status"] == ("completed" if spot else "disabled")
+    assert modes["auto_futures"]["status"] == ("completed" if futures else "disabled")
+    assert autoloop_mod._last_cycle["status"] == "completed"
+
+
+@pytest.mark.parametrize("closed_mode", ["auto_spot_enabled", "auto_futures_enabled"])
+def test_cycle_closing_one_mode_during_spot_analysis_preserves_the_other(
+    tmp_path, monkeypatch, closed_mode,
+):
+    from tradingagents.execution.bridge import ExchangeBridge
+
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    set_config({"auto_spot_enabled": True, "auto_futures_enabled": True})
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
+    seen_modes = []
+
+    class SpotGraph(_FakeGraph):
+        def propagate(self, *args, **kwargs):
+            decision = super().propagate(*args, **kwargs)
+            set_config({closed_mode: False})
+            return decision
+
+    def graph_builder(config, analysts):
+        is_spot = config["auto_spot_enabled"]
+        seen_modes.append("spot" if is_spot else "futures")
+        return SpotGraph("Buy") if is_spot else _FakeGraph("Buy")
+
+    results = autoloop_mod._run_cycle(graph_builder)
+
+    remaining_market = "derivatives" if closed_mode == "auto_spot_enabled" else "spot"
+    assert [result.plan.market for result in results] == [remaining_market]
+    assert results[0].executed is True
+    assert seen_modes == (["spot", "futures"] if remaining_market == "derivatives" else ["spot"])
+    modes = autoloop_mod._last_cycle["modes"]
+    assert modes["auto_spot"]["status"] == ("disabled" if closed_mode == "auto_spot_enabled" else "completed")
+    assert modes["auto_futures"]["status"] == ("disabled" if closed_mode == "auto_futures_enabled" else "completed")
+
+
+@pytest.mark.parametrize("market", ["spot", "futures"])
+def test_cycle_closing_mode_during_planning_prevents_execution(tmp_path, monkeypatch, market):
+    from tradingagents.execution.bridge import ExchangeBridge
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    set_config({"auto_spot_enabled": market == "spot", "auto_futures_enabled": market == "futures"})
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config, *, authorization: ExchangeBridge(
+            config=config, exchange_factory=_StubVenue, authorization=authorization,
+        ),
+    )
+    executor_type = ExchangeBridge if market == "spot" else DerivativesExecutor
+    original_plan = executor_type.plan_order
+    planned = []
+    submitted = []
+
+    def close_after_planning(self, *args, **kwargs):
+        plan = original_plan(self, *args, **kwargs)
+        planned.append(plan)
+        set_config({f"auto_{market}_enabled": False})
+        return plan
+
+    def execute_order(*args, **kwargs):
+        submitted.append((args, kwargs))
+        pytest.fail("disabled mode must not execute an order")
+
+    monkeypatch.setattr(executor_type, "plan_order", close_after_planning)
+    monkeypatch.setattr(executor_type, "execute_order", execute_order)
+
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+
+    assert len(planned) == 1
+    assert planned[0].side == "buy"
+    assert results == []
+    assert submitted == []
+    assert autoloop_mod._last_cycle["modes"][f"auto_{market}"]["status"] == "disabled"
+
+
 def test_run_cycle_derivatives_dry_buy_long_bracket(tmp_path, monkeypatch):
-    """exec_derivatives armed: the crypto candidate plans through the
+    """Auto Futures plans through the
     DerivativesExecutor using the AGENT's leverage (not a code default) and the
     Buy's dry fill carries the LONG bracket (stop below entry, target above).
     The executed row keeps the PM's verbatim decision — HEAD wrote it there and
@@ -1833,12 +2061,23 @@ def test_executed_row_records_the_venue_order_id(tmp_path, monkeypatch):
 
 
 def test_run_cycle_derivatives_awaiting_approval_is_never_entered(tmp_path, monkeypatch):
-    """An approval gate closing after planning leaves the plan unsent: the row
-    keeps its own awaiting_approval outcome with the gate's reason, executed
-    stays false, and the funnel summary never counts it as an entered."""
+    """A closed executor authorization leaves a planned order awaiting approval."""
     from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
 
-    _derivatives_cycle_env(tmp_path, monkeypatch, config_extra={"exec_auto_confirm": False})
+    _derivatives_cycle_env(tmp_path, monkeypatch)
+    original_plan = DerivativesExecutor.plan_order
+
+    def plan_then_require_approval(self, *args, **kwargs):
+        plan = original_plan(self, *args, **kwargs)
+        # The cycle token remains valid; model a separate executor authorization
+        # closing between planning and the approval policy.
+        self._bridge._auto_authorization = capture_authorization(
+            {"auto_futures_enabled": False}
+        )
+        return plan
+
+    monkeypatch.setattr(DerivativesExecutor, "plan_order", plan_then_require_approval)
 
     results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
 
@@ -2022,29 +2261,41 @@ def test_run_cycle_derivatives_execute_failure_lands_in_execution_failed(tmp_pat
     assert summary.get("execution_failed") == 1
 
 
-def test_run_cycle_derivatives_gates_closed_refuse_planning(tmp_path, monkeypatch):
-    """The derivatives executor's own gates still decide: config armed but the
-    TRADINGAGENTS_EXEC_DERIVATIVES env flag missing fails closed — the
-    candidate records the refusal, the cycle completes (a candidate's failure
-    never stops the cycle)."""
+def test_run_cycle_derivatives_mode_disabled_before_planning(tmp_path, monkeypatch):
+    """Closing Auto Futures during analysis must prevent a new plan or order."""
+    from server import job_store
+    from tradingagents.execution.derivatives import DerivativesExecutor
+
     engine_audit = _derivatives_cycle_env(tmp_path, monkeypatch)
-    monkeypatch.delenv("TRADINGAGENTS_EXEC_DERIVATIVES", raising=False)
 
-    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+    def plan_order(*_args, **_kwargs):
+        pytest.fail("disabled futures mode must not plan an order")
 
-    (btc,) = results
-    assert btc.executed is False and btc.plan is None
-    assert "TRADINGAGENTS_EXEC_DERIVATIVES" in (btc.reason or "")
-    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines() if line.strip()] if engine_audit.exists() else []
-    assert events[-1]["action"] == "derivatives_denied"
-    assert autoloop_mod._last_cycle["status"] == "completed"
+    class ClosingGraph(_FakeGraph):
+        def propagate(self, *args, **kwargs):
+            decision = super().propagate(*args, **kwargs)
+            set_config({"auto_futures_enabled": False})
+            return decision
+
+    monkeypatch.setattr(DerivativesExecutor, "plan_order", plan_order)
+    results = autoloop_mod._run_cycle(lambda config, analysts: ClosingGraph("Buy"))
+
+    assert results == []
+    assert autoloop_mod._last_cycle["modes"]["auto_futures"]["status"] == "disabled"
+    (cycle,) = job_store.list_futures_cycles(limit=1)
+    assert cycle["status"] == "rejected"
+    assert cycle["payload"]["execution_status"] == "not_executed"
+    assert cycle["payload"]["executed"] is False
+    assert "disabled before planning" in cycle["payload"]["execution_reason"]
+    events = [json.loads(line) for line in engine_audit.read_text(encoding="utf-8").splitlines()] if engine_audit.exists() else []
+    assert all(event.get("phase") not in {"plan", "execute"} for event in events)
 
 
 def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch):
     from tradingagents.execution.sizing import PlannedOrder
 
     now = datetime(2026, 10, 7, 8, tzinfo=UTC)
-    set_config({"exec_auto_confirm": False})
+    set_config({"auto_futures_enabled": False})
     class FixedDateTime:
         @classmethod
         def now(cls, tz=None):
@@ -2064,7 +2315,7 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
             return {"last": 100.0, "close": 100.0}
 
     class Bridge:
-        config = {"exec_auto_confirm": False}
+        config = {"auto_futures_enabled": False}
         def client(self): return Exchange()
         def symbol_for(self, ticker): return "BTC/USDT:USDT"
         def fetch_price(self, ticker): return 100.0
@@ -2072,7 +2323,7 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
 
     class Derivatives:
         _bridge = Bridge()
-        config = {}
+        config = {"auto_futures_enabled": False}
         def symbol_for(self, ticker): return self._bridge.symbol_for(ticker)
         def audit_plan(self, *args, **kwargs):
             return None

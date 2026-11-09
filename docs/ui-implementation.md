@@ -50,8 +50,8 @@ FastAPI (`web/next.config.ts:4-12`); FastAPI là lớp mỏng bọc engine theo 
   origin 8420 được whitelist để bảng điều khiển cũng có thể được phục vụ ở
   port hợp đồng chỉ định mà CSRF vẫn cho phép.
 - **`settings.py`** — GET/PUT `/api/settings`: đọc config + env với mask
-  credential; PUT áp `set_config` in-memory rồi upsert `.env` (ghi utf-8,
-  tmp + replace). Cấm ghi key gate (FR5) — cổng thực thi chỉ mở được qua env.
+  credential; PUT áp in-memory và lưu PostgreSQL, không ghi `.env`. Hai mode tự
+  động được ghi qua `/api/operator-config`, không phải qua settings.
 - **`watchlist.py`** — CRUD watchlist dùng file state riêng
   (`server/data/watchlist.json`) và sync ngược `exec_watchlist` trong
   `DEFAULT_CONFIG` để một daily runner chạy trong cùng process đọc đúng danh
@@ -64,9 +64,10 @@ FastAPI (`web/next.config.ts:4-12`); FastAPI là lớp mỏng bọc engine theo 
   `run_id`); worker thread stream chunk theo đúng mô hình
   `cli/run.py:226-323`. File tự ghi chú endpoint daily là
   "future daily-job endpoint" (`server/runs.py:7`).
-- **`approvals.py`** — hàng đợi bền tại `server/data/approvals.jsonl`
-  (JSONL, sống sót qua restart). Approve chỉ mở khi config `exec_live=True`;
-  cổng đóng → **412 `gate_closed`**, `halted_today` → **403**. Reject là
+- **`approvals.py`** — approve chỉ hỗ trợ Spot và cần Auto Spot cùng authorization
+  còn hợp lệ; mode tắt hoặc authorization cũ → **412 `mode_closed`**, thị trường
+  khác → **409 `unsupported_market`**, `halted_today` → **403**. Managed approve
+  gửi tới venue đã cấu hình, không cần `exec_live`. Reject là
   audit-only, không đụng exchange. Mọi action ghi audit trail riêng tại
   `server/data/audit.jsonl`. Item chưa xử lý **hết hạn sau 24h**
   (`EXPIRY_HOURS = 24`, `server/approvals.py:27`; action vào item hết hạn
@@ -119,15 +120,11 @@ App shell (không đổi khi làm từng màn):
   (`/scanner`), M4 Duyệt lệnh (`/approvals`), M5 Cấu hình (`/settings`),
   M6 Lịch sử & Audit (`/audit`), kèm dòng miễn trừ trách nhiệm
   "Công cụ nghiên cứu — không phải lời khuyên tài chính" (`sidebar.tsx:57-59`).
-- **Mode bar toàn cục** — `web/components/mode-bar.tsx`, mounted trong
-  `web/app/layout.tsx:33`: đọc `GET /api/settings` mỗi 30s
-  (`mode-bar.tsx:22,47-51`). Hiển thị **SANDBOX** (viền xanh dương + khiên
-  `ShieldCheckIcon`, chữ "Chế độ mô phỏng — không có lệnh thật nào được gửi")
-  khi `effective_exec_mode !== "live"`, hoặc **"LIVE — LỆNH THẬT"** (viền đỏ
-  + `TriangleAlertIcon` + mô tả "lệnh được duyệt sẽ gửi thẳng lên sàn") khi
-  cả hai cổng FR5 mở (`mode-bar.tsx:53-79`). Màu không phải tín hiệu duy
-  nhất — luôn kèm icon + chữ. Ba trạng thái hạng nhất: ĐANG TẢI,
-  KHÔNG KẾT NỐI (viền amber + nút "Thử lại") (`mode-bar.tsx:80-101,116-125`).
+- **Chỉ báo sidebar** đọc `gates_readonly` từ `GET /api/settings` và hiển thị tự
+  động bật khi Auto Spot hoặc Auto Futures bật; nó không xác định venue/account.
+  Trường `effective_exec_mode` của API hiện được tính bằng bridge standalone dựa
+  trên `exec_live`; `dry` không chứng minh autoloop hay approve không gửi lệnh tới
+  venue đã cấu hình. Thay đổi mode qua SSE làm chip refetch trạng thái.
 
 Design tokens (`web/app/globals.css`): `--color-profit` / `--color-loss`
 (globals.css:31-32, giá trị oklch ở :71-72 light và :110-111 dark) qua
@@ -350,11 +347,37 @@ không cần sửa code.
   do đó **chưa được phép** chạy `--host` ngoài loopback. Để mở bind cần
   lần lượt: thêm token (middleware auth), đưa token vào `web/` khi gọi
   `/api/*`, rồi mới đổi port/host.
-- **Quyền thực thi do operator config điều khiển.** PUT
-  `/api/operator-config` cập nhật `exec_live`, `exec_auto_confirm` và
-  `exec_derivatives` với xác nhận + lý do; mode bar đọc `effective_exec_mode`,
-  và gate tắt sẽ chặn lệnh mới ở bước thực thi. Không còn biến môi trường gate
-  thứ hai; `.env` chỉ giữ credential/venue deployment.
+- **Chế độ tự động theo thị trường.** PUT `/api/operator-config` ghi hai
+  boolean `auto_spot_enabled` (Auto Spot) và `auto_futures_enabled` (Auto Futures),
+  mặc định tắt trên cài mới, với xác nhận + lý do và audit. Khi chưa có dòng mode
+  mới, migration chỉ bật Futures nếu `exec_auto_confirm`, `exec_derivatives` và
+  `exec_live` cũ đều là boolean `true`; nếu `exec_auto_confirm` và `exec_live`
+  là `true` còn `exec_derivatives` là `false` hoặc thiếu thì chỉ bật Spot. Nếu
+  `exec_live` thiếu hoặc không phải `true`, cả hai tắt để tránh nâng cấp dry thành
+  lệnh thật. Dòng mode mới đã tồn tại được giữ nguyên; nếu chỉ có một dòng thì
+  dòng còn thiếu khởi tạo `false`, không suy ra từ cờ cũ. Xem bảng đầy đủ tại
+  `docs/ui-api-contract.md` §1 và đọc trạng thái hiện hành trước khi chạy.
+- `settings.py` xuất `GET /api/settings` với `gates_readonly`; sidebar đọc trạng thái
+  này. Operator config có `modes`/`gates` cùng trạng thái và `effective_exec_mode`
+  standalone. Managed entry dùng authorization riêng, không cần `exec_live`; phải
+  kiểm tra venue Demo/production và credentials trước khi bật mode.
+- **Phạm vi tắt mode.** Autoloop chỉ sàng lọc/phân tích, lập kế hoạch và vào lệnh
+  mới cho các mode bật, chạy Spot rồi Futures nếu cả hai bật; backend kiểm tra lại
+  ở các bước tiếp theo, không huỷ tức thời call đang chạy. Daily job cần Auto Spot;
+  phân tích riêng `/api/runs` không bị chặn. Approve chỉ hỗ trợ Spot và cần Auto Spot,
+  không cần `exec_live`. Tắt Auto Futures không tự đóng vị thế. Khi policy
+  `risk_derivatives_profit_protection_enabled` bật, Futures protection và bracket recovery
+  không cần Auto Futures hoặc `exec_live`; mutation chỉ được phép sau khi task thường
+  `bracket:*` qua xác minh venue/account identity, đúng một durable position state liên kết
+  chính xác symbol/side/entry/task, sổ vị thế hiện tại đầy đủ cùng phía, contracts/entry/mark
+  hợp lệ và các kiểm tra BracketManager trong symbol operation lock. Entry-intent,
+  unbound, missing/ambiguous, uncertain và emergency vẫn chỉ đọc, manual hoặc deferred.
+- **Autoloop payload hiện tại.** Server trả cả `modes` và `gates` với ba trường
+  `auto_spot`, `auto_futures`, `any_auto_enabled`; card autoloop đọc `modes`.
+  Khi đọc được scheduler state, `enabled` suy ra từ `any_auto_enabled`. `POST
+  /api/autoloop` khi yêu cầu bật hoặc `/api/autoloop/run-now` trả 409
+  `mode_closed` nếu cả hai mode tắt; gửi `enabled: false` không dừng scheduler
+  khi một mode vẫn bật. Tắt cả hai mode để dừng.
 - **Giao diện của guard không thay thế net-isolation**: 3000/8000 vẫn là
   port local; nếu phải mở ra LAN, làm theo §6 trên và review lại toàn bộ
   mục này.

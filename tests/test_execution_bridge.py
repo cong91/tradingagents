@@ -20,9 +20,11 @@ import ccxt
 import pytest
 
 import tradingagents.execution.risk as risk_module
+from tradingagents.dataflows.config import set_config
 from tradingagents.default_config import DEFAULT_CONFIG, _apply_env_overrides
 from tradingagents.execution import ExchangeBridge, PlannedOrder, SizingRules
 from tradingagents.execution.audit import append_event
+from tradingagents.execution.auto_authorization import AutoAuthorizationError
 from tradingagents.execution.sizing import compute
 from tradingagents.portfolio import PortfolioContext, Position
 
@@ -132,7 +134,8 @@ def read_audit(tmp_path):
 
 
 def live_bridge(tmp_path, monkeypatch, exchange, **kwargs):
-    """A bridge with the config-controlled live gate open."""
+    """A bridge with live execution and process Auto Spot enabled."""
+    set_config({"auto_spot_enabled": True})
     return make_bridge(
         tmp_path, monkeypatch,
         config={"exec_live": True},
@@ -338,6 +341,7 @@ def test_sizing_rules_are_configurable(tmp_path, monkeypatch):
 
 
 def test_dry_run_needs_no_confirm_and_touches_no_endpoint(tmp_path, monkeypatch):
+    set_config({"auto_spot_enabled": False})
     exchange = FakeExchange()
     bridge = make_bridge(tmp_path, monkeypatch, factory=lambda: exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
@@ -403,12 +407,13 @@ def test_live_without_confirm_is_denied(tmp_path, monkeypatch):
     exchange = FakeExchange()
     bridge = live_bridge(tmp_path, monkeypatch, exchange)
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="confirm=True"):
         bridge.execute_order(order)
     assert not any(call[0] == "create_order" for call in exchange.calls)
     event = read_audit(tmp_path)[-1]
     assert event["action"] == "execute_denied"
     assert event["mode"] == "live"
+    assert event["confirmed"] is False
 
 
 def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
@@ -429,8 +434,44 @@ def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
     assert isinstance(event["qty_precision"], str)
 
 
+def test_live_override_cannot_authorize_closed_process_spot_mode(tmp_path, monkeypatch):
+    set_config({"auto_spot_enabled": False})
+    exchange = FakeExchange()
+    bridge = make_bridge(
+        tmp_path, monkeypatch,
+        config={"exec_live": True, "auto_spot_enabled": True},
+        factory=lambda: exchange,
+    )
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+
+    with pytest.raises(AutoAuthorizationError, match="Auto Spot is disabled"):
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
+
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+    event = read_audit(tmp_path)[-1]
+    assert event["action"] == "rejected_at_execute"
+    assert "Auto Spot is disabled" in event["reason"]
+
+
+def test_reenabled_process_spot_mode_does_not_revive_stale_live_bridge(tmp_path, monkeypatch):
+    exchange = FakeExchange()
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+    set_config({"auto_spot_enabled": False})
+    set_config({"auto_spot_enabled": True})
+
+    with pytest.raises(AutoAuthorizationError, match="authorization is stale"):
+        bridge.execute_order(order, confirm=True, portfolio=buy_book())
+
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+    event = read_audit(tmp_path)[-1]
+    assert event["action"] == "rejected_at_execute"
+    assert "authorization is stale" in event["reason"]
+
+
 @pytest.mark.parametrize("value", ["false", "off", "0", "garbage", ""])
 def test_legacy_live_env_does_not_change_config_gate(tmp_path, monkeypatch, value):
+    set_config({"auto_spot_enabled": True})
     exchange = FakeExchange()
     bridge = make_bridge(
         tmp_path, monkeypatch,
@@ -501,8 +542,6 @@ def test_gate_closure_after_bridge_creation_blocks_new_order(tmp_path, monkeypat
         factory=lambda: exchange,
     )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
-    from tradingagents.dataflows.config import set_config
-
     set_config({"exec_live": False})
     assert bridge.execute_order(order, confirm=True) is None
     assert not any(call[0] == "create_order" for call in exchange.calls)
@@ -897,18 +936,20 @@ def test_plan_rejection_is_never_double_counted_as_a_fill(tmp_path, monkeypatch)
     assert [e.get("phase") for e in read_audit(tmp_path)] == ["plan", "execute"]
 
 
-def test_execute_halt_refuses_both_dry_and_live(tmp_path, monkeypatch):
+@pytest.mark.parametrize("live", [False, True])
+def test_execute_halt_refuses_both_dry_and_live(tmp_path, monkeypatch, live):
     exchange = FakeExchange()
-    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    bridge = (
+        live_bridge(tmp_path, monkeypatch, exchange)
+        if live else make_bridge(tmp_path, monkeypatch, factory=lambda: exchange)
+    )
     order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
     append_event(
         bridge.config["exec_log_path"],
         {"event": "halt", "timestamp": "2026-09-28T10:00:00+00:00", "reason": "mid-flight"},
     )
     with pytest.raises(PermissionError, match="halt"):
-        bridge.execute_order(order)  # dry path guarded too
-    with pytest.raises(PermissionError, match="halt"):
-        bridge.execute_order(order, confirm=True)  # live path guarded too
+        bridge.execute_order(order, confirm=True)
     assert not any(call[0] == "create_order" for call in exchange.calls)
     assert read_audit(tmp_path)[-1]["action"] == "rejected_by_risk"
     assert read_audit(tmp_path)[-1]["phase"] == "execute"
@@ -1265,7 +1306,7 @@ def test_derivatives_gates_closed_plan_order_never_touches_the_exchange(tmp_path
         config={"exec_log_path": str(tmp_path / "deriv-audit.jsonl")},
         exchange_factory=lambda: exchange,
     )
-    with pytest.raises(PermissionError, match="exec_derivatives"):
+    with pytest.raises(PermissionError, match="Auto Futures is disabled; nothing was planned"):
         executor.plan_order(
             "BTC-USD", "Buy", buy_book(), price=50_000.0,
             stop_loss=48_000.0, take_profit=55_000.0,

@@ -11,6 +11,7 @@ import type {
 } from "./autoloop-types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
+const HEALTH_TIMEOUT_MS = 10_000;
 
 /** Lỗi HTTP/network chuẩn hoá để UI hiển thị thông điệp + nút retry. */
 export class AutoloopApiError extends Error {
@@ -51,6 +52,24 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 export const autoloopApi = {
   get(): Promise<AutoloopPayload> {
     return requestJson<AutoloopPayload>("/api/autoloop", { cache: "no-store" });
+  },
+  async getHaltState(): Promise<boolean | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    try {
+      const data = await requestJson<unknown>("/api/health", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (
+        typeof data !== "object" || data === null ||
+        !("audit_log_readable" in data) || data.audit_log_readable !== true ||
+        !("halted_today" in data) || typeof data.halted_today !== "boolean"
+      ) return null;
+      return data.halted_today;
+    } finally {
+      clearTimeout(timeout);
+    }
   },
   /** POST /api/autoloop — server trả 409 gate_closed khi cổng chưa đủ (fail-closed). */
   set(enabled: boolean, intervalMinutes: number): Promise<AutoloopPayload> {
