@@ -21,6 +21,10 @@ export const vi = {
   updatedAt: (time: string) => `Cập nhật lúc ${time}`,
   haltedToday: "Bot đã dừng đặt lệnh mới hôm nay (bộ bảo vệ rủi ro chặn).",
   viewAudit: "Xem audit",
+  viewAllOrders: (shown: number, total: number) =>
+    total > shown
+      ? `Hiển thị ${shown}/${total} lệnh gần nhất — xem tất cả ở Lịch sử & Audit`
+      : "Xem tất cả ở Lịch sử & Audit",
   pendingApprovals: (n: number) => `${n} lệnh đang chờ duyệt.`,
   openApprovals: "Mở màn Duyệt lệnh",
   decisionPerformanceTitle: "Hiệu suất quyết định",
@@ -97,6 +101,21 @@ export const vi = {
     heldFees: "Giữ / phí",
     noFuturesPositions: "Sàn không báo vị thế Futures đang mở.",
     futuresUnconfirmed: "Chưa thể xác nhận có vị thế Futures đang mở hay không.",
+    futuresReadAt: (time: string) => `Thời điểm đọc vị thế tại sàn: ${time}.`,
+    futuresListUnavailable:
+      "Danh sách vị thế Futures không khả dụng; không thể xác nhận vị thế đang mở.",
+    futuresReadUnavailable:
+      "Không đọc được danh sách vị thế Futures từ sàn; không thể xác nhận vị thế đang mở.",
+    futuresSkipped: (n: number) =>
+      `Lần đọc này bỏ qua ${n} phần dữ liệu vị thế; danh sách có thể thiếu.`,
+    futuresSkippedUnknown:
+      "Lần đọc không báo cáo số phần dữ liệu vị thế bị bỏ qua; danh sách có thể thiếu.",
+    futuresUnknownSymbol: "mã không xác định",
+    futuresIssueUnknown: "Lý do đọc chưa rõ.",
+    futuresIssues: {
+      scope_unverified: "Chưa xác minh đầy đủ phạm vi hoặc phân trang của sàn.",
+      monitor_position_missing: "Vị thế đang được hệ thống quản lý nhưng không có trong danh sách sàn.",
+    } as Record<string, string>,
     futuresStale:
       "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc; không thể xác nhận trạng thái Futures hiện tại.",
     futuresNoObservedAt:
@@ -108,6 +127,8 @@ export const vi = {
     snapshotStale: "Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận.",
     riskGuardUnknown: "Không xác định được trạng thái dừng giao dịch của bot.",
     spotUnavailable: "Không xác định được số dư và vị thế Spot.",
+    spotNotVenue:
+      "Vị thế Spot hiện tại không khả dụng vì không có snapshot được xác minh từ sàn.",
     spotStale: "Snapshot Spot đã cũ; không thể xác nhận trạng thái Spot hiện tại.",
     notionalNote:
       "Notional là giá trị danh nghĩa, margin là tài sản ký quỹ; cả hai không phải tiền lãi hay dòng tiền đã nhận.",
@@ -135,7 +156,7 @@ export const vi = {
   },
   performance: {
     title: "Hiệu suất giao dịch",
-    description: "Vị thế từ sàn, khớp lệnh Futures và nhật ký sự kiện.",
+    description: "Khớp lệnh Futures và nhật ký sự kiện.",
     closedStatsTitle: "Thống kê giao dịch đã đóng",
     closedStatsBody:
       "— Chưa đủ dữ liệu đối soát để xác nhận số lệnh đóng, tỷ lệ thắng và kỳ vọng.",
@@ -201,6 +222,10 @@ export const en: typeof vi = {
   updatedAt: (time) => `Updated at ${time}`,
   haltedToday: "The bot has stopped placing new orders today (blocked by its risk guard).",
   viewAudit: "View audit",
+  viewAllOrders: (shown, total) =>
+    total > shown
+      ? `Showing ${shown}/${total} most recent orders — see all in History & Audit`
+      : "See all in History & Audit",
   pendingApprovals: (n) => `${n} ${n === 1 ? "order is" : "orders are"} awaiting approval.`,
   openApprovals: "Open Order approvals",
   decisionPerformanceTitle: "Decision performance",
@@ -275,6 +300,21 @@ export const en: typeof vi = {
     heldFees: "Held / fees",
     noFuturesPositions: "The exchange reports no open Futures positions.",
     futuresUnconfirmed: "Cannot confirm yet whether any Futures positions are open.",
+    futuresReadAt: (time) => `Positions read at the exchange: ${time}.`,
+    futuresListUnavailable:
+      "The Futures position list is unavailable; open positions cannot be confirmed.",
+    futuresReadUnavailable:
+      "The Futures position list could not be read from the exchange; open positions cannot be confirmed.",
+    futuresSkipped: (n) =>
+      `This read skipped ${n} position entries; the list may be incomplete.`,
+    futuresSkippedUnknown:
+      "This read did not report how many position entries were skipped; the list may be incomplete.",
+    futuresUnknownSymbol: "unknown symbol",
+    futuresIssueUnknown: "The read reason is unclear.",
+    futuresIssues: {
+      scope_unverified: "The exchange's scope or pagination was not fully verified.",
+      monitor_position_missing: "A position the system manages is missing from the exchange's list.",
+    } as Record<string, string>,
     futuresStale:
       "Futures data is stale or its read time is unverified; the current Futures state cannot be confirmed.",
     futuresNoObservedAt:
@@ -286,6 +326,8 @@ export const en: typeof vi = {
     snapshotStale: "Snapshot is stale; the current Spot and Futures state is unconfirmed.",
     riskGuardUnknown: "Could not determine the bot's trading-halt status.",
     spotUnavailable: "Spot balance and positions could not be determined.",
+    spotNotVenue:
+      "Current Spot positions are unavailable because there is no verified snapshot from the exchange.",
     spotStale: "Spot snapshot is stale; the current Spot state cannot be confirmed.",
     notionalNote:
       "Notional is face value and margin is posted collateral; neither is profit or cash received.",
@@ -313,7 +355,7 @@ export const en: typeof vi = {
   },
   performance: {
     title: "Trading performance",
-    description: "Exchange positions, Futures fills and the event log.",
+    description: "Futures fills and the event log.",
     closedStatsTitle: "Closed-trade statistics",
     closedStatsBody:
       "— Not enough reconciled data yet to confirm closed trades, win rate and expectancy.",

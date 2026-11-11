@@ -4,6 +4,7 @@
 import { getLocale, type Locale } from "../locale";
 import * as approvals from "./approvals";
 import * as audit from "./audit";
+import * as brief from "./brief";
 import * as common from "./common";
 import * as cycles from "./cycles";
 import * as dataSources from "./data-sources";
@@ -18,6 +19,7 @@ const vi = {
   common: common.vi,
   pages: pages.vi,
   overview: overview.vi,
+  brief: brief.vi,
   performance: performance.vi,
   settings: settings.vi,
   dataSources: dataSources.vi,
@@ -34,6 +36,7 @@ const en: Messages = {
   common: common.en,
   pages: pages.en,
   overview: overview.en,
+  brief: brief.en,
   performance: performance.en,
   settings: settings.en,
   dataSources: dataSources.en,

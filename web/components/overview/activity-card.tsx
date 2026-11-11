@@ -79,7 +79,7 @@ export function OverviewActivityCard() {
   return (
     <Card className="mb-4">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2"><ActivityIcon className="size-4" aria-hidden="true" />{a.title}</CardTitle>
+        <CardTitle as="h2" className="flex items-center gap-2"><ActivityIcon className="size-4" aria-hidden="true" />{a.title}</CardTitle>
         <CardDescription>{a.description}</CardDescription>
         <CardAction>
           <Button variant="outline" size="sm" className="min-touch" onClick={() => void refresh()}>

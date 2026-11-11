@@ -1026,8 +1026,12 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 | 23| POST  | `/api/halt`                      | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay |
 | 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
 | 25| GET   | `/api/runs`                      | lịch sử run (database) + `active_run_id` (§3 rev 7) |
+| 26| GET   | `/api/outcomes`                  | sổ kết quả ròng read-only từ `outcome_*` (§16); rỗng → `unavailable`, không bao giờ 0 PnL |
+| 27| GET   | `/api/experiments`               | registry thí nghiệm read-only: run đã đăng ký + verdict so sánh (§17); rỗng → `unavailable` |
+| 28| GET   | `/api/experiments/{run_id}`      | một run: manifest đã khóa, per-repeat rows, comparisons (§17); run lạ → `unavailable` |
+| 29| GET   | `/api/shadow`                    | quan sát shadow read-only từ `shadow_*` (§19); rỗng → `unavailable`; tỷ lệ hướng là tỷ lệ mẫu, không phải xác suất |
 
-**endpointCount = 28.**
+**endpointCount = 32.**
 
 ---
 
@@ -1261,3 +1265,85 @@ Bracket replacement đặt conditional leg mới trước, persist order ID/trig
 Policy không đảm bảo giá khớp/lợi nhuận trong gap, slippage, liquidation hay outage. Binance Futures mutation hiện là venue được hỗ trợ; venue khác fail-closed. Không tự đổi One-way/Hedge mode; `reduceOnly` rejection được ghi nhận và không đổi state policy.
 
 **Venue Binance:** mặc định chọn Demo qua `TRADINGAGENTS_EXEC_BASE_URL=https://demo-api.binance.com`; ccxt tự route futures tới `demo-fapi.binance.com`. Chuyển production bằng cách thay URL thành `https://api.binance.com`, dùng `BINANCE_API_KEY`/`BINANCE_SECRET`, rồi restart backend. Bridge chỉ nhận đúng hai profile HTTPS allowlist này và chọn key pair tương ứng. Auto Futures cấp authorization cho entry managed tới venue đã cấu hình, không phụ thuộc `exec_live`; Demo order vẫn là live execution trên tài khoản Demo, không phải dry-run. Kiểm tra profile và cặp credential trước khi bật mode.
+
+## 16. Outcome ledger — `GET /api/outcomes` (rev 7)
+
+Read-only tổng hợp từ sổ kết quả ròng (`outcome_*`, migration `0008`): positions, fills, totals theo từng loại tiền (realized, fee, funding có dấu venue), coverage gần nhất. Không có route ghi; không gọi venue; không đổi state.
+
+**Truthfulness (bất biến test):**
+
+- Sổ rỗng/chưa ingest → `status: "unavailable"` kèm `reason`; **không bao giờ trình bày 0 PnL**.
+- `funding_unknown_currencies` liệt kê các loại tiền có realized/fee nhưng **không có dòng funding nào** — net của các loại tiền đó không được tuyên bố (`net_by_currency[i].funding_known = false`), vì kỳ funding có thể đọc thất bại; thiếu ≠ 0.
+- Fee chỉ được trừ vào net khi mọi fill realized của loại tiền đó mang `realized_pnl_semantics` khẳng định realized của venue KHÔNG gồm fee (hợp đồng ghi lúc ingestion); lệch/miếu → `fee_unknown_currencies` + `net_by_currency[i].fee_known = false`, thành phần fee bị omit khỏi net (không bịa 0).
+- `window_start`/`window_end` (ISO, optional) lọc coverage rows giao nhau với cửa sổ; bound sai định dạng → lỗi 400-grade, không nuýt thành "không lọc".
+- Coverage rows là **per-cycle** snapshots chồng lấn theo cấu trúc (mỗi row đối soát cửa sổ fill của một cycle, `snapshot.cycle_id` nhận dạng) — **không bao giờ cộng dồn** các row.
+- Coverage trả nguyên trạng vocabulary `ok/partial/error/unsupported/unavailable` của `FuturesTradeHistory` và công bố `realized_diff` (venue vs ledger) — sai số đối soát là bằng chứng, không được gạt đi. Row `status='error'` (account `cycle-error:<cycle_id>`) là dấu vết bền vững của cycle mà worker không xử lý được sau `MAX_CYCLE_ATTEMPTS`.
+- Endpoint decision-score cũ (`/api/backtest`: hit-rate/mean-alpha theo rating) giữ nguyên semantics; `/api/outcomes` không dùng các trường đó và không đổi tên gì của `/api/backtest`.
+
+CLI consumer: `tradingagents outcomes` in cùng payload (yêu cầu `TRADINGAGENTS_DATABASE_URL`). Worker ghi dữ liệu: `server/outcome_ledger.py`, bật bằng `outcome_ledger_ingest_enabled` (mặc định tắt; không backfill trước thời điểm bật).
+
+---
+
+## 17. Experiment registry — `GET /api/experiments` (rev 1)
+
+Read-only tổng hợp từ registry thí nghiệm (`experiment_*`, migration `0009`): các run đã đăng ký kèm manifest đã khóa (criteria khóa TRƯỚC khi chạy, digest SHA-256 ghi kèm), per-repeat results, và comparisons ghép cặp theo repeat index. Không có route ghi; không gọi LLM; không đổi state.
+
+**Truthfulness (bất biến test):**
+
+- Registry rỗng → `status: "unavailable"` kèm lý do; run lạ ở `/api/experiments/{run_id}` → `unavailable` — không bao giờ trình bày "0 runs" như một kết quả.
+- Verdict pass-through nguyên trạng: `insufficient_evidence_coverage` / `insufficient_evidence_interval` / `consistent_difference` — **không có verdict "winner" nào tồn tại trong schema** (CHECK của migration 0009 chặn); `consistent_difference` không phải promotion.
+- `metric_value` nullable: một repeat thiếu metric (funding unknown, net không sản sinh được) lưu NULL — không bao giờ 0.
+- Digest ràng buộc: results/comparisons tham chiếu `manifest_digest`; đăng ký lại cùng run_id với digest khác bị từ chối — criteria đã khóa thì không sửa lại.
+- So sánh là paired theo repeat index (cùng nến holdout, cùng cost model): số cặp `pairs` được công bố; dưới ngưỡng `min_paired_repeats` (mặc định 3) là insufficient-evidence-by-coverage.
+- Endpoint decision-score cũ (`/api/backtest`) và ledger (`/api/outcomes`) giữ nguyên semantics; registry không dùng các trường đó.
+
+CLI consumer: `tradingagents experiments` in cùng payload (yêu cầu `TRADINGAGENTS_DATABASE_URL`). Entrypoint CLI module: `python -m tradingagents.experiments.replay_experiment` (deterministic, không LLM), `python -m tradingagents.experiments.report <run_dir>` (đọc lại, verify digest). `python -m tradingagents.experiments.run` (biến thể LLM) exit 2 với hướng dẫn kích hoạt — không chạy chi phí LLM im lặng.
+
+---
+
+## 18. Operating brief — `GET /api/brief` (rev 1)
+
+Một aggregate **chỉ đọc** cho bản tin vận hành trên dashboard (`/`): việc cần xử lý, kết quả đã đối soát, rủi ro đang mở, hoạt động hôm nay, quan sát shadow, thí nghiệm gần nhất. Không có route POST/PUT/DELETE (403/405/415); không đổi state; **không tự gọi sàn** — phần tài khoản dùng lại đúng lần đọc hiển thị của `/api/portfolio` nên mỗi màn vẫn chỉ đọc tài khoản một lần. `read_only: true` trong payload.
+
+**Cấu trúc:** `generated_at`, `stale_after` (30), `disclaimer`, `status`, `funnel`, `results`, `risk`, `activity`, `experiments`, `portfolio`, `needs_attention`.
+
+**Truthfulness (bất biến test — `tests/test_operating_brief.py`):**
+
+- Sổ kết quả rỗng → `results.ledger.status: "unavailable"` kèm `reason`; `totals` là `null` — **không bao giờ 0 PnL**.
+- **Đã đối soát tách khỏi ước tính:** `results.ledger` chỉ mang số đã đối soát (per-currency, `net_by_currency[]` với `funding_known`/`fee_known`); `results.estimated` (Spot audit FIFO, Futures unrealized) nằm khối riêng, không có tổng chung — không được trình bày cùng cấp.
+- `results.unattributed_manual[]` giữ **từng dòng coverage** kèm cửa sổ riêng, có `count`; không có tổng gộp (các cửa sổ chồng lấn). `results.coverage_note` nói rõ điều đó.
+- `risk.open_positions.spot/futures` là `null` khi lần đọc vị thế chưa được chứng minh đầy đủ (`positions_read.status != "complete"`) — danh sách `partial` **không phải** tài khoản phẳng.
+- `risk.exposure.value_pct` chỉ được công bố khi mọi notional và equity cùng một loại tiền (không quy đổi FX); ngược lại `null` + `reason`.
+- `risk.heat.value_pct` **luôn `null`** kèm lý do: risk-at-stop của từng vị thế không nằm trong snapshot vị thế, nên heat không được tuyên bố.
+- `risk.protection` đếm từ **cycle đã executed hôm nay** (theo `updated_at` UTC), có `scope`; `open_positions_verified: false` vì vị thế sàn không có binding bền vững tới lệnh vào (xem §6) — không suy đoán mức bảo vệ từng vị thế.
+- `risk.limits` là **hiển thị chỉ đọc** của hạn mức operator đã cấu hình; không có đường ghi từ endpoint này.
+- `activity` tách hai nhóm: `no_entry_top_reasons[]` (top 3, không có tín hiệu / bị loại hợp lệ, kèm `sample_cycle_id`) và `pipeline_error_cycles` (failed/interrupted/timeout) — **không bao giờ gộp**. Cycle đang bay (`claimed/running`) bị loại khỏi cả hai. `activity.scope: "futures"`, `window: "today_utc"`.
+- `activity.shadow.state` ∈ `ok | disabled | empty | error` — **tên đúng loại "chưa có gì"**, vì ba loại này là ba sự thật khác nhau và UI render một câu riêng cho mỗi loại: `disabled` (công tắc `shadow_observations_enabled` đang tắt), `empty` (worker đang bật nhưng chưa ghi được dòng nào), `error` (lần đọc store thất bại). Trước đây một câu chung đã nói "chưa bật" cho cả ba, tức **nói sai cấu hình của operator** khi worker thực ra đang bật. Payload cũ không có `state` → UI rơi về câu trung tính, không mặc định là "đã tắt".
+- `activity.shadow.status: "unavailable"` khi worker shadow đang tắt (`shadow_observations_enabled = False`) kèm lý do, hoặc khi chưa có quan sát nào trong `shadow_forecasts`; `providers` (danh sách cấu hình) và `kronos` (model tùy chọn có cài trong môi trường cách ly hay không, kèm lý do) luôn được công bố để operator biết vì sao chưa có quan sát — không bịa dự báo.
+- `activity.shadow` khi đã bật: `totals` (đếm theo status), `providers_detail[]` (đếm theo nguồn: `attempts`, `verdicts`, `evaluations`), `observations[]` (5 dòng gần nhất: symbol/timeframe/horizon/provider/direction/status/generation_kind/outcome_group). **Tỷ lệ hướng là tỷ lệ mẫu trên số đường của mô hình**, in kèm mẫu số — không bao giờ là xác suất đã hiệu chỉnh; `distribution_kind: "deterministic_rule"` không có tỷ lệ/khoảng/độ phân tán nên không hiển thị chúng.
+- `experiments` lấy từ registry (§17); khi rỗng → `unavailable` + lý do; verdict pass-through, **không có promotion**.
+- `portfolio` là **body nguyên vẹn của `/api/portfolio`** (giữ `generated_at`, snapshot metadata, warnings, `positions_read`) để card dùng lại mà không mất hợp đồng/source freshness. Lần đọc danh mục thất bại → `portfolio: null` và chỉ section đó suy giảm; brief vẫn trả 200.
+- `needs_attention[]` được **dedup ở server** theo `kind` (một mục một kind, priority thấp nhất thắng), sắp theo `priority` 1→3, mỗi mục có `message_code` (i18n), `detail` (nguyên văn) và `link` nội bộ. Sổ rỗng **không** sinh mục "ledger unavailable" (đã có ở khối results) — tránh dạy operator bỏ qua danh sách cảnh báo.
+- Không có control nào thay đổi state trên dashboard: chỉ `refresh` (GET) và link điều hướng.
+
+Consumer web: `web/components/overview/brief/` (card + scope filter UI-local) và `web/components/overview/dashboard.tsx` gọi `GET /api/brief` thay cho `GET /api/portfolio`; footer trang hiển thị `generated_at` của brief **và** `risk.positions_read.observed_at` riêng, vì `generated_at` là lúc dựng response HTTP, không phải lúc đọc sàn.
+
+---
+
+## 19. Shadow observations — `GET /api/shadow` (rev 1)
+
+Aggregate **chỉ đọc** trên các bảng `shadow_*` (migration 0010, plan §6). Không có route ghi; không gọi provider; không đọc sàn; **không bao giờ tác động lệnh, hạn mức rủi ro hay protection** — worker shadow chạy độc lập sau khi cycle đã terminal.
+
+**Cấu trúc:** `status`, `reason`, `totals` (đếm `rows/ok/unavailable/errors/timeouts/retrospective` + `first_data_open_time`/`last_data_open_time`), `providers[]` (mỗi nguồn: `attempts`, `verdicts`, `evaluations`), `evaluations[]` (bản thô theo status), `recent[]` (20 dòng mới nhất, kèm evaluation join), `generated_at`, `read_only: true`, `disclaimer`.
+
+**Truthfulness (bất biến test — `tests/test_shadow_forecasts.py`, `tests/test_shadow_worker.py`):**
+
+- Bảng rỗng → `status: "unavailable"`, `totals: null`, `providers: []` kèm lý do — **không bao giờ "0% đồng ý"**.
+- `calibration_label` đi kèm từng dòng: `model_sample_ratio_not_probability` (mô hình) hoặc `deterministic_rule_no_distribution` (bộ lọc). Tỷ lệ hướng chỉ là **tỷ lệ mẫu trên N đường** với `sample_count` + `per_path_sample_count = 1`; không có trường nào được đặt tên/probability.
+- `generation_kind`: `forward` chỉ khi dự báo được tạo **trước khi nến dự báo đầu tiên đóng**; replay muộn là `retrospective` và được đếm riêng trong `totals.retrospective`.
+- `outcome_group` ∈ `executed | rejected | abstained`, suy từ `execution_status` đã ghi của cycle; status lạ không bao giờ được nâng thành `executed`.
+- `status` của một dòng ∈ `ok | unavailable | error | timeout`; dòng thất bại có `paths: []`, `samples: {}` và `reason` — không có dự báo "gần đúng".
+- `evaluation_status` chỉ có khi horizon 24h đã thực sự đóng đủ; `net_r` chỉ có khi ledger đã join, kèm `net_r_reason`.
+- `band_coverage` = **close cuối kỳ** có nằm trong band p10–p90 (band là phân phối của end-close, không phải hành lang từng nến); `null` với quy tắc cố định (không có khoảng). Câu hỏi "cả đường đi có nằm trong band" trả lời riêng ở `realized.band_held_throughout`, và `realized.band_semantics` nói rõ định nghĩa đang dùng.
+- `providers[].evaluations.stop_first_rate_mean` dùng `worst-first` của `tradingagents.simulation.fills.match_exit`; mẫu số là **các path thực sự chạm một mức** (`realized.stop_first_measured_paths`), path không chạm stop lẫn target bị loại chứ không bị tính là "target first"; số ca mơ hồ được công bố trong `realized.stop_first_ambiguity_count`.
+- `?limit` phải là số nguyên dương và ≤ 200; vi phạm → 400 `validation_error` (không phải 500 từ PostgreSQL).

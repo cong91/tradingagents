@@ -10,7 +10,6 @@
 import {
   InboxIcon,
   LoaderCircleIcon,
-  RefreshCwIcon,
   TriangleAlertIcon,
 } from "lucide-react";
 
@@ -25,10 +24,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
+  decimalSeparator,
   formatAssetQuantity,
   formatDateTime,
   formatMoney,
-  formatQuantityValue,
   formatSignedCurrency,
   pnlTextClass,
 } from "@/lib/format";
@@ -39,6 +38,7 @@ import type {
   PortfolioPayload,
   PortfolioPosition,
 } from "./contract";
+import { inScope, type Scope } from "./brief/contract";
 import type { PanelState } from "./use-panel";
 import { useT } from "@/lib/i18n";
 
@@ -106,6 +106,13 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
       <dd className="truncate text-base font-semibold tabular-nums">{children}</dd>
     </div>
   );
+}
+
+/** Full-precision quantity: every digit the venue reported survives the render
+ * (Intl rounding at 8 digits silently rewrote 0.123456789123). */
+function quantityValue(value: number | null | undefined): string | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return String(value).replace(".", decimalSeparator());
 }
 
 /** Hours held: "12.3h"; missing/invalid → null. */
@@ -208,14 +215,15 @@ function FuturesSection({
   const positions: FuturesPosition[] | null = Array.isArray(futures.positions)
     ? futures.positions
     : null;
-  const observedAt = futures.positions_read?.observed_at;
+  const read = futures.positions_read ?? null;
+  const observedAt = read?.observed_at;
   const hasObservedAt = typeof observedAt === "string" && Number.isFinite(Date.parse(observedAt));
+  const issues = Array.isArray(read?.issues) ? read.issues : [];
   const completePositionsRead =
     positions !== null &&
-    futures.positions_read?.status === "complete" &&
-    futures.positions_read.skipped === 0 &&
-    Array.isArray(futures.positions_read.issues) &&
-    futures.positions_read.issues.length === 0;
+    read?.status === "complete" &&
+    read.skipped === 0 &&
+    issues.length === 0;
 
   return (
     <section className="space-y-3 border-t pt-4">
@@ -254,11 +262,35 @@ function FuturesSection({
       {stale ? (
         <p role="alert" className="text-sm text-destructive">{c.futuresStale}</p>
       ) : null}
-      {!hasObservedAt ? (
+      {/* Freshness is stated both ways: the read time when it exists, and an
+          explicit unverified alert when it does not — never silence. */}
+      {hasObservedAt ? (
+        <p className="text-xs text-muted-foreground" data-futures-read-at>
+          {c.futuresReadAt(formatDateTime(observedAt))}
+        </p>
+      ) : (
         <p role="alert" className="text-sm text-destructive">{c.futuresNoObservedAt}</p>
-      ) : null}
+      )}
       {!completePositionsRead ? (
-        <p role="alert" className="text-sm text-destructive">{c.futuresIncomplete}</p>
+        <p role="alert" className="text-sm text-destructive">
+          {read?.status === "unavailable" ? c.futuresReadUnavailable : c.futuresIncomplete}
+        </p>
+      ) : null}
+      {read?.skipped != null && read.skipped > 0 ? (
+        <p role="alert" className="text-sm text-destructive">{c.futuresSkipped(read.skipped)}</p>
+      ) : null}
+      {read && read.skipped == null ? (
+        <p role="alert" className="text-sm text-destructive">{c.futuresSkippedUnknown}</p>
+      ) : null}
+      {issues.length > 0 ? (
+        <ul className="list-inside list-disc space-y-1 break-words text-xs text-muted-foreground">
+          {issues.map((issue, index) => (
+            <li key={`${issue.symbol ?? "unknown"}-${index}`} data-futures-issue={issue.reason}>
+              {issue.symbol ?? c.futuresUnknownSymbol}:{" "}
+              {c.futuresIssues[issue.reason] ?? c.futuresIssueUnknown}
+            </li>
+          ))}
+        </ul>
       ) : null}
       {positions !== null && positions.length > 0 ? (
         <div className="overflow-x-auto">
@@ -284,14 +316,14 @@ function FuturesSection({
                   <td className="py-2 pr-3 font-mono font-medium">{position.symbol ?? "—"}</td>
                   <td className="py-2 pr-3">{position.side === "short" ? "Short" : position.side === "long" ? "Long" : "—"}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">
-                    {position.contracts != null ? formatQuantityValue(position.contracts) : "—"}
-                    {position.quantity != null ? ` / ${formatQuantityValue(position.quantity)}` : ""}
+                    {position.contracts != null ? quantityValue(position.contracts) : "—"}
+                    {position.quantity != null ? ` / ${quantityValue(position.quantity)}` : ""}
                   </td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.entry_price, position.price_currency)}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.mark_price, position.price_currency)}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.notional, position.notional_currency)}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.margin, position.margin_currency)}</td>
-                  <td className="py-2 pr-3 text-right tabular-nums">{position.leverage != null ? `${formatQuantityValue(position.leverage)}x` : "—"}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.entry_price, position.price_currency ?? t.overview.unknownCurrency)}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.mark_price, position.price_currency ?? t.overview.unknownCurrency)}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.notional, position.notional_currency ?? t.overview.unknownCurrency)}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{formatMoney(position.margin, position.margin_currency ?? t.overview.unknownCurrency)}</td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{position.leverage != null ? `${quantityValue(position.leverage)}x` : "—"}</td>
                   <td className="py-2 pr-3 text-right tabular-nums">{heldAndCostText(position, t.overview.unknownCurrency)}</td>
                   <td className={`py-2 text-right tabular-nums ${position.unrealized_pnl != null ? pnlTextClass(position.unrealized_pnl) : ""}`}>
                     {position.unrealized_pnl != null ? formatSignedCurrency(position.unrealized_pnl, position.unrealized_pnl_currency ?? "") : "—"}
@@ -301,6 +333,8 @@ function FuturesSection({
             </tbody>
           </table>
         </div>
+      ) : positions === null ? (
+        <p role="alert" className="text-sm text-destructive">{c.futuresListUnavailable}</p>
       ) : completePositionsRead && hasObservedAt && !stale ? (
         <p className="text-sm text-muted-foreground">{c.noFuturesPositions}</p>
       ) : (
@@ -312,12 +346,15 @@ function FuturesSection({
   );
 }
 
-function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
+function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode,
+                        showSpot, showFutures }: {
   data: PortfolioPayload;
   stale: boolean;
   futuresStale: boolean;
   staleMessage: string | null;
   staleCode: string | null;
+  showSpot: boolean;
+  showFutures: boolean;
 }) {
   const t = useT();
   const c = t.overview.portfolio;
@@ -344,10 +381,13 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
         </p>
       ) : null}
 
-      {data.positions_source === "unavailable" ? (
+      {/* The Spot block is hidden only when the filter asks for Futures alone.
+          Its own state branches (unavailable / stale / empty / populated) stay
+          untouched so a scoped view loses no honesty signal. */}
+      {!showSpot ? null : data.positions_source === "unavailable" ? (
         <p role="alert" className="text-sm text-destructive">{c.spotUnavailable}</p>
       ) : null}
-      {staleEmptySpot ? (
+      {!showSpot ? null : staleEmptySpot ? (
         <p className="rounded-lg border border-dashed px-6 py-8 text-sm text-muted-foreground">
           {c.spotStale}
         </p>
@@ -378,35 +418,45 @@ function PortfolioBody({ data, stale, futuresStale, staleMessage, staleCode }: {
             </Kpi>
           </dl>
 
-          {data.positions.length > 0 ? (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <caption className="sr-only">{c.spotCaption}</caption>
-                <thead>
-                  <tr className="border-b text-left text-xs text-muted-foreground">
-                    <th scope="col" className="py-2 pr-3 font-medium">{c.ticker}</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">{c.quantity}</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">{c.costBasis}</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">{c.marketPrice}</th>
-                    <th scope="col" className="py-2 pr-3 font-medium">{c.value}</th>
-                    <th scope="col" className="py-2 font-medium">{c.unrealizedEst}</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {data.positions.map((position) => (
-                    <PositionRow key={position.ticker} position={position} currency={currency} />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : null}
+          {/* Only a verified venue snapshot may render as "current" positions.
+              Audit-replay rows are the reference calculation, not the live
+              book — showing them here would present reconstructed history as
+              an account read. */}
+          {data.positions_source === "venue" ? (
+            data.positions.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <caption className="sr-only">{c.spotCaption}</caption>
+                  <thead>
+                    <tr className="border-b text-left text-xs text-muted-foreground">
+                      <th scope="col" className="py-2 pr-3 font-medium">{c.ticker}</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">{c.quantity}</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">{c.costBasis}</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">{c.marketPrice}</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">{c.value}</th>
+                      <th scope="col" className="py-2 font-medium">{c.unrealizedEst}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {data.positions.map((position) => (
+                      <PositionRow key={position.ticker} position={position} currency={currency} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null
+          ) : (
+            <p className="text-sm text-muted-foreground">{c.spotNotVenue}</p>
+          )}
         </>
       )}
 
-      <FuturesSection futures={data.futures} stale={stale || futuresStale} />
+      {showFutures ? (
+        <FuturesSection futures={data.futures} stale={stale || futuresStale} />
+      ) : null}
 
       <div className="space-y-1 text-xs text-muted-foreground">
-        {!staleEmptySpot && realized ? (
+        {showSpot && !staleEmptySpot && realized ? (
           <>
             <p>
               {c.closedTrades(realized.closed_trades)}
@@ -434,18 +484,28 @@ export function PortfolioCard({
   stale,
   futuresStale,
   onRetry,
+  scope = "all",
 }: {
   state: PanelState<PortfolioPayload>;
   stale: boolean;
   futuresStale: boolean;
   onRetry: () => void;
+  /** Spot/Futures filter from the brief: hides the section it excludes. */
+  scope?: Scope;
 }) {
   const t = useT();
   const isStale = stale || state.status === "stale";
+  const showSpot = inScope(scope, "spot");
+  const showFutures = inScope(scope, "futures");
+  // One primary refresh per page (the page header). A card keeps its own
+  // control only for recovery: retry appears when its poll errored or went
+  // stale, and disappears in the healthy state where it duplicated the page
+  // action (measured on mobile: four identical "Refresh" buttons at once).
+  const needsRecovery = state.status === "error" || isStale;
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t.overview.portfolio.title}</CardTitle>
+        <CardTitle as="h2">{t.overview.portfolio.title}</CardTitle>
         <CardDescription>{t.overview.portfolio.description}</CardDescription>
         <CardAction>
           <div className="flex items-center gap-2">
@@ -455,19 +515,19 @@ export function PortfolioCard({
                 {t.common.staleData}
               </Badge>
             ) : null}
-            <Button
-              variant="outline"
-              size="sm"
-              className="min-touch"
-              onClick={onRetry}
-            >
-              {state.status === "loading" ? (
-                <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-              ) : (
-                <RefreshCwIcon aria-hidden="true" />
-              )}
-              {t.common.refresh}
-            </Button>
+            {needsRecovery ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="min-touch"
+                onClick={onRetry}
+              >
+                {state.status === "loading" ? (
+                  <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                ) : null}
+                {t.common.retry}
+              </Button>
+            ) : null}
           </div>
         </CardAction>
       </CardHeader>
@@ -491,6 +551,8 @@ export function PortfolioCard({
             futuresStale={futuresStale}
             staleMessage={state.status === "stale" ? state.message : null}
             staleCode={state.status === "stale" ? state.code : null}
+            showSpot={showSpot}
+            showFutures={showFutures}
           />
         )}
       </CardContent>
