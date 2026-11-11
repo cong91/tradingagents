@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import ccxt
 import pytest
 
 from server import kronos_context
@@ -38,6 +39,26 @@ def _pages_exchange(pages: list[list[list[float | int]]], *, cap: int = 3):
     return Exchange()
 
 
+def _binance_futures_exchange(monkeypatch, pages):
+    exchange = ccxt.binanceusdm()
+    exchange.set_markets([{
+        "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC",
+        "quote": "USDT", "settle": "USDT", "settleId": "USDT",
+        "type": "swap", "spot": False, "swap": True, "future": False,
+        "contract": True, "linear": True, "inverse": False,
+        "contractSize": 1,
+    }])
+    calls = []
+    page_iter = iter(pages)
+
+    def fetch(params):
+        calls.append(dict(params))
+        return next(page_iter, [])
+
+    monkeypatch.setattr(exchange, "fapiPublicGetKlines", fetch)
+    return exchange, calls
+
+
 def test_pagination_dedupes_boundary_overlap_and_filters_forming_bar():
     exchange = _pages_exchange([
         [_row(2), _row(3), _row(4)],
@@ -56,6 +77,51 @@ def test_pagination_dedupes_boundary_overlap_and_filters_forming_bar():
     assert [call["limit"] for call in exchange.calls] == [3, 3, 3]
     assert exchange.calls[1]["since"] > exchange.calls[0]["since"]
     assert exchange.calls[2]["since"] > exchange.calls[1]["since"]
+
+
+def test_non_boundary_as_of_aligns_single_page_window():
+    exchange = _pages_exchange([[_row(6), _row(7), _row(8)]], cap=3)
+    as_of = datetime.fromtimestamp((_CUTOFF + 5 * 60_000) / 1000, UTC)
+
+    candles = fetch_closed_candles(
+        exchange, "BTC/USDT:USDT", "1h", as_of=as_of, limit=2,
+    )
+
+    assert [candle.open_time for candle in candles] == [6 * _DURATION, 7 * _DURATION]
+    assert exchange.calls[0]["since"] == 6 * _DURATION
+
+
+def test_binanceusdm_feature_limit_paginates_2048_closed_four_hour_candles(monkeypatch):
+    duration = 14_400_000
+    requested = 2048
+    closed_cutoff = 10_000 * duration
+    start_index = closed_cutoff // duration - requested
+    rows = [
+        [index * duration, str(index), str(index + 1), str(index - 1), str(index), "10"]
+        for index in range(start_index, closed_cutoff // duration)
+    ]
+    pages = [rows[index:index + 500] for index in range(0, len(rows), 500)]
+    exchange, calls = _binance_futures_exchange(monkeypatch, pages)
+    as_of = datetime.fromtimestamp((closed_cutoff + 5 * 60_000) / 1000, UTC)
+
+    candles = fetch_closed_candles(
+        exchange, "BTC/USDT:USDT", "4h", as_of=as_of, limit=requested,
+    )
+
+    assert len(candles) == requested
+    assert candles[0].open_time == closed_cutoff - requested * duration
+    assert candles[-1].open_time == closed_cutoff - duration
+    assert all(
+        current.open_time == previous.open_time + duration
+        for previous, current in zip(candles, candles[1:], strict=False)
+    )
+    assert len(calls) == 5
+    assert [call["limit"] for call in calls] == [500] * 5
+    assert calls[0]["startTime"] == closed_cutoff - requested * duration
+    assert all(
+        current["startTime"] > previous["startTime"]
+        for previous, current in zip(calls, calls[1:], strict=False)
+    )
 
 
 def test_limit_at_or_below_venue_cap_keeps_one_call_behavior():

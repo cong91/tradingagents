@@ -52,7 +52,7 @@ def _coerce_limit(value: Any, timeframe: str) -> int | None:
     return int(value)
 
 
-def _venue_ohlcv_limit(exchange: Any, timeframe: str) -> int | None:
+def _venue_ohlcv_limit(exchange: Any, timeframe: str, symbol: str) -> int | None:
     """Read an optional per-venue OHLCV page cap from common adapter shapes."""
     for name in (
         "max_ohlcv_limit",
@@ -75,7 +75,41 @@ def _venue_ohlcv_limit(exchange: Any, timeframe: str) -> int | None:
             limit = _coerce_limit(container[key], timeframe)
             if limit is not None:
                 return limit
-    return None
+
+    markets = getattr(exchange, "markets", None)
+    market = markets.get(symbol) if isinstance(markets, Mapping) else None
+    feature_value = getattr(exchange, "feature_value", None)
+    if market is not None and callable(feature_value):
+        limit = _coerce_limit(
+            feature_value(symbol, "fetchOHLCV", "limit"), timeframe,
+        )
+        if limit is not None:
+            return limit
+
+    features = getattr(exchange, "features", None)
+    if not isinstance(features, Mapping):
+        return None
+
+    options = getattr(exchange, "options", None)
+    market_type = market.get("type") if isinstance(market, Mapping) else None
+    if market_type is None and isinstance(options, Mapping):
+        market_type = options.get("defaultType")
+    market_features = features.get(market_type) if market_type is not None else None
+    if isinstance(market_features, Mapping):
+        subtype = None
+        if isinstance(market, Mapping):
+            if market.get("linear"):
+                subtype = "linear"
+            elif market.get("inverse"):
+                subtype = "inverse"
+        if subtype is None and isinstance(options, Mapping):
+            subtype = options.get("defaultSubType")
+        if subtype is not None and isinstance(market_features.get(subtype), Mapping):
+            market_features = market_features[subtype]
+        if "fetchOHLCV" in market_features:
+            return _coerce_limit(market_features["fetchOHLCV"], timeframe)
+
+    return _coerce_limit(features.get("fetchOHLCV"), timeframe)
 
 
 def _fetch_ohlcv_page(
@@ -127,7 +161,8 @@ def _single_closed_candles(
     duration: int,
     limit: int,
 ) -> list[Candle]:
-    query_since = max(0, cutoff - duration * limit)
+    closed_cutoff = cutoff - cutoff % duration
+    query_since = max(0, closed_cutoff - duration * limit)
     try:
         rows = exchange.fetch_ohlcv(
             symbol, timeframe=timeframe, since=query_since, limit=limit,
@@ -246,7 +281,7 @@ def fetch_closed_candles(exchange: Any, symbol: str, timeframe: str,
         raise ValueError("limit must be positive")
     cutoff = int(as_of.astimezone(UTC).timestamp() * 1000)
     duration = timeframe_ms(timeframe)
-    venue_limit = _venue_ohlcv_limit(exchange, timeframe)
+    venue_limit = _venue_ohlcv_limit(exchange, timeframe, symbol)
     if venue_limit is None or limit <= venue_limit:
         return _single_closed_candles(
             exchange, symbol, timeframe, as_of=as_of, cutoff=cutoff,
