@@ -9,11 +9,22 @@ from types import SimpleNamespace
 import anyio
 import pytest
 
-from server import autoloop
+from server import (
+    autoloop,
+    autoloop_analysis,
+    autoloop_api,
+    autoloop_candidates,
+    autoloop_execution,
+    autoloop_futures_context,
+    autoloop_futures_execution,
+    futures_cycle_telemetry,
+    job_store,
+)
 from server.auto_modes import MODE_KEYS, AutoMode
 from server.contract import ApiError
 from tests.server_api_fixtures import _no_network as _no_network
 from tradingagents.dataflows.config import set_config
+from tradingagents.execution import futures_signals
 from tradingagents.execution.auto_authorization import capture_process_config, mode_update_lock
 from tradingagents.execution.daily import DailyResult
 
@@ -28,6 +39,7 @@ def mode_state(monkeypatch):
     starts = []
     wakeup = threading.Event()
     monkeypatch.setattr(autoloop, "get_config", lambda: dict(config))
+    monkeypatch.setattr(autoloop_execution, "get_config", lambda: dict(config))
     monkeypatch.setattr(autoloop.control_store, "load_autoloop_state", lambda: dict(persisted))
 
     def save(state):
@@ -38,7 +50,7 @@ def mode_state(monkeypatch):
     monkeypatch.setattr(autoloop.control_store, "save_autoloop_state", save)
     monkeypatch.setattr(autoloop, "ensure_started", lambda: starts.append(True))
     monkeypatch.setattr(autoloop, "_wakeup", wakeup)
-    monkeypatch.setattr(autoloop.job_store, "list_futures_cycles", lambda **_kwargs: [])
+    monkeypatch.setattr(job_store, "list_futures_cycles", lambda **_kwargs: [])
     monkeypatch.setattr(autoloop, "_last_cycle", None)
     monkeypatch.setattr(autoloop, "_last_telemetry", None)
     return config, persisted, writes, starts, wakeup
@@ -52,7 +64,7 @@ def test_load_state_and_payload_derive_enabled_from_modes(mode_state, spot, futu
     persisted["enabled"] = persisted_enabled
 
     state = autoloop._load_state()
-    payload = autoloop._payload()
+    payload = autoloop_api._payload()
 
     expected = spot or futures
     assert state["enabled"] is expected
@@ -102,7 +114,7 @@ def test_unreadable_scheduler_store_remains_fail_closed(mode_state, monkeypatch)
 
     monkeypatch.setattr(autoloop.control_store, "load_autoloop_state", unreadable)
     assert autoloop._load_state()["enabled"] is False
-    assert autoloop._payload()["enabled"] is False
+    assert autoloop_api._payload()["enabled"] is False
     with pytest.raises(OSError, match="store unavailable"):
         autoloop.sync_mode_state()
 
@@ -115,8 +127,8 @@ def test_interval_update_cannot_disable_an_enabled_mode(mode_state, monkeypatch)
     async def body(_request):
         return {"enabled": False, "interval_minutes": 45}
 
-    monkeypatch.setattr(autoloop, "json_body", body)
-    response = anyio.run(autoloop.set_autoloop, None)
+    monkeypatch.setattr(autoloop_api, 'json_body', body)
+    response = anyio.run(autoloop_api.set_autoloop, None)
 
     assert response["enabled"] is True
     assert persisted["enabled"] is True
@@ -134,11 +146,11 @@ def test_run_now_requires_enabled_mode(mode_state, monkeypatch):
     async def body(_request):
         return {}
 
-    monkeypatch.setattr(autoloop, "json_body", body)
+    monkeypatch.setattr(autoloop_api, 'json_body', body)
     with pytest.raises(ApiError) as closed:
-        anyio.run(autoloop.run_autoloop_now, None)
+        anyio.run(autoloop_api.run_autoloop_now, None)
     config["auto_futures_enabled"] = True
-    opened = anyio.run(autoloop.run_autoloop_now, None)
+    opened = anyio.run(autoloop_api.run_autoloop_now, None)
 
     assert closed.value.status_code == 409
     assert closed.value.code == "mode_closed"
@@ -154,6 +166,7 @@ def _install_cycle_stubs(monkeypatch, config):
             return config.get(MODE_KEYS[mode]) is True
 
     monkeypatch.setattr(autoloop, "get_config", lambda: dict(config))
+    monkeypatch.setattr(autoloop_execution, "get_config", lambda: dict(config))
     monkeypatch.setattr(autoloop, "capture_process_config", lambda: (dict(config), Authorization()))
     monkeypatch.setattr(autoloop.audit_log, "record", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(autoloop.runs_mod, "active_run_id", lambda: None)
@@ -163,8 +176,8 @@ def _install_cycle_stubs(monkeypatch, config):
     monkeypatch.setattr(autoloop, "_build_bridge", lambda _config: object())
     executor = SimpleNamespace(_bridge=object())
     monkeypatch.setattr(autoloop, "_build_derivatives_executor", lambda _config: executor)
-    monkeypatch.setattr(autoloop, "_futures_crypto_universe", lambda *_args: lambda *_args: [])
-    monkeypatch.setattr(autoloop, "_pinning_screen", lambda screen, *_args, **_kwargs: screen)
+    monkeypatch.setattr(autoloop_candidates, '_futures_crypto_universe', lambda *_args: lambda *_args: [])
+    monkeypatch.setattr(autoloop_candidates, '_pinning_screen', lambda screen, *_args, **_kwargs: screen)
 
     def screen(*_args, mode, timeout_seconds, **_kwargs):
         calls.append(("screen", mode, timeout_seconds))
@@ -178,8 +191,8 @@ def _install_cycle_stubs(monkeypatch, config):
         calls.append(("candidate", mode, deadline, cancelled, telemetry, authorization))
         return DailyResult(ticker=candidate["ticker"], signal="Hold")
 
-    monkeypatch.setattr(autoloop, "_screen_with_timeout", screen)
-    monkeypatch.setattr(autoloop, "_select_cycle_candidates", select)
+    monkeypatch.setattr(autoloop_candidates, '_screen_with_timeout', screen)
+    monkeypatch.setattr(autoloop_candidates, '_select_cycle_candidates', select)
     monkeypatch.setattr(autoloop, "_run_candidate_with_timeout", candidate)
     return calls
 
@@ -238,7 +251,7 @@ def test_timeout_in_spot_does_not_cancel_futures_mode(monkeypatch):
 def test_pending_mode_reports_timeout_when_shared_deadline_expires(monkeypatch):
     config = {"auto_spot_enabled": True, "auto_futures_enabled": True}
     calls = _install_cycle_stubs(monkeypatch, config)
-    monkeypatch.setattr(autoloop, "CYCLE_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(autoloop_execution, 'CYCLE_TIMEOUT_SECONDS', 1.0)
     clock = [10.0]
     monkeypatch.setattr(autoloop.time, "monotonic", lambda: clock[0])
     original = autoloop._run_candidate_with_timeout
@@ -274,14 +287,15 @@ def test_futures_disabled_during_venue_setup_never_screens(monkeypatch):
 def test_mode_disabled_during_graph_build_never_propagates(monkeypatch):
     config = {"auto_spot_enabled": True}
     monkeypatch.setattr(autoloop, "get_config", lambda: dict(config))
+    monkeypatch.setattr(autoloop_execution, "get_config", lambda: dict(config))
     propagated = []
 
     def build(*_args):
         config["auto_spot_enabled"] = False
         return SimpleNamespace(propagate=lambda *_args, **_kwargs: propagated.append(True))
 
-    with pytest.raises(autoloop._AutoModeDisabled, match="before analysis"):
-        autoloop._process_candidate(
+    with pytest.raises(autoloop_execution.AutoModeDisabled, match="before analysis"):
+        autoloop_analysis._process_candidate(
             object(), {"ticker": "BTC-USD", "asset_type": "crypto"}, config, build,
             mode=AutoMode.SPOT,
         )
@@ -291,9 +305,10 @@ def test_mode_disabled_during_graph_build_never_propagates(monkeypatch):
 def test_futures_disable_after_portfolio_sync_stops_planning(monkeypatch):
     config = {"auto_futures_enabled": True}
     monkeypatch.setattr(autoloop, "get_config", lambda: dict(config))
-    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(autoloop, "_unified_mark_price", lambda *_args: 100.0)
-    monkeypatch.setattr(autoloop.FuturesSignalEnvelope, "create", lambda **_kwargs: None)
+    monkeypatch.setattr(autoloop_execution, "get_config", lambda: dict(config))
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(autoloop_futures_context, '_unified_mark_price', lambda *_args: 100.0)
+    monkeypatch.setattr(futures_signals.FuturesSignalEnvelope, "create", lambda **_kwargs: None)
     now_ms = int(time.time() * 1000)
     one = SimpleNamespace(open_time=now_ms - 3_600_000, close_time=now_ms - 1)
     four = SimpleNamespace(open_time=now_ms - 14_400_000, close_time=now_ms - 1)
@@ -316,8 +331,8 @@ def test_futures_disable_after_portfolio_sync_stops_planning(monkeypatch):
         "margin_mode": "isolated", "leverage": 2, "risk_fraction": 0.01,
         "margin_fraction": 0.25, "rationale": "Aligned signals with bounded risk.",
     }
-    with pytest.raises(autoloop._AutoModeDisabled, match="before futures planning"):
-        autoloop._process_futures_candidate(
+    with pytest.raises(autoloop_execution.AutoModeDisabled, match="before futures planning"):
+        autoloop_futures_execution._process_futures_candidate(
             executor, "BTC-USD", "Buy", config, result, context=context, proposal=proposal,
             brackets={"long": (90.0, 110.0), "short": (110.0, 90.0)}, intent="enter",
             cycle_id="test-cycle", cycle_payload={"execution_status": "in_progress"},
@@ -329,8 +344,8 @@ def test_futures_disable_after_portfolio_sync_stops_planning(monkeypatch):
 def test_execution_guard_refuses_when_mode_is_disabled(monkeypatch):
     monkeypatch.setattr(autoloop, "get_config", lambda: {"auto_spot_enabled": False})
     submitted = []
-    with pytest.raises(autoloop._AutoModeDisabled, match="before execution"):
-        autoloop._execute_with_deadline(
+    with pytest.raises(autoloop_execution.AutoModeDisabled, match="before execution"):
+        autoloop_execution.execute_with_deadline(
             lambda: submitted.append(True), None, None, threading.Lock(), AutoMode.SPOT,
         )
     assert submitted == []
@@ -353,7 +368,7 @@ def test_mode_generation_change_during_screening_stops_only_old_mode(monkeypatch
     _set_auto_modes(**config)
     calls = _install_cycle_stubs(monkeypatch, config)
     monkeypatch.setattr(autoloop, "capture_process_config", capture_process_config)
-    first_screen = autoloop._screen_with_timeout
+    first_screen = autoloop_candidates._screen_with_timeout
 
     def screen(*args, mode, **kwargs):
         result = first_screen(*args, mode=mode, **kwargs)
@@ -361,7 +376,7 @@ def test_mode_generation_change_during_screening_stops_only_old_mode(monkeypatch
             _reenable_mode(changed)
         return result
 
-    monkeypatch.setattr(autoloop, "_screen_with_timeout", screen)
+    monkeypatch.setattr(autoloop_candidates, '_screen_with_timeout', screen)
     autoloop._run_cycle_locked(lambda *_args: None)
 
     unaffected = AutoMode.FUTURES if changed is AutoMode.SPOT else AutoMode.SPOT
@@ -387,8 +402,8 @@ def test_graph_callback_uses_captured_generation(monkeypatch):
             steps.append("second")
             return {}, "Hold"
 
-    with pytest.raises(autoloop._AutoModeDisabled):
-        autoloop._process_candidate(
+    with pytest.raises(autoloop_execution.AutoModeDisabled):
+        autoloop_analysis._process_candidate(
             object(), {"ticker": "BTC-USD", "asset_type": "crypto"}, config,
             lambda *_args: Graph(), mode=AutoMode.SPOT, authorization=authorization,
         )
@@ -401,8 +416,8 @@ def test_execution_guard_rejects_reenabled_generation(mode):
     _, authorization = capture_process_config()
     _reenable_mode(mode)
     submitted = []
-    with pytest.raises(autoloop._AutoModeDisabled):
-        autoloop._execute_with_deadline(
+    with pytest.raises(autoloop_execution.AutoModeDisabled):
+        autoloop_execution.execute_with_deadline(
             lambda: submitted.append(True), None, None, threading.Lock(), mode, authorization,
         )
     assert submitted == []

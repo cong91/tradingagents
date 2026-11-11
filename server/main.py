@@ -28,17 +28,22 @@ from server import (
     audit,
     auto_modes,
     autoloop,
+    autoloop_api,
     bracket_monitor,
     control_store,
     daily,
     data_source_credentials,
     data_sources,
+    experiments_api,
     health,
     history,
     job_store,
     llm_credentials,
     llm_credentials_api,
+    operating_brief,
     operator_config,
+    outcome_ledger,
+    outcomes_api,
     performance,
     performance_history,
     portfolio,
@@ -47,6 +52,8 @@ from server import (
     runs,
     settings,
     settings_events,
+    shadow_api,
+    shadow_worker,
     snapshot_events,
     watchlist,
 )
@@ -167,12 +174,21 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         autoloop.ensure_started()
     bracket_monitor.start()
     position_monitor.start()
+    # Outcome ledger worker: reads recorded cycles + venue READ history only;
+    # no-op while outcome_ledger_ingest_enabled stays False (plan §2.6).
+    outcome_ledger.start()
+    # Shadow observation worker: off by default, reads recorded cycles + closed
+    # candles only, and never reaches an order, a risk limit or protection
+    # (plan §6.4). Its failures cannot fail a cycle.
+    shadow_worker.start()
     try:
         yield
     finally:
         autoloop.stop()
         position_monitor.stop()
         bracket_monitor.stop()
+        outcome_ledger.stop()
+        shadow_worker.stop()
 
 
 app = FastAPI(title="TradingAgents Control Panel", version="0.1.0", lifespan=lifespan)
@@ -214,8 +230,12 @@ for _router in (
     health.router,
     performance.router,
     performance_history.router,
-    autoloop.router,
+    autoloop_api.router,
     data_sources.router,
     llm_credentials_api.router,
+    outcomes_api.router,
+    experiments_api.router,
+    operating_brief.router,
+    shadow_api.router,
 ):
     app.include_router(_router)

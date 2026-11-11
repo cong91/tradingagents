@@ -160,7 +160,7 @@ function renderScreens() {
           phase: phase === "loading" || phase === "error" ? phase : "ready",
           errorMessage: "offline", payload: phase === "loading" || phase === "error" ? null : operatorPayload,
           draft: { risk_max_daily_loss_pct: "3.5" }, changed: [], dirtyCount: 0,
-          invalidKeys: [], sectionChanges: { modes: [], risk: [] }, feedback: {},
+          invalidKeys: [], sectionChanges: { modes: [], risk: [], forecast: [] }, feedback: {},
           saving: false, refreshing: false, refreshFailed: false, serverAhead: false,
           confirmGate: false, reason: "",
           setValue() {}, setConfirmation() {}, setGateReason() {}, save() {}, undo() {},

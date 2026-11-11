@@ -25,7 +25,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from server import job_store
-from server.autoloop import _futures_derivative_metrics
+from server.autoloop_futures_context import _futures_derivative_metrics
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import autoloop
+from server import autoloop_analysis, autoloop_futures_context, futures_cycle_telemetry
+from tradingagents.execution import futures_account
 from tradingagents.execution.futures_account import FuturesAccountSnapshot
 from tradingagents.execution.risk import RiskGuard, RiskLimits
 
@@ -25,17 +26,17 @@ def test_candidate_defers_before_analysis_when_scope_is_unverified(monkeypatch, 
         _bridge=object(), risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=1)),
     )
     writes = []
-    monkeypatch.setattr(autoloop, "_closed_futures_context", lambda *_: market)
-    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_args, **_kwargs: account)
-    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: market)
+    monkeypatch.setattr(futures_account, 'read_futures_account', lambda *_args, **_kwargs: account)
+    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
-        autoloop, "persist_futures_cycle_progress", lambda *args, **kwargs: writes.append(kwargs),
+        futures_cycle_telemetry, 'persist_progress', lambda *args, **kwargs: writes.append(kwargs),
     )
 
     def no_graph(*args, **kwargs):
         pytest.fail("unverified book must not reach the decision graph")
 
-    result = autoloop._process_candidate(
+    result = autoloop_analysis._process_candidate(
         None, {"ticker": "BTC-USD", "asset_type": "crypto"}, {}, no_graph, executor,
     )
 
@@ -68,14 +69,14 @@ def test_unverified_scope_can_be_retried_without_claiming_candle_pair(monkeypatc
     def no_graph(*args, **kwargs):
         pytest.fail("unverified book must not reach the decision graph")
 
-    monkeypatch.setattr(autoloop, "_closed_futures_context", lambda *_: market)
-    monkeypatch.setattr(autoloop, "read_futures_account", read)
-    monkeypatch.setattr(autoloop, "claim_futures_cycle", claim)
-    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: market)
+    monkeypatch.setattr(futures_account, 'read_futures_account', read)
+    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', claim)
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *args, **kwargs: None)
 
     candidate = {"ticker": "BTC-USD", "asset_type": "crypto"}
-    first = autoloop._process_candidate(None, candidate, {}, no_graph, executor)
-    second = autoloop._process_candidate(None, candidate, {}, no_graph, executor)
+    first = autoloop_analysis._process_candidate(None, candidate, {}, no_graph, executor)
+    second = autoloop_analysis._process_candidate(None, candidate, {}, no_graph, executor)
 
     assert "scope is unverified" in first.reason
     assert "scope is unverified" in second.reason

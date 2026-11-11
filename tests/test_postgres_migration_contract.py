@@ -50,6 +50,10 @@ def test_dry_run_loads_files_without_opening_database(monkeypatch):
         "0005_futures_account_identity.sql",
         "0006_engine_settings.sql",
         "0007_llm_credentials.sql",
+        "0008_outcome_ledger.sql",
+        "0009_experiment_registry.sql",
+        "0010_shadow_forecasts.sql",
+        "0011_experiment_run_kinds.sql",
     ]
 
 

@@ -187,6 +187,26 @@ async def put_settings(request: Request):
                 422, "coercion_error", str(exc), {"env_var": env_var, "message": str(exc)}
             ) from exc
 
+    # Domain validation BEFORE anything is applied or persisted: a tuning value
+    # the forecast core cannot run (a 3-path budget, an unknown mode, a horizon
+    # that is not whole bars of its timeframe, a non-finite number) must be
+    # refused per field here, not land half-applied and surface later as an
+    # ``unavailable`` block during a live cycle. Nothing has been mutated yet,
+    # so a refusal leaves both memory and PostgreSQL untouched.
+    kronos_fields = [key for key in validated if key.startswith("kronos_active_")]
+    if kronos_fields:
+        from tradingagents.forecast.settings import tuning_problems
+
+        problems = tuning_problems(validated, get_config())
+        if problems:
+            raise ApiError(
+                422, "validation_error",
+                "one or more Kronos tuning values cannot run: " + "; ".join(
+                    f"{key}: {reason}" for key, reason in sorted(problems.items())
+                ),
+                {"fields": problems},
+            )
+
     set_config(validated)  # in-memory: effective for runs created after this call
     # Durable in PostgreSQL (0006_engine_settings.sql), re-applied at boot
     # between the env layer and the operator overrides — .env is never written

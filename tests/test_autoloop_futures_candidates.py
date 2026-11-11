@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import autoloop
+from server import autoloop, autoloop_candidates, autoloop_cycle_records
 from server.auto_modes import AutoMode
 from tradingagents.dataflows.config import set_config
 from tradingagents.execution.auto_authorization import mode_update_lock
@@ -60,7 +60,7 @@ def test_screen_timeout_cancels_worker_and_prevents_overlap(monkeypatch):
     release = threading.Event()
     exited = threading.Event()
     cancel_events: list[threading.Event] = []
-    monkeypatch.setattr(autoloop, "SCREENING_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(autoloop_candidates, 'SCREENING_TIMEOUT_SECONDS', 0.01)
 
     def slow_screen(_crypto, _stocks, _date, _top_n, *, cancel_event):
         cancel_events.append(cancel_event)
@@ -71,7 +71,7 @@ def test_screen_timeout_cancels_worker_and_prevents_overlap(monkeypatch):
         return []
 
     with pytest.raises(TimeoutError, match="screening timed out"):
-        autoloop._screen_with_timeout(
+        autoloop_candidates._screen_with_timeout(
             lambda *_args: ["BTC-USD"],
             lambda *_args: [],
             slow_screen,
@@ -83,7 +83,7 @@ def test_screen_timeout_cancels_worker_and_prevents_overlap(monkeypatch):
     assert len(cancel_events) == 1
     assert cancel_events[0].is_set()
     with pytest.raises(TimeoutError, match="worker from a timed-out cycle is still stopping"):
-        autoloop._screen_with_timeout(
+        autoloop_candidates._screen_with_timeout(
             lambda *_args: pytest.fail("overlapping screen worker must not start"),
             lambda *_args: [],
             lambda *_args: [],
@@ -93,7 +93,7 @@ def test_screen_timeout_cancels_worker_and_prevents_overlap(monkeypatch):
 
     release.set()
     assert exited.wait(timeout=1.0)
-    assert autoloop._screen_with_timeout(
+    assert autoloop_candidates._screen_with_timeout(
         lambda *_args: ["BTC-USD"],
         lambda *_args: [],
         lambda crypto, stocks, _date, _top_n: [],
@@ -143,7 +143,7 @@ def test_screening_pool_expands_for_futures_but_not_spot():
         return []
 
     for futures_enabled in (True, False):
-        autoloop._screen_with_timeout(
+        autoloop_candidates._screen_with_timeout(
             crypto_universe,
             stock_universe,
             screen,
@@ -152,19 +152,19 @@ def test_screening_pool_expands_for_futures_but_not_spot():
         )
 
     assert [call[0] for call in discovery_calls] == [
-        autoloop.AUTO_FUTURES_SCREEN_POOL,
-        autoloop.AUTO_UNIVERSE_PER_ASSET,
+        autoloop_candidates.AUTO_FUTURES_SCREEN_POOL,
+        autoloop_candidates.AUTO_UNIVERSE_PER_ASSET,
     ]
-    assert stock_calls == [autoloop.AUTO_UNIVERSE_PER_ASSET]
+    assert stock_calls == [autoloop_candidates.AUTO_UNIVERSE_PER_ASSET]
     assert screen_calls == [
-        (["QNT-USD", "BTC-USD"], [], autoloop.AUTO_FUTURES_SCREEN_POOL),
-        (["QNT-USD", "BTC-USD"], ["AAPL"], autoloop.AUTO_SCREEN_POOL),
+        (["QNT-USD", "BTC-USD"], [], autoloop_candidates.AUTO_FUTURES_SCREEN_POOL),
+        (["QNT-USD", "BTC-USD"], ["AAPL"], autoloop_candidates.AUTO_SCREEN_POOL),
     ]
-    assert autoloop.AUTO_FUTURES_SCREEN_POOL == autoloop.AUTO_UNIVERSE_PER_ASSET * 2
+    assert autoloop_candidates.AUTO_FUTURES_SCREEN_POOL == autoloop_candidates.AUTO_UNIVERSE_PER_ASSET * 2
 
 
 def test_discovery_pool_refills_executable_futures_after_unusable_candidates(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     discovered: list[int] = []
     screened: list[tuple[list[str], list[str], int]] = []
     bridge = _MarketsBridge({"BTC/USDT:USDT": _contract("BTC")})
@@ -187,22 +187,22 @@ def test_discovery_pool_refills_executable_futures_after_unusable_candidates(mon
         # stock, while the executable crypto is lower in that same pool.
         assert crypto == ["QNT-USD", "BTC-USD"]
         assert stocks == []
-        assert top_n == autoloop.AUTO_FUTURES_SCREEN_POOL
+        assert top_n == autoloop_candidates.AUTO_FUTURES_SCREEN_POOL
         return candidates
 
-    crypto, stocks, screened_candidates = autoloop._screen_with_timeout(
+    crypto, stocks, screened_candidates = autoloop_candidates._screen_with_timeout(
         crypto_universe,
         stock_universe,
         screen,
         {"auto_futures_enabled": True},
         "2026-10-07",
     )
-    selected, skipped, selection = autoloop._select_cycle_candidates(
+    selected, skipped, selection = autoloop_candidates._select_cycle_candidates(
         screened_candidates, _Derivatives(bridge), limit=1,
     )
 
-    assert discovered == [autoloop.AUTO_FUTURES_SCREEN_POOL]
-    assert screened == [(crypto, stocks, autoloop.AUTO_FUTURES_SCREEN_POOL)]
+    assert discovered == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL]
+    assert screened == [(crypto, stocks, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL)]
     assert crypto == ["QNT-USD", "BTC-USD"] and stocks == []
     assert [candidate["ticker"] for candidate in selected] == ["BTC-USD"]
     assert selected[0]["asset_type"] == "crypto"
@@ -215,7 +215,7 @@ def test_discovery_pool_refills_executable_futures_after_unusable_candidates(mon
 
 
 def test_preflight_reports_exhausted_futures_pool_and_rejects_unknown_asset_type(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     bridge = _MarketsBridge({"BTC/USDT:USDT": _contract("BTC")})
     candidates = [
         {"ticker": "QNT-USD", "asset_type": "crypto"},
@@ -223,7 +223,7 @@ def test_preflight_reports_exhausted_futures_pool_and_rejects_unknown_asset_type
         {"ticker": "NO-TYPE"},
     ]
 
-    selected, skipped, selection = autoloop._select_cycle_candidates(
+    selected, skipped, selection = autoloop_candidates._select_cycle_candidates(
         candidates, _Derivatives(bridge), limit=2,
     )
 
@@ -237,7 +237,7 @@ def test_preflight_reports_exhausted_futures_pool_and_rejects_unknown_asset_type
 
 
 def test_preflight_reports_metadata_failure_but_keeps_only_crypto(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     class DeadBridge:
         def client(self):
             raise OSError("venue down")
@@ -247,7 +247,7 @@ def test_preflight_reports_metadata_failure_but_keeps_only_crypto(monkeypatch):
         {"ticker": "AAPL", "asset_type": "stock"},
     ]
 
-    runnable, skipped, metadata_available = autoloop._preflight_candidates_with_metadata(
+    runnable, skipped, metadata_available = autoloop_candidates._preflight_candidates_with_metadata(
         candidates, _Derivatives(DeadBridge())
     )
 
@@ -263,7 +263,7 @@ def test_preflight_keeps_stock_screening_unchanged_without_futures_executor():
         {"ticker": "BTC-USD", "asset_type": "crypto"},
     ]
 
-    runnable, skipped = autoloop._preflight_candidates(candidates, None)
+    runnable, skipped = autoloop_candidates._preflight_candidates(candidates, None)
 
     assert runnable == candidates
     assert skipped == []
@@ -319,17 +319,17 @@ def _refill(
     deadline: float | None = None,
 ):
     """Run one screen + preflight, then the refill, like ``_run_cycle`` does."""
-    crypto, stocks, candidates = autoloop._screen_with_timeout(
+    crypto, stocks, candidates = autoloop_candidates._screen_with_timeout(
         pool,
         lambda *_args: pytest.fail("futures discovery must not query the stock universe"),
         screen,
         {"auto_futures_enabled": True},
         "2026-10-07",
     )
-    selected, skipped, selection = autoloop._select_cycle_candidates(
+    selected, skipped, selection = autoloop_candidates._select_cycle_candidates(
         candidates, derivatives, limit=limit,
     )
-    return autoloop._refill_futures_candidates(
+    return autoloop_candidates._refill_futures_candidates(
         pool,
         lambda *_args: pytest.fail("futures refill must not query the stock universe"),
         screen,
@@ -341,13 +341,13 @@ def _refill(
         skipped=skipped,
         selection=selection,
         crypto=crypto,
-        inspected=autoloop.AUTO_FUTURES_SCREEN_POOL,
+        inspected=autoloop_candidates.AUTO_FUTURES_SCREEN_POOL,
         deadline=deadline,
     )[2:]  # drop the universes: these tests assert on selection only
 
 
 def test_refill_pulls_lower_ranked_executable_futures_past_contractless_and_stock(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     # Only the three majors have a live USDT-settled contract; everything else
     # in the ranked pool is a spot-only pair.
     bridge = _MarketsBridge({
@@ -373,10 +373,10 @@ def test_refill_pulls_lower_ranked_executable_futures_past_contractless_and_stoc
             ranked.insert(0, _candidate("AAPL", "stock", score=9.0))
         return ranked
 
-    selected, skipped, selection = _refill(pool, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge))
+    selected, skipped, selection = _refill(pool, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge))
 
     # Discovery widened exactly once: 60 -> 120 inspected tickers.
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert [len(entry[0]) for entry in screened] == [60, 120]
     assert [entry[2] for entry in screened] == [60, 120]
 
@@ -407,7 +407,7 @@ def test_refill_does_not_persist_the_same_rejection_twice(monkeypatch):
     """A widened round re-screens the same pool; each rejection is written once."""
     recorded: list[str] = []
     monkeypatch.setattr(
-        autoloop, "_record_futures_cycle_rejection",
+        autoloop_cycle_records, '_record_futures_cycle_rejection',
         lambda ticker, **kwargs: recorded.append(ticker),
     )
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
@@ -419,7 +419,7 @@ def test_refill_does_not_persist_the_same_rejection_twice(monkeypatch):
         return [_candidate(ticker) for ticker in crypto]
 
     selected, _skipped, _selection = _refill(
-        pool, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge),
+        pool, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge),
     )
 
     assert [candidate["ticker"] for candidate in selected] == ["ETH-USD"]
@@ -436,7 +436,7 @@ def test_refill_keeps_contracts_a_wider_snapshot_no_longer_lists(monkeypatch):
     otherwise the cycle loses an executable candidate and misreports the
     shortfall.
     """
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     bridge = _MarketsBridge({
         "ETH/USDT:USDT": _contract("ETH"),
         "SOL/USDT:USDT": _contract("SOL"),
@@ -444,9 +444,9 @@ def test_refill_keeps_contracts_a_wider_snapshot_no_longer_lists(monkeypatch):
     contractless = [f"NOC{index:03d}-USD" for index in range(58)]
     snapshots = {
         # Round 1 ranks both contracts inside the pool.
-        autoloop.AUTO_FUTURES_SCREEN_POOL: ["ETH-USD", "SOL-USD"] + contractless,
+        autoloop_candidates.AUTO_FUTURES_SCREEN_POOL: ["ETH-USD", "SOL-USD"] + contractless,
         # Round 2 is a fresh, wider snapshot in which ETH-USD has dropped out.
-        autoloop.AUTO_FUTURES_SCREEN_POOL * 2: contractless + ["SOL-USD"] + [
+        autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2: contractless + ["SOL-USD"] + [
             f"TAIL{index:03d}-USD" for index in range(62)
         ],
     }
@@ -456,10 +456,10 @@ def test_refill_keeps_contracts_a_wider_snapshot_no_longer_lists(monkeypatch):
         return [_candidate(ticker) for ticker in crypto]
 
     selected, _skipped, selection = _refill(
-        pool, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge),
+        pool, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge),
     )
 
-    assert pool.requests[:2] == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert pool.requests[:2] == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     # ETH-USD still runs: it was executable in round 1 and the wider snapshot
     # simply omitted it.
     assert [candidate["ticker"] for candidate in selected] == ["ETH-USD", "SOL-USD"]
@@ -475,7 +475,7 @@ def test_refill_keeps_vetted_candidates_when_a_later_round_fails(monkeypatch):
     The refill is an optimisation: whatever preflight already vetted in round 1
     must still run, and the failed round is reported instead.
     """
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
     contractless = [f"NOC{index:03d}-USD" for index in range(59)]
     calls: list[int] = []
@@ -490,10 +490,10 @@ def test_refill_keeps_vetted_candidates_when_a_later_round_fails(monkeypatch):
         return [_candidate(ticker) for ticker in crypto]
 
     selected, _skipped, selection = _refill(
-        flaky_universe, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge),
+        flaky_universe, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge),
     )
 
-    assert calls == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert calls == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert [candidate["ticker"] for candidate in selected] == ["ETH-USD"]
     assert selection["refill_rounds"] == 0  # the failed round does not count
     assert "RuntimeError" in selection["refill_error"]
@@ -508,8 +508,8 @@ def test_refill_stops_before_a_round_that_would_outlive_the_cycle_deadline(monke
     deadline and the post-refill ``_cycle_timeout`` would discard a full
     selection instead of running it.
     """
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
-    monkeypatch.setattr(autoloop, "SCREENING_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_candidates, 'SCREENING_TIMEOUT_SECONDS', 30.0)
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
     contractless = [f"NOC{index:03d}-USD" for index in range(59)]
     calls: list[int] = []
@@ -526,7 +526,7 @@ def test_refill_stops_before_a_round_that_would_outlive_the_cycle_deadline(monke
     started = time.monotonic()
     try:
         selected, _skipped, selection = _refill(
-            stalling_universe, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge),
+            stalling_universe, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge),
             deadline=time.monotonic() + 2.0,
         )
         elapsed = time.monotonic() - started
@@ -534,7 +534,7 @@ def test_refill_stops_before_a_round_that_would_outlive_the_cycle_deadline(monke
         # The cancelled worker keeps the shared screening lock until it wakes;
         # do not let that leak into the next test.
         wait_until = time.monotonic() + 5.0
-        while autoloop._screening_worker_lock.locked() and time.monotonic() < wait_until:
+        while autoloop_candidates._screening_worker_lock.locked() and time.monotonic() < wait_until:
             time.sleep(0.05)
 
     # Capped at half the remaining budget (~1s), not at 30s.
@@ -548,7 +548,7 @@ def test_refill_stops_before_a_round_that_would_outlive_the_cycle_deadline(monke
 
 def test_refill_does_not_start_a_round_when_the_cycle_budget_is_spent(monkeypatch):
     """No budget left means no round at all — the vetted selection still runs."""
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH")})
     contractless = [f"NOC{index:03d}-USD" for index in range(59)]
     calls: list[int] = []
@@ -561,43 +561,43 @@ def test_refill_does_not_start_a_round_when_the_cycle_budget_is_spent(monkeypatc
         return [_candidate(ticker) for ticker in crypto]
 
     selected, _skipped, selection = _refill(
-        counting_universe, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge),
+        counting_universe, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge),
         deadline=time.monotonic() - 1.0,  # the cycle budget is already gone
     )
 
-    assert calls == [autoloop.AUTO_FUTURES_SCREEN_POOL]  # only the initial screen
+    assert calls == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL]  # only the initial screen
     assert [candidate["ticker"] for candidate in selected] == ["ETH-USD"]
     assert selection["refill_rounds"] == 0
     assert "refill_error" not in selection
     assert selection["executable"] == 1
-    assert selection["shortfall"] == autoloop.AUTO_TOP_N - 1
+    assert selection["shortfall"] == autoloop_candidates.AUTO_TOP_N - 1
 
 
 def test_refill_reports_pool_exhaustion_when_discovery_runs_dry(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     bridge = _MarketsBridge({})  # no live contracts at all
     pool = _RefillPool([f"NOC{index:03d}-USD" for index in range(60)])
 
     def screen(crypto, _stocks, _date, _top_n):
         return [_candidate(ticker) for ticker in crypto]
 
-    selected, skipped, selection = _refill(pool, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(bridge))
+    selected, skipped, selection = _refill(pool, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(bridge))
 
     # Discovery could not offer a wider pool than the one just inspected, so
     # the shortfall is reported instead of pretending the cycle was full.
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert selected == []
     assert len(skipped) == 60
     assert selection["executable"] == 0
-    assert selection["shortfall"] == autoloop.AUTO_TOP_N
+    assert selection["shortfall"] == autoloop_candidates.AUTO_TOP_N
     assert selection["pool_exhausted"] is True
     assert selection["refill_rounds"] == 1
-    assert selection["discovery_universe"] == autoloop.AUTO_FUTURES_SCREEN_POOL * 2
+    assert selection["discovery_universe"] == autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2
     assert selection["discovery_pool"] == 60
 
 
 def test_refill_skips_when_venue_metadata_is_unavailable(monkeypatch):
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
 
     class DeadBridge:
         def client(self):
@@ -609,13 +609,13 @@ def test_refill_skips_when_venue_metadata_is_unavailable(monkeypatch):
         return [_candidate(ticker) for ticker in crypto]
 
     selected, _skipped, selection = _refill(
-        pool, screen, limit=autoloop.AUTO_TOP_N, derivatives=_Derivatives(DeadBridge()),
+        pool, screen, limit=autoloop_candidates.AUTO_TOP_N, derivatives=_Derivatives(DeadBridge()),
     )
 
     # Without market metadata a contractless pair is indistinguishable from an
     # unreachable venue, so the per-candidate path must decide: no refill.
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL]
-    assert len(selected) == autoloop.AUTO_TOP_N  # fail-open crypto candidates kept
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL]
+    assert len(selected) == autoloop_candidates.AUTO_TOP_N  # fail-open crypto candidates kept
     assert selection["market_metadata_available"] is False
     assert selection["shortfall"] is None
     assert selection["refill_rounds"] == 0
@@ -626,27 +626,27 @@ def test_refill_leaves_spot_selection_unchanged():
         {"ticker": "BTC-USD", "asset_type": "crypto"},
         {"ticker": "AAPL", "asset_type": "stock"},
     ]
-    selected, skipped, selection = autoloop._select_cycle_candidates(
-        candidates, None, limit=autoloop.AUTO_TOP_N,
+    selected, skipped, selection = autoloop_candidates._select_cycle_candidates(
+        candidates, None, limit=autoloop_candidates.AUTO_TOP_N,
     )
 
     assert selected == candidates and skipped == [] and selection is None
 
     # Spot/daily selection never widens or re-screens: no derivatives executor
     # means the helper returns the preflight result untouched.
-    assert autoloop._refill_futures_candidates(
+    assert autoloop_candidates._refill_futures_candidates(
         lambda *_args: pytest.fail("spot selection must not re-discover"),
         lambda *_args: pytest.fail("spot selection must not re-discover"),
         lambda *_args: pytest.fail("spot selection must not re-screen"),
         {},
         "2026-10-07",
         None,
-        limit=autoloop.AUTO_TOP_N,
+        limit=autoloop_candidates.AUTO_TOP_N,
         selected=selected,
         skipped=skipped,
         selection=selection,
         crypto=["BTC-USD"],
-        inspected=autoloop.AUTO_UNIVERSE_PER_ASSET,
+        inspected=autoloop_candidates.AUTO_UNIVERSE_PER_ASSET,
     ) == (["BTC-USD"], [], candidates, [], None)
 
 
@@ -663,7 +663,7 @@ def _install_futures_discovery(monkeypatch, pool):
     stands in for that builder, called once per discovery round.
     """
     monkeypatch.setattr(
-        autoloop, "_futures_crypto_universe", lambda _derivatives, _contracts, _summary: pool,
+        autoloop_candidates, '_futures_crypto_universe', lambda _derivatives, _contracts, _summary: pool,
     )
 
 
@@ -675,7 +675,7 @@ def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
     monkeypatch.setattr(autoloop.audit_log, "record", lambda *args, **kwargs: None)
     monkeypatch.setattr(autoloop.runs_mod, "active_run_id", lambda: None)
     monkeypatch.setattr(autoloop.daily_mod, "active_job_id", lambda: None)
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     _set_futures_mode(True)
 
     bridge = _MarketsBridge({"ETH/USDT:USDT": _contract("ETH"), "SOL/USDT:USDT": _contract("SOL")})
@@ -708,13 +708,13 @@ def test_cycle_refills_discovery_before_running_the_pipeline(monkeypatch):
 
     # Round 1 inspected 60 contractless pairs and found nothing executable;
     # round 2 widened to 120 and reached the two contracts at the tail.
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert screened == [(60, 60), (62, 120)]
     assert ran == ["ETH-USD", "SOL-USD"]  # lower-ranked contracts filled the cycle
     selection = autoloop._last_cycle["candidate_selection"]
     assert selection["refill_rounds"] == 1
     assert selection["executable"] == 2
-    assert selection["shortfall"] == autoloop.AUTO_TOP_N - 2
+    assert selection["shortfall"] == autoloop_candidates.AUTO_TOP_N - 2
     assert selection["pool_exhausted"] is True
     assert autoloop._last_cycle["status"] == "completed"
     # Discovery covered the union of both rounds, not just the last snapshot.
@@ -730,7 +730,7 @@ def _wire_cycle(monkeypatch, pool, screen, bridge, *, after_candidate=None):
     monkeypatch.setattr(autoloop.audit_log, "record", lambda *args, **kwargs: None)
     monkeypatch.setattr(autoloop.runs_mod, "active_run_id", lambda: None)
     monkeypatch.setattr(autoloop.daily_mod, "active_job_id", lambda: None)
-    monkeypatch.setattr(autoloop, "_record_futures_cycle_rejection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *args, **kwargs: None)
     monkeypatch.setattr(autoloop, "_build_bridge", lambda *_args: bridge)
     monkeypatch.setattr(autoloop, "_build_derivatives_executor", lambda *_args: _Derivatives(bridge))
     _install_futures_discovery(monkeypatch, pool)
@@ -761,7 +761,7 @@ def test_cycle_stops_before_candidates_when_futures_disabled_during_screening(mo
 
     ran = _wire_cycle(monkeypatch, pool, screen, bridge)
 
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL]
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL]
     assert ran == []
     futures = autoloop._last_cycle["modes"]["auto_futures"]
     assert futures["status"] == "disabled"
@@ -786,7 +786,7 @@ def test_cycle_stops_when_futures_disabled_during_refill(monkeypatch):
 
     ran = _wire_cycle(monkeypatch, pool, screen, bridge)
 
-    assert pool.requests == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert pool.requests == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert screen_calls == [60, 60]
     assert ran == []
     futures = autoloop._last_cycle["modes"]["auto_futures"]
@@ -834,8 +834,8 @@ def test_cycle_runs_a_contract_the_wider_snapshot_dropped(monkeypatch):
     })
     contractless = [f"NOC{index:03d}-USD" for index in range(58)]
     pool = _SnapshotPool({
-        autoloop.AUTO_FUTURES_SCREEN_POOL: ["ETH-USD", "SOL-USD"] + contractless,
-        autoloop.AUTO_FUTURES_SCREEN_POOL * 2: contractless + ["SOL-USD"] + [
+        autoloop_candidates.AUTO_FUTURES_SCREEN_POOL: ["ETH-USD", "SOL-USD"] + contractless,
+        autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2: contractless + ["SOL-USD"] + [
             f"TAIL{index:03d}-USD" for index in range(62)
         ],
     })
@@ -871,7 +871,7 @@ def test_cycle_completes_when_the_refill_round_fails(monkeypatch):
 
     ran = _wire_cycle(monkeypatch, flaky_universe, screen, bridge)
 
-    assert calls == [autoloop.AUTO_FUTURES_SCREEN_POOL, autoloop.AUTO_FUTURES_SCREEN_POOL * 2]
+    assert calls == [autoloop_candidates.AUTO_FUTURES_SCREEN_POOL, autoloop_candidates.AUTO_FUTURES_SCREEN_POOL * 2]
     assert ran == ["ETH-USD"]  # the round-1 candidate still ran
     assert autoloop._last_cycle["status"] == "completed"
     selection = autoloop._last_cycle["candidate_selection"]

@@ -161,7 +161,7 @@ def test_pinning_screen_pins_picks_and_drops_price_mismatches():
     """Every discovery round (initial and refill) pins through the same wrapper."""
     from types import SimpleNamespace
 
-    from server.autoloop import _pinning_screen
+    from server.autoloop_candidates import _pinning_screen
     from tradingagents.dataflows.screening import MAX_PRICE_MISMATCH, price_mismatch
 
     bridge = _bridge()
@@ -196,7 +196,7 @@ def test_pinning_screen_pins_picks_and_drops_price_mismatches():
 def test_pinning_screen_keeps_a_two_argument_seam_working():
     from types import SimpleNamespace
 
-    from server.autoloop import _pinning_screen
+    from server.autoloop_candidates import _pinning_screen
     from tradingagents.dataflows.screening import MAX_PRICE_MISMATCH, price_mismatch
 
     def screen_universe(crypto, stocks, trade_date, pool_limit):

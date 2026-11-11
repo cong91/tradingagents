@@ -87,7 +87,13 @@ def entry_journal_leg(
     order: PlannedOrder, client_order_id: str, *, quantity: str, created_at: str,
     identity: Any, venue: str, config: dict,
 ) -> dict:
-    """Capture the exact entry terms and recovery policy before a venue mutation."""
+    """Capture the exact entry terms and recovery policy before a venue mutation.
+
+    The immutable ``managed_live_entry`` provenance marker rides inside the
+    leg itself, so every journal row written through this builder carries the
+    attribution evidence the outcome ledger needs — no caller can produce a
+    marker-less managed entry by forgetting to attach it.
+    """
     return {
         "name": "entry-intent",
         "status": "uncertain",
@@ -105,6 +111,9 @@ def entry_journal_leg(
         "created_at": created_at,
         "profile": identity.profile,
         "venue_key": venue,
+        "entry_provenance": managed_live_provenance(
+            order, client_order_id, identity=identity, venue=venue,
+        ),
         "scale_out_policy": {
             "enabled": config.get("risk_derivatives_scale_out_enabled") is True,
             "first_r": config.get("risk_derivatives_scale_out_first_r", 1.0),

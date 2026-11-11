@@ -40,7 +40,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import autoloop as autoloop_mod, futures_replay
+from server import (
+    autoloop_futures_context,
+    autoloop_futures_execution,
+    futures_cycle_telemetry,
+    futures_replay,
+)
 from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.market_data import Candle, fetch_closed_candles
 from tradingagents.execution.daily import DailyResult
@@ -113,8 +118,8 @@ def _context(one_h: Candle, four_h: Candle) -> dict:
         "one_hour_close": one_h.close,
         "four_hour_open": four_h.open_time,
         "four_hour_close": four_h.close,
-        "one_hour_direction": autoloop_mod._candle_direction(one_h),
-        "four_hour_direction": autoloop_mod._candle_direction(four_h),
+        "one_hour_direction": autoloop_futures_context._candle_direction(one_h),
+        "four_hour_direction": autoloop_futures_context._candle_direction(four_h),
     }
 
 
@@ -137,7 +142,7 @@ def rejections(monkeypatch):
     persist_rejection seam — the telemetry dict arrives merged into payload."""
     captured: list[dict] = []
     monkeypatch.setattr(
-        autoloop_mod, "persist_futures_cycle_rejection",
+        futures_cycle_telemetry, 'persist_rejection',
         lambda cycle_id, **kwargs: captured.append({"cycle_id": cycle_id, **kwargs}),
     )
     return captured
@@ -161,7 +166,7 @@ def _run_candidate(**overrides) -> DailyResult:
     }
     kwargs.update(overrides)
     result = DailyResult(ticker="BTC-USD")
-    autoloop_mod._process_futures_candidate(
+    autoloop_futures_execution._process_futures_candidate(
         kwargs.pop("derivatives", _mark_derivatives(_MARK)), "BTC-USD",
         kwargs.pop("signal", "Buy"), _CONFIG, result, **kwargs
     )
@@ -197,7 +202,7 @@ def test_closed_context_requires_exact_alignment_with_the_closed_pair(monkeypatc
     """The alignment contract _closed_futures_context enforces: the served 1h
     and 4h rows must open exactly at closed_candle_pair(as_of) — this is the
     replay baseline; any drift refuses the cycle instead of confirming."""
-    monkeypatch.setattr(autoloop_mod, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(autoloop_futures_context, "datetime", _FrozenDatetime)
     one, four = _aligned_pair("bullish")
     venue = _CandleVenue(
         one_h=[[one.open_time, one.open, one.high, one.low, one.close, one.volume]],
@@ -208,7 +213,7 @@ def test_closed_context_requires_exact_alignment_with_the_closed_pair(monkeypatc
         _bridge=SimpleNamespace(client=lambda: venue),
     )
 
-    context = autoloop_mod._closed_futures_context(derivatives, "BTC-USD")
+    context = autoloop_futures_context._closed_futures_context(derivatives, "BTC-USD")
 
     pair_one, pair_four = closed_candle_pair(AS_OF)
     assert context is not None
@@ -223,7 +228,7 @@ def test_closed_context_is_fail_closed_when_the_pair_drifts(monkeypatch, which):
     """A forming bar is dropped by fetch_closed_candles and a stale bar fails
     the open-time equality: both leave the context None and the cycle refuses
     with confirmation_missing — never a confirmation from drifting candles."""
-    monkeypatch.setattr(autoloop_mod, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(autoloop_futures_context, "datetime", _FrozenDatetime)
     one, four = _aligned_pair("bullish")
     if which == "1h":
         # Open at the CONTAINING hour: the forming bar (close_time > cutoff),
@@ -240,7 +245,7 @@ def test_closed_context_is_fail_closed_when_the_pair_drifts(monkeypatch, which):
         _bridge=SimpleNamespace(client=lambda: venue),
     )
 
-    context = autoloop_mod._closed_futures_context(derivatives, "BTC-USD")
+    context = autoloop_futures_context._closed_futures_context(derivatives, "BTC-USD")
 
     assert context is None
 
@@ -269,7 +274,7 @@ def test_non_tradeable_signal_skips_confirmation_entirely(signal):
     """Hold/REVIEW/unparsed are not futures positions: the gate confirms them
     whatever the candles say — the signal group's reject lives downstream at
     signal_not_tradeable, not in confirmation."""
-    ok, reason = autoloop_mod._confirmation_state(
+    ok, reason = autoloop_futures_context._confirmation_state(
         _context(*_aligned_pair("bearish")), signal)
     assert ok is True
     assert reason == "not_required_for_non_tradeable_signal"
@@ -280,7 +285,7 @@ def test_non_tradeable_signal_skips_confirmation_entirely(signal):
     ("Underweight", "bearish"), ("Sell", "bearish"),
 ])
 def test_tradeable_signal_maps_to_expected_direction(signal, expected):
-    ok, reason = autoloop_mod._confirmation_state(
+    ok, reason = autoloop_futures_context._confirmation_state(
         _context(*_aligned_pair(expected)), signal)
     assert (ok, reason) == (True, "aligned_direction")
 
@@ -294,7 +299,7 @@ def test_tradeable_signal_maps_to_expected_direction(signal, expected):
 def test_ltf_against_htf_aligned_rejects_direction_mismatch(signal, aligned, against):
     """4h agrees, the closed 1h does not: direction_mismatch — this is the
     pullback class the counterfactual rule below would admit with a bound."""
-    ok, reason = autoloop_mod._confirmation_state(
+    ok, reason = autoloop_futures_context._confirmation_state(
         _context(_candle("1h", _ONE_HOUR_OPEN, against),
                  _candle("4h", _FOUR_HOUR_OPEN, aligned)), signal)
     assert (ok, reason) == (False, "direction_mismatch")
@@ -310,7 +315,7 @@ def test_htf_against_ltf_aligned_rejects_direction_mismatch(signal, aligned, aga
     """1h agrees, the closed 4h does not: still direction_mismatch — the gate
     cannot tell the two apart on reason alone, which is exactly why the
     alternative rule's admission mix is unscorable on the archived rejects."""
-    ok, reason = autoloop_mod._confirmation_state(
+    ok, reason = autoloop_futures_context._confirmation_state(
         _context(_candle("1h", _ONE_HOUR_OPEN, aligned),
                  _candle("4h", _FOUR_HOUR_OPEN, against)), signal)
     assert (ok, reason) == (False, "direction_mismatch")
@@ -321,7 +326,7 @@ def test_htf_against_ltf_aligned_rejects_direction_mismatch(signal, aligned, aga
 
 def test_doji_is_exact_close_equals_open():
     candle = Candle("BTC/USDT:USDT", "1h", 0, 1, 100.0, 101.0, 99.0, 100.0, 1.0, True)
-    assert autoloop_mod._candle_direction(candle) == "doji"
+    assert autoloop_futures_context._candle_direction(candle) == "doji"
 
 
 @pytest.mark.parametrize("one_dir,four_dir", [
@@ -329,7 +334,7 @@ def test_doji_is_exact_close_equals_open():
     ("doji", "bearish"),  # doji wins over the mismatch below it
 ])
 def test_doji_in_either_closed_candle_rejects(one_dir, four_dir):
-    ok, reason = autoloop_mod._confirmation_state(
+    ok, reason = autoloop_futures_context._confirmation_state(
         _context(_candle("1h", _ONE_HOUR_OPEN, one_dir),
                  _candle("4h", _FOUR_HOUR_OPEN, four_dir)), "Buy")
     assert (ok, reason) == (False, "doji_candle")
@@ -368,14 +373,14 @@ def _proposal(**overrides) -> dict:
      "does not protect"),
 ])
 def test_proposal_terms_rejects_the_bracket_group(proposal, mark, fragment):
-    terms, error = autoloop_mod._proposal_terms(
+    terms, error = autoloop_futures_execution._proposal_terms(
         proposal, mark=mark, direction="long", config=_CONFIG)
     assert terms is None
     assert fragment in (error or "")
 
 
 def test_proposal_terms_keeps_a_protecting_bracket():
-    terms, error = autoloop_mod._proposal_terms(
+    terms, error = autoloop_futures_execution._proposal_terms(
         _proposal(stop_loss=49_000.0, take_profit=51_000.0),
         mark=_MARK, direction="long", config=_CONFIG)
     assert error is None
@@ -388,7 +393,7 @@ def test_proposal_terms_keeps_a_protecting_bracket():
 def test_proposal_terms_leaves_levels_open_for_the_atr_fallback():
     """No stop/take in the proposal is valid: the cycle falls back to the
     engine's ATR bracket for the protective levels only."""
-    terms, error = autoloop_mod._proposal_terms(
+    terms, error = autoloop_futures_execution._proposal_terms(
         _proposal(), mark=_MARK, direction="long", config=_CONFIG)
     assert error is None
     assert terms["stop_loss"] is None and terms["take_profit"] is None
@@ -396,14 +401,14 @@ def test_proposal_terms_leaves_levels_open_for_the_atr_fallback():
 
 def test_direction_brackets_reuses_the_callers_reads():
     brackets = {"long": (49_000.0, 51_000.0), "short": (51_000.0, 49_000.0)}
-    assert autoloop_mod._direction_brackets("BTC-USD", brackets) == (
+    assert autoloop_futures_context._direction_brackets("BTC-USD", brackets) == (
         (49_000.0, 51_000.0), (51_000.0, 49_000.0))
 
 
 def test_invalid_fallback_bracket_is_reflected(monkeypatch, rejections):
     """When the ATR fallback bracket does not protect the mark the cycle
     refuses with its own reason — a replayed protective-bracket reject."""
-    monkeypatch.setattr(autoloop_mod, "_bracket_prices",
+    monkeypatch.setattr(autoloop_futures_context, '_bracket_prices',
                         lambda ticker, direction="long": (51_000.0, 49_000.0))
     result = _run_candidate(proposal=_proposal())
 
@@ -537,11 +542,11 @@ def test_completed_cycles_replay_consistently_through_the_live_gate(replay_fixtu
             "one_hour_direction": row["one_hour_direction"],
             "four_hour_direction": row["four_hour_direction"],
         }
-        ok, reason = autoloop_mod._confirmation_state(context, row["signal"])
+        ok, reason = autoloop_futures_context._confirmation_state(context, row["signal"])
         if row["signal"] in _TRADEABLE:
             # A tradeable completion could only have passed an aligned pair.
             expected = ("bearish"
-                        if autoloop_mod._direction(row["signal"]) == "short"
+                        if autoloop_futures_context._direction(row["signal"]) == "short"
                         else "bullish")
             assert (ok, reason) == (True, "aligned_direction"), row
             assert (row["one_hour_direction"], row["four_hour_direction"]) == (

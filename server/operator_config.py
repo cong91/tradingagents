@@ -237,6 +237,30 @@ _ALLOWED: dict[str, dict] = {
             "stop cơ học. 0 = không grace, đóng ngay."
         ),
     },
+    "kronos_active_enabled": {
+        "type": "bool",
+        # A deliberate operator switch: enabling it changes what an unattended
+        # decision cycle reads and pays 20-200 s of model inference per
+        # candidate, so the write needs confirm + reason + audit like the Auto
+        # modes. It is NOT an order-arming gate: the confirmation machinery
+        # (`_GATE_KEYS`) is what enforces the deliberate-write rule, while the
+        # actual live-order arming lives in auto_modes.MODE_KEYS, which this key
+        # is deliberately not part of.
+        "gate": True,
+        "group": "forecast",
+        "label": "Kronos làm ngữ cảnh quyết định",
+        "hint": (
+            "Bật: mỗi ứng viên futures được dự báo bằng model Kronos đã ghim "
+            "(nến 4h đóng, horizon 24h, 16 paths, T=0.5) và khối dự báo nén "
+            "được đưa vào ngữ cảnh TRƯỚC khi Trader/Portfolio Manager quyết "
+            "định. Đây là DỮ LIỆU, không phải lệnh và không phải veto: không "
+            "ứng viên nào bị cắt, không nới risk/leverage, không thay đổi "
+            "confirmation hay RiskGuard. Tắt (mặc định): không đọc gì, không "
+            "chạy model, chu kỳ giữ nguyên như trước. Đây là switch vận hành "
+            "nên cần confirm + lý do và được ghi audit. Lưu ý: model không "
+            "công bố training cutoff và chưa có bằng chứng lợi nhuận."
+        ),
+    },
 }
 
 _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}
@@ -278,6 +302,63 @@ def _row(key: str, stored: dict[str, dict]) -> dict:
     }
 
 
+def _kronos_section() -> dict:
+    """Read-only Kronos status for the settings screen.
+
+    Everything here is derived from the same sources the decision path reads —
+    the engine config's ``kronos_active_*`` keys and the pinned-artifact
+    verification the forecast service runs before any child process — so the
+    screen shows what a cycle would actually use, not a parallel claim. No
+    model is started: ``from_config``-level artifact checks are file reads and
+    hashes (memoized), nothing heavier.
+    """
+    from tradingagents.forecast.artifact import (
+        MODEL_REPO,
+        MODEL_REVISION,
+        SOURCE_REVISION,
+        isolated_model_dir,
+        isolated_python,
+        isolated_source_dir,
+        verify_artifacts,
+    )
+    from tradingagents.forecast.settings import settings_from_config
+
+    config = get_config()
+    settings = settings_from_config(config)
+    python = isolated_python()
+    if not python.exists():
+        readiness = {
+            "status": "unavailable",
+            "reason": f"the isolated Kronos interpreter is absent ({python}); "
+                      "the model cannot run here until it is installed outside the repo",
+        }
+    else:
+        try:
+            problem, _verified = verify_artifacts(isolated_source_dir(), isolated_model_dir())
+        except OSError as exc:
+            problem = f"the pinned artifacts could not be inspected: {exc}"
+        readiness = {"status": "ready" if problem is None else "unavailable", "reason": problem}
+    return {
+        "enabled": settings.enabled,
+        "mode": settings.mode,
+        "timeframe": settings.timeframe,
+        "horizon_hours": settings.horizon_hours,
+        "paths": settings.paths,
+        "temperature": settings.temperature,
+        "lookback_bars": settings.lookback_bars,
+        "max_batch_rows": settings.max_batch_rows,
+        "failure_policy": settings.failure_policy,
+        "max_band_spread_ratio": settings.max_band_spread_ratio,
+        # A tuning value the core cannot run: reported here AND enforced by
+        # PUT /api/settings, so the screen never shows a knob the cycle would
+        # silently turn into an unavailable forecast.
+        "settings_problem": settings.unavailable_reason(),
+        "readiness": readiness,
+        "model": {"source_revision": SOURCE_REVISION, "model_revision": MODEL_REVISION,
+                  "repo": MODEL_REPO},
+    }
+
+
 def _payload() -> dict:
     stored = {row["key"]: row for row in control_store.load_operator_setting_rows()}
     rows = [_row(key, stored) for key in _ALLOWED]
@@ -297,6 +378,7 @@ def _payload() -> dict:
             "any_auto_enabled": any(modes.values()),
         },
         "effective_exec_mode": effective_exec_mode(),
+        "kronos": _kronos_section(),
         "allowlist": sorted(_ALLOWED),
     }
 

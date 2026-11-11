@@ -94,6 +94,29 @@ _ENV_OVERRIDES = {
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
     # their ccxt sandbox when available. This is safe-direction and env-overridable.
     "TRADINGAGENTS_EXEC_SANDBOX":                      "exec_sandbox",
+    # Outcome-ledger worker knobs (plan §2.6): ingest is off by default; the
+    # worker reads recorded cycles and venue READ history only, never a send.
+    "TRADINGAGENTS_OUTCOME_LEDGER_INGEST_ENABLED": "outcome_ledger_ingest_enabled",
+    "TRADINGAGENTS_OUTCOME_LEDGER_INTERVAL_SECONDS": "outcome_ledger_interval_seconds",
+    # Shadow observation worker (plan §6): observations are off by default and
+    # never reach an order, risk limit or protection decision. The provider list
+    # is a comma-separated vocabulary ("filter:donchian_breakout", "kronos").
+    "TRADINGAGENTS_SHADOW_OBSERVATIONS_ENABLED": "shadow_observations_enabled",
+    "TRADINGAGENTS_SHADOW_OBSERVATIONS_INTERVAL_SECONDS": "shadow_observations_interval_seconds",
+    "TRADINGAGENTS_SHADOW_PROVIDERS": "shadow_providers",
+    # Active Kronos context tuning. ``kronos_active_enabled`` is deliberately
+    # ABSENT: it is a managed operator switch (control_operator_settings) with
+    # confirmation, reason and audit, exactly like the Auto modes, so it is not
+    # a plain engine setting an env var could arm.
+    "TRADINGAGENTS_KRONOS_ACTIVE_MODE": "kronos_active_mode",
+    "TRADINGAGENTS_KRONOS_ACTIVE_TIMEFRAME": "kronos_active_timeframe",
+    "TRADINGAGENTS_KRONOS_ACTIVE_HORIZON_HOURS": "kronos_active_horizon_hours",
+    "TRADINGAGENTS_KRONOS_ACTIVE_PATHS": "kronos_active_paths",
+    "TRADINGAGENTS_KRONOS_ACTIVE_TEMPERATURE": "kronos_active_temperature",
+    "TRADINGAGENTS_KRONOS_ACTIVE_LOOKBACK_BARS": "kronos_active_lookback_bars",
+    "TRADINGAGENTS_KRONOS_ACTIVE_MAX_BATCH_ROWS": "kronos_active_max_batch_rows",
+    "TRADINGAGENTS_KRONOS_ACTIVE_FAILURE_POLICY": "kronos_active_failure_policy",
+    "TRADINGAGENTS_KRONOS_ACTIVE_MAX_BAND_SPREAD_RATIO": "kronos_active_max_band_spread_ratio",
 }
 
 
@@ -371,6 +394,51 @@ def build_default_config() -> dict:
         "exec_base_url": "https://demo-api.binance.com",
         # Route non-Binance exchanges through ccxt sandbox when requested.
         "exec_sandbox": False,
+        # Outcome-ledger worker: ingest off by default (the flag turn-on is the
+        # ingestion start moment; nothing before it is backfilled), poll every
+        # minute. The worker only reads recorded cycles and venue history.
+        "outcome_ledger_ingest_enabled": False,
+        "outcome_ledger_interval_seconds": 60,
+        # Shadow observation worker (plan §6): off by default. While off, the
+        # module is never imported by a decision path and no observation is
+        # recorded, so the incumbent behaviour is exactly what it was. The
+        # provider list defaults to the cheap filter: the optional Kronos model
+        # is added only when it is installed in its own isolated environment.
+        "shadow_observations_enabled": False,
+        "shadow_observations_interval_seconds": 300,
+        "shadow_providers": "filter:donchian_breakout",
+        # Active Kronos context (plan §4.1): the pinned model's compact forecast
+        # is placed in the futures decision context BEFORE the Trader and the
+        # Portfolio Manager decide. It is CONTEXT, never a veto — the direction
+        # gate was rejected by measurement (2/10 stable at T=1.0, 3/10 at T=0.5,
+        # both under the 8/10 bar), so no candidate is ever cut by it.
+        # OFF by default: while off, nothing is read, no model runs, and the
+        # cycle's candidates, context and orders are exactly what they were.
+        # ``kronos_active_enabled`` is a managed operator switch
+        # (control_operator_settings, confirmation + reason + audit) and is
+        # deliberately absent from _ENV_OVERRIDES. The tuning keys below are
+        # engine settings: editable through PUT /api/settings.
+        "kronos_active_enabled": False,
+        "kronos_active_mode": "context_only",
+        "kronos_active_timeframe": "4h",
+        "kronos_active_horizon_hours": 24,
+        # 16 is the floor at which a direction ratio can be told apart from
+        # chance; below it the service refuses rather than reporting a number.
+        "kronos_active_paths": 16,
+        # 0.5: measured more stable than the 1.0 default the shadow observations
+        # use, and it is part of the forecast's identity (a cached T=1.0 forecast
+        # must never be served to a T=0.5 cycle).
+        "kronos_active_temperature": 0.5,
+        "kronos_active_lookback_bars": 96,
+        # 5 symbols x 16 paths measured 874 MiB peak against 6.07 GiB for the
+        # un-chunked 960-row call, for 13% more wall time.
+        "kronos_active_max_batch_rows": 80,
+        # defer = no context for this cycle, and the cycle keeps running. It does
+        # NOT mean the candidate was gated: "no gate" is not "gate passed".
+        "kronos_active_failure_policy": "defer",
+        # UNCALIBRATED: a band wider than this marks the forecast ``unclear``.
+        # Reported, never used to drop a candidate.
+        "kronos_active_max_band_spread_ratio": 0.15,
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],
         # L2 runtime gates are config/operator switches only. The operator

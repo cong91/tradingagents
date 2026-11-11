@@ -12,7 +12,7 @@ import { DataSourceCard } from "./data-source-card";
 import { formatDateTimeVi } from "./format-time";
 import { InterfacePreferencesCard } from "./interface-preferences-card";
 import { LLM_SETTING_KEYS, LlmConfigCard } from "./llm-config-card";
-import { OperatorModes, OperatorRisk } from "./operator-config-card";
+import { OperatorForecast, OperatorModes, OperatorRisk } from "./operator-config-card";
 import { useOperatorConfig } from "./operator-config-controller";
 import { PathsCard } from "./paths-card";
 import { SaveBar } from "./save-bar";
@@ -88,6 +88,10 @@ export function SettingsScreen() {
 
   const selectArea = useCallback((next: SettingsArea) => setArea(next), []);
   const systemRows = rowsByArea.system;
+  // Kronos forecast tuning is a distinct group inside the AI area (beside its
+  // managed switch), not a loose row in the generic advanced pile.
+  const kronosTuningRows = rowsByArea.ai.filter((row) => row.key.startsWith("kronos_active_"));
+  const otherAiRows = rowsByArea.ai.filter((row) => !row.key.startsWith("kronos_active_"));
   const aiKeys = [
     ...LLM_SETTING_KEYS,
     ...rowsByArea.ai.map((row) => row.key),
@@ -185,10 +189,20 @@ export function SettingsScreen() {
           </section>
           <section id="ai" hidden={area !== "ai"} className="space-y-4">
             {controller.payload ? <LlmConfigCard controller={controller} onDirtyChange={setLlmDirty} /> : null}
-            {rowsByArea.ai.length ? (
-              <details className="rounded-md border bg-card p-4" open={rowsByArea.ai.some((row) => Boolean(controller.fieldErrors[row.key])) || undefined}>
+            {/* The managed Kronos switch lives in the AI/forecasting area —
+                deliberately NOT beside the Auto Spot/Futures gates in
+                automation: it changes what a cycle reads, never what it arms. */}
+            <OperatorForecast controller={operator} />
+            {kronosTuningRows.length ? (
+              <details className="rounded-md border bg-card p-4" open={kronosTuningRows.some((row) => Boolean(controller.fieldErrors[row.key])) || undefined}>
+                <summary className="cursor-pointer text-sm font-medium">{c.kronosTuning}</summary>
+                <div className="mt-4"><SettingsSection title={t.settings.kronos.tuningTitle} description={t.settings.kronos.tuningDescription} rows={kronosTuningRows} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
+              </details>
+            ) : null}
+            {otherAiRows.length ? (
+              <details className="rounded-md border bg-card p-4" open={otherAiRows.some((row) => Boolean(controller.fieldErrors[row.key])) || undefined}>
                 <summary className="cursor-pointer text-sm font-medium">{c.advanced}</summary>
-                <div className="mt-4"><SettingsSection title={t.settings.groups.llm.title} description={t.settings.groups.llm.description} rows={rowsByArea.ai} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
+                <div className="mt-4"><SettingsSection title={t.settings.groups.llm.title} description={t.settings.groups.llm.description} rows={otherAiRows} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
               </details>
             ) : null}
             {controller.payload ? <SaveBar controller={controller} keys={aiKeys} scope="ai" /> : null}
