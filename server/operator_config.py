@@ -313,12 +313,11 @@ def _kronos_section() -> dict:
     hashes (memoized), nothing heavier.
     """
     from tradingagents.forecast.artifact import (
-        MODEL_REPO,
-        MODEL_REVISION,
-        SOURCE_REVISION,
+        MIN_LOOKBACK_BARS,
         isolated_model_dir,
         isolated_python,
         isolated_source_dir,
+        profile_for,
         verify_artifacts,
     )
     from tradingagents.forecast.settings import settings_from_config
@@ -326,18 +325,31 @@ def _kronos_section() -> dict:
     config = get_config()
     settings = settings_from_config(config)
     python = isolated_python()
-    if not python.exists():
-        readiness = {
-            "status": "unavailable",
-            "reason": f"the isolated Kronos interpreter is absent ({python}); "
-                      "the model cannot run here until it is installed outside the repo",
-        }
-    else:
+    try:
+        profile = profile_for(settings.profile)
+    except ValueError as exc:
+        problem = str(exc)
+        profile = None
+    verified = False
+    if profile is not None and not python.exists():
+        problem = (
+            f"the isolated Kronos interpreter is absent ({python}); "
+            "the model cannot run here until it is installed outside the repo"
+        )
+    elif profile is not None:
         try:
-            problem, _verified = verify_artifacts(isolated_source_dir(), isolated_model_dir())
+            problem, _verified = verify_artifacts(
+                isolated_source_dir(), isolated_model_dir(), settings.profile,
+            )
         except OSError as exc:
             problem = f"the pinned artifacts could not be inspected: {exc}"
-        readiness = {"status": "ready" if problem is None else "unavailable", "reason": problem}
+        else:
+            verified = problem is None
+    readiness = {
+        "status": "ready" if problem is None else "unavailable",
+        "reason": problem,
+        "verified": verified,
+    }
     return {
         "enabled": settings.enabled,
         "mode": settings.mode,
@@ -349,13 +361,22 @@ def _kronos_section() -> dict:
         "max_batch_rows": settings.max_batch_rows,
         "failure_policy": settings.failure_policy,
         "max_band_spread_ratio": settings.max_band_spread_ratio,
+        "profile_id": settings.profile,
+        "max_context": profile.max_context if profile is not None else None,
+        "lookback_min": MIN_LOOKBACK_BARS,
+        "lookback_max": profile.max_context if profile is not None else None,
         # A tuning value the core cannot run: reported here AND enforced by
         # PUT /api/settings, so the screen never shows a knob the cycle would
         # silently turn into an unavailable forecast.
         "settings_problem": settings.unavailable_reason(),
         "readiness": readiness,
-        "model": {"source_revision": SOURCE_REVISION, "model_revision": MODEL_REVISION,
-                  "repo": MODEL_REPO},
+        "model": {
+            "source_revision": profile.source_revision if profile is not None else "",
+            "model_revision": profile.model_revision if profile is not None else "",
+            "repo": profile.model_repo if profile is not None else "",
+            "tokenizer_revision": profile.tokenizer_revision if profile is not None else "",
+            "tokenizer_repo": profile.tokenizer_repo if profile is not None else "",
+        },
     }
 
 

@@ -66,6 +66,7 @@ def cache_key(
         "cutoff_ms": None if cutoff_ms is None else int(cutoff_ms),
         "data_digest": data_digest,
         "params": settings.as_params(),
+        "profile": settings.profile,
         "mode": settings.mode,
         "model_revision": model_revision,
         "artifact_hash": artifact_hash,

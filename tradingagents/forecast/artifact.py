@@ -17,28 +17,108 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 # Pinned upstream: shiyu-coder/Kronos @ 67b630e67f6a18c9e9be918d9b4337c960db1e9a
-SOURCE_REVISION = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
-TOKENIZER_REPO = "NeoQuasar/Kronos-Tokenizer-base"
-TOKENIZER_REVISION = "0e0117387f39004a9016484a186a908917e22426"
-MODEL_REPO = "NeoQuasar/Kronos-small"
-MODEL_REVISION = "901c26c1332695a2a8f243eb2f37243a37bea320"
+_SOURCE_REVISION = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
 
-# Content pins: the source files this adapter will import and the weights it will
-# load. A re-download that changes even one byte is refused rather than trusted.
-PINNED_SOURCE_HASHES = {
+
+@dataclass(frozen=True)
+class ArtifactProfile:
+    """One closed model/tokenizer pair and its content verification pins."""
+
+    name: str
+    model_repo: str
+    tokenizer_repo: str
+    source_revision: str
+    model_revision: str
+    tokenizer_revision: str
+    max_context: int
+    source_hashes: Mapping[str, str]
+    model_hashes: Mapping[str, str]
+
+
+_SMALL_SOURCE_HASHES = MappingProxyType({
     "model/kronos.py": "0a5f90282e2039c2de0771473419715c845def154896dbd0f5747837e6241032",
     "model/module.py": "a07edbadc0e96804c8158c021bbc6063bb7cc43b34d7fc470d5c8ff2005a409f",
     "model/__init__.py": "f8f856ca3fedadcaac97e196be23d1aeda1c3c9ffe8903d66d43ea3bcac6240c",
-}
-PINNED_WEIGHT_HASHES = {
+})
+_SMALL_MODEL_HASHES = MappingProxyType({
+    "Kronos-Tokenizer-base/config.json":
+        "2366e7ccfec76cbc19cf3c4c1b9c5d901be336ca1e83f2d2292c9bff381b77a2",
     "Kronos-Tokenizer-base/model.safetensors":
         "59d85f6af76a2c3b8240ea06cb21db4213b4eeca053f246b23e29cf832fc6bee",
+    "Kronos-small/config.json":
+        "5e0f6a605d5f81b5c9b559fe5cf716a1acb041c744e6f41bd05b097b7a685396",
     "Kronos-small/model.safetensors":
         "b082dfcbd8e8c142a725c8bbb99781802f38fec81210e13479effb32b3c3e020",
-}
+})
+_MINI_MODEL_HASHES = MappingProxyType({
+    "Kronos-Tokenizer-2k/config.json":
+        "0b30a443affb03e05a876a083857de9164f899feb7b4d261da02c485c9a3e3b6",
+    "Kronos-Tokenizer-2k/model.safetensors":
+        "b97ec46b3b72160509e289183eaf7bdf5f0dac5bb9b49522f6d46638a99a8717",
+    "Kronos-mini/config.json":
+        "70daca2cb11e3a979dd6b8ac12ee08e2aace877acf28f5b8dfb4fe5609736201",
+    "Kronos-mini/model.safetensors":
+        "a7d5f37e2e9fbd9891f7d7d4f72574512dd1f704fee14223e0a8cd0fbf54197c",
+})
+
+
+PROFILES = MappingProxyType({
+    "small_base": ArtifactProfile(
+        name="small_base",
+        model_repo="NeoQuasar/Kronos-small",
+        tokenizer_repo="NeoQuasar/Kronos-Tokenizer-base",
+        source_revision=_SOURCE_REVISION,
+        model_revision="901c26c1332695a2a8f243eb2f37243a37bea320",
+        tokenizer_revision="0e0117387f39004a9016484a186a908917e22426",
+        max_context=512,
+        source_hashes=_SMALL_SOURCE_HASHES,
+        model_hashes=_SMALL_MODEL_HASHES,
+    ),
+    "mini_2k": ArtifactProfile(
+        name="mini_2k",
+        model_repo="NeoQuasar/Kronos-mini",
+        tokenizer_repo="NeoQuasar/Kronos-Tokenizer-2k",
+        source_revision=_SOURCE_REVISION,
+        model_revision="f4e68697d9d5aed55cef5c96aabc3376bcad9f81",
+        tokenizer_revision="26966d0035065a0cae0ebad7af8ece35bc1fb51c",
+        max_context=2048,
+        source_hashes=_SMALL_SOURCE_HASHES,
+        model_hashes=_MINI_MODEL_HASHES,
+    ),
+})
+
+DEFAULT_PROFILE = "small_base"
+
+
+def profile_for(profile: str = DEFAULT_PROFILE) -> ArtifactProfile:
+    """Return a selectable profile, refusing model/tokenizer hybrids."""
+    try:
+        return PROFILES[profile]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"unknown Kronos profile {profile!r}; supported: {sorted(PROFILES)}"
+        ) from exc
+
+
+# Legacy aliases: existing callers default to the verified small_base pair.
+_SMALL_PROFILE = PROFILES[DEFAULT_PROFILE]
+SOURCE_REVISION = _SMALL_PROFILE.source_revision
+TOKENIZER_REPO = _SMALL_PROFILE.tokenizer_repo
+TOKENIZER_REVISION = _SMALL_PROFILE.tokenizer_revision
+MODEL_REPO = _SMALL_PROFILE.model_repo
+MODEL_REVISION = _SMALL_PROFILE.model_revision
+PINNED_SOURCE_HASHES = dict(_SMALL_PROFILE.source_hashes)
+PINNED_WEIGHT_HASHES = dict(_SMALL_PROFILE.model_hashes)
+
+def max_context_for(profile: str = DEFAULT_PROFILE) -> int:
+    return profile_for(profile).max_context
+
 
 # Bounds that keep one forecast cheap and reproducible.
 MIN_LOOKBACK_BARS = 32
@@ -88,32 +168,44 @@ def isolated_model_dir() -> Path:
 RUNNER_PATH = Path(__file__).resolve().parents[1] / "forecast" / "kronos_runner.py"
 
 
-def verify_artifacts(source_dir: Path, model_dir: Path) -> tuple[str | None, dict[str, str]]:
-    """Check the pinned files by content; returns (problem, verified hashes).
+def _profile_cache_key(profile: str) -> tuple[str, str, str]:
+    return (profile, "", "")
+
+
+def verify_artifacts(
+    source_dir: Path, model_dir: Path, profile: str = DEFAULT_PROFILE,
+) -> tuple[str | None, dict[str, str]]:
+    """Check the selected profile's pinned files by content.
 
     The result is memoized against each file's (size, mtime) signature: hashing
-    ~115 MB of weights on every API request would be wasteful, but a swapped or
+    the weights on every API request would be wasteful, but a swapped or
     re-downloaded file changes that signature and is re-hashed before use.
     """
-    signature = _signature(source_dir, model_dir)
-    cached = _VERIFY_CACHE.get((str(source_dir), str(model_dir)))
+    selected = profile_for(profile)
+    cache_key = _profile_cache_key(selected.name)
+    signature = _signature(source_dir, model_dir, selected)
+    cached = _VERIFY_CACHE.get((cache_key, str(source_dir), str(model_dir)))
     if cached is not None and cached[0] == signature:
         return cached[1], cached[2]
-    problem, verified = _verify_uncached(source_dir, model_dir)
-    _VERIFY_CACHE[(str(source_dir), str(model_dir))] = (signature, problem, verified)
+    problem, verified = _verify_uncached(source_dir, model_dir, selected)
+    _VERIFY_CACHE[(cache_key, str(source_dir), str(model_dir))] = (
+        signature, problem, verified,
+    )
     return problem, verified
 
 
 _VERIFY_CACHE: dict[
-    tuple[str, str], tuple[tuple[tuple[str, int, int], ...], str | None, dict[str, str]]
+    tuple[tuple[str, str, str], str, str],
+    tuple[tuple[tuple[str, int, int], ...], str | None, dict[str, str]],
 ] = {}
 
 
-def _signature(source_dir: Path, model_dir: Path) -> tuple[tuple[str, int, int], ...]:
+def _signature(
+    source_dir: Path, model_dir: Path, profile: ArtifactProfile = _SMALL_PROFILE,
+) -> tuple[tuple[str, int, int], ...]:
     entries = []
-    for relative in (*PINNED_SOURCE_HASHES, *PINNED_WEIGHT_HASHES):
-        root = source_dir if relative in PINNED_SOURCE_HASHES else model_dir
-        path = root / relative
+    for relative in (*profile.source_hashes, *profile.model_hashes):
+        path = (source_dir if relative in profile.source_hashes else model_dir) / relative
         try:
             stat = path.stat()
             entries.append((relative, stat.st_size, stat.st_mtime_ns))
@@ -122,9 +214,11 @@ def _signature(source_dir: Path, model_dir: Path) -> tuple[tuple[str, int, int],
     return tuple(entries)
 
 
-def _verify_uncached(source_dir: Path, model_dir: Path) -> tuple[str | None, dict[str, str]]:
+def _verify_uncached(
+    source_dir: Path, model_dir: Path, profile: ArtifactProfile = _SMALL_PROFILE,
+) -> tuple[str | None, dict[str, str]]:
     verified: dict[str, str] = {}
-    for relative, expected in PINNED_SOURCE_HASHES.items():
+    for relative, expected in profile.source_hashes.items():
         path = source_dir / relative
         if not path.exists():
             return f"pinned Kronos source file is missing: {relative}", verified
@@ -136,49 +230,60 @@ def _verify_uncached(source_dir: Path, model_dir: Path) -> tuple[str | None, dic
                 f"{actual} != {expected}",
                 verified,
             )
-    for relative, expected in PINNED_WEIGHT_HASHES.items():
+    for relative, expected in profile.model_hashes.items():
         path = model_dir / relative
         if not path.exists():
-            return f"pinned Kronos weight file is missing: {relative}", verified
+            return f"pinned Kronos artifact file is missing: {relative}", verified
         actual = _sha256(path)
         verified[relative] = actual
         if actual != expected:
             return (
-                f"pinned Kronos weight hash mismatch for {relative}: "
+                f"pinned Kronos artifact hash mismatch for {relative}: "
                 f"{actual} != {expected}",
                 verified,
             )
     return None, verified
 
 
-def artifact_digest() -> str:
-    """A stable digest of the pinned source/weight hashes this adapter expects."""
-    parts = [SOURCE_REVISION, MODEL_REVISION, TOKENIZER_REVISION]
-    parts.extend(f"{name}:{digest}" for name, digest in sorted(PINNED_SOURCE_HASHES.items()))
-    parts.extend(f"{name}:{digest}" for name, digest in sorted(PINNED_WEIGHT_HASHES.items()))
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+def artifact_digest(profile: str = DEFAULT_PROFILE) -> str:
+    """A stable digest of one profile's pinned source/config/weight hashes."""
+    selected = profile_for(profile)
+    return _digest(selected, selected.source_hashes, selected.model_hashes)
 
 
-def artifact_digest_from(verified: dict[str, str]) -> str | None:
-    """The digest of the hashes that were ACTUALLY checked, or None.
-
-    ``artifact_digest()`` describes the pins a run is ALLOWED under; this
-    describes what a run verified on disk. A result may only carry this digest
-    when ``verify_artifacts`` succeeded — an expected hash must never be
-    labelled as one that was checked.
-    """
-    required = set(PINNED_SOURCE_HASHES) | set(PINNED_WEIGHT_HASHES)
+def artifact_digest_from(
+    verified: dict[str, str], profile: str = DEFAULT_PROFILE,
+) -> str | None:
+    """Digest only the source/config/weight hashes that were actually checked."""
+    selected = profile_for(profile)
+    required = set(selected.source_hashes) | set(selected.model_hashes)
     if not required.issubset(verified):
         return None
-    parts = [SOURCE_REVISION, MODEL_REVISION, TOKENIZER_REVISION]
-    parts.extend(f"{name}:{verified[name]}" for name in sorted(PINNED_SOURCE_HASHES))
-    parts.extend(f"{name}:{verified[name]}" for name in sorted(PINNED_WEIGHT_HASHES))
+    source_hashes = {name: verified[name] for name in selected.source_hashes}
+    model_hashes = {name: verified[name] for name in selected.model_hashes}
+    return _digest(selected, source_hashes, model_hashes)
+
+
+def _digest(
+    profile: ArtifactProfile,
+    source_hashes: Mapping[str, str],
+    model_hashes: Mapping[str, str],
+) -> str:
+    parts = [
+        profile.name, profile.source_revision,
+        f"{profile.model_repo}@{profile.model_revision}",
+        f"{profile.tokenizer_repo}@{profile.tokenizer_revision}",
+    ]
+    parts.extend(f"{name}:{digest}" for name, digest in sorted(source_hashes.items()))
+    parts.extend(f"{name}:{digest}" for name, digest in sorted(model_hashes.items()))
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 __all__ = [
+    "ArtifactProfile",
     "DEFAULT_LOOKBACK_BARS",
     "DEFAULT_PATHS",
+    "DEFAULT_PROFILE",
     "MAX_HORIZON_BARS",
     "MAX_LOOKBACK_BARS",
     "MAX_PATHS",
@@ -188,6 +293,7 @@ __all__ = [
     "MODEL_REVISION",
     "PINNED_SOURCE_HASHES",
     "PINNED_WEIGHT_HASHES",
+    "PROFILES",
     "RUNNER_PATH",
     "SOURCE_REVISION",
     "TIMEFRAME_HOURS",
@@ -198,5 +304,7 @@ __all__ = [
     "isolated_model_dir",
     "isolated_python",
     "isolated_source_dir",
+    "max_context_for",
+    "profile_for",
     "verify_artifacts",
 ]

@@ -4,6 +4,8 @@ import { useT, type Messages } from "@/lib/i18n";
 import type { SettingRow, SettingValue } from "./types";
 import { fieldTypeOf } from "./use-settings";
 
+const KRONOS_PROFILE_OPTIONS = ["small_base", "mini_2k"] as const;
+
 function formatDefault(t: Messages, row: SettingRow): string {
   if (fieldTypeOf(row.type) === "bool")
     return row.default === true ? t.settings.field.defaultOn : t.settings.field.defaultOff;
@@ -34,6 +36,7 @@ export function SettingField({
     meta?.unit && fieldType !== "bool" ? `${id}-unit` : null,
     error ? `${id}-error` : null,
   ].filter(Boolean).join(" ") || undefined;
+  const isKronosProfile = row.key === "kronos_active_profile";
 
   return (
     <div className="grid gap-2 border-t py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_minmax(0,340px)] sm:items-center sm:gap-4">
@@ -77,6 +80,21 @@ export function SettingField({
               {value === true ? t.common.on : t.common.off}
             </span>
           </label>
+        ) : isKronosProfile ? (
+          <select
+            id={id}
+            value={typeof value === "string" ? value : ""}
+            onChange={(event) => onChange(event.target.value)}
+            aria-invalid={error ? true : undefined}
+            aria-describedby={describedBy}
+            className="h-11 w-full min-w-0 rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 aria-[invalid=true]:border-destructive"
+          >
+            {KRONOS_PROFILE_OPTIONS.map((profile) => (
+              <option key={profile} value={profile}>
+                {t.settings.kronos.profileOptions[profile]}
+              </option>
+            ))}
+          </select>
         ) : (
           <span className="flex min-w-0 flex-1 items-center gap-2">
             <input

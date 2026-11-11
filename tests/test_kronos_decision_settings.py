@@ -31,6 +31,7 @@ from tradingagents.default_config import _ENV_OVERRIDES, DEFAULT_CONFIG
 pytestmark = pytest.mark.unit
 
 _TUNING_KEYS = (
+    "kronos_active_profile",
     "kronos_active_mode",
     "kronos_active_timeframe",
     "kronos_active_horizon_hours",
@@ -41,6 +42,82 @@ _TUNING_KEYS = (
     "kronos_active_failure_policy",
     "kronos_active_max_band_spread_ratio",
 )
+
+
+def test_operator_status_reports_invalid_profile_as_unavailable(client, monkeypatch):
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    config = {**DEFAULT_CONFIG, "kronos_active_profile": "invalid-profile"}
+    monkeypatch.setattr("server.operator_config.get_config", lambda: config)
+    response = client.get("/api/operator-config")
+    assert response.status_code == 200, response.text
+    kronos = response.json()["kronos"]
+    assert kronos["profile_id"] == "invalid-profile"
+    assert kronos["readiness"]["status"] == "unavailable"
+    assert "unknown Kronos profile" in kronos["readiness"]["reason"]
+    assert kronos["settings_problem"]
+    assert kronos["max_context"] is None
+    assert kronos["model"]["repo"] == ""
+
+
+def test_supported_kronos_profiles_are_closed_model_tokenizer_pairs():
+    from tradingagents.forecast.artifact import PROFILES, profile_for
+
+    assert set(PROFILES) == {"small_base", "mini_2k"}
+    assert profile_for("small_base").model_repo == "NeoQuasar/Kronos-small"
+    assert profile_for("small_base").tokenizer_repo == "NeoQuasar/Kronos-Tokenizer-base"
+    assert profile_for("small_base").max_context == 512
+    assert profile_for("mini_2k").model_repo == "NeoQuasar/Kronos-mini"
+    assert profile_for("mini_2k").tokenizer_repo == "NeoQuasar/Kronos-Tokenizer-2k"
+    assert profile_for("mini_2k").max_context == 2048
+    with pytest.raises(ValueError, match="unknown Kronos profile"):
+        profile_for("model-only")
+
+
+def test_profile_controls_lookback_bound_and_cache_parameters():
+    from tradingagents.forecast.settings import ForecastSettings
+
+    assert ForecastSettings(profile="small_base", lookback_bars=512).settings_problem() is None
+    assert ForecastSettings(profile="small_base", lookback_bars=513).settings_problem()
+    assert ForecastSettings(profile="mini_2k", lookback_bars=2048).settings_problem() is None
+    assert ForecastSettings(profile="mini_2k", lookback_bars=2049).settings_problem()
+    assert ForecastSettings(profile="mini_2k").as_params()["profile"] == "mini_2k"
+
+
+def test_settings_api_validates_profile_and_lookback_as_one_prospective_config(client):
+    response = client.put(
+        "/api/settings",
+        json={"settings": {
+            "kronos_active_profile": "mini_2k",
+            "kronos_active_lookback_bars": 2048,
+        }},
+    )
+    assert response.status_code == 200, response.text
+    from tradingagents.dataflows.config import get_config
+
+    assert get_config()["kronos_active_profile"] == "mini_2k"
+    assert get_config()["kronos_active_lookback_bars"] == 2048
+
+    invalid = client.put(
+        "/api/settings",
+        json={"settings": {"kronos_active_profile": "small_base"}},
+    )
+    assert invalid.status_code == 422, invalid.text
+    fields = invalid.json()["error"]["details"]["fields"]
+    assert "kronos_active_lookback_bars" in fields
+    assert get_config()["kronos_active_profile"] == "mini_2k"
+    assert get_config()["kronos_active_lookback_bars"] == 2048
+
+
+def test_unknown_profile_is_refused_before_settings_mutation(client):
+    response = client.put(
+        "/api/settings",
+        json={"settings": {"kronos_active_profile": "unknown"}},
+    )
+    assert response.status_code == 422, response.text
+    fields = response.json()["error"]["details"]["fields"]
+    assert "kronos_active_profile" in fields
+
 
 
 def test_the_shipped_default_is_off():

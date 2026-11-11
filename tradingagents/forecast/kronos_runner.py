@@ -48,6 +48,22 @@ import platform
 import sys
 import time
 
+_ALLOWED_PROFILES = {"small_base", "mini_2k"}
+
+
+def _profile_metadata(payload: dict) -> dict:
+    profile = payload.get("profile")
+    if profile not in _ALLOWED_PROFILES:
+        raise ValueError(f"unknown Kronos profile {profile!r}")
+    fields = (
+        "profile", "model_repo", "tokenizer_repo", "model_revision",
+        "tokenizer_revision", "max_context",
+    )
+    metadata = {field: payload.get(field) for field in fields}
+    if any(metadata[field] is None for field in fields):
+        raise ValueError("Kronos request is missing profile metadata")
+    return metadata
+
 
 def _sha256(path: str) -> str:
     digest = hashlib.sha256()
@@ -57,7 +73,7 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _answer(payload, predictor, device, torch, model_dir, load_ms):
+def _answer(payload, predictor, device, torch, model_dir, load_ms, metadata):
     import numpy as np
     import pandas as pd
 
@@ -142,10 +158,6 @@ def _answer(payload, predictor, device, torch, model_dir, load_ms):
         "torch": torch.__version__,
         "device": device,
         "python": platform.python_version(),
-        "system": {
-            "tokenizer_sha256": _sha256(f"{model_dir}/Kronos-Tokenizer-base/model.safetensors"),
-            "model_sha256": _sha256(f"{model_dir}/Kronos-small/model.safetensors"),
-        },
         "params": {
             "paths": path_count,
             "pred_len": pred_len,
@@ -153,6 +165,21 @@ def _answer(payload, predictor, device, torch, model_dir, load_ms):
             "temperature": temperature,
             "top_p": top_p,
             "sample_count_per_path": 1,
+        },
+        "metadata": metadata,
+        "system": {
+            "model_sha256": _sha256(
+                f"{model_dir}/{metadata['model_repo'].rsplit('/', 1)[-1]}/model.safetensors"
+            ),
+            "tokenizer_sha256": _sha256(
+                f"{model_dir}/{metadata['tokenizer_repo'].rsplit('/', 1)[-1]}/model.safetensors"
+            ),
+            "model_config_sha256": _sha256(
+                f"{model_dir}/{metadata['model_repo'].rsplit('/', 1)[-1]}/config.json"
+            ),
+            "tokenizer_config_sha256": _sha256(
+                f"{model_dir}/{metadata['tokenizer_repo'].rsplit('/', 1)[-1]}/config.json"
+            ),
         },
     }
 
@@ -164,17 +191,22 @@ def main() -> int:
     if not first_request.strip():
         return 0
     payload = json.loads(first_request)
+    profile = _profile_metadata(payload)
     source_dir = payload["source_dir"]
     model_dir = payload["model_dir"]
+    model_name = profile["model_repo"].rsplit("/", 1)[-1]
+    tokenizer_name = profile["tokenizer_repo"].rsplit("/", 1)[-1]
 
     process_started = time.perf_counter()
     sys.path.insert(0, source_dir)
     from model import Kronos, KronosPredictor, KronosTokenizer
 
-    tokenizer = KronosTokenizer.from_pretrained(f"{model_dir}/Kronos-Tokenizer-base")
-    model = Kronos.from_pretrained(f"{model_dir}/Kronos-small")
+    tokenizer = KronosTokenizer.from_pretrained(f"{model_dir}/{tokenizer_name}")
+    model = Kronos.from_pretrained(f"{model_dir}/{model_name}")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+    predictor = KronosPredictor(
+        model, tokenizer, device=device, max_context=profile["max_context"],
+    )
     # The load is paid once per process; the FIRST request reports it, the rest
     # report the warm ~0.3 s load the measured decomposition showed.
     load_ms = (time.perf_counter() - process_started) * 1000.0
@@ -197,7 +229,7 @@ def main() -> int:
         try:
             answer = _answer(
                 payload, predictor, device, torch, model_dir,
-                pending_load_ms,
+                pending_load_ms, profile,
             )
         except Exception as exc:  # one bad request must not kill the warm child
             answer = {"error": f"{type(exc).__name__}: {exc}"}

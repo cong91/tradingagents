@@ -36,6 +36,7 @@ class ForecastBlock:
     per_path_samples: int = 1
     generation_kind: str | None = None
     temperature: float | None = None
+    profile: str | None = None
     model_revision: str | None = None
     artifact_hash: str | None = None
     latency_ms: float | None = None
@@ -77,6 +78,7 @@ class ForecastBlock:
             "per_path_samples": self.per_path_samples,
             "generation_kind": self.generation_kind,
             "temperature": self.temperature,
+            "profile": self.profile,
             "model_revision": self.model_revision,
             "artifact_hash": self.artifact_hash,
             "latency_ms": self.latency_ms,

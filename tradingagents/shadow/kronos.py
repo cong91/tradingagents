@@ -26,6 +26,7 @@ from typing import Any
 from tradingagents.forecast.artifact import (
     DEFAULT_LOOKBACK_BARS,
     DEFAULT_PATHS,
+    DEFAULT_PROFILE,
     MAX_HORIZON_BARS,
     MAX_LOOKBACK_BARS,
     MAX_PATHS,
@@ -43,6 +44,7 @@ from tradingagents.forecast.artifact import (
     isolated_model_dir,
     isolated_python,
     isolated_source_dir,
+    profile_for,
     verify_artifacts,
 )
 from tradingagents.forecast.contract import (
@@ -71,6 +73,7 @@ _TIMEFRAME_HOURS = TIMEFRAME_HOURS
 class KronosSettings:
     """The knobs that must be identical between two comparable observations."""
 
+    profile: str = DEFAULT_PROFILE
     paths: int = DEFAULT_PATHS
     lookback_bars: int = DEFAULT_LOOKBACK_BARS
     temperature: float = 1.0
@@ -78,17 +81,20 @@ class KronosSettings:
     contexts: tuple[str, ...] = ()
 
     def as_params(self) -> dict[str, Any]:
+        profile = profile_for(self.profile)
         return {
+            "profile": self.profile,
             "paths": self.paths,
             "lookback_bars": self.lookback_bars,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "max_context": MAX_LOOKBACK_BARS,
+            "max_context": profile.max_context,
         }
 
     def sampler_settings(self) -> SamplerSettings:
         return SamplerSettings(
-            paths=max(MIN_PATHS, self.paths), temperature=self.temperature, top_p=self.top_p,
+            profile=self.profile, paths=max(MIN_PATHS, self.paths),
+            temperature=self.temperature, top_p=self.top_p,
         )
 
 
@@ -99,7 +105,6 @@ class KronosProvider:
     distribution_kind = DISTRIBUTION_MODEL
     calibration_label = CALIBRATION_SAMPLE_RATIO
     source_revision = SOURCE_REVISION
-    model_revision = f"{MODEL_REPO}@{MODEL_REVISION[:12]}+{TOKENIZER_REPO}@{TOKENIZER_REVISION[:12]}"
 
     def __init__(
         self,
@@ -120,6 +125,14 @@ class KronosProvider:
         # verification succeeds, before any row that records it exists.
         self.artifact_hash: str | None = None
 
+    @property
+    def model_revision(self) -> str:
+        profile = profile_for(self.settings.profile)
+        return (
+            f"{profile.model_repo}@{profile.model_revision[:12]}+"
+            f"{profile.tokenizer_repo}@{profile.tokenizer_revision[:12]}"
+        )
+
     # -- availability -------------------------------------------------------
 
     def unavailable_reason(self) -> str | None:
@@ -133,11 +146,12 @@ class KronosProvider:
         problem, verified = verify_artifacts(
             self._source_dir or isolated_source_dir(),
             self._model_dir or isolated_model_dir(),
+            self.settings.profile,
         )
         if problem is None:
             # The recorded hash must be the one ACTUALLY checked on disk, not
             # merely the expected pins — an expected hash is not a checked one.
-            self.artifact_hash = artifact_digest_from(verified)
+            self.artifact_hash = artifact_digest_from(verified, self.settings.profile)
         return problem
 
     # -- forecasting --------------------------------------------------------
@@ -178,6 +192,7 @@ class KronosProvider:
             )
         settings = self.settings.sampler_settings()
         settings = SamplerSettings(
+            profile=settings.profile,
             paths=settings.paths, temperature=settings.temperature, top_p=settings.top_p,
             chunk_deadline_seconds=self.deadline_seconds,
         )
@@ -240,6 +255,7 @@ def _attempt_from_paths(
             **request.params,
             "paths": len(summaries),
             "temperature": None,
+            "profile": request.params.get("profile", DEFAULT_PROFILE),
         },
     )
 

@@ -9,11 +9,8 @@ from typing import Any, Protocol
 
 from tradingagents.dataflows.market_data import Candle
 from tradingagents.forecast.artifact import (
-    MODEL_REPO,
-    MODEL_REVISION,
     TIMEFRAME_HOURS,
-    TOKENIZER_REPO,
-    TOKENIZER_REVISION,
+    profile_for,
 )
 from tradingagents.forecast.block import CandleSeries, ForecastBlock
 from tradingagents.forecast.cache import ForecastCache, cache_key, content_digest
@@ -107,7 +104,14 @@ class KronosForecastService:
     provider_id = "kronos"
     distribution_kind = DISTRIBUTION_MODEL
     calibration_label = CALIBRATION_SAMPLE_RATIO
-    model_revision = f"{MODEL_REPO}@{MODEL_REVISION[:12]}+{TOKENIZER_REPO}@{TOKENIZER_REVISION[:12]}"
+
+    @property
+    def model_revision(self) -> str:
+        profile = profile_for(self.settings.profile)
+        return (
+            f"{profile.model_repo}@{profile.model_revision[:12]}+"
+            f"{profile.tokenizer_repo}@{profile.tokenizer_revision[:12]}"
+        )
 
     def __init__(
         self,
@@ -153,12 +157,18 @@ class KronosForecastService:
             isolated_model_dir,
             isolated_python,
             isolated_source_dir,
+            profile_for,
             verify_artifacts,
         )
 
         settings = settings_from_config(config)
         source_dir, model_dir = isolated_source_dir(), isolated_model_dir()
-        problem, verified = verify_artifacts(source_dir, model_dir)
+        try:
+            profile_for(settings.profile)
+        except ValueError as exc:
+            problem, verified = str(exc), {}
+        else:
+            problem, verified = verify_artifacts(source_dir, model_dir, settings.profile)
         # Consumed here either way: a caller's budget must never leak into the
         # constructor as an unexpected keyword when verification failed.
         deadline = kwargs.pop("chunk_deadline_seconds", None)
@@ -167,6 +177,7 @@ class KronosForecastService:
             sampler_settings = settings.sampler_settings()
             if deadline is not None:
                 sampler_settings = SamplerSettings(
+                    profile=sampler_settings.profile,
                     paths=sampler_settings.paths, temperature=sampler_settings.temperature,
                     top_p=sampler_settings.top_p, max_batch_rows=sampler_settings.max_batch_rows,
                     chunk_deadline_seconds=min(sampler_settings.chunk_deadline_seconds, float(deadline)),
@@ -178,7 +189,7 @@ class KronosForecastService:
         venue = str(config.get("exec_exchange_id") or "")
         return cls(
             sampler=sampler, settings=settings,
-            artifact_hash=artifact_digest_from(verified) if problem is None else None,
+            artifact_hash=artifact_digest_from(verified, settings.profile) if problem is None else None,
             artifact_problem=problem, venue=venue, **kwargs,
         )
 
@@ -333,6 +344,7 @@ class KronosForecastService:
             ),
             temperature=settings.temperature,
             model_revision=self.model_revision,
+            profile=settings.profile,
             artifact_hash=self.artifact_hash,
             latency_ms=sampled.duration_ms,
             created_at=created.isoformat(),

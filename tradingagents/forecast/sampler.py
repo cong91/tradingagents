@@ -43,11 +43,13 @@ from typing import Any
 
 from tradingagents.dataflows.market_data import Candle
 from tradingagents.forecast.artifact import (
+    DEFAULT_PROFILE,
     MAX_HORIZON_BARS,
     MAX_PATHS,
     MIN_PATHS,
     RUNNER_PATH,
     TIMEFRAME_HOURS,
+    profile_for,
 )
 
 # Rows per child request: 5 symbols x 16 paths measured 874 MiB peak against
@@ -68,6 +70,7 @@ class SamplerError(RuntimeError):
 class SamplerSettings:
     """The knobs a forecast is drawn under; part of every cache identity."""
 
+    profile: str = DEFAULT_PROFILE
     paths: int = MIN_PATHS
     temperature: float = 0.5
     top_p: float = 0.9
@@ -78,6 +81,7 @@ class SamplerSettings:
 
     def as_params(self) -> dict[str, Any]:
         return {
+            "profile": self.profile,
             "paths": self.paths,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -111,6 +115,7 @@ def validate_settings(settings: SamplerSettings) -> str | None:
     reportable with its counts. It is NOT evidence of predictive skill, and the
     ratio stays a sample ratio, never a calibrated probability.
     """
+    profile_for(settings.profile)
     if settings.paths < MIN_PATHS:
         return (
             f"paths={settings.paths} is below the {MIN_PATHS}-path floor; a ratio "
@@ -400,6 +405,7 @@ class KronosSampler:
                 ],
             })
         self._request_counter += 1
+        profile = profile_for(self.settings.profile)
         return {
             # The id lets the parent prove the line it read answers the request
             # it just sent — banners and stale lines are skipped, not trusted.
@@ -413,6 +419,24 @@ class KronosSampler:
             "top_p": self.settings.top_p,
             "source_dir": str(self._source_dir),
             "model_dir": str(self._model_dir),
+            "profile": profile.name,
+            "model_repo": profile.model_repo,
+            "tokenizer_repo": profile.tokenizer_repo,
+            "model_revision": profile.model_revision,
+            "tokenizer_revision": profile.tokenizer_revision,
+            "max_context": profile.max_context,
+            "model_sha256": profile.model_hashes[
+                f"{profile.model_repo.rsplit('/', 1)[-1]}/model.safetensors"
+            ],
+            "tokenizer_sha256": profile.model_hashes[
+                f"{profile.tokenizer_repo.rsplit('/', 1)[-1]}/model.safetensors"
+            ],
+            "model_config_sha256": profile.model_hashes[
+                f"{profile.model_repo.rsplit('/', 1)[-1]}/config.json"
+            ],
+            "tokenizer_config_sha256": profile.model_hashes[
+                f"{profile.tokenizer_repo.rsplit('/', 1)[-1]}/config.json"
+            ],
         }
 
     # The pinned upstream model prints load banners (e.g. "Loading weights from
@@ -483,6 +507,10 @@ class KronosSampler:
         *,
         pred_len: int,
     ) -> list[SampledSymbol]:
+        expected = profile_for(self.settings.profile)
+        metadata_problem = _response_metadata_problem(result, expected)
+        if metadata_problem is not None:
+            return [self._failed(symbol, "error", metadata_problem) for symbol, *_ in chunk]
         raw = result.get("paths")
         duration_ms = result.get("duration_ms")
         params = {
@@ -524,6 +552,45 @@ class KronosSampler:
     @staticmethod
     def _failed(symbol: str, status: str, reason: str) -> SampledSymbol:
         return SampledSymbol(symbol=symbol, status=status, reason=reason)
+
+
+def _response_metadata_problem(result: dict[str, Any], expected: Any) -> str | None:
+    """Reject a child answer that claims a different selected artifact profile."""
+    fields = {
+        "profile": expected.name,
+        "model_revision": expected.model_revision,
+        "tokenizer_revision": expected.tokenizer_revision,
+        "model_repo": expected.model_repo,
+        "tokenizer_repo": expected.tokenizer_repo,
+        "max_context": expected.max_context,
+    }
+    metadata = result.get("metadata")
+    if not isinstance(metadata, dict):
+        return "Kronos response is missing profile metadata"
+    for name, value in fields.items():
+        if metadata.get(name) != value:
+            return f"Kronos response metadata {name}={metadata.get(name)!r} does not match {value!r}"
+    system = result.get("system")
+    if not isinstance(system, dict):
+        return "Kronos response is missing artifact hashes"
+    expected_hashes = {
+        "model_sha256": expected.model_hashes[
+            f"{expected.model_repo.rsplit('/', 1)[-1]}/model.safetensors"
+        ],
+        "tokenizer_sha256": expected.model_hashes[
+            f"{expected.tokenizer_repo.rsplit('/', 1)[-1]}/model.safetensors"
+        ],
+        "model_config_sha256": expected.model_hashes[
+            f"{expected.model_repo.rsplit('/', 1)[-1]}/config.json"
+        ],
+        "tokenizer_config_sha256": expected.model_hashes[
+            f"{expected.tokenizer_repo.rsplit('/', 1)[-1]}/config.json"
+        ],
+    }
+    for name, value in expected_hashes.items():
+        if system.get(name) != value:
+            return f"Kronos response artifact hash {name}={system.get(name)!r} does not match the selected profile"
+    return None
 
 
 def _entry_problem(

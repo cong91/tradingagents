@@ -66,6 +66,7 @@ const settingMetaVi = {
   exec_base_url: { label: "URL sàn đang dùng", hint: "Chỉ đọc. Đổi endpoint và đúng cặp API key/secret trong .env rồi khởi động lại backend để chuyển Demo/production." },
   exec_sandbox: { label: "Sandbox cho sàn khác Binance", hint: "Binance chọn Demo hoặc production bằng URL phía trên; chế độ này chỉ áp dụng các sàn khác." },
   kronos_active_mode: { label: "Chế độ dự báo Kronos", hint: "context_only: khối dự báo chỉ là dữ liệu ngữ cảnh trước khi Trader/PM quyết định; không có chế độ lọc theo hướng." },
+  kronos_active_profile: { label: "Hồ sơ model Kronos", hint: "Chỉ chọn một cặp model/tokenizer đã được kiểm chứng; thay đổi áp dụng cho phiên chu kỳ mới." },
   kronos_active_timeframe: { label: "Khung nến dự báo", hint: "Nến đóng của khung này là đầu vào; 1h hoặc 4h." },
   kronos_active_horizon_hours: { label: "Chu kỳ dự báo", unit: "giờ", hint: "Phải là bội của khung nến và trong giới hạn 72 nến của model." },
   kronos_active_paths: { label: "Số đường mẫu", hint: "Từ 16 đến 32; dưới 16 service từ chối thay vì báo một tỉ lệ mẫu." },
@@ -138,6 +139,7 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   exec_base_url: { label: "Active exchange URL", hint: "Read-only. Change the endpoint and the matching API key/secret in .env, then restart the backend to switch Demo/production." },
   exec_sandbox: { label: "Sandbox for non-Binance exchanges", hint: "Binance picks Demo or production via the URL above; this mode only applies to other exchanges." },
   kronos_active_mode: { label: "Kronos forecast mode", hint: "context_only: the forecast block is decision-context data before the Trader/PM decide; there is no direction-filter mode." },
+  kronos_active_profile: { label: "Kronos model profile", hint: "Choose one verified model/tokenizer pair; changes apply to new cycles." },
   kronos_active_timeframe: { label: "Forecast timeframe", hint: "Closed candles of this timeframe feed the model; 1h or 4h." },
   kronos_active_horizon_hours: { label: "Forecast horizon", unit: "hours", hint: "Must be a whole number of timeframe bars and inside the model's 72-bar bound." },
   kronos_active_paths: { label: "Sample paths", hint: "16 to 32; below 16 the service refuses instead of reporting a sample ratio." },
@@ -203,6 +205,10 @@ export const vi = {
           ? "pass_through: chu kỳ tiếp tục KHÔNG có dự báo; lỗi vẫn được ghi rõ trong ngữ cảnh — không có dự báo không phải “đã kiểm tra”."
           : `Chính sách hiện tại: ${policy}.`,
     modelLabel: "Model ghim",
+    profileOptions: {
+      small_base: "Kronos-small + Kronos-Tokenizer-base",
+      mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
+    },
     scopeLabel: "Phạm vi dự báo",
     scopeValue: (timeframe: string, horizon: string, paths: string, temperature: string, lookback: string, batch: string, band: string) =>
       `${timeframe} nến đóng · horizon ${horizon}h · ${paths} đường mẫu · T=${temperature} · lookback ${lookback} nến · batch ${batch} dòng · band ≤ ${band}`,
@@ -578,6 +584,10 @@ export const en: typeof vi = {
           ? "pass_through: the cycle continues WITHOUT a forecast; the failure is stated in its context — a missing forecast is not a passed check."
           : `Current policy: ${policy}.`,
     modelLabel: "Pinned model",
+    profileOptions: {
+      small_base: "Kronos-small + Kronos-Tokenizer-base",
+      mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
+    },
     scopeLabel: "Forecast scope",
     scopeValue: (timeframe, horizon, paths, temperature, lookback, batch, band) =>
       `${timeframe} closed candles · horizon ${horizon}h · ${paths} sample paths · T=${temperature} · lookback ${lookback} bars · batch ${batch} rows · band ≤ ${band}`,

@@ -197,7 +197,8 @@ async def put_settings(request: Request):
     if kronos_fields:
         from tradingagents.forecast.settings import tuning_problems
 
-        problems = tuning_problems(validated, get_config())
+        current_config = get_config()
+        problems = tuning_problems(validated, current_config)
         if problems:
             raise ApiError(
                 422, "validation_error",

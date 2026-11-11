@@ -45,9 +45,14 @@ SETTINGS_FIXTURE_SCRIPT = r"""
       max_batch_rows: 80, failure_policy: "defer", max_band_spread_ratio: 0.15,
       settings_problem: null,
       readiness: {status: "unavailable", reason: "fixture model unavailable"},
-      model: {source_revision: "source", model_revision: "revision123456789", repo: "thuml/Kronos"}},
+      profile_id: "small_base", max_context: 512, lookback_min: 32, lookback_max: 512,
+      model: {source_revision: "source", model_revision: "revision123456789",
+        repo: "NeoQuasar/Kronos-small", tokenizer_repo: "NeoQuasar/Kronos-Tokenizer-base",
+        tokenizer_revision: "tokenizer-revision"}},
   });
   const settingRows = [
+    {key: "kronos_active_profile", env_var: "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE", value: "small_base",
+      default: "small_base", type: "str", editable: true, source: "default"},
     {key: "kronos_active_paths", env_var: "TRADINGAGENTS_KRONOS_ACTIVE_PATHS", value: 16,
       default: 16, type: "int", editable: true, source: "default"},
   ];
@@ -84,10 +89,13 @@ SETTINGS_FIXTURE_SCRIPT = r"""
     if (path === "/api/settings" && method === "GET") return json(settingsPayload());
     if (path === "/api/settings" && method === "PUT") {
       const body = JSON.parse(init.body);
-      if (body.settings.kronos_active_paths < 16) return json({error: {
+      if (body.settings.kronos_active_paths !== undefined && body.settings.kronos_active_paths < 16) return json({error: {
         code: "validation_error", message: "invalid Kronos tuning", details: {
           fields: {kronos_active_paths: "paths must be between 16 and 32"}}}}, 422);
-      settingRows[0].value = body.settings.kronos_active_paths;
+      for (const [key, value] of Object.entries(body.settings)) {
+        const setting = settingRows.find(row => row.key === key);
+        if (setting) setting.value = value;
+      }
       return json({...settingsPayload(), applied_at: "2026-11-11T12:01:00Z"});
     }
     if (path === "/api/health") return json({halted_today: false, audit_log_readable: true});
@@ -201,6 +209,33 @@ function reap(child) {
     check(!initial.inAutomation, 'Kronos switch appeared in Automation beside Auto modes');
     check(initial.auto && !initial.futures, 'fixture Auto initial state incorrect');
     check(initial.aria.includes('operator-kronos_active_enabled-status'), 'switch status relationship missing');
+    await until(() => get('document.getElementById("setting-kronos_active_profile") !== null'), 'Kronos profile select');
+    const profileOptions = await get(`Array.from(document.getElementById('setting-kronos_active_profile').options)
+      .map(option => ({value: option.value, label: option.textContent.trim()}))`);
+    check(profileOptions.length === 2 && profileOptions[0].value === 'small_base' && profileOptions[1].value === 'mini_2k',
+      'profile dropdown options must be closed to verified profiles');
+    check(/Kronos-small/.test(profileOptions[0].label) && /Kronos-Tokenizer-base/.test(profileOptions[0].label),
+      'small_base label must name both model and tokenizer');
+    check(/Kronos-mini/.test(profileOptions[1].label) && /Kronos-Tokenizer-2k/.test(profileOptions[1].label),
+      'mini_2k label must name both model and tokenizer');
+
+    await evaluate(`document.getElementById('setting-kronos_active_profile').value = 'mini_2k';
+      document.getElementById('setting-kronos_active_profile').dispatchEvent(new Event('change',{bubbles:true}));`);
+    const profileSave = `Array.from(document.querySelectorAll('#ai button')).find(button => button.textContent.includes('Save settings'))`;
+    await until(() => get('!' + profileSave + '.disabled'), 'profile save enabled');
+    await evaluate(profileSave + '.click()');
+    await until(() => get(`window.fixtureRequests.some(row => row.path === '/api/settings' && row.method === 'PUT' && row.body.settings.kronos_active_profile === 'mini_2k')`),
+      'generic Kronos profile settings PUT');
+    check(await get(`window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT').length === 0`),
+      'profile selection must not use operator-config or confirmation');
+    check(await get('document.getElementById("setting-kronos_active_profile").value === "mini_2k"'),
+      'saved profile value not reflected in field');
+    await evaluate(`document.getElementById('setting-kronos_active_profile').value = 'small_base';
+      document.getElementById('setting-kronos_active_profile').dispatchEvent(new Event('change',{bubbles:true}));`);
+    await until(() => get('!' + profileSave + '.disabled'), 'profile undo enabled');
+    const discardProfile = `Array.from(document.querySelectorAll('#ai button')).find(button => button.textContent.includes('Discard changes'))`;
+    await evaluate(discardProfile + '.click()');
+    await until(() => get('document.getElementById("setting-kronos_active_profile").value === "mini_2k"'), 'profile undo');
 
     await evaluate('document.getElementById("operator-kronos_active_enabled").click()');
     await until(() => get('document.getElementById("operator-forecast-reason") !== null'), 'Kronos confirmation');
@@ -277,7 +312,7 @@ function reap(child) {
       autoSpot: window.fixtureBackend.auto.auto_spot_enabled, autoFutures: window.fixtureBackend.auto.auto_futures_enabled,
       puts: window.fixtureRequests.filter(row=>row.path==='/api/settings'&&row.method==='PUT').length}))()`);
     check(domain.invalid === 'true' && /between 16 and 32/.test(domain.error), 'domain error not mapped to Kronos field');
-    check(domain.puts === 1 && domain.autoSpot && !domain.autoFutures, 'domain error mutated unrelated state');
+    check(domain.puts === 2 && domain.autoSpot && !domain.autoFutures, 'domain error mutated unrelated state');
     check(await get('window.__consoleErrors.length === 0'), 'browser console error: ' + await get('window.__consoleErrors'));
     process.stdout.write(JSON.stringify({result: 'pass', initial, saved, domain}));
   } finally {

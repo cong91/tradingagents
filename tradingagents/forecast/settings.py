@@ -8,12 +8,14 @@ from typing import Any
 
 from tradingagents.forecast.artifact import (
     DEFAULT_LOOKBACK_BARS,
+    DEFAULT_PROFILE,
     MAX_HORIZON_BARS,
-    MAX_LOOKBACK_BARS,
     MAX_PATHS,
     MIN_LOOKBACK_BARS,
     MIN_PATHS,
     TIMEFRAME_HOURS,
+    max_context_for,
+    profile_for,
 )
 from tradingagents.forecast.sampler import MAX_BATCH_ROWS, SamplerSettings, validate_settings
 
@@ -46,6 +48,7 @@ class ForecastSettings:
     """The whole configuration of one active forecast; part of the cache key."""
 
     enabled: bool = False
+    profile: str = DEFAULT_PROFILE
     mode: str = MODE_CONTEXT_ONLY
     timeframe: str = DEFAULT_TIMEFRAME
     horizon_hours: int = DEFAULT_HORIZON_HOURS
@@ -59,6 +62,7 @@ class ForecastSettings:
 
     def sampler_settings(self) -> SamplerSettings:
         return SamplerSettings(
+            profile=self.profile,
             paths=self.paths, temperature=self.temperature, top_p=self.top_p,
             max_batch_rows=self.max_batch_rows,
         )
@@ -69,6 +73,7 @@ class ForecastSettings:
         # ``unclear``, so it travels with the rest.
         return {
             "timeframe": self.timeframe,
+            "profile": self.profile,
             "horizon_hours": self.horizon_hours,
             "paths": self.paths,
             "temperature": self.temperature,
@@ -102,10 +107,15 @@ class ForecastSettings:
         bars = self.horizon_hours // hours
         if bars < 1 or bars > MAX_HORIZON_BARS:
             return f"horizon of {bars} bars exceeds the {MAX_HORIZON_BARS}-bar bound"
-        if self.lookback_bars < MIN_LOOKBACK_BARS or self.lookback_bars > MAX_LOOKBACK_BARS:
+        try:
+            max_context = max_context_for(self.profile)
+        except ValueError as exc:
+            return str(exc)
+        if self.lookback_bars < MIN_LOOKBACK_BARS or self.lookback_bars > max_context:
             return (
                 f"lookback_bars={self.lookback_bars} is outside the "
-                f"[{MIN_LOOKBACK_BARS}, {MAX_LOOKBACK_BARS}] window the model accepts"
+                f"[{MIN_LOOKBACK_BARS}, {max_context}] window for profile "
+                f"{self.profile!r}"
             )
         if self.max_batch_rows < 1 or self.max_batch_rows > MAX_BATCH_ROWS:
             return (
@@ -167,6 +177,7 @@ def settings_from_config(config: dict[str, Any]) -> ForecastSettings:
         band_spread = -1.0
     return ForecastSettings(
         enabled=value("kronos_active_enabled", defaults.enabled) is True,
+        profile=str(value("kronos_active_profile", defaults.profile)),
         mode=str(value("kronos_active_mode", defaults.mode)),
         timeframe=str(value("kronos_active_timeframe", defaults.timeframe)),
         horizon_hours=horizon,
@@ -181,6 +192,7 @@ def settings_from_config(config: dict[str, Any]) -> ForecastSettings:
 
 
 _TUNING_KEYS = (
+    "kronos_active_profile",
     "kronos_active_mode",
     "kronos_active_timeframe",
     "kronos_active_horizon_hours",
@@ -193,22 +205,38 @@ _TUNING_KEYS = (
 )
 
 
-def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
-    """Field -> reason for tuning values that cannot run, checked at the API.
+def prospective_tuning_config(
+    payload: dict[str, Any], config: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the effective config that would result from applying this payload."""
+    return {**config, **{key: payload[key] for key in _TUNING_KEYS if key in payload}}
 
-    Returns an empty dict when every written field is usable. This is the
-    boundary check: the settings API refuses BEFORE applying or persisting, so
-    a bad write can never land half-applied and surface later as a mysterious
-    ``unavailable``.
-    """
+
+def _lookback_for_config(config: dict[str, Any]) -> int:
+    try:
+        return int(config.get("kronos_active_lookback_bars", DEFAULT_LOOKBACK_BARS))
+    except (TypeError, ValueError):
+        return -1
+
+
+def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
+    """Field -> reason for tuning values that cannot run, checked at the API."""
     problems: dict[str, str] = {}
     for key in _TUNING_KEYS:
         if key not in payload:
             continue
         raw = payload[key]
-        if key in ("kronos_active_mode", "kronos_active_timeframe", "kronos_active_failure_policy"):
+        if key in (
+            "kronos_active_profile", "kronos_active_mode",
+            "kronos_active_timeframe", "kronos_active_failure_policy",
+        ):
             if not isinstance(raw, str) or not raw:
                 problems[key] = "expected a non-empty string"
+            elif key == "kronos_active_profile":
+                try:
+                    profile_for(raw)
+                except ValueError as exc:
+                    problems[key] = str(exc)
             elif key == "kronos_active_mode" and raw not in MODES:
                 problems[key] = f"unknown mode {raw!r}; supported: {list(MODES)}"
             elif key == "kronos_active_timeframe" and raw not in TIMEFRAME_HOURS:
@@ -220,8 +248,10 @@ def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str
                     f"unknown failure policy {raw!r}; supported: {list(FAILURE_POLICIES)}"
                 )
             continue
-        if key in ("kronos_active_horizon_hours", "kronos_active_paths",
-                   "kronos_active_lookback_bars", "kronos_active_max_batch_rows"):
+        if key in (
+            "kronos_active_horizon_hours", "kronos_active_paths",
+            "kronos_active_lookback_bars", "kronos_active_max_batch_rows",
+        ):
             if isinstance(raw, bool) or not isinstance(raw, int):
                 problems[key] = "expected an integer"
                 continue
@@ -254,13 +284,6 @@ def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str
                     "sampling budget, not a skill claim"
                 )
             continue
-        if key == "kronos_active_lookback_bars":
-            if raw < MIN_LOOKBACK_BARS or raw > MAX_LOOKBACK_BARS:
-                problems[key] = (
-                    f"lookback_bars={raw} is outside "
-                    f"[{MIN_LOOKBACK_BARS}, {MAX_LOOKBACK_BARS}]"
-                )
-            continue
         if key == "kronos_active_max_batch_rows":
             if raw < 1 or raw > MAX_BATCH_ROWS:
                 problems[key] = f"max_batch_rows={raw} is outside [1, {MAX_BATCH_ROWS}]"
@@ -269,8 +292,14 @@ def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str
             if not 0.0 < float(raw) <= 2.0:
                 problems[key] = f"temperature={raw} is outside (0, 2]"
             continue
-        if key == "kronos_active_max_band_spread_ratio":
-            if float(raw) <= 0:
-                problems[key] = f"max_band_spread_ratio={raw} must be positive"
-            continue
+        if key == "kronos_active_max_band_spread_ratio" and float(raw) <= 0:
+            problems[key] = f"max_band_spread_ratio={raw} must be positive"
+
+    merged = prospective_tuning_config(payload, config)
+    effective_problem = settings_from_config(merged).settings_problem()
+    if effective_problem is not None:
+        if "lookback" in effective_problem:
+            problems.setdefault("kronos_active_lookback_bars", effective_problem)
+        elif "profile" in effective_problem or "unknown Kronos profile" in effective_problem:
+            problems.setdefault("kronos_active_profile", effective_problem)
     return problems

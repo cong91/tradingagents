@@ -101,8 +101,14 @@ export function operatorGateKeys(settings: readonly OperatorSettingRow[]): Set<s
   return new Set(settings.filter((row) => row.gate).map((row) => row.key));
 }
 
+export type KronosProfileId = "small_base" | "mini_2k";
+
 export type KronosStatus = {
   enabled: boolean;
+  profile_id: KronosProfileId;
+  max_context: number | null;
+  lookback_min: number | null;
+  lookback_max: number | null;
   mode: string;
   timeframe: string;
   horizon_hours: number | null;
@@ -114,7 +120,13 @@ export type KronosStatus = {
   max_band_spread_ratio: number | null;
   settings_problem: string | null;
   readiness: { status: "ready" | "unavailable"; reason: string | null };
-  model: { source_revision: string; model_revision: string; repo: string };
+  model: {
+    source_revision: string;
+    model_revision: string;
+    repo: string;
+    tokenizer_repo: string;
+    tokenizer_revision: string;
+  };
 };
 
 /** Giá trị form ban đầu từ payload: dùng value đang hiệu lực. */

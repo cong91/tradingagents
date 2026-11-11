@@ -108,6 +108,7 @@ _ENV_OVERRIDES = {
     # ABSENT: it is a managed operator switch (control_operator_settings) with
     # confirmation, reason and audit, exactly like the Auto modes, so it is not
     # a plain engine setting an env var could arm.
+    "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE": "kronos_active_profile",
     "TRADINGAGENTS_KRONOS_ACTIVE_MODE": "kronos_active_mode",
     "TRADINGAGENTS_KRONOS_ACTIVE_TIMEFRAME": "kronos_active_timeframe",
     "TRADINGAGENTS_KRONOS_ACTIVE_HORIZON_HOURS": "kronos_active_horizon_hours",
@@ -419,6 +420,7 @@ def build_default_config() -> dict:
         # deliberately absent from _ENV_OVERRIDES. The tuning keys below are
         # engine settings: editable through PUT /api/settings.
         "kronos_active_enabled": False,
+        "kronos_active_profile": "small_base",
         "kronos_active_mode": "context_only",
         "kronos_active_timeframe": "4h",
         "kronos_active_horizon_hours": 24,

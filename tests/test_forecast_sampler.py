@@ -85,6 +85,20 @@ def main():
         pred = payload.get("pred_len", 2)
         seeds = payload.get("seeds", [])
         series = payload.get("requests", [])
+        metadata = {{
+            "profile": payload.get("profile", "small_base"),
+            "model_repo": payload.get("model_repo", "NeoQuasar/Kronos-small"),
+            "tokenizer_repo": payload.get("tokenizer_repo", "NeoQuasar/Kronos-Tokenizer-base"),
+            "model_revision": payload.get("model_revision", "901c26c1332695a2a8f243eb2f37243a37bea320"),
+            "tokenizer_revision": payload.get("tokenizer_revision", "0e0117387f39004a9016484a186a908917e22426"),
+            "max_context": payload.get("max_context", 512),
+        }}
+        system = {{
+            "model_sha256": payload.get("model_sha256", "b082dfcbd8e8c142a725c8bbb99781802f38fec81210e13479effb32b3c3e020"),
+            "tokenizer_sha256": payload.get("tokenizer_sha256", "59d85f6af76a2c3b8240ea06cb21db4213b4eeca053f246b23e29cf832fc6bee"),
+            "model_config_sha256": payload.get("model_config_sha256", "5e0f6a605d5f81b5c9b559fe5cf716a1acb041c744e6f41bd05b097b7a685396"),
+            "tokenizer_config_sha256": payload.get("tokenizer_config_sha256", "2366e7ccfec76cbc19cf3c4c1b9c5d901be336ca1e83f2d2292c9bff381b77a2"),
+        }}
         if MODE == "banner":
             print("Loading weights from local directory", flush=True)
         if MODE == "stale_then_answer" and seen == 0:
@@ -102,11 +116,11 @@ def main():
                 for path in paths:
                     path["seed"] = 42  # NOT distinct: the draws are not independent
                 rows.append({{"symbol": r["symbol"], "paths": paths}})
-            print(json.dumps({{"request_id": rid, "paths": rows}}), flush=True)
+            print(json.dumps({{"request_id": rid, "paths": rows, "metadata": metadata, "system": system}}), flush=True)
             seen += 1
             continue
         if MODE == "nan_price":
-            answer = {{"request_id": rid, "paths": []}}
+            answer = {{"request_id": rid, "paths": [], "metadata": metadata, "system": system}}
             rows = []
             for ri, r in enumerate(series):
                 paths = _paths(seeds[ri], count, pred)
@@ -120,14 +134,14 @@ def main():
             answer = {{"request_id": rid, "paths": [
                 {{"symbol": "ETH/USDT:USDT", "paths": _paths(seeds[ri], count, pred)}}
                 for ri, r in enumerate(series)
-            ]}}
+            ], "metadata": metadata, "system": system}}
             print(json.dumps(answer), flush=True)
             seen += 1
             continue
         answer = {{"request_id": rid, "paths": [
             {{"symbol": r["symbol"], "paths": _paths(seeds[ri], count, pred)}}
             for ri, r in enumerate(series)
-        ]}}
+        ], "metadata": metadata, "system": system}}
         print(json.dumps(answer), flush=True)
         seen += 1
     return 0
@@ -411,6 +425,42 @@ def test_a_correct_answer_carries_the_drawn_paths(tmp_path):
     )
 
 
+def test_response_rejects_a_changed_pinned_config_hash():
+    from tradingagents.forecast.artifact import profile_for
+    from tradingagents.forecast.sampler import _response_metadata_problem
+
+    profile = profile_for("small_base")
+    system = {
+        "model_sha256": profile.model_hashes["Kronos-small/model.safetensors"],
+        "tokenizer_sha256": profile.model_hashes["Kronos-Tokenizer-base/model.safetensors"],
+        "model_config_sha256": "changed-config",
+        "tokenizer_config_sha256": profile.model_hashes["Kronos-Tokenizer-base/config.json"],
+    }
+    metadata = {
+        "profile": profile.name,
+        "model_repo": profile.model_repo,
+        "tokenizer_repo": profile.tokenizer_repo,
+        "model_revision": profile.model_revision,
+        "tokenizer_revision": profile.tokenizer_revision,
+        "max_context": profile.max_context,
+    }
+    problem = _response_metadata_problem({"metadata": metadata, "system": system}, profile)
+    assert problem is not None
+    assert "model_config_sha256" in problem
+
+
+def test_from_config_refuses_an_invalid_profile_before_artifact_verification(monkeypatch):
+    from tradingagents.forecast.service import KronosForecastService
+
+    service = KronosForecastService.from_config({
+        "kronos_active_enabled": True,
+        "kronos_active_profile": "invalid-profile",
+    })
+    assert service._sampler is None
+    assert service.artifact_hash is None
+    assert "unknown Kronos profile" in (service.artifact_problem or "")
+
+
 # -- nothing spawns before the pinned artifacts verify ------------------------
 
 
@@ -427,8 +477,11 @@ def test_from_config_refuses_before_spawning_when_verification_fails(monkeypatch
     monkeypatch.setattr(artifact_module, "isolated_source_dir", lambda: tmp_path / "src")
     monkeypatch.setattr(artifact_module, "isolated_model_dir", lambda: tmp_path / "models")
     monkeypatch.setattr(
-        artifact_module, "verify_artifacts",
-        lambda _s, _m: ("pinned Kronos weight hash mismatch for Kronos-small", {}),
+        artifact_module,
+        "verify_artifacts",
+        lambda _source, _model, _profile: (
+            "pinned Kronos weight hash mismatch for Kronos-small", {}
+        ),
     )
     service = KronosForecastService.from_config({
         "kronos_active_enabled": True, "kronos_active_paths": 16,
@@ -457,7 +510,7 @@ def test_from_config_records_the_verified_digest_when_artifacts_match(monkeypatc
     monkeypatch.setattr(artifact_module, "isolated_source_dir", lambda: tmp_path / "src")
     monkeypatch.setattr(artifact_module, "isolated_model_dir", lambda: tmp_path / "models")
 
-    def _verify(_source, _model):
+    def _verify(_source, _model, _profile):
         verified = {**artifact_module.PINNED_SOURCE_HASHES, **artifact_module.PINNED_WEIGHT_HASHES}
         return None, verified
 

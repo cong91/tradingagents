@@ -85,6 +85,8 @@ def history_for(
 
     ``fetch_closed_candles`` drops every bar whose close is after ``as_of``, so
     the series cannot contain a bar that had not closed at the decision moment.
+    When the requested lookback exceeds the venue page cap, the same reader
+    paginates forward and validates the complete closed-bar grid before returning.
     That is the same reader and the same cutoff discipline the confirmation path
     uses — the forecast is not given a more recent view of the market than the
     decision itself has. The service re-validates the series' identity (symbol,
