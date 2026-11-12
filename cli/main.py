@@ -171,7 +171,7 @@ def outcomes() -> None:
     import json as _json
     import os
 
-    from server import outcome_store
+    from server import outcome_report
 
     if not os.environ.get("TRADINGAGENTS_DATABASE_URL"):
         console.print(
@@ -180,7 +180,7 @@ def outcomes() -> None:
         )
         raise typer.Exit(code=1)
     try:
-        summary = outcome_store.summary()
+        summary = outcome_report.summary()
     except Exception as exc:
         console.print(f"[red]ledger read failed: {exc}[/red]")
         raise typer.Exit(code=1) from None

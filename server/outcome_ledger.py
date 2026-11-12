@@ -24,6 +24,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from server import outcome_store
+from server.outcome_venue_reads import read_venue_window
 from tradingagents.dataflows.config import get_config
 from tradingagents.execution.futures_entry_journal import (
     record_entry_provenance,
@@ -41,7 +42,6 @@ from tradingagents.outcomes.coverage import build_coverage
 from tradingagents.outcomes.currency import CurrencyAmount
 from tradingagents.outcomes.netting import (
     REALIZED_PNL_EXCLUDES_FEE,
-    VENUE_SEMANTICS_BINANCE,
     classify_exit_leg,
     partition_position_fills,
 )
@@ -199,9 +199,9 @@ def _process_cycle(
     if opened_at is None:
         return {"cycle_id": cycle_order.cycle_id, "result": "unavailable_cycle_timestamp"}
     now = datetime.now(UTC)
-    if fill_source is _venue_fill_source:
-        window = _venue_fill_source(account_id, symbol, _ms(opened_at), _ms(now),
-                                    expected_venue=journal["venue_key"])
+    if fill_source is read_venue_window:
+        window = read_venue_window(account_id, symbol, _ms(opened_at), _ms(now),
+                                   expected_venue=journal["venue_key"])
     else:
         window = fill_source(account_id, symbol, _ms(opened_at), _ms(now))
     source_status = str(window.get("status") or "unavailable")
@@ -512,7 +512,7 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
     if not ingest_enabled(config):
         return {"status": "disabled"}
     if fill_source is None:
-        fill_source = _venue_fill_source
+        fill_source = read_venue_window
     cursor = outcome_store.get_cursor()
     if cursor is None:
         outcome_store.set_cursor(datetime.now(UTC).isoformat())
@@ -603,83 +603,6 @@ def _record_cycle_error(cycle: dict[str, Any], error: repr) -> None:
         snapshot={"cycle_id": cycle_id, "status": str(cycle.get("status") or "")},
     )
     outcome_store.upsert_coverage(coverage)
-
-
-def _venue_fill_source(account_id: str, symbol: str, since_ms: int, until_ms: int, *,
-                       expected_venue: str | None = None) -> dict:
-    """Read-only venue history for the window, via the executor's own readers.
-
-    Builds the derivatives executor the same way bracket_monitor does. Fills
-    come from the bounded trade-history reader; funding income from the
-    venue income reader. Both are reads; nothing is sent.
-    """
-    from server.futures_trade_history import read_futures_trade_history
-    from tradingagents.execution import futures_identity
-    from tradingagents.execution.derivatives import DerivativesExecutor
-    from tradingagents.execution.exchange_client import venue_key
-
-    config = get_config()
-    executor = DerivativesExecutor(config=config)
-    bridge = executor._bridge  # the bridge is the executor's venue reader (not a public API)
-    selected_venue = venue_key(bridge)
-    if expected_venue is not None and selected_venue != expected_venue:
-        return {"status": "unavailable", "fills": [], "funding": None,
-                "warnings": ["venue_mismatch_or_unknown"]}
-    observed = futures_identity.read_futures_account_identity(bridge)
-    if (observed is None or observed.account_type not in {"futures", "usds_futures"}
-            or f"{observed.exchange}:{observed.profile}:{observed.identity_hash}" != account_id):
-        return {"status": "unavailable", "fills": [], "funding": None,
-                "warnings": ["account_identity_mismatch_or_unknown"]}
-    client = bridge.client()
-    credentials = (getattr(client, "apiKey", None), getattr(client, "secret", None))
-    ccxt_symbol = symbol
-    history = read_futures_trade_history(bridge, [ccxt_symbol], since_ms, until_ms)
-    funding: list[dict] | None = None
-    if history["status"] in ("ok", "partial"):
-        from server.futures_trade_history import _endpoint_matches, _profile
-        from tradingagents.execution.futures_funding import fetch_funding_income
-
-        profile = _profile(bridge)
-        if profile != observed.profile or not _endpoint_matches(client, observed.profile):
-            return {"status": "unavailable", "fills": [], "funding": None,
-                    "warnings": ["funding_venue_endpoint_mismatch"]}
-        rows = fetch_funding_income(client, ccxt_symbol, since_ms)
-        if rows is not None:
-            funding = []
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                info = row.get("info") if isinstance(row.get("info"), dict) else {}
-                if (row.get("symbol") != symbol or info.get("incomeType") != "FUNDING_FEE"
-                        or type(row.get("timestamp")) is not int
-                        or not since_ms <= row["timestamp"] < until_ms):
-                    continue
-                currency = info.get("asset") or row.get("code") or info.get("incomeAsset")
-                amount = info.get("income") if info.get("income") is not None else row.get("amount")
-                event_id = row.get("id") if row.get("id") is not None else info.get("tranId")
-                if not isinstance(currency, str) or not currency or amount is None or event_id is None:
-                    continue
-                funding.append({
-                    "id": str(event_id),
-                    "timestamp": row.get("timestamp"),
-                    "amount": amount,
-                    "currency": currency,
-                    "venue_semantics": VENUE_SEMANTICS_BINANCE,
-                })
-    if (bridge.client() is not client or venue_key(bridge) != selected_venue
-            or (getattr(client, "apiKey", None), getattr(client, "secret", None)) != credentials
-            or futures_identity.read_futures_account_identity(bridge) != observed):
-        return {"status": "unavailable", "fills": [], "funding": None,
-                "warnings": ["account_identity_changed_during_read"]}
-    return {
-        "status": history["status"],
-        "venue_key": selected_venue,
-        "fills": list(history["fills"]),
-        "warnings": [*history["warnings"], "funding_history_unverified"],
-        "start_at": history.get("start_at"),
-        "end_at": history.get("end_at"),
-        "funding": funding,
-    }
 
 
 def _worker_loop() -> None:

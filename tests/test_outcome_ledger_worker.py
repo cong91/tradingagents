@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import psycopg
 import pytest
 
-from server import futures_cycle_store, job_store, outcome_ledger, outcome_store
+from server import futures_cycle_store, job_store, outcome_ledger, outcome_report, outcome_store
 from tradingagents.execution.futures_entry_journal import managed_live_provenance
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -204,7 +204,7 @@ def test_disabled_ingest_does_nothing(postgres_schema):
     _record_executed_cycle("futures:BTC/USDT:USDT:t0")
     result = outcome_ledger.poll_once(_fill_source([]))
     assert result["status"] == "disabled"
-    assert outcome_store.summary()["status"] == "unavailable"
+    assert outcome_report.summary()["status"] == "unavailable"
 
 
 def test_first_poll_initializes_cursor_without_backfill(postgres_schema, ingest_enabled):
@@ -213,7 +213,7 @@ def test_first_poll_initializes_cursor_without_backfill(postgres_schema, ingest_
     assert result["status"] == "initialized"
     assert "no backfill" in result["note"]
     # History before enable stays uncovered: nothing was attributed.
-    assert outcome_store.summary()["status"] == "unavailable"
+    assert outcome_report.summary()["status"] == "unavailable"
 
 
 @pytest.fixture
@@ -251,7 +251,7 @@ def test_executed_cycle_with_managed_fills_is_recorded(postgres_schema, ingest_e
     assert outcome["result"] == "recorded"
     assert outcome["fills_attributed"] == 2
     assert outcome["unattributed"] == 0
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["status"] == "partial"
     assert summary["positions"]["total"] == 1
     assert summary["positions"]["closed"] == 1
@@ -280,7 +280,7 @@ def test_exit_fill_without_bracket_evidence_stays_unattributed(
     outcome = result["outcomes"][0]
     assert outcome["fills_attributed"] == 1
     assert outcome["unattributed"] == 1
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["totals"]["realized_by_currency"] == {}
     coverage = summary["coverage"][0]
     assert coverage["unattributed_manual_detected"] == 1
@@ -300,7 +300,7 @@ def test_cursor_advances_and_dedup_is_durable(postgres_schema, ingest_enabled):
     # Discovery has advanced; reconciliation revisits without duplicating fills.
     assert again["processed"] == 0
     assert len(again["reconciled"]) == 1
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 1
     assert summary["fills"] == 2
 
@@ -328,7 +328,7 @@ def test_restart_catch_up_covers_cycles_completed_while_worker_was_down(
     ]))
     assert caught_up["processed"] == 1
     assert caught_up["outcomes"][0]["cycle_id"] == "futures:BTC/USDT:USDT:t4b"
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 2
     assert summary["totals"]["realized_by_currency"]["USDT"] == "8.0"
 
@@ -369,7 +369,7 @@ def test_manual_fills_stay_unattributed_and_reach_coverage(postgres_schema, inge
     outcome = result["outcomes"][0]
     assert outcome["result"] == "no_fills_in_window"
     assert outcome["unattributed"] == 1
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     # Nothing was attributed to the bot: zero positions, and the manual fill
     # lives only in the coverage row — never in the ledger's PnL.
     assert summary["positions"]["total"] == 0
@@ -385,7 +385,7 @@ def test_unsupported_venue_status_is_preserved_in_coverage(postgres_schema, inge
     _record_journal(placed_ids=[ORDER_ID])
     result = outcome_ledger.poll_once(_fill_source([], status="unsupported"))
     assert result["outcomes"][0]["result"] == "no_fills_in_window"
-    coverage = outcome_store.summary()["coverage"][0]
+    coverage = outcome_report.summary()["coverage"][0]
     assert coverage["status"] == "unsupported"
 
 
@@ -406,7 +406,7 @@ def test_recovery_map_merges_a_retry_fill_into_the_same_position(
     outcome = result["outcomes"][0]
     assert outcome["fills_attributed"] == 2
     assert outcome["counts"]["positions_new"] == 1
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 1
     assert summary["fills"] == 2
 
@@ -427,7 +427,7 @@ def test_funding_without_event_identity_remains_unattributed(postgres_schema, in
         _venue_fill("870", ORDER_ID),
         _venue_fill("871", "9508", side="sell", price="104", realized="1.0"),
     ], funding=funding))
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     totals = summary["totals"]
     assert totals["funding_by_currency"] == {}
     assert any("funding_position_attribution_unknown" in row["warnings"]
@@ -454,7 +454,7 @@ def test_funding_without_venue_semantics_is_skipped_not_guessed(
     outcome = result["outcomes"][0]
     assert outcome["result"] == "recorded"
     assert outcome["counts"]["funding_new"] == 0
-    assert outcome_store.summary()["totals"]["funding_by_currency"] == {}
+    assert outcome_report.summary()["totals"]["funding_by_currency"] == {}
 
 
 def test_cycle_without_executed_order_is_skipped(postgres_schema, ingest_enabled):
@@ -462,7 +462,7 @@ def test_cycle_without_executed_order_is_skipped(postgres_schema, ingest_enabled
     _record_executed_cycle("futures:BTC/USDT:USDT:t9", executed=False)
     result = outcome_ledger.poll_once(_fill_source([]))
     assert result["outcomes"][0]["result"] == "skipped_not_executed"
-    assert outcome_store.summary()["status"] == "unavailable"
+    assert outcome_report.summary()["status"] == "unavailable"
 
 
 def test_failing_cycle_is_retried_then_published_as_error_coverage(
@@ -501,7 +501,7 @@ def test_failing_cycle_is_retried_then_published_as_error_coverage(
     third = outcome_ledger.poll_once(_fill_source(poisoned_fills))
     assert third["outcomes"][0]["result"].startswith("error:")
     # Past MAX_CYCLE_ATTEMPTS the failure is published and the pipeline moves.
-    coverage = outcome_store.summary()["coverage"]
+    coverage = outcome_report.summary()["coverage"]
     error_rows = [row for row in coverage if row["status"] == "error"]
     assert len(error_rows) == 1
     assert error_rows[0]["account_id"].startswith("cycle-error:")

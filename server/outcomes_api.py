@@ -9,7 +9,7 @@ this surface reports reconciled ledger data only.
 
 from fastapi import APIRouter
 
-from server import outcome_store
+from server import outcome_report
 from server.contract import utc_now_iso
 
 router = APIRouter(prefix="/api", tags=["outcomes"])
@@ -23,7 +23,7 @@ def get_outcomes(window_start: str | None = None, window_end: str | None = None)
     absent — their net is not claimed there. Coverage warnings and statuses
     (including ``unsupported``) pass through verbatim.
     """
-    payload = outcome_store.summary(window_start=window_start, window_end=window_end)
+    payload = outcome_report.summary(window_start=window_start, window_end=window_end)
     payload["generated_at"] = utc_now_iso()
     payload["disclaimer"] = (
         "Reconciled ledger data only; missing data is reported as missing, "

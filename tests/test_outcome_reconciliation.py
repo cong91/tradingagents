@@ -15,6 +15,7 @@ from server import (
     outcome_ledger,
     outcome_store,
 )
+from server.outcome_venue_reads import read_venue_window
 from tests.test_outcome_ledger_worker import (
     ACCOUNT_HASH,
     ACCOUNT_ID,
@@ -409,7 +410,7 @@ def test_ccxt_income_payload_preserves_timestamp_currency_and_raw_precision(monk
         "info": {"income": "-0.100000000000000001", "asset": "USDT", "tranId": 123456,
                  "incomeType": "FUNDING_FEE"},
     }])
-    window = outcome_ledger._venue_fill_source(ACCOUNT_ID, SYMBOL, timestamp - 1, timestamp + 1000)
+    window = read_venue_window(ACCOUNT_ID, SYMBOL, timestamp - 1, timestamp + 1000)
     event = window["funding"][0]
     assert event["timestamp"] == timestamp
     assert event["currency"] == "USDT"
@@ -431,7 +432,7 @@ def test_venue_identity_mismatch_refuses_history_read(monkeypatch):
     monkeypatch.setattr(futures_trade_history, "read_futures_trade_history", lambda *args: pytest.fail(
         "history must not be fetched for a different account"
     ))
-    result = outcome_ledger._venue_fill_source(ACCOUNT_ID, SYMBOL, 1, 2)
+    result = read_venue_window(ACCOUNT_ID, SYMBOL, 1, 2)
     assert result["status"] in {"error", "unavailable"}
     assert result["fills"] == []
 
@@ -446,7 +447,7 @@ def test_configured_venue_mismatch_refuses_history_and_identity_reads(monkeypatc
     monkeypatch.setattr(futures_identity, "read_futures_account_identity", lambda bridge: pytest.fail(
         "identity must not be read on a different venue"
     ))
-    result = outcome_ledger._venue_fill_source(ACCOUNT_ID, SYMBOL, 1, 2, expected_venue="other")
+    result = read_venue_window(ACCOUNT_ID, SYMBOL, 1, 2, expected_venue="other")
     assert result["status"] == "unavailable"
     assert result["fills"] == []
 

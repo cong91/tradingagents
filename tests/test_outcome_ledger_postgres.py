@@ -87,7 +87,7 @@ def test_migration_0008_creates_outcome_tables(postgres_schema):
 
 
 def test_ingest_is_idempotent_rereading_the_same_window_changes_no_total(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report
 
     first = _record()
     assert first["positions_new"] == 1
@@ -97,7 +97,7 @@ def test_ingest_is_idempotent_rereading_the_same_window_changes_no_total(postgre
         "positions_new": 0, "fills_new": 0, "fills_duplicate": 1,
         "exits_new": 0, "funding_new": 0,
     }
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 1
     assert summary["fills"] == 1
     # Totals did not move: same window, same venue trades, same ledger.
@@ -105,7 +105,7 @@ def test_ingest_is_idempotent_rereading_the_same_window_changes_no_total(postgre
 
 
 def test_partial_entry_keeps_one_position_with_filled_below_planned(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     position = {**_POSITION, "filled_quantity": Decimal("0.5")}
     fill_half = {**_FILL, "quantity": Decimal("0.5")}
@@ -113,7 +113,7 @@ def test_partial_entry_keeps_one_position_with_filled_below_planned(postgres_sch
         account_id=ACCOUNT_ID, position=position,
         fills=[fill_half], exits=[], funding=[],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 1
     with psycopg.connect(postgres_schema) as conn:
         row = conn.execute(
@@ -126,7 +126,7 @@ def test_same_intent_second_ingest_merges_into_one_position(postgres_schema):
     """Store contract: a second ingest of the same intent (e.g. the recovery
     path re-recording under the same client_order_id) merges into the one
     position row — the position key is (account_id, client_order_id)."""
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     counts = _record()
     assert counts["positions_new"] == 1
@@ -142,7 +142,7 @@ def test_same_intent_second_ingest_merges_into_one_position(postgres_schema):
     )
     assert counts["positions_new"] == 0  # merged, never a second position
     assert counts["fills_new"] == 1
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["positions"]["total"] == 1
     assert summary["fills"] == 2
 
@@ -163,7 +163,7 @@ def test_managed_position_without_client_order_id_is_rejected_by_the_schema(
 
 
 def test_mixed_currency_realized_totals_stay_separate(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION),
@@ -185,7 +185,7 @@ def test_mixed_currency_realized_totals_stay_separate(postgres_schema):
         position={**_POSITION, "client_order_id": "ta_def"},
         fills=[pnl_usdt, pnl_bnb_fee], exits=[], funding=[],
     )
-    totals = outcome_store.summary()["totals"]
+    totals = outcome_report.summary()["totals"]
     assert totals["realized_by_currency"]["USDT"] == "15"
     assert totals["fee_by_currency"]["BNB"] == "0.01"
 
@@ -193,7 +193,7 @@ def test_mixed_currency_realized_totals_stay_separate(postgres_schema):
 def test_summary_requires_fee_semantics_but_does_not_claim_net_without_funding(postgres_schema):
     """Fee semantics are recorded at ingestion; unknown funding or fee
     semantics prevent the summary from claiming a net."""
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     with_semantics = {
         **_FILL, "venue_trade_id": "310", "role": "exit", "side": "sell",
@@ -206,7 +206,7 @@ def test_summary_requires_fee_semantics_but_does_not_claim_net_without_funding(p
         position={**_POSITION, "client_order_id": "ta_sem1"},
         fills=[with_semantics], exits=[], funding=[],
     )
-    net_rows = {row["currency"]: row for row in outcome_store.summary()["totals"]["net_by_currency"]}
+    net_rows = {row["currency"]: row for row in outcome_report.summary()["totals"]["net_by_currency"]}
     assert net_rows["USDT"]["amount"] is None  # no proof of complete funding
     assert net_rows["USDT"]["fee_known"] is True
     assert net_rows["USDT"]["funding_known"] is False
@@ -222,7 +222,7 @@ def test_summary_requires_fee_semantics_but_does_not_claim_net_without_funding(p
         position={**_POSITION, "client_order_id": "ta_sem2"},
         fills=[without_semantics], exits=[], funding=[],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     net_rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
     assert net_rows["ETH"]["amount"] is None  # an incomplete subtotal is not net
     assert net_rows["ETH"]["fee_known"] is False
@@ -230,7 +230,7 @@ def test_summary_requires_fee_semantics_but_does_not_claim_net_without_funding(p
 
 
 def test_summary_does_not_infer_funding_completeness_from_an_event(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     fill = {
         **_FILL, "role": "exit", "realized_pnl": Decimal("5"),
@@ -243,7 +243,7 @@ def test_summary_does_not_infer_funding_completeness_from_an_event(postgres_sche
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[fill], exits=[], funding=funding,
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     row = summary["totals"]["net_by_currency"][0]
     assert summary["totals"]["funding_by_currency"]["USDT"]["received"] == "0"
     assert row["funding_known"] is False
@@ -252,7 +252,7 @@ def test_summary_does_not_infer_funding_completeness_from_an_event(postgres_sche
 
 
 def test_summary_mixed_fee_semantics_fail_closed_across_accounts(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     for index, semantics in enumerate((REALIZED_PNL_EXCLUDES_FEE, None)):
         fill = {
@@ -265,7 +265,7 @@ def test_summary_mixed_fee_semantics_fail_closed_across_accounts(postgres_schema
             position={**_POSITION, "client_order_id": f"ta_mix{index}"},
             fills=[fill], exits=[], funding=[],
         )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     row = summary["totals"]["net_by_currency"][0]
     assert row["fee_known"] is False
     assert row["amount"] is None
@@ -274,7 +274,7 @@ def test_summary_mixed_fee_semantics_fail_closed_across_accounts(postgres_schema
 
 
 def test_summary_keeps_different_and_unknown_fee_currency_buckets(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     fills = [
         {**_FILL, "venue_trade_id": "501", "role": "exit", "realized_pnl": Decimal("5"),
@@ -285,7 +285,7 @@ def test_summary_keeps_different_and_unknown_fee_currency_buckets(postgres_schem
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION), fills=fills, exits=[], funding=[],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
     assert {"USDT", "BNB", None} <= rows.keys()
     assert all(rows[currency]["amount"] is None for currency in ("USDT", "BNB", None))
@@ -295,7 +295,7 @@ def test_summary_keeps_different_and_unknown_fee_currency_buckets(postgres_schem
 
 
 def test_summary_fee_unknown_does_not_poison_another_accounts_currency(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     for index, (currency, semantics, fee) in enumerate((
         ("USDT", REALIZED_PNL_EXCLUDES_FEE, Decimal("0.1")),
@@ -311,7 +311,7 @@ def test_summary_fee_unknown_does_not_poison_another_accounts_currency(postgres_
             position={**_POSITION, "client_order_id": f"ta_independent{index}"},
             fills=[fill], exits=[], funding=[],
         )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
     assert rows["USDT"]["fee_known"] is True
     assert rows["ETH"]["fee_known"] is False
@@ -319,7 +319,7 @@ def test_summary_fee_unknown_does_not_poison_another_accounts_currency(postgres_
 
 
 def test_summary_missing_fee_does_not_disappear_from_known_bucket(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     fills = [
         {**_FILL, "venue_trade_id": "701", "role": "exit", "realized_pnl": Decimal("1"),
@@ -329,7 +329,7 @@ def test_summary_missing_fee_does_not_disappear_from_known_bucket(postgres_schem
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION), fills=fills, exits=[], funding=[],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     row = summary["totals"]["net_by_currency"][0]
     assert summary["totals"]["fee_by_currency"]["USDT"] == "0.1"
     assert row["fee_known"] is False
@@ -337,7 +337,7 @@ def test_summary_missing_fee_does_not_disappear_from_known_bucket(postgres_schem
 
 
 def test_summary_funding_only_account_does_not_claim_known_fees(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[], exits=[],
@@ -346,7 +346,7 @@ def test_summary_funding_only_account_does_not_claim_known_fees(postgres_schema)
             "currency": "USDT", "venue_semantics": "binance: income positive = received",
         }],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     row = summary["totals"]["net_by_currency"][0]
     assert row["fee_known"] is False
     assert row["funding_known"] is False
@@ -354,7 +354,7 @@ def test_summary_funding_only_account_does_not_claim_known_fees(postgres_schema)
 
 
 def test_summary_funding_in_other_account_does_not_inherit_fee_coverage(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION),
@@ -370,14 +370,14 @@ def test_summary_funding_in_other_account_does_not_inherit_fee_coverage(postgres
             "currency": "USDT", "venue_semantics": "binance: income positive = received",
         }],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     row = summary["totals"]["net_by_currency"][0]
     assert row["fee_known"] is False
     assert row["amount"] is None
 
 
 def test_summary_discloses_unattributed_funding_without_merging_legacy(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     outcome_store.record_outcome(
         account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[], exits=[],
@@ -396,7 +396,7 @@ def test_summary_discloses_unattributed_funding_without_merging_legacy(postgres_
     ]
     outcome_store.record_funding_observations(ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events)
     outcome_store.record_funding_observations(ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events)
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["totals"]["funding_by_currency"]["USDT"]["received"] == "0.125"
     observations = summary["funding_observations"]
     assert observations["status"] == "partial"
@@ -408,14 +408,14 @@ def test_summary_discloses_unattributed_funding_without_merging_legacy(postgres_
     assert Decimal(by_id["income-2"]["amount"]) == Decimal("0.000000000000000000123456789")
     assert by_id["income-2"]["currency"] == "BNB"
     assert all(row["amount"] is None for row in summary["totals"]["net_by_currency"])
-    filtered = outcome_store.summary(
+    filtered = outcome_report.summary(
         window_start="2026-11-10T00:00:00+00:00", window_end="2026-11-11T00:00:00+00:00",
     )
     assert [row["venue_income_id"] for row in filtered["funding_observations"]["events"]] == ["income-1"]
 
 
 def test_summary_exposes_observations_even_without_an_attributed_position(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     outcome_store.record_funding_observations(
         ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", [{
@@ -424,7 +424,7 @@ def test_summary_exposes_observations_even_without_an_attributed_position(postgr
             "venue_semantics": "binance: income positive = received",
         }],
     )
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["status"] == "partial"
     assert summary["totals"]["funding_by_currency"] == {}
     assert summary["totals"]["net_by_currency"] == []
@@ -432,7 +432,7 @@ def test_summary_exposes_observations_even_without_an_attributed_position(postgr
 
 
 def test_summary_marks_funding_observations_truncated_after_latest_100(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     events = [{
         "id": f"income-{index:03d}",
@@ -443,7 +443,7 @@ def test_summary_marks_funding_observations_truncated_after_latest_100(postgres_
     outcome_store.record_funding_observations(
         ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events,
     )
-    observations = outcome_store.summary()["funding_observations"]
+    observations = outcome_report.summary()["funding_observations"]
     assert observations["status"] == "partial"
     assert observations["truncated"] is True
     assert len(observations["events"]) == 100
@@ -454,7 +454,7 @@ def test_summary_window_filter_selects_intersecting_coverage_rows(postgres_schem
     """Finding 3: window_start/window_end filter the coverage rows to those
     intersecting the window; a malformed bound is refused, never read as
     'no filter'."""
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     for index, (start, end) in enumerate((
         ("2026-11-10T00:00:00+00:00", "2026-11-10T01:00:00+00:00"),
@@ -474,21 +474,21 @@ def test_summary_window_filter_selects_intersecting_coverage_rows(postgres_schem
             warnings=[],
             snapshot={"cycle_id": f"c{index}"},
         ))
-    summary = outcome_store.summary(
+    summary = outcome_report.summary(
         window_start="2026-11-10T00:30:00+00:00",
         window_end="2026-11-10T02:00:00+00:00",
     )
     assert len(summary["coverage"]) == 1
     assert summary["coverage"][0]["snapshot"]["cycle_id"] == "c0"
     with pytest.raises(ValueError):
-        outcome_store.summary(window_start="not-a-timestamp")
+        outcome_report.summary(window_start="not-a-timestamp")
 
 
 def test_coverage_rows_are_per_cycle_and_never_summed(postgres_schema):
     """Finding 6: each coverage row reconciles ONE cycle's own window; rows
     overlap by construction, so the row keeps its cycle id in the snapshot
     and consumers must not add them up."""
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     for index in range(2):
         outcome_store.upsert_coverage(build_coverage(
@@ -505,14 +505,14 @@ def test_coverage_rows_are_per_cycle_and_never_summed(postgres_schema):
             warnings=[],
             snapshot={"cycle_id": f"cycle-{index}"},
         ))
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["coverage"][0]["fills_found"] == 2
     cycle_ids = {row["snapshot"]["cycle_id"] for row in summary["coverage"]}
     assert len(summary["coverage"]) == len(cycle_ids)  # distinct per-cycle rows
 
 
 def test_funding_rows_carry_venue_semantics_and_stay_idempotent(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     funding = [{
         "funding_at": "2026-11-10T02:00:00+00:00",
@@ -530,23 +530,23 @@ def test_funding_rows_carry_venue_semantics_and_stay_idempotent(postgres_schema)
         fills=[dict(_FILL)], exits=[], funding=funding,
     )
     assert second["funding_new"] == 0
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     funding_totals = summary["totals"]["funding_by_currency"]["USDT"]
     assert funding_totals["received"] == "1.5"
     assert funding_totals["venue_semantics"] == "binance: income positive = received"
 
 
 def test_summary_unavailable_when_ledger_is_empty_not_zero(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report
 
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert summary["status"] == "unavailable"
     assert "not zero" in summary["reason"]
     assert summary["totals"] is None
 
 
 def test_coverage_row_upsert_preserves_unsupported_status(postgres_schema):
-    from server import outcome_store
+    from server import outcome_report, outcome_store
 
     row = build_coverage(
         account_id=ACCOUNT_ID,
@@ -562,7 +562,7 @@ def test_coverage_row_upsert_preserves_unsupported_status(postgres_schema):
         warnings=["unsupported_exchange"],
     )
     outcome_store.upsert_coverage(row)
-    summary = outcome_store.summary()
+    summary = outcome_report.summary()
     assert len(summary["coverage"]) == 1
     stored = summary["coverage"][0]
     assert stored["status"] == "unsupported"
@@ -587,13 +587,13 @@ def test_worker_restart_cursor_survives_across_calls(postgres_schema):
 def test_pg_persistence_restart_cycle_reingest_is_stable(postgres_schema):
     """A fresh store process (new connection) re-reading the same window
     changes nothing — persistence and idempotency across restarts."""
-    from server import outcome_store
+    from server import outcome_report
 
     _record()
-    before = outcome_store.summary()["totals"]
+    before = outcome_report.summary()["totals"]
     _record()
     _record()
-    after = outcome_store.summary()["totals"]
+    after = outcome_report.summary()["totals"]
     assert before == after
     with psycopg.connect(postgres_schema) as conn:
         rows = conn.execute("SELECT count(*) FROM outcome_fills").fetchone()[0]

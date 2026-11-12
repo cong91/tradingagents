@@ -502,12 +502,13 @@ def test_time_stop_uses_current_candle_funding_before_verdict():
 def test_gap_settlement_before_a_pending_exit_is_still_accounted():
     """A settlement in the inter-candle gap accrued while the position was
     open: it is applied BEFORE the pending time-stop exit fills at the next
-    open, even though that exit closes the position and its own candle window
-    is never applied."""
+    open, even though that exit closes the position and the exiting candle's
+    own window is never applied. The candles are spaced 2h apart (close = open
+    + 1h) so a real one-hour gap exists between them."""
     candles = [
         _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
-        _candle(1_700_003_600_000, 100.2, 100.5, 99.8, 100.0),
-        _candle(1_700_007_200_000, 100.0, 100.3, 99.6, 99.8),
+        _candle(1_700_007_200_000, 100.2, 100.5, 99.8, 100.0),
+        _candle(1_700_014_400_000, 100.0, 100.3, 99.6, 99.8),
     ]
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
@@ -515,7 +516,7 @@ def test_gap_settlement_before_a_pending_exit_is_still_accounted():
         risk_fraction=0.004, margin_fraction=0.25,
     )
     funding = FundingSeries(
-        amounts={candles[1].close_time + 1: 5.0},  # inside the gap, before the exit
+        amounts={candles[1].close_time + 60_000: 5.0},  # inside the c1→c2 gap
         venue_semantics="test: positive = received",
         known_from_ms=candles[1].open_time,
         known_to_ms=candles[-1].close_time,

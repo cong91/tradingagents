@@ -42,7 +42,7 @@ from server import (
     db,
     experiment_store,
     futures_cycle_store,
-    outcome_store,
+    outcome_report,
     portfolio as portfolio_module,
     portfolio_snapshot,
 )
@@ -203,7 +203,7 @@ def _unattributed_from_coverage(coverage: list[dict[str, Any]]) -> list[dict[str
 
 def _results_section(portfolio_body: dict[str, Any] | None) -> dict[str, Any]:
     try:
-        ledger = outcome_store.summary()
+        ledger = outcome_report.summary()
     except Exception as exc:
         logger.warning("brief: outcome ledger unreadable: %r", exc)
         ledger = _unavailable(f"the outcome ledger could not be read: {type(exc).__name__}")
