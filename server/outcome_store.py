@@ -18,7 +18,6 @@ from __future__ import annotations
 import json as _json_module
 import uuid
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 from server import db
@@ -77,10 +76,16 @@ def record_outcome(
         ).fetchone()
         if position_row is None:
             outcome_row = conn.execute(
-                """SELECT outcome_id FROM outcome_positions
-                   WHERE account_id = %s AND client_order_id = %s""",
+                """SELECT outcome_id, symbol, side, market_type, planned_quantity,
+                          venue_order_id, cycle_id FROM outcome_positions
+                   WHERE account_id = %s AND client_order_id = %s FOR UPDATE""",
                 (account_id, position["client_order_id"]),
             ).fetchone()
+            identity_fields = (
+                "symbol", "side", "market_type", "planned_quantity", "venue_order_id", "cycle_id",
+            )
+            if any(outcome_row[key] != position.get(key) for key in identity_fields):
+                raise ValueError("conflicting position identity")
             positions_new = 0
         else:
             outcome_row = position_row
@@ -88,7 +93,10 @@ def record_outcome(
         outcome_id = outcome_row["outcome_id"]
 
         fills_new = fills_duplicate = 0
+        fill_ids = {}
         for fill in fills:
+            if fill["symbol"] != position["symbol"]:
+                raise ValueError("fill symbol does not match position")
             cursor = conn.execute(
                 """INSERT INTO outcome_fills
                    (fill_id, account_id, outcome_id, venue_trade_id, venue_order_id,
@@ -96,37 +104,68 @@ def record_outcome(
                     realized_pnl, realized_pnl_currency, realized_pnl_semantics,
                     occurred_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (account_id, venue_trade_id) DO NOTHING""",
+                   ON CONFLICT (account_id, symbol, venue_trade_id) DO NOTHING
+                   RETURNING fill_id""",
                 (
                     _uuid(), account_id, outcome_id, fill["venue_trade_id"],
                     fill.get("venue_order_id"), fill["symbol"], fill["side"],
                     fill["role"], fill["quantity"], fill["price"],
                     fill.get("fee"), fill.get("fee_currency"),
                     fill.get("realized_pnl"), fill.get("realized_pnl_currency"),
-                    fill.get("realized_pnl_semantics"),
-                    fill["occurred_at"],
+                    fill.get("realized_pnl_semantics"), fill["occurred_at"],
                 ),
             )
-            if cursor.rowcount == 1:
+            inserted = cursor.fetchone()
+            if inserted is not None:
                 fills_new += 1
+                fill_ids[fill["venue_trade_id"]] = inserted["fill_id"]
             else:
+                existing = conn.execute(
+                    """SELECT fill_id, outcome_id, venue_order_id, side, role, quantity, price,
+                              fee, fee_currency, realized_pnl, realized_pnl_currency,
+                              realized_pnl_semantics, occurred_at = %s::timestamptz AS same_time
+                       FROM outcome_fills
+                       WHERE account_id = %s AND symbol = %s AND venue_trade_id = %s""",
+                    (fill["occurred_at"], account_id, fill["symbol"], fill["venue_trade_id"]),
+                ).fetchone()
+                if existing["outcome_id"] != outcome_id or not existing["same_time"] or any(
+                    existing[key] != fill.get(key) for key in (
+                        "venue_order_id", "side", "role", "quantity", "price", "fee",
+                        "fee_currency", "realized_pnl", "realized_pnl_currency",
+                        "realized_pnl_semantics",
+                    )
+                ):
+                    raise ValueError("conflicting venue trade identity")
                 fills_duplicate += 1
+                fill_ids[fill["venue_trade_id"]] = existing["fill_id"]
 
         exits_new = 0
         for exit_row in exits:
+            fill_id = fill_ids.get(exit_row.get("venue_trade_id"))
+            if fill_id is None:
+                conflict = "(account_id, outcome_id, leg, price, quantity, closed_at) WHERE fill_id IS NULL"
+            else:
+                legacy = conn.execute(
+                    """SELECT 1 FROM outcome_exits WHERE account_id = %s AND outcome_id = %s
+                       AND fill_id IS NULL AND price = %s AND quantity = %s AND closed_at = %s""",
+                    (account_id, outcome_id, exit_row["price"], exit_row["quantity"],
+                     exit_row.get("closed_at")),
+                ).fetchone()
+                if legacy is not None:
+                    continue
+                conflict = "(fill_id)"
             cursor = conn.execute(
-                """INSERT INTO outcome_exits
+                f"""INSERT INTO outcome_exits
                    (exit_id, account_id, outcome_id, leg, exit_reason, quantity,
-                    price, net_per_currency, r_multiple, closed_at, provenance)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb)
-                   ON CONFLICT (account_id, outcome_id, leg, price, quantity, closed_at)
-                   DO NOTHING""",
+                    price, net_per_currency, r_multiple, closed_at, provenance, fill_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s)
+                   ON CONFLICT {conflict} DO NOTHING""",
                 (
                     _uuid(), account_id, outcome_id, exit_row["leg"],
                     exit_row.get("exit_reason"), exit_row["quantity"],
                     exit_row["price"], _json(exit_row.get("net_per_currency") or []),
                     exit_row.get("r_multiple"), exit_row.get("closed_at"),
-                    _json(exit_row.get("provenance") or {}),
+                    _json(exit_row.get("provenance") or {}), fill_id,
                 ),
             )
             exits_new += cursor.rowcount
@@ -146,6 +185,51 @@ def record_outcome(
                 ),
             )
             funding_new += cursor.rowcount
+
+        if position.get("reconcile"):
+            totals = conn.execute(
+                """SELECT COALESCE(SUM(quantity) FILTER (WHERE role = 'entry'), 0) AS entry_qty,
+                          COALESCE(SUM(quantity) FILTER (WHERE role = 'exit'), 0) AS exit_qty,
+                          MIN(occurred_at) FILTER (WHERE role = 'entry') AS opened_at,
+                          MAX(occurred_at) FILTER (WHERE role = 'exit') AS closed_at
+                   FROM outcome_fills WHERE outcome_id = %s""", (outcome_id,),
+            ).fetchone()
+            planned = position.get("planned_quantity")
+            if planned is None:
+                planned = totals["entry_qty"]
+            already_closed = conn.execute(
+                "SELECT closed_at FROM outcome_positions WHERE outcome_id = %s FOR UPDATE",
+                (outcome_id,),
+            ).fetchone()["closed_at"]
+            closed_at = already_closed
+            chronology = conn.execute(
+                """SELECT MIN(balance) AS minimum_balance FROM (
+                       SELECT SUM(CASE WHEN role = 'entry' THEN quantity ELSE -quantity END)
+                           OVER (ORDER BY occurred_at, CASE WHEN role = 'entry' THEN 0 ELSE 1 END,
+                                 fill_id) AS balance
+                       FROM outcome_fills WHERE outcome_id = %s
+                   ) timeline""", (outcome_id,),
+            ).fetchone()
+            # Closure is position-scoped fill evidence (plan §4.4): entry total
+            # equals the journaled venue-rounded plan and exit total equals the
+            # entry total with a sane chronology. Venue-window completeness is
+            # a coverage concern — the CCXT reader reports "partial" on every
+            # successful read, so gating closure on it would freeze every
+            # production position open forever. A missed fill shows up as a
+            # totals mismatch, which keeps the position open.
+            if (planned is not None
+                    and planned > 0 and totals["entry_qty"] == planned
+                    and totals["exit_qty"] == totals["entry_qty"]
+                    and totals["opened_at"] is not None and totals["closed_at"] is not None
+                    and chronology["minimum_balance"] >= 0):
+                closed_at = totals["closed_at"]
+            conn.execute(
+                """UPDATE outcome_positions SET filled_quantity = %s, opened_at = %s,
+                   closed_at = %s, provenance = %s::jsonb WHERE outcome_id = %s""",
+                (totals["entry_qty"], totals["opened_at"], closed_at,
+                 _json({**(position.get("provenance") or {}),
+                        "history_complete": position.get("history_complete")}), outcome_id),
+            )
 
     return {
         "positions_new": positions_new,
@@ -234,6 +318,113 @@ def clear_state(key: str) -> None:
         )
 
 
+def schedule_reconciliation(cycle_id: str) -> None:
+    """Keep a durable round-robin queue even before a position has fills."""
+    with db.session() as conn:
+        conn.execute(
+            """INSERT INTO outcome_ledger_state (state_key, cursor_value, updated_at)
+               VALUES (%s, %s, %s) ON CONFLICT (state_key) DO NOTHING""",
+            (f"reconcile:{cycle_id}", cycle_id, datetime.now(UTC)),
+        )
+
+
+def reconciliation_batch(*, batch_size: int) -> list[dict[str, Any]]:
+    """Claim the least recently attempted cycles, including closed positions.
+
+    Claiming locks the batch rows (FOR UPDATE SKIP LOCKED) and bumps their
+    updated_at in the same transaction: a concurrent poller skips the held
+    rows instead of double-reading the same venue window, and the bump
+    rotates the claimed batch to the back of the round-robin queue.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    with db.session() as conn:
+        rows = conn.execute(
+            """WITH claimed AS (
+                   SELECT s.state_key
+                   FROM outcome_ledger_state s
+                   JOIN futures_cycles c ON c.cycle_id = s.cursor_value
+                   WHERE s.state_key = 'reconcile:' || c.cycle_id
+                   ORDER BY s.updated_at, s.state_key
+                   LIMIT %s
+                   FOR UPDATE OF s SKIP LOCKED
+               ),
+               rotated AS (
+                   UPDATE outcome_ledger_state st SET updated_at = now()
+                   WHERE st.state_key IN (SELECT state_key FROM claimed)
+               )
+               SELECT c.cycle_id, c.symbol, c.four_hour_open, c.one_hour_open,
+                      c.strategy_version, c.status, c.phase, c.payload, c.created_at,
+                      c.updated_at, c.finished_at
+               FROM claimed cl
+               JOIN futures_cycles c ON 'reconcile:' || c.cycle_id = cl.state_key
+               ORDER BY c.updated_at, c.cycle_id""", (batch_size,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def schedule_existing_positions(*, batch_size: int) -> None:
+    """Enqueue previously recorded positions without altering their history."""
+    with db.session() as conn:
+        conn.execute(
+            """INSERT INTO outcome_ledger_state (state_key, cursor_value, updated_at)
+               SELECT 'reconcile:' || p.cycle_id, p.cycle_id, now()
+               FROM outcome_positions p JOIN futures_cycles c ON c.cycle_id = p.cycle_id
+               WHERE NOT EXISTS (SELECT 1 FROM outcome_ledger_state s
+                                 WHERE s.state_key = 'reconcile:' || p.cycle_id)
+               GROUP BY p.cycle_id ORDER BY p.cycle_id LIMIT %s
+               ON CONFLICT (state_key) DO NOTHING""", (batch_size,),
+        )
+
+
+def record_funding_observations(account_id: str, venue_key: str, account_type: str,
+                                symbol: str, events: list[dict]) -> None:
+    """Store identified income without assigning it to a position."""
+    if any(not isinstance(value, str) or not value.strip() or value != value.strip() for value in (
+        account_id, venue_key, account_type, symbol,
+    )):
+        raise ValueError("funding observation requires complete account and venue identity")
+    if any(not isinstance(event, dict) or not isinstance(event.get("id"), str)
+           or not event["id"].strip() or event["id"] != event["id"].strip() for event in events):
+        raise ValueError("funding observation requires a venue income ID")
+    with db.session() as conn:
+        for event in events:
+            inserted = conn.execute(
+                """INSERT INTO outcome_funding_observations
+                   (account_id, venue_key, account_type, symbol, venue_income_id,
+                    funding_at, amount, currency, venue_semantics)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (account_id, venue_key, account_type, symbol, venue_income_id)
+                   DO NOTHING
+                   RETURNING venue_income_id""",
+                (account_id, venue_key, account_type, symbol, event["id"],
+                 event["funding_at"], event["amount"], event["currency"],
+                 event["venue_semantics"]),
+            ).fetchone()
+            if inserted is None:
+                same = conn.execute(
+                    """SELECT 1 FROM outcome_funding_observations
+                       WHERE account_id = %s AND venue_key = %s AND account_type = %s
+                         AND symbol = %s AND venue_income_id = %s AND funding_at = %s
+                         AND amount = %s AND currency = %s AND venue_semantics = %s""",
+                    (account_id, venue_key, account_type, symbol, event["id"],
+                     event["funding_at"], event["amount"], event["currency"],
+                     event["venue_semantics"]),
+                ).fetchone()
+                if same is None:
+                    raise ValueError("conflicting venue funding identity")
+
+
+def stored_cycle_fills(account_id: str, cycle_id: str) -> list[dict]:
+    with db.read() as conn:
+        rows = conn.execute(
+            """SELECT f.venue_trade_id, f.symbol, f.realized_pnl, f.realized_pnl_currency
+               FROM outcome_fills f JOIN outcome_positions p ON p.outcome_id = f.outcome_id
+               WHERE p.account_id = %s AND p.cycle_id = %s""", (account_id, cycle_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def terminal_cycles_after(
     cursor_updated_at: str | None,
     cursor_cycle_id: str | None,
@@ -266,12 +457,14 @@ def terminal_cycles_after(
     return [dict(row) for row in rows]
 
 
-def find_journal_tasks(symbol: str, venue_order_id: str | None = None) -> list[dict[str, Any]]:
+def find_journal_tasks(symbol: str, venue_order_id: str | None = None, *,
+                       intent_id: str | None = None) -> list[dict[str, Any]]:
     """Read-only attribution evidence from the durable entry journal.
 
     Matches the entry-intent rows of one symbol; with ``venue_order_id`` given,
-    only tasks whose ``placed_ids`` contain that venue order id (the recovery
-    path records the ids it found there). The journal is never modified here.
+    only tasks whose ``placed_ids`` contain that venue order id are returned.
+    ``intent_id`` restricts the result to the exact durable journal task.
+    The journal is never modified here.
     """
     query = (
         "SELECT task_id, symbol, entry_order_id, close_side, quantity, legs, "
@@ -283,31 +476,33 @@ def find_journal_tasks(symbol: str, venue_order_id: str | None = None) -> list[d
     if venue_order_id is not None:
         query += " AND placed_ids @> %s::jsonb"
         params.append(_json([venue_order_id]))
+    if intent_id is not None:
+        query += " AND task_id = %s"
+        params.append(intent_id)
     with db.read() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(row) for row in rows]
 
 
-def find_bracket_task(symbol: str, entry_order_id: str) -> dict[str, Any] | None:
-    """The position's bracket task — the durable EXIT evidence.
-
-    Bracket tasks are keyed ``bracket:{symbol}:{entry_order_id}`` and their
-    ``placed_ids`` / per-leg ``order_id`` values hold the stop, target and
-    scale-out tranche order ids as the runtime places them (brackets._save,
-    scale_out_apply). Read-only; the task is never modified here.
-    """
+def find_bracket_tasks(symbol: str, entry_order_id: str) -> list[dict[str, Any]]:
+    """Return all bracket evidence rows; callers must reject ambiguity."""
     with db.read() as conn:
-        row = conn.execute(
-            """SELECT task_id, symbol, entry_order_id, close_side, quantity, legs,
-                      placed_ids, status, venue_key, account_identity_exchange,
+        rows = conn.execute(
+            """SELECT task_id, symbol, entry_order_id, close_side, legs, placed_ids,
+                      status, venue_key, account_identity_exchange,
                       account_identity_profile, account_identity_type,
                       account_identity_hash
                FROM bracket_recovery_tasks
-               WHERE symbol = %s AND entry_order_id = %s AND task_id LIKE 'bracket:%%'
-               LIMIT 1""",
+               WHERE symbol = %s AND entry_order_id = %s AND task_id LIKE 'bracket:%%'""",
             (symbol, entry_order_id),
-        ).fetchone()
-    return dict(row) if row is not None else None
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_bracket_task(symbol: str, entry_order_id: str) -> dict[str, Any] | None:
+    """Read one bracket task only when its evidence key is unique."""
+    rows = find_bracket_tasks(symbol, entry_order_id)
+    return rows[0] if len(rows) == 1 else None
 
 
 def _fetch_component_totals(conn: Any, column: str, currency_column: str) -> dict:
@@ -324,28 +519,24 @@ def _fetch_component_totals(conn: Any, column: str, currency_column: str) -> dic
 def summary(window_start: str | None = None, window_end: str | None = None) -> dict[str, Any]:
     """Read-only ledger aggregate; an empty ledger reports unavailable, not zero.
 
-    Totals are per currency, computed from the stored numeric columns. The
-    net figure folds realized - fee + signed funding per currency through the
-    pure outcomes layer, with two honesty gates:
-
-    - fees are subtracted only when every realized-PnL fill of that currency
-      carries ``realized_pnl_semantics`` saying the venue's realized value
-      EXCLUDES the fee (ingestion records the contract per plan §2.2); mixed
-      or missing semantics flags ``fee_known: false`` and subtracts nothing;
-    - funding is folded only for currencies where funding rows actually
-      exist; currencies with realized PnL but no funding rows are listed in
-      ``funding_unknown_currencies`` and their net is not claimed
-      (``funding_known: false``).
+    Component totals preserve every currency and expose recorded amounts only.
+    Fee completeness requires known amounts and consistent exclusion semantics
+    in the relevant account/position. Funding rows do not prove the funding
+    read was complete: no durable funding coverage is currently stored, so net
+    remains unknown even when one or more funding events were recorded.
 
     ``window_start``/``window_end`` (optional ISO timestamps) filter the
-    coverage rows to those intersecting the window. Coverage rows are
+    coverage rows to those intersecting the window and filter unattributed
+    funding observations by event time. Coverage rows are
     PER-CYCLE reconciliation snapshots: they overlap by construction and must
     never be summed — each row reconciles one cycle's own fill window.
     When nothing has been ingested yet, ``status`` is ``unavailable`` with
     the reason attached — a missing ledger is never presented as zero PnL.
     """
-    from tradingagents.outcomes.currency import sum_components, to_json
+    from tradingagents.outcomes.currency import to_json
 
+    start = _parse_window_bound(window_start)
+    end = _parse_window_bound(window_end)
     with db.read() as conn:
         position_row = conn.execute(
             """SELECT COUNT(*) AS positions,
@@ -356,12 +547,10 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
         fill_row = conn.execute("SELECT COUNT(*) AS fills FROM outcome_fills").fetchone()
         realized = _fetch_component_totals(conn, "realized_pnl", "realized_pnl_currency")
         fees = _fetch_component_totals(conn, "fee", "fee_currency")
-        semantics_rows = conn.execute(
-            """SELECT realized_pnl_currency AS currency, realized_pnl_semantics AS semantics,
-                      COUNT(*) AS fills
-               FROM outcome_fills
-               WHERE realized_pnl IS NOT NULL
-               GROUP BY realized_pnl_currency, realized_pnl_semantics"""
+        fee_coverage_rows = conn.execute(
+            """SELECT account_id, outcome_id, realized_pnl_currency, fee_currency,
+                      fee, realized_pnl, realized_pnl_semantics
+               FROM outcome_fills"""
         ).fetchall()
         funding_rows = conn.execute(
             """SELECT currency,
@@ -371,6 +560,22 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
                       MIN(venue_semantics) AS venue_semantics
                FROM outcome_funding GROUP BY currency"""
         ).fetchall()
+        funding_position_rows = conn.execute(
+            "SELECT DISTINCT account_id, outcome_id, currency FROM outcome_funding"
+        ).fetchall()
+        observation_query = (
+            "SELECT account_id, venue_key, account_type, symbol, venue_income_id, "
+            "funding_at, amount, currency, venue_semantics FROM outcome_funding_observations WHERE TRUE"
+        )
+        observation_params: list[Any] = []
+        if start is not None:
+            observation_query += " AND funding_at >= %s"
+            observation_params.append(start)
+        if end is not None:
+            observation_query += " AND funding_at < %s"
+            observation_params.append(end)
+        observation_query += " ORDER BY funding_at DESC, account_id, symbol, venue_income_id LIMIT 101"
+        observation_rows = conn.execute(observation_query, tuple(observation_params)).fetchall()
         coverage_rows = conn.execute(
             """SELECT account_id, window_start, window_end, fills_found,
                       ledger_realized_total, venue_realized_total, realized_diff,
@@ -380,22 +585,44 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
                ORDER BY window_end DESC LIMIT 20"""
         ).fetchall()
 
-    # Fee honesty per currency: exactly one recorded semantics saying the
-    # venue's realized value excludes the fee, else the fee is not claimed.
-    fee_known_currencies = {
-        row["currency"]
-        for row in semantics_rows
-        if row["semantics"] == REALIZED_PNL_EXCLUDES_FEE
+    # Semantics belong to a position/account, not the global fee currency:
+    # entry fees can be in a different asset from exit realized P&L.
+    position_currencies: dict[tuple[Any, Any], set[str | None]] = {}
+    position_fee_complete: dict[tuple[Any, Any], bool] = {}
+    for row in fee_coverage_rows:
+        key = (row["account_id"], row["outcome_id"])
+        currencies = position_currencies.setdefault(key, set())
+        if row["realized_pnl"] is not None:
+            currencies.add(row["realized_pnl_currency"])
+        if row["fee"] is not None or row["fee_currency"] is not None:
+            currencies.add(row["fee_currency"])
+        fee_complete = row["fee"] is not None and row["fee_currency"] is not None
+        if row["realized_pnl"] is not None:
+            fee_complete = fee_complete and row["realized_pnl_semantics"] == REALIZED_PNL_EXCLUDES_FEE
+        position_fee_complete[key] = position_fee_complete.get(key, True) and fee_complete
+
+    for row in funding_position_rows:
+        key = (row["account_id"], row["outcome_id"])
+        position_currencies.setdefault(key, set()).add(row["currency"])
+        position_fee_complete.setdefault(key, False)
+
+    fee_unknown = {
+        currency
+        for key, currencies in position_currencies.items()
+        if not position_fee_complete[key]
+        for currency in currencies
     }
-    currencies_with_realized = {
-        row["currency"] for row in semantics_rows if row["currency"] is not None
-    }
-    fee_unknown_currencies = sorted(currencies_with_realized - fee_known_currencies)
+    fee_unknown_currencies = sorted(fee_unknown, key=lambda currency: (currency is None, currency or ""))
 
     positions = int(position_row["positions"] or 0)
     fills = int(fill_row["fills"] or 0)
     selected_coverage = _filter_coverage(coverage_rows, window_start, window_end)
-    if positions == 0 and fills == 0 and not selected_coverage:
+    observations = {
+        "status": "partial",
+        "events": [{**dict(row), "amount": str(row["amount"])} for row in observation_rows[:100]],
+        "truncated": len(observation_rows) > 100,
+    }
+    if positions == 0 and fills == 0 and not selected_coverage and not observation_rows:
         return {
             "status": "unavailable",
             "reason": "no outcome data has been ingested yet; the ledger is empty, "
@@ -405,13 +632,14 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
             "totals": None,
             "funding_unknown_currencies": [],
             "fee_unknown_currencies": [],
+            "funding_observations": observations,
             "coverage": [],
         }
 
     funding: dict[str | None, Any] = {}
     for row in funding_rows:
-        # Rows exist for this currency, so an empty sign bucket is a genuine
-        # zero (every row the venue returned is held), not a missing value.
+        # These are sums of recorded events, not proof that the read covered
+        # every event; absent signs are zero only within the recorded subset.
         funding[row["currency"]] = {
             "received": str(row["received"]) if row["received"] is not None else "0",
             "paid": str(row["paid"]) if row["paid"] is not None else "0",
@@ -419,43 +647,23 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
             "venue_semantics": row["venue_semantics"],
         }
 
-    def bucket(pairs: dict[str | None, str | None]) -> dict[str | None, Any]:
-        return {
-            currency: None if amount is None else Decimal(amount)
-            for currency, amount in pairs.items()
-        }
-
-    realized_bucket = bucket(realized)
-    fee_bucket = bucket(fees)
-    # Funding amounts already carry the venue sign recorded at ingest time
-    # (positive = received); received + paid is the signed window total.
-    funding_bucket = {
-        currency: Decimal(totals["received"]) + Decimal(totals["paid"])
-        for currency, totals in funding.items()
-    }
-    # Fees fold into the net only where the recorded semantics allow it;
-    # elsewhere the fee component is OMITTED (not None-poisoned): the net is
-    # realized + funding with fee_known=false carrying the honesty.
-    fee_fold = {
-        currency: -amount
-        for currency, amount in fee_bucket.items()
-        if currency in fee_known_currencies and amount is not None
-    }
-    net = sum_components([realized_bucket, fee_fold, funding_bucket])
-    # A currency that holds realized or fee money but no funding rows cannot
-    # have a net claimed for it: its funding read may simply have failed.
-    funding_unknown_currencies = sorted(
-        currency
-        for currency in set(realized) | set(fees)
-        if currency not in funding
-    )
-    net_rows = to_json(net)
-    for row in net_rows:
-        row["funding_known"] = row["currency"] in funding
-        row["fee_known"] = (
-            row["currency"] in fee_known_currencies
-            or row["currency"] not in currencies_with_realized
+    # A position with a missing fee can have no monetary currency bucket yet.
+    # Keep its unknown currency visible instead of manufacturing a zero.
+    currencies = set(realized) | set(fees) | set(funding) | fee_unknown
+    if any(not complete and not position_currencies[key]
+           for key, complete in position_fee_complete.items()):
+        currencies.add(None)
+        fee_unknown.add(None)
+        fee_unknown_currencies = sorted(
+            fee_unknown, key=lambda currency: (currency is None, currency or "")
         )
+    # None-valued net rows are deliberate: the current schema has no durable
+    # evidence proving funding coverage for the aggregated positions.
+    net_rows = to_json(dict.fromkeys(currencies))
+    for row in net_rows:
+        row["funding_known"] = False
+        row["fee_known"] = row["currency"] is not None and row["currency"] not in fee_unknown
+    funding_unknown_currencies = [row["currency"] for row in net_rows]
     return {
         "status": "partial",
         "positions": {
@@ -473,6 +681,7 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
         },
         "funding_unknown_currencies": funding_unknown_currencies,
         "fee_unknown_currencies": fee_unknown_currencies,
+        "funding_observations": observations,
         "coverage": [dict(row) for row in selected_coverage],
     }
 

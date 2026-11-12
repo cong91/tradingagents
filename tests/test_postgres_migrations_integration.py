@@ -96,6 +96,7 @@ def test_migrate_applies_once_and_checks_checksum(postgres_dsn, monkeypatch):
         "0009_experiment_registry.sql",
         "0010_shadow_forecasts.sql",
         "0011_experiment_run_kinds.sql",
+        "0012_outcome_event_identity.sql",
     ]
     assert postgres.migrate() == []
 
@@ -153,9 +154,10 @@ def test_migrate_serializes_concurrent_invocations(postgres_dsn):
             "0009_experiment_registry.sql",
             "0010_shadow_forecasts.sql",
             "0011_experiment_run_kinds.sql",
+        "0012_outcome_event_identity.sql",
         ]
         with psycopg.connect(dsn) as conn:
-            assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 11
+            assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 12
             assert conn.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
     finally:
         if worker.is_alive():

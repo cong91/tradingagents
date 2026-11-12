@@ -14,6 +14,7 @@ explicit runtime-style limits, exactly like a configured runtime would.
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -22,13 +23,13 @@ from tradingagents.dataflows.market_data import Candle
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 from tradingagents.execution.risk import RiskLimits
 from tradingagents.simulation.costs import CostModel, FundingSeries
+from tradingagents.simulation.decision_replay import replay_recorded_decisions
 from tradingagents.simulation.engine import (
     DISCLAIMER,
     SIMULATION_LABEL,
     Proposal,
     SizingCaps,
     futures_plan,
-    replay_recorded_decisions,
     run_simulation,
 )
 from tradingagents.simulation.fills import MarketRules
@@ -92,6 +93,20 @@ def _run(candles, *, proposal_source=None, **kwargs) -> "object":
     kwargs.setdefault("risk_limits", _runtime_limits())
     kwargs.setdefault("include_sensitivity", False)
     return run_simulation(candles, **kwargs)
+
+
+def _flat_proposal_source(price: float = 100.0) -> "Callable[[Candle], Proposal]":
+    """A scale-out-free proposal source: funding tests pin coverage semantics,
+    not tranche proration (that has its own test)."""
+    def source(candle: Candle) -> Proposal:
+        return Proposal(
+            signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+            stop_loss=price * 0.98, take_profit=price * 1.4,
+            leverage=1.0, risk_fraction=0.004, margin_fraction=0.25,
+            scale_out_enabled=False,
+        )
+
+    return source
 
 
 def test_engine_plan_matches_runtime_size_chain():
@@ -334,7 +349,7 @@ def test_funding_no_settlement_inside_known_span_is_a_known_zero():
         known_from_ms=candles[0].open_time,
         known_to_ms=candles[-1].close_time,
     )
-    result = _run(candles, funding=funding)
+    result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
     assert result.funding_known is True  # every window covered by the span
     assert result.net_after_costs["funding_partial"] is False
     assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
@@ -345,13 +360,209 @@ def test_funding_window_outside_known_span_is_unknown_not_zero():
     funding = FundingSeries(
         amounts={candles[3].open_time + 1: 2.0},
         venue_semantics="test: positive = received",
-        known_from_ms=candles[3].open_time,  # windows before that are unknown
+        known_from_ms=candles[3].open_time,
     )
-    result = _run(candles, funding=funding)
+    result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
     assert result.funding_known is False
     assert result.net_after_costs["funding_partial"] is True
     assert result.net_after_costs["funding_unknown_windows"] > 0
     assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
+    assert result.net_after_costs["final_equity_status"] == "estimate"
+
+
+def test_funding_series_requires_full_window_coverage_at_boundaries_and_splits():
+    series = FundingSeries(
+        amounts={200: 2.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=100,
+        known_to_ms=300,
+    )
+    # Exact boundaries and adjacent windows are covered by the half-open span.
+    assert series.received_between(100, 200) == pytest.approx(0.0)
+    assert series.received_between(200, 300) == pytest.approx(2.0)
+    assert series.received_between(100, 300) == pytest.approx(2.0)
+    # Any overlap before or after the span is unknown, including a one-ms overlap.
+    assert series.received_between(99, 200) is None
+    assert series.received_between(100, 301) is None
+    assert series.received_between(50, 100) is None
+    assert series.received_between(300, 350) is None
+
+
+def test_funding_window_partially_overlapping_known_span_is_unknown():
+    series = FundingSeries(
+        amounts={200: 2.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=100,
+        known_to_ms=300,
+    )
+    assert series.received_between(99, 150) is None
+    assert series.received_between(250, 301) is None
+
+
+def test_unknown_funding_on_traded_simulation_preserves_labeled_estimate():
+    result = _run(_rising_candles(4), include_sensitivity=True)
+    net = result.net_after_costs
+    assert result.fills
+    assert result.funding_known is False
+    assert isinstance(net["final_equity"], float)
+    assert net["final_equity_status"] == "estimate"
+    assert net["final_equity_estimate"] == pytest.approx(net["final_equity"])
+    assert all(point["equity_status"] == "estimate" for point in result.equity_curve[1:])
+    assert result.report()["max_drawdown_status"] == "estimate"
+    assert all(row["final_equity_status"] == "estimate" for row in result.sensitivity)
+    assert all(
+        row["final_equity_estimate"] == pytest.approx(row["final_equity"])
+        for row in result.sensitivity
+    )
+
+
+def test_final_candle_exposure_settles_before_forced_close():
+    candles = _rising_candles(2)
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
+        risk_fraction=0.004, margin_fraction=0.25,
+    )
+    funding = FundingSeries(
+        amounts={candles[-1].open_time + 1: 5.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[-1].open_time,
+        known_to_ms=candles[-1].close_time,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        funding=funding,
+    )
+    assert result.exit_reason_distribution.get("final_close") == 1
+    assert result.net_after_costs["funding_received"] == pytest.approx(5.0)
+    assert result.funding_known is True
+    assert result.net_after_costs["final_equity_status"] == "known"
+
+
+def test_intrabar_exit_with_settlement_in_same_candle_marks_funding_unknown():
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
+        _candle(1_700_003_600_000, 100.2, 102.0, 99.8, 101.5),
+    ]
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=98.0, take_profit=101.0, scale_out_enabled=False,
+        risk_fraction=0.004, margin_fraction=0.25,
+    )
+    funding = FundingSeries(
+        amounts={candles[1].open_time + 1_800_000: 5.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[1].close_time,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        funding=funding,
+    )
+    assert result.exit_reason_distribution.get("target") == 1
+    assert result.net_after_costs["funding_received"] == pytest.approx(0.0)
+    assert result.net_after_costs["funding_unknown_windows"] > 0
+    assert result.funding_known is False
+    assert result.net_after_costs["final_equity_status"] == "estimate"
+
+
+def test_time_stop_uses_current_candle_funding_before_verdict():
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
+        _candle(1_700_003_600_000, 100.2, 100.5, 99.8, 100.0),
+    ]
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
+        risk_fraction=0.004, margin_fraction=0.25,
+    )
+    funding = FundingSeries(
+        amounts={candles[1].open_time + 1_800_000: 100.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[1].close_time,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        funding=funding,
+        max_hold_hours=0.1,
+    )
+    protection = next(
+        entry for entry in result.parity_log
+        if entry["call"] == "evaluate_profit_protection"
+    )
+    assert protection["input"]["cumulative_funding_r"] > 1.0
+    assert protection["output"]["phase"] == "time_stop_blocked_by_funding"
+    assert "time_stop_pending" not in [decision["decision"] for decision in result.decisions]
+
+
+def test_gap_settlement_before_a_pending_exit_is_still_accounted():
+    """A settlement in the inter-candle gap accrued while the position was
+    open: it is applied BEFORE the pending time-stop exit fills at the next
+    open, even though that exit closes the position and its own candle window
+    is never applied."""
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
+        _candle(1_700_003_600_000, 100.2, 100.5, 99.8, 100.0),
+        _candle(1_700_007_200_000, 100.0, 100.3, 99.6, 99.8),
+    ]
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
+        risk_fraction=0.004, margin_fraction=0.25,
+    )
+    funding = FundingSeries(
+        amounts={candles[1].close_time + 1: 5.0},  # inside the gap, before the exit
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[-1].close_time,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        funding=funding,
+        max_hold_hours=0.1,
+    )
+    assert result.exit_reason_distribution.get("time_stop") == 1
+    assert result.net_after_costs["funding_received"] == pytest.approx(5.0)
+    assert result.funding_known is True
+
+
+def test_funding_after_scale_out_is_prorated_to_remaining_exposure():
+    """Funding accrues on the position's CURRENT size: after a tranche fired
+    in an earlier candle, a later settlement applies only to the remaining
+    quantity. A settlement inside the scale-out candle itself stays unknown."""
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
+        _candle(1_700_003_600_000, 100.2, 102.5, 100.0, 101.8),
+        _candle(1_700_007_200_000, 101.8, 102.0, 101.0, 101.5),
+        _candle(1_700_010_800_000, 101.5, 101.8, 100.8, 101.2),
+    ]
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=98.0, take_profit=140.0,
+        risk_fraction=0.004, margin_fraction=0.25,
+    )
+    funding = FundingSeries(
+        amounts={candles[2].open_time + 1_800_000: 3.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[-1].close_time,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        funding=funding,
+    )
+    scale_out = next(fill for fill in result.fills if fill["kind"] == "scale_out")
+    assert scale_out["candle_open_time"] == candles[1].open_time
+    entry_qty = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
+    expected = 3.0 * (entry_qty - scale_out["quantity"]) / entry_qty
+    assert result.net_after_costs["funding_received"] == pytest.approx(expected)
+    assert result.funding_known is True
 
 
 def test_costs_slippage_moves_price_once_and_fee_charges_on_slipped_price():
@@ -384,7 +595,7 @@ def test_funding_series_applies_signed_amounts():
         amounts={candles[3].open_time + 1: 2.0},  # one settlement inside window
         venue_semantics="test: positive = received",
     )
-    result = _run(candles, funding=funding)
+    result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
     assert result.funding_known is True
     assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
     assert result.net_after_costs["funding_semantics"] == "test: positive = received"

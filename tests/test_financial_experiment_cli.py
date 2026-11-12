@@ -75,10 +75,11 @@ def test_full_candle_import_produces_fills_equity_and_net(tmp_path):
     summary = _summary_of(proc)
 
     baseline = summary["per_variant"]["baseline"]
-    assert baseline["metric_values"][0] is not None, summary
-    # A traded rule moves equity off the initial cash; cash-only does not.
+    # Funding was not supplied, so a traded result is an estimate and cannot
+    # support a net comparison. Cash without trades remains a known control.
+    assert baseline["metric_values"][0] is None, summary
     assert summary["per_variant"]["no_trade"]["metric_values"][0] == 10_000.0
-    assert baseline["metric_values"][0] != 10_000.0, "the rule never traded"
+    assert summary["comparisons"][0]["verdict"] == "insufficient_evidence_coverage"
     assert baseline["max_drawdowns"][0] > 0.0, "a traded run must show a drawdown"
     assert summary["candle_coverage"]["holdout"] > 0
 
@@ -98,7 +99,9 @@ def test_full_candle_import_produces_fills_equity_and_net(tmp_path):
     rows = [json.loads(line) for line in
             (run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines() if line]
     assert rows and all("report" in row for row in rows)
-    assert any(row["report"]["fills"] for row in rows), "no fills recorded in the artifact"
+    traded = next(row["report"] for row in rows if row["report"]["fills"])
+    assert traded["net_after_costs"]["final_equity_status"] == "estimate"
+    assert traded["net_after_costs"]["final_equity_estimate"] != 10_000.0
 
 
 def test_cli_registration_populates_the_registry(postgres_schema, tmp_path, monkeypatch):
@@ -274,6 +277,20 @@ def test_results_never_land_in_the_repo(tmp_path, monkeypatch):
                                results_dir=tmp_path))
     assert (tmp_path / "experiments" / summary["run_id"]).is_dir()
     assert not (_REPO / "experiments" / summary["run_id"]).exists()
+
+
+def test_cli_uses_configured_default_results_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_RESULTS_DIR", str(tmp_path))
+    proc = subprocess.run(
+        [sys.executable, "-m", "tradingagents.experiments.financial_experiment",
+         *_base_args(_CANDLES)],
+        cwd=_REPO, capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    summary = _summary_of(proc)
+    run_dir = tmp_path / "experiments" / summary["run_id"]
+    stored = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert stored["manifest_digest"] == summary["manifest_digest"]
+    assert (run_dir / "results.jsonl").is_file()
 
 
 def test_script_replay_is_labelled_a_gate_agreement_report(tmp_path):

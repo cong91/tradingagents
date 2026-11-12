@@ -54,6 +54,7 @@ def test_dry_run_loads_files_without_opening_database(monkeypatch):
         "0009_experiment_registry.sql",
         "0010_shadow_forecasts.sql",
         "0011_experiment_run_kinds.sql",
+        "0012_outcome_event_identity.sql",
     ]
 
 

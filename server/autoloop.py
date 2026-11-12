@@ -274,7 +274,14 @@ def _terminalize_timed_out_cycle(
     timestamps.setdefault("kronos_finished_at", finished_at)
     timestamps["timeout_finished_at"] = finished_at
     payload["phase_timestamps"] = timestamps
-    if not forecast_started:
+    evidence_status = payload.get("execution_status")
+    if evidence_status in {"executed", "uncertain", "not_executed"}:
+        payload["timeout_reason"] = reason
+        phase = "entry" if evidence_status == "executed" else "execution"
+        terminal_status = "completed" if evidence_status == "executed" else "interrupted"
+        if evidence_status == "uncertain":
+            payload.pop("executed", None)
+    elif not forecast_started:
         payload.update({
             "timeout_reason": reason,
             "interrupted_reason": f"Futures cycle interrupted before Kronos forecast: {reason}",
@@ -375,12 +382,19 @@ def _run_candidate_with_timeout(
             stage = timeout_stage
         _terminalize_timed_out_cycle(snapshot, reason=reason, stage=stage)
 
-    def save_checkpoint(value: dict) -> None:
+    def save_checkpoint(value: dict) -> bool:
         nonlocal checkpoint
         with checkpoint_lock:
             checkpoint = deepcopy(value)
+            if value.get("persist_attempt"):
+                if not autoloop_execution.cycle_writes_allowed(deadline, cancelled):
+                    return False
+                futures_cycle_telemetry.persist_progress(
+                    value["cycle_id"], phase="execution", payload=value["payload"],
+                )
         if timeout_requested.is_set() and barrier_released.is_set():
             terminalize_once()
+        return True
 
     def request_timeout(reason: str, stage: str) -> None:
         nonlocal timeout_reason, timeout_stage
@@ -407,7 +421,8 @@ def _run_candidate_with_timeout(
     try:
         outcome = result_queue.get(timeout=remaining)
     except queue.Empty as exc:
-        cancelled.set()
+        with checkpoint_lock:
+            cancelled.set()
         telemetry.close()
         snapshot = telemetry.snapshot()
         stage = snapshot["active_stage"] or snapshot["last_stage"] or "candidate_start"
@@ -424,13 +439,16 @@ def _run_candidate_with_timeout(
         terminalize_once()
         raise TimeoutError(timeout_reason) from exc
     if isinstance(outcome, BaseException):
-        if isinstance(outcome, TimeoutError):
+        snapshot = telemetry.snapshot()
+        stage = snapshot["active_stage"] or snapshot["last_stage"] or "candidate_timeout"
+        telemetry.close()
+        with checkpoint_lock:
             cancelled.set()
-            request_timeout(str(outcome), "candidate_timeout")
-            with execution_lock:
-                pass
-            barrier_released.set()
-            terminalize_once()
+        request_timeout(str(outcome), stage)
+        with execution_lock:
+            pass
+        barrier_released.set()
+        terminalize_once()
         raise outcome
     return outcome
 

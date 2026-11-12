@@ -21,8 +21,8 @@ CandleSource = Callable[[str, str], list[Candle]]
 def candle_from_payload(
     raw: Any, timeframe: str, symbol: str
 ) -> Candle | None:
-    """Build one closed Candle from a recorded snapshot dict; None if unusable."""
-    if not isinstance(raw, dict):
+    """Build one Candle from a recorded snapshot dict; None if unusable."""
+    if not isinstance(raw, dict) or raw.get("is_closed") is not True:
         return None
     try:
         return Candle(

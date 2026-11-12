@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from tradingagents.dataflows.market_data import Candle
+from tradingagents.execution.risk import RiskLimits
 from tradingagents.experiments import artifacts, runner as experiment_runner
 from tradingagents.experiments.runner import VariantSpec, build_manifest, run_experiment
 from tradingagents.experiments.walkforward import (
@@ -21,6 +22,8 @@ from tradingagents.experiments.walkforward import (
     holdout_start_ms_from_iso,
     split_walkforward,
 )
+from tradingagents.simulation.costs import FundingSeries
+from tradingagents.simulation.engine import Proposal
 
 pytestmark = pytest.mark.unit
 
@@ -87,6 +90,50 @@ def _variants() -> list[VariantSpec]:
     ]
 
 
+def _trading_variants() -> list[VariantSpec]:
+    def trader_factory():
+        def source(candle: Candle) -> Proposal:
+            return Proposal(
+                signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+                stop_loss=candle.close * 0.98, take_profit=candle.close * 1.04,
+                risk_fraction=0.004, margin_fraction=0.25,
+            )
+
+        return source
+
+    return [
+        VariantSpec(name="no_trade", kind="no_trade", factory=lambda: lambda candle: None),
+        VariantSpec(name="rule", kind="rule", factory=trader_factory),
+    ]
+
+
+def _funding_for(candles: list[Candle], *, partial: bool) -> FundingSeries:
+    # "Full" must cover every exposure window the engine now accounts,
+    # including the final candle's open-to-close interval; "partial" stops at
+    # the last open so that final window stays unknown. The settlement sits in
+    # candles[3] because candles[2] fires the first scale-out tranche — a
+    # settlement sharing that candle is honestly unattributable intrabar.
+    return FundingSeries(
+        amounts={candles[3].open_time + 1: 2.0},
+        venue_semantics="test: positive = received",
+        known_from_ms=candles[2 if partial else 1].open_time,
+        known_to_ms=candles[-1].open_time if partial else candles[-1].close_time,
+    )
+
+
+def _run_trading_experiment(tmp_path, *, funding: FundingSeries | None) -> dict:
+    start_ms = holdout_start_ms_from_iso("2026-06-01")
+    split = _split(start_ms)
+    candles = _holdout_candles(6, start_ms)
+    manifest = _manifest(tmp_path, seed=17, repeat=3, variants=("no_trade", "rule"))
+    return run_experiment(
+        results_dir=tmp_path, manifest=manifest, split=split,
+        variants=_trading_variants(), candles_holdout=candles,
+        risk_limits=RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0),
+        funding=funding,
+    )
+
+
 def test_all_repeats_are_stored_and_seed_reproduces_them(tmp_path):
     start_ms = holdout_start_ms_from_iso("2026-02-01")
     split = _split(start_ms)
@@ -113,7 +160,39 @@ def test_all_repeats_are_stored_and_seed_reproduces_them(tmp_path):
         summary["per_variant"]["no_trade"]["metric_values"]
 
 
-def test_manifest_is_locked_before_results_exist(tmp_path):
+
+def test_traded_run_with_missing_funding_is_unpairable_but_cash_control_is_numeric(tmp_path):
+    summary = _run_trading_experiment(tmp_path, funding=None)
+    assert summary["per_variant"]["no_trade"]["metric_values"] == [10000.0] * 3
+    assert summary["per_variant"]["rule"]["metric_values"] == [None] * 3
+    comparison = summary["comparisons"][0]
+    assert comparison["verdict"] == "insufficient_evidence_coverage"
+
+
+def test_traded_run_with_partial_funding_is_unpairable(tmp_path):
+    start_ms = holdout_start_ms_from_iso("2026-06-01")
+    candles = _holdout_candles(6, start_ms)
+    summary = _run_trading_experiment(
+        tmp_path, funding=_funding_for(candles, partial=True),
+    )
+    assert summary["per_variant"]["no_trade"]["metric_values"] == [10000.0] * 3
+    assert summary["per_variant"]["rule"]["metric_values"] == [None] * 3
+    assert summary["comparisons"][0]["verdict"] == "insufficient_evidence_coverage"
+
+
+def test_traded_run_with_full_funding_keeps_numeric_comparison(tmp_path):
+    start_ms = holdout_start_ms_from_iso("2026-06-01")
+    candles = _holdout_candles(6, start_ms)
+    summary = _run_trading_experiment(
+        tmp_path, funding=_funding_for(candles, partial=False),
+    )
+    assert all(
+        isinstance(value, float)
+        for value in summary["per_variant"]["rule"]["metric_values"]
+    )
+    assert summary["comparisons"][0]["verdict"] != "insufficient_evidence_coverage"
+
+
     start_ms = holdout_start_ms_from_iso("2026-02-01")
     split = _split(start_ms)
     candles = _holdout_candles(4, start_ms)

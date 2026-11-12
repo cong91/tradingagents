@@ -608,7 +608,7 @@ def test_executed_row_records_the_venue_order_id(tmp_path, monkeypatch):
 
     _derivatives_cycle_env(tmp_path, monkeypatch)
 
-    def live_fill(_executor, _plan, _book, result, execute_guard):
+    def live_fill(_executor, _plan, _book, result, execute_guard, **_kwargs):
         result.executed = True
         result.order_id = "venue-123"
 
@@ -793,10 +793,8 @@ def test_run_cycle_derivatives_no_order_plan_records_not_executed(tmp_path, monk
     assert summary.get("not_executed") == 1
 
 
-def test_run_cycle_derivatives_execute_failure_lands_in_execution_failed(tmp_path, monkeypatch):
-    """A malfunction after planning (venue refused the order) keeps
-    executed=false and lands in the execution_failed bucket — the funnel can
-    never promote it to entered."""
+def test_run_cycle_derivatives_ambiguous_execution_is_uncertain(tmp_path, monkeypatch):
+    """An exception at the execution boundary does not prove no order was sent."""
     from server import futures_cycle_store
     from tradingagents.execution.derivatives import DerivativesExecutor
 
@@ -816,15 +814,15 @@ def test_run_cycle_derivatives_execute_failure_lands_in_execution_failed(tmp_pat
     assert cycle["status"] == "failed"
     assert cycle["phase"] == "execution"
     payload = cycle["payload"]
-    assert payload["execution_status"] == "failed"
-    assert payload["executed"] is False
+    assert payload["execution_status"] == "uncertain"
+    assert payload.get("executed") is not False
     assert payload["order_id"] is None
     assert payload["failure_reason"] == "RuntimeError: venue refused connection"
     assert "execution_started_at" in payload["phase_timestamps"]
     assert "execution_failed_at" in payload["phase_timestamps"]
     summary = futures_cycle_store.futures_cycle_summary()
     assert summary.get("entered", 0) == 0
-    assert summary.get("execution_failed") == 1
+    assert summary.get("interrupted") == 1
 
 
 def test_run_cycle_derivatives_mode_disabled_before_planning(tmp_path, monkeypatch):

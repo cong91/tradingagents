@@ -4,9 +4,8 @@
 // Two rules from the contract show up directly in these types:
 //   * a missing value is `null`, never `0` — the renderers must say "not enough
 //     data" rather than print a zero the server never claimed;
-//   * decimals travel as strings (the ledger's own convention) so precision is
-//     not lost in float conversion. `asNumber` is the only place they are parsed,
-//     and it returns null for anything it cannot read exactly.
+//   * ledger decimals remain strings all the way to the renderer; converting
+//     them to JavaScript numbers would round some stored monetary amounts.
 
 import { fetchJson } from "@/components/overview/contract";
 import type { PortfolioPayload } from "@/components/overview/contract";
@@ -15,14 +14,10 @@ export type CoverageStatus = "ok" | "partial" | "error" | "unsupported" | "unava
 
 export type NetRow = {
   currency: string | null;
-  realized: string | null;
-  fees: string | null;
-  funding: string | null;
-  net: string | null;
-  funding_known?: boolean;
-  fee_known?: boolean;
   /** Decimal totals are exact strings of the stored numeric columns. */
-  amount?: string | null;
+  amount: string | null;
+  funding_known: boolean;
+  fee_known: boolean;
 };
 
 export type CoverageRow = {
@@ -40,7 +35,9 @@ export type CoverageRow = {
 export type LedgerTotals = {
   realized_by_currency?: Record<string, string | null>;
   fee_by_currency?: Record<string, string | null>;
-  funding_by_currency?: Record<string, { received: string; paid: string; events: number }>;
+  funding_by_currency?: Record<string, {
+    received: string; paid: string; events: number; venue_semantics: string | null;
+  }>;
   net_by_currency?: NetRow[];
 } | null;
 
@@ -50,8 +47,23 @@ export type BriefLedger = {
   positions?: { total: number; closed: number } | null;
   fills?: number | null;
   totals?: LedgerTotals;
-  funding_unknown_currencies?: string[];
-  fee_unknown_currencies?: string[];
+  funding_unknown_currencies?: (string | null)[];
+  fee_unknown_currencies?: (string | null)[];
+  funding_observations?: {
+    status: "partial";
+    events: {
+      account_id: string;
+      venue_key: string;
+      account_type: string;
+      symbol: string;
+      venue_income_id: string;
+      funding_at: string;
+      amount: string;
+      currency: string;
+      venue_semantics: string;
+    }[];
+    truncated: boolean;
+  };
   coverage?: CoverageRow[];
 };
 
@@ -226,7 +238,7 @@ export function fetchBrief(): Promise<BriefPayload> {
   return fetchJson<BriefPayload>("/api/brief");
 }
 
-/** Parse a wire decimal exactly; anything unreadable is null, never 0. */
+/** Parse non-ledger numeric display values; unreadable values remain null. */
 export function asNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;

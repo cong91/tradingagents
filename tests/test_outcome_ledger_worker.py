@@ -8,11 +8,13 @@ borrowing the entry order id, a state production cannot produce.
 """
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 from server import futures_cycle_store, job_store, outcome_ledger, outcome_store
@@ -32,13 +34,14 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _marker(client_order_id: str = CLIENT_ORDER_ID) -> dict:
+def _marker(client_order_id: str = CLIENT_ORDER_ID,
+            account_type: str = "futures") -> dict:
     order = PlannedOrder(
         ticker="BTC-USD", ccxt_symbol=SYMBOL, signal="Buy", side="buy",
         quantity=1.0, estimated_price=100.0, cost=100.0,
     )
     identity = SimpleNamespace(
-        exchange="binance", profile="demo", account_type="futures",
+        exchange="binance", profile="demo", account_type=account_type,
         identity_hash=ACCOUNT_HASH,
     )
     return managed_live_provenance(order, client_order_id, identity=identity, venue="binance:demo")
@@ -78,19 +81,30 @@ def _record_executed_cycle(cycle_id: str, *, order_id: str | None = ORDER_ID,
     )
 
 
-def _record_journal(*, placed_ids: list[str], task_id: str = "entry-intent:worker",
-                    client_order_id: str = CLIENT_ORDER_ID) -> None:
+def _record_journal(*, placed_ids: list[str], task_id: str | None = None,
+                    client_order_id: str = CLIENT_ORDER_ID, bind_cycle: bool = True,
+                    account_type: str = "futures") -> None:
+    marker = _marker(client_order_id, account_type=account_type)
+    task_id = task_id or marker["intent_id"]
+    if bind_cycle:
+        with psycopg.connect(os.environ["TRADINGAGENTS_DATABASE_URL"]) as conn:
+            conn.execute(
+                """UPDATE futures_cycles SET payload = payload || %s::jsonb
+                   WHERE payload->>'order_id' = ANY(%s)""",
+                (json.dumps({"entry_provenance": marker, "entry_intent_id": marker["intent_id"]}),
+                 placed_ids),
+            )
     leg = {
         "name": "entry-intent", "client_order_id": client_order_id,
         "symbol": SYMBOL, "side": "buy",
-        "entry_provenance": _marker(client_order_id),
+        "entry_provenance": marker,
     }
     assert job_store.create_bracket_recovery(
         task_id, symbol=SYMBOL, entry_order_id=client_order_id, close_side="sell",
         quantity=1.0, legs=[leg], now=_now_iso(),
         venue_key="binance:demo",
         identity=SimpleNamespace(
-            exchange="binance", profile="demo", account_type="futures",
+            exchange="binance", profile="demo", account_type=account_type,
             identity_hash=ACCOUNT_HASH,
         ),
     )
@@ -101,7 +115,8 @@ def _record_journal(*, placed_ids: list[str], task_id: str = "entry-intent:worke
 
 
 def _record_bracket_task(entry_order_id: str, placed_ids: list[str],
-                         task_id: str | None = None) -> None:
+                         task_id: str | None = None,
+                         account_type: str = "futures") -> None:
     """The production exit evidence: a bracket task keyed by the ENTRY venue
     order id, whose placed_ids carry the stop/target/scale-out order ids
     (brackets._save / scale_out_apply), bound to the same account identity."""
@@ -114,7 +129,7 @@ def _record_bracket_task(entry_order_id: str, placed_ids: list[str],
         quantity=1.0, legs=legs, now=_now_iso(),
         venue_key="binance:demo",
         identity=SimpleNamespace(
-            exchange="binance", profile="demo", account_type="futures",
+            exchange="binance", profile="demo", account_type=account_type,
             identity_hash=ACCOUNT_HASH,
         ),
     )
@@ -144,7 +159,9 @@ def _venue_fill(trade_id: str, order_id: str, *, realized: str | None = None,
 
 def _fill_source(fills: list[dict], *, status: str = "ok", funding: list | None = None):
     def source(account_id: str, symbol: str, since_ms: int, until_ms: int) -> dict:
-        return {"status": status, "fills": fills, "warnings": [], "funding": funding}
+        return {"status": status, "fills": fills, "warnings": [], "funding": funding,
+                "start_at": datetime.fromtimestamp(since_ms / 1000, UTC).isoformat(),
+                "end_at": datetime.fromtimestamp((until_ms + 1) / 1000, UTC).isoformat()}
     return source
 
 
@@ -280,8 +297,9 @@ def test_cursor_advances_and_dedup_is_durable(postgres_schema, ingest_enabled):
     ]
     outcome_ledger.poll_once(_fill_source(fills))
     again = outcome_ledger.poll_once(_fill_source(fills))
-    # The cursor moved past the cycle: no reprocessing, no double counting.
+    # Discovery has advanced; reconciliation revisits without duplicating fills.
     assert again["processed"] == 0
+    assert len(again["reconciled"]) == 1
     summary = outcome_store.summary()
     assert summary["positions"]["total"] == 1
     assert summary["fills"] == 2
@@ -292,8 +310,7 @@ def test_restart_catch_up_covers_cycles_completed_while_worker_was_down(
 ):
     _enable_and_seed()
     _record_executed_cycle("futures:BTC/USDT:USDT:t4a")
-    _record_journal(placed_ids=[ORDER_ID], task_id="entry-intent:a",
-                    client_order_id="ta_worker_a")
+    _record_journal(placed_ids=[ORDER_ID], client_order_id="ta_worker_a")
     _record_bracket_task(ORDER_ID, placed_ids=["8500"], task_id=f"bracket:{SYMBOL}:{ORDER_ID}")
     result = outcome_ledger.poll_once(_fill_source([
         _venue_fill("850", ORDER_ID),
@@ -303,8 +320,7 @@ def test_restart_catch_up_covers_cycles_completed_while_worker_was_down(
     # The worker was "down": a second cycle landed afterwards.
     second_order = "9100"
     _record_executed_cycle("futures:BTC/USDT:USDT:t4b", order_id=second_order)
-    _record_journal(placed_ids=[second_order], task_id="entry-intent:b",
-                    client_order_id="ta_worker_b")
+    _record_journal(placed_ids=[second_order], client_order_id="ta_worker_b")
     _record_bracket_task(second_order, placed_ids=["9500"], task_id=f"bracket:{SYMBOL}:{second_order}")
     caught_up = outcome_ledger.poll_once(_fill_source([
         _venue_fill("851", second_order),
@@ -322,8 +338,7 @@ def test_batch_is_bounded_and_ordered(postgres_schema, ingest_enabled):
     for index in range(5):
         cycle_order_id = str(9000 + index)
         _record_executed_cycle(f"futures:BTC/USDT:USDT:b{index}", order_id=cycle_order_id)
-        _record_journal(placed_ids=[cycle_order_id], task_id=f"entry-intent:{index}",
-                        client_order_id=f"ta_worker_{index}")
+        _record_journal(placed_ids=[cycle_order_id], client_order_id=f"ta_worker_{index}")
         _record_bracket_task(cycle_order_id, placed_ids=[str(9500 + index)],
                              task_id=f"bracket:{SYMBOL}:{cycle_order_id}")
     fills = [
@@ -386,7 +401,7 @@ def test_recovery_map_merges_a_retry_fill_into_the_same_position(
     _record_journal(placed_ids=[ORDER_ID, "7777"])  # task records both ids
     result = outcome_ledger.poll_once(_fill_source([
         _venue_fill("860", ORDER_ID),
-        _venue_fill("861", "7777", side="sell", price="104", realized="4.0"),
+        _venue_fill("861", "7777", side="buy", price="104"),
     ]))
     outcome = result["outcomes"][0]
     assert outcome["fills_attributed"] == 2
@@ -396,7 +411,7 @@ def test_recovery_map_merges_a_retry_fill_into_the_same_position(
     assert summary["fills"] == 2
 
 
-def test_funding_events_attach_to_the_position_window(postgres_schema, ingest_enabled):
+def test_funding_without_event_identity_remains_unattributed(postgres_schema, ingest_enabled):
     _enable_and_seed()
     _record_executed_cycle("futures:BTC/USDT:USDT:t8")
     _record_journal(placed_ids=[ORDER_ID])
@@ -414,10 +429,9 @@ def test_funding_events_attach_to_the_position_window(postgres_schema, ingest_en
     ], funding=funding))
     summary = outcome_store.summary()
     totals = summary["totals"]
-    assert totals["funding_by_currency"]["USDT"]["paid"] == "-0.25"
-    assert totals["funding_by_currency"]["USDT"]["venue_semantics"] == (
-        "binance: income positive = received"
-    )
+    assert totals["funding_by_currency"] == {}
+    assert any("funding_position_attribution_unknown" in row["warnings"]
+               for row in summary["coverage"])
 
 
 def test_funding_without_venue_semantics_is_skipped_not_guessed(
@@ -464,9 +478,13 @@ def test_failing_cycle_is_retried_then_published_as_error_coverage(
     """
     _enable_and_seed()
     _record_executed_cycle("futures:BTC/USDT:USDT:e1")
+    _record_executed_cycle("futures:BTC/USDT:USDT:e2")
+    # The journal is bound AFTER both cycles so each carries the marker:
+    # a legacy marker-less cycle is skipped cleanly, which would move the
+    # cursor past it instead of exercising the retry bound below.
     _record_journal(placed_ids=[ORDER_ID])
     _record_bracket_task(ORDER_ID, placed_ids=["9510"])
-    _record_executed_cycle("futures:BTC/USDT:USDT:e2")
+
     poisoned_fills = [
         _venue_fill("900", ORDER_ID),
         _venue_fill("901", "9510", side="sell", price="104", realized="9.9"),

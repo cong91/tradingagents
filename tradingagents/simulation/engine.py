@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import math
 import tempfile
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -46,7 +45,6 @@ from tradingagents.execution.scale_out import ScaleOutPlan, plan_scale_out
 from tradingagents.execution.sizing import PlannedOrder
 from tradingagents.portfolio import PortfolioContext, Position
 from tradingagents.simulation.costs import CostLedger, CostModel, FundingSeries
-from tradingagents.simulation.data import candle_from_payload
 from tradingagents.simulation.fills import (
     AMBIGUITY_POLICIES,
     MarketRules,
@@ -196,6 +194,8 @@ class _Position:
     fired_tranches: int = 0
     remaining: float = 0.0
     funding_received: float = 0.0
+    funding_accounted_until_ms: int = 0
+    funding_complete: bool = True
 
 
 @dataclass
@@ -207,7 +207,7 @@ class SimulationResult:
     candles: int = 0
     ambiguity_policy: str = "worst-first"
     ambiguity_count: int = 0
-    equity_curve: list[dict[str, float]] = field(default_factory=list)
+    equity_curve: list[dict[str, Any]] = field(default_factory=list)
     max_drawdown: float = 0.0
     net_after_costs: dict[str, Any] = field(default_factory=dict)
     exit_reason_distribution: dict[str, int] = field(default_factory=dict)
@@ -228,6 +228,10 @@ class SimulationResult:
             "ambiguity_count": self.ambiguity_count,
             "equity_curve": self.equity_curve,
             "max_drawdown": self.max_drawdown,
+            "max_drawdown_status": (
+                "estimate" if any(point.get("equity_status") == "estimate"
+                                  for point in self.equity_curve) else "known"
+            ),
             "net_after_costs": self.net_after_costs,
             "exit_reason_distribution": dict(sorted(self.exit_reason_distribution.items())),
             "fills": self.fills,
@@ -256,10 +260,10 @@ def _book_position(position: _Position, *, mark: float) -> Position:
     """The PortfolioContext view of one open simulated position."""
     return Position(
         ticker=position.plan.ticker,
-        quantity=position.quantity,
+        quantity=position.remaining,
         market="derivatives",
         market_symbol=position.plan.ccxt_symbol,
-        notional=position.quantity * mark,
+        notional=position.remaining * mark,
         notional_currency="USDT",
         stop_loss=position.current_stop,
     )
@@ -305,7 +309,7 @@ def _unrealized(position: _Position, mark: float) -> float:
     return _realized(position.side, position.entry, mark, position.remaining)
 
 
-def _max_drawdown(curve: list[dict[str, float]]) -> float:
+def _max_drawdown(curve: list[dict[str, Any]]) -> float:
     """Deepest peak-to-trough drop of the equity path, as a positive fraction."""
     peak = -math.inf
     drawdown = 0.0
@@ -316,6 +320,37 @@ def _max_drawdown(curve: list[dict[str, float]]) -> float:
         if peak > 0:
             drawdown = max(drawdown, (peak - value) / peak)
     return drawdown
+
+
+def _apply_position_funding(
+    state: _RunState,
+    position: _Position,
+    funding: FundingSeries | None,
+    start_ms: int,
+    end_ms: int,
+    *,
+    exposure_changed_intrabar: bool = False,
+) -> None:
+    """Apply covered notional funding, refusing ambiguous intrabar exposure."""
+    if funding is None:
+        return
+    start_ms = max(start_ms, position.opened_at_ms, position.funding_accounted_until_ms)
+    if start_ms >= end_ms:
+        return
+    position.funding_accounted_until_ms = end_ms
+    state.ledger.mark_funding_available(funding)
+    settlements = [ts for ts in funding.amounts if start_ms <= ts < end_ms]
+    if exposure_changed_intrabar and settlements:
+        state.ledger.mark_funding_uncertain(funding)
+        return
+    rate = funding.received_in_known_span(start_ms, end_ms)
+    exposure_fraction = position.remaining / position.quantity if position.quantity else 0.0
+    amount = rate * exposure_fraction
+    if amount:
+        state.ledger.record_funding(amount)
+        position.funding_received += amount
+    if not funding.covers(start_ms, end_ms):
+        state.ledger.mark_funding_uncertain(funding)
 
 
 def _record_exit(
@@ -480,6 +515,7 @@ def _maybe_open(
                       "initial_stop": plan.stop_loss, "contracts": fill.quantity},
             "output": [level.price for level in entry.scale_out.levels],
         })
+    entry.funding_accounted_until_ms = next_candle.open_time
     state.position = entry
     _audit_fill(
         state.audit_path, entry,
@@ -510,14 +546,7 @@ def _manage_position(
     position = state.position
     if position is None:
         return
-    if funding is not None and previous_window is not None:
-        start_ms = max(previous_window[0], position.opened_at_ms)
-        end_ms = previous_window[1]
-        if start_ms < end_ms:
-            state.ledger.apply_funding(funding, start_ms, end_ms)
-            window_funding = funding.received_between(start_ms, end_ms)
-            if window_funding is not None:
-                position.funding_received += window_funding
+    remaining_before_matching = position.remaining
     # 1. Match exits against the levels resting during this candle.
     # Runtime parity: with scale-out enabled the take-profit order is
     # REPLACED by the tranche legs plus a trailed runner (scale_out_apply),
@@ -562,9 +591,19 @@ def _manage_position(
             position.fired_tranches += 1
             if state.position is None:
                 break
+    # Funding settles at a known candle boundary before the protection verdict.
+    # A settlement inside a candle that changed exposure is not attributable to
+    # either the pre- or post-exit size from OHLC alone, so it stays unknown.
+    if funding is not None:
+        candle_start = max(candle.open_time, position.opened_at_ms)
+        _apply_position_funding(
+            state, position, funding, candle_start, candle.close_time,
+            exposure_changed_intrabar=(
+                state.position is None or position.remaining != remaining_before_matching
+            ),
+        )
     if state.position is None:
         return  # fully exited during this candle; nothing left to protect
-    # 2. Protection at the close updates the levels for FUTURE candles.
     held_hours = (candle.close_time - position.opened_at_ms) / 3_600_000
     # The runtime's funding conversion divides by the size the bracket
     # OPENED with (futures_protection._time_stop_funding_inputs), never the
@@ -665,8 +704,24 @@ def run_simulation(
             previous_window = (
                 (ordered[index - 1].open_time, candle.open_time) if index > 0 else None
             )
+            # Funding in the inter-candle gap settles before any exit that
+            # fills at this candle's open — if that exit closes the position,
+            # the gap's settlements still accrued on the open exposure. The
+            # clamp prevents double-counting with the candle window applied
+            # inside _manage_position.
+            if state.position is not None and funding is not None and previous_window is not None:
+                _apply_position_funding(
+                    state, state.position, funding,
+                    previous_window[0], previous_window[1],
+                )
             _try_pending_exit(state, candle, model=model, rules=rules)
-            if state.position is None:
+            if state.position is not None:
+                _manage_position(
+                    state, candle, previous_window, model=model, rules=rules,
+                    funding=funding, max_hold_hours=max_hold_hours,
+                    ambiguity_policy=ambiguity_policy,
+                )
+            else:
                 proposal = proposal_source(candle)
                 if proposal is not None:
                     equity = initial_cash + state.realized_total - ledger.fee_paid
@@ -676,12 +731,6 @@ def run_simulation(
                         proposal,
                         model=model, rules=rules, caps=caps, equity=equity,
                     )
-            else:
-                _manage_position(
-                    state, candle, previous_window, model=model, rules=rules,
-                    funding=funding, max_hold_hours=max_hold_hours,
-                    ambiguity_policy=ambiguity_policy,
-                )
             equity_now = (
                 initial_cash + state.realized_total - ledger.fee_paid
                 + ledger.funding_received
@@ -690,17 +739,26 @@ def run_simulation(
                 _unrealized(state.position, candle.close)
                 if state.position is not None else 0.0
             )
+            # A cash point with no trades yet is exact; once the run trades,
+            # equity carries unproven funding until the whole span is covered.
+            traded_so_far = bool(result.fills)
+            funding_unproven = funding is None or ledger.funding_uncertain
             result.equity_curve.append({
                 "candle_open_time": candle.open_time, "equity": equity_now + unrealized,
+                "equity_status": (
+                    "estimate" if traded_so_far and funding_unproven else "known"
+                ),
             })
 
         # Realize any position still open at the end at the last close, so the
-        # net figure never reports an open position as flat equity.
+        # net figure never reports an open position as flat equity. The last
+        # candle's funding window was already applied inside _manage_position.
         if state.position is not None:
-            exit_price = model.exit_price(state.position.side, ordered[-1].close)
+            final_position = state.position
+            exit_price = model.exit_price(final_position.side, ordered[-1].close)
             _record_exit(
-                state, state.position, kind="final_close", price=exit_price,
-                quantity=state.position.remaining,
+                state, final_position, kind="final_close", price=exit_price,
+                quantity=final_position.remaining,
                 open_time_ms=ordered[-1].open_time, maker=False, model=model,
             )
 
@@ -708,22 +766,26 @@ def run_simulation(
         initial_cash + state.realized_total - ledger.fee_paid + ledger.funding_received
     )
     result.max_drawdown = _max_drawdown(result.equity_curve)
-    result.funding_known = ledger.funding_available and ledger.funding_unknown_windows == 0
+    result.funding_known = ledger.funding_available and not ledger.funding_uncertain
+    has_trades = bool(result.fills)
+    final_equity_status = "known" if result.funding_known or not has_trades else "estimate"
     result.net_after_costs = {
         "currency": quote_currency,
         "initial_cash": initial_cash,
         "final_equity": final_equity,
+        "final_equity_status": final_equity_status,
+        "final_equity_estimate": final_equity if final_equity_status == "estimate" else None,
         "realized_price_pnl": state.realized_total,
         "fee_paid": ledger.fee_paid,
         "funding_received": ledger.funding_received if ledger.funding_available else None,
         "funding_known": result.funding_known,
-        "funding_partial": ledger.funding_available and ledger.funding_unknown_windows > 0,
+        "funding_partial": ledger.funding_available and ledger.funding_uncertain,
         "funding_unknown_windows": ledger.funding_unknown_windows,
         "funding_semantics": ledger.settlement_semantics(),
         "note": (
             "funding_received is None when no funding series was supplied; a "
-            "partial series (funding_partial) means some windows lay outside "
-            "the known span — unknown funding is never reported as zero"
+            "partial series (funding_partial) means some exposure intervals were "
+            "outside the known span or had ambiguous intrabar exposure"
         ),
     }
     if include_sensitivity:
@@ -770,6 +832,9 @@ def _cost_sensitivity(
         rows.append({
             "variant": name,
             "final_equity": outcome.net_after_costs["final_equity"],
+            "final_equity_estimate": outcome.net_after_costs["final_equity_estimate"],
+            "final_equity_status": outcome.net_after_costs["final_equity_status"],
+            "funding_known": outcome.funding_known,
             "fee_paid": outcome.net_after_costs["fee_paid"],
             "ambiguity_count": outcome.ambiguity_count,
         })
@@ -777,115 +842,8 @@ def _cost_sensitivity(
 
 
 # ---------------------------------------------------------------------------
-# Recorded-proposal replay: real review functions over recorded cycle data.
+# Cost sensitivity re-runs live with the event-driven simulation above.
 # ---------------------------------------------------------------------------
-
-# The recorded review result is read from the export's confirmation_reason
-# vocabulary, using the same flip classification futures_replay.summary
-# establishes: direction_mismatch / doji_candle are recorded rejections,
-# anything else (aligned_direction, bounded_pullback, not_required...) was a
-# passed confirmation. A cycle later rejected at the proposal phase keeps its
-# passed-confirmation reason — the terminal status/phase cannot decide this.
-_RECORDED_REJECTION_REASONS = {"direction_mismatch", "doji_candle"}
-
-
-def replay_recorded_decisions(
-    cycles: list[dict[str, Any]],
-    *,
-    confirmation_rule: Callable[[dict, str], tuple[bool, str]],
-) -> dict[str, Any]:
-    """Replay recorded cycle proposals through the real confirmation rule.
-
-    ``cycles`` are exported futures_cycles rows: the recorded proposal is the
-    cycle's signal, the recorded review result is the row's confirmation
-    reason in the recorded vocabulary above. The rule is a real production
-    rule (e.g. server.futures_replay.RULES), never a re-implementation. The
-    report separates what the recorded data can prove from what it cannot:
-    the export holds only the two decision candles, so exits, funding and PnL
-    are reported unavailable-with-reason, never zero.
-    """
-    outcomes: list[dict[str, Any]] = []
-    missing_snapshot = 0
-    missing_signal = 0
-    for row in cycles:
-        if not isinstance(row, dict):
-            continue
-        signal = row.get("signal")
-        if not signal:
-            missing_signal += 1
-            continue
-        snapshot = row.get("snapshot")
-        symbol = str(row.get("symbol") or "")
-        one_hour = candle_from_payload(
-            snapshot.get("one_hour") if isinstance(snapshot, dict) else None,
-            "1h", symbol,
-        )
-        four_hour = candle_from_payload(
-            snapshot.get("four_hour") if isinstance(snapshot, dict) else None,
-            "4h", symbol,
-        )
-        if one_hour is None or four_hour is None:
-            missing_snapshot += 1
-            continue
-
-        def direction(candle: Candle) -> str:
-            if candle.close > candle.open:
-                return "bullish"
-            if candle.close < candle.open:
-                return "bearish"
-            return "doji"
-
-        context = {
-            "one_hour": one_hour, "four_hour": four_hour,
-            "one_hour_direction": direction(one_hour),
-            "four_hour_direction": direction(four_hour),
-            "one_hour_open": one_hour.open_time,
-            "one_hour_close": one_hour.close,
-            "four_hour_open": four_hour.open_time,
-            "four_hour_close": four_hour.close,
-        }
-        confirmed, reason = confirmation_rule(context, signal)
-        recorded_confirmed = (
-            row.get("confirmation_reason") not in _RECORDED_REJECTION_REASONS
-        )
-        outcomes.append({
-            "cycle_id": row.get("cycle_id"),
-            "symbol": symbol,
-            "recorded_confirmation_reason": row.get("confirmation_reason"),
-            "recorded_confirmed": recorded_confirmed,
-            "rule_result": confirmed,
-            "rule_reason": reason,
-        })
-    agreements = sum(
-        1 for outcome in outcomes
-        if outcome["rule_result"] == outcome["recorded_confirmed"]
-    )
-    reason_counts = Counter(outcome["rule_reason"] for outcome in outcomes)
-    return {
-        # A gate-agreement report, not a financial simulation: this compares the
-        # rule's decision with the recorded one and states that exits, funding
-        # and PnL are unavailable from a decision-only export.
-        "kind": "gate_agreement_replay",
-        "disclaimer": DISCLAIMER,
-        "recorded_cycles": len(cycles),
-        "replayed_with_snapshot": len(outcomes),
-        "skipped_missing_signal": missing_signal,
-        "skipped_missing_snapshot": missing_snapshot,
-        "decision_agreements": agreements,
-        "decision_disagreements": len(outcomes) - agreements,
-        "rule_reason_distribution": dict(sorted(reason_counts.items())),
-        "financial_simulation": {
-            "status": "unavailable",
-            "reason": (
-                "the recorded export holds only the two decision candles (1h + 4h) "
-                "per cycle: no post-decision candle history, no recorded portfolio "
-                "or proposal execution terms, so exits, funding and net PnL cannot "
-                "be replayed from this data. Missing data is not zero."
-            ),
-        },
-    }
-
-
 def main() -> int:  # pragma: no cover - CLI entry lives in scripts/replay_futures_decisions.py
     raise SystemExit(
         "the recorded-decision replay CLI is scripts/replay_futures_decisions.py"

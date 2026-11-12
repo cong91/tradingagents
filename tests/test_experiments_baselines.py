@@ -6,6 +6,8 @@ call with the identical cost model; the rule baseline reuses
 or its functions is visible here); an unknown ablation knob is refused.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 
 import server.futures_replay as futures_replay
@@ -34,8 +36,26 @@ def _candle(open_ms: int, close: float, open_: float | None = None) -> Candle:
     )
 
 
+def _activated_candle(candle: Candle, close: float | None = None) -> Candle:
+    return _candle(candle.open_time + 14_400_000, close or candle.close)
+
+
 def _recorded_cycle(candle: Candle, signal: str = "Buy", *, confirmed: str | None = "aligned_direction",
                     payload: dict | None = None) -> dict:
+    decision_ms = max(candle.close_time, candle.open_time + 3_600_000) + 120_000
+    cycle_payload = dict(payload) if payload is not None else {"agent_proposal": {
+        "entry_price": candle.close, "stop_loss": candle.close * 0.98,
+        "take_profit": candle.close * 1.04, "leverage": 1.0,
+        "risk_fraction": 0.01,
+    }}
+    cycle_payload.setdefault("phase_timestamps", {
+        "analysis_finished_at": datetime.fromtimestamp(
+            (decision_ms - 60_000) / 1000, UTC,
+        ).isoformat(),
+        "proposal_validated_at": datetime.fromtimestamp(
+            decision_ms / 1000, UTC,
+        ).isoformat(),
+    })
     return {
         "cycle_id": f"futures:BTC-USD:{candle.open_time}",
         "symbol": "BTC/USDT:USDT",
@@ -56,11 +76,7 @@ def _recorded_cycle(candle: Candle, signal: str = "Buy", *, confirmed: str | Non
                 "close": candle.close, "volume": 10.0, "is_closed": True,
             },
         },
-        "payload": payload or {"agent_proposal": {
-            "entry_price": candle.close, "stop_loss": candle.close * 0.98,
-            "take_profit": candle.close * 1.04, "leverage": 1.0,
-            "risk_fraction": 0.01,
-        }},
+        "payload": cycle_payload,
     }
 
 
@@ -82,6 +98,8 @@ def test_rule_baseline_imports_the_production_rule_not_a_fork():
     cycle = _recorded_cycle(candle)
     rule = futures_replay.baseline_confirms
     source = rule_source(rule, [cycle])
+    # The rule's verdict is available when the snapshot evidence closed, so the
+    # proposal rides the snapshot's own 4h bar; the engine fills one bar later.
     proposal = source(candle)
     # The source carries the rule function identity itself — no fork object.
     assert source.rule_fn is rule  # type: ignore[attr-defined]
@@ -116,7 +134,7 @@ def test_recorded_baseline_passes_a_confirmed_entry_through():
         [_recorded_cycle(candle, confirmed="aligned_direction")],
         confirmation_rule=futures_replay.baseline_confirms,
     )
-    proposal = source(candle)
+    proposal = source(_activated_candle(candle))
     assert proposal is not None
     assert proposal.stop_loss == pytest.approx(101.0 * 0.98)
     assert proposal.take_profit == pytest.approx(101.0 * 1.04)
@@ -152,13 +170,13 @@ def test_memory_on_ablation_dedup_one_proposal_per_symbol_day():
         ablation={"memory_on": False},
     )
     # On: the day's first confirmed entry stands, the second is deduped.
-    assert on(first) is not None
-    assert on(second) is None
+    assert on(_activated_candle(first)) is not None
+    assert on(_activated_candle(second)) is None
     assert on.skipped["memory_dedup"] == 1
     assert on.built == 1
     # Off: no dedup, both confirmed entries propose.
-    assert off(first) is not None
-    assert off(second) is not None
+    assert off(_activated_candle(first)) is not None
+    assert off(_activated_candle(second)) is not None
     assert off.skipped["memory_dedup"] == 0
     assert off.built == 2
 
@@ -169,8 +187,8 @@ def test_memory_on_dedup_starts_again_on_the_next_day():
     day_two = _candle(_DAY_START + _DAY_MS, 102.0)
     cycles = [_recorded_cycle(day_one), _recorded_cycle(day_two)]
     source = recorded_source(cycles, confirmation_rule=futures_replay.baseline_confirms)
-    assert source(day_one) is not None
-    assert source(day_two) is not None
+    assert source(_activated_candle(day_one)) is not None
+    assert source(_activated_candle(day_two)) is not None
     assert source.skipped["memory_dedup"] == 0
     assert source.built == 2
 
@@ -204,6 +222,7 @@ def test_no_trade_and_rule_run_through_the_identical_engine(tmp_path):
 
     cycle = _recorded_cycle(candles[0])
     rule_variant = rule_source(futures_replay.baseline_confirms, [cycle])
+    assert rule_variant.rule_fn is futures_replay.baseline_confirms
 
     no_trade = run_simulation(
         candles, proposal_source=no_trade_source, risk_limits=_limits(),
@@ -218,3 +237,146 @@ def test_no_trade_and_rule_run_through_the_identical_engine(tmp_path):
     assert with_rule.fills, "the rule variant must actually trade"
     assert not no_trade.fills
     assert rule_variant is not None  # the rule source builds on the same engine types
+
+
+
+def _snapshot_cycle(
+    symbol: str,
+    four_hour_open: int,
+    one_hour_open: int,
+    *,
+    one_hour_closed: bool = True,
+    four_hour_closed: bool = True,
+    decision_at: str | None = None,
+    stop_loss: float = 98.0,
+    take_profit: float = 104.0,
+) -> dict:
+    """Build a cycle with independently timed evidence and decision metadata."""
+    four_hour_close = four_hour_open + 14_400_000
+    one_hour_close = one_hour_open + 3_600_000
+    row = {
+        "cycle_id": f"futures:{symbol}:{four_hour_open}:{one_hour_open}",
+        "symbol": symbol,
+        "status": "completed",
+        "phase": "entry",
+        "signal": "Buy",
+        "confirmation_reason": "aligned_direction",
+        "analysis_finished_at": datetime.fromtimestamp(
+            (max(one_hour_close, four_hour_close) + 60_000) / 1000, UTC,
+        ).isoformat(),
+        "proposal_validated_at": decision_at or datetime.fromtimestamp(
+            (max(one_hour_close, four_hour_close) + 120_000) / 1000, UTC,
+        ).isoformat(),
+        "snapshot": {
+            "one_hour": {
+                "symbol": symbol, "timeframe": "1h",
+                "open_time": one_hour_open, "close_time": one_hour_close,
+                "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0,
+                "volume": 10.0, "is_closed": one_hour_closed,
+            },
+            "four_hour": {
+                "symbol": symbol, "timeframe": "4h",
+                "open_time": four_hour_open, "close_time": four_hour_close,
+                "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0,
+                "volume": 10.0, "is_closed": four_hour_closed,
+            },
+        },
+        "payload": {"agent_proposal": {
+            "entry_price": 101.0, "stop_loss": stop_loss,
+            "take_profit": take_profit, "leverage": 1.0,
+            "risk_fraction": 0.01,
+        }},
+    }
+    if decision_at is not None:
+        row["proposal_validated_at"] = decision_at
+    else:
+        row.pop("proposal_validated_at", None)
+    return row
+
+
+def _symbol_candle(symbol: str, timeframe: str, open_time: int, close: float) -> Candle:
+    return Candle(
+        symbol=symbol, timeframe=timeframe, open_time=open_time,
+        close_time=open_time + (14_400_000 if timeframe == "4h" else 3_600_000),
+        open=close - 1.0, high=close + 1.0, low=close - 2.0,
+        close=close, volume=10.0, is_closed=True,
+    )
+
+
+def test_rule_source_waits_for_late_snapshot_evidence_before_engine_fill():
+    """A 1h close after the 4h close cannot trigger the earlier 4h entry."""
+    candles = [
+        _candle(_START, 101.0),
+        _candle(_START + 14_400_000, 102.0),
+        _candle(_START + 3 * 14_400_000, 103.0),
+        _candle(_START + 4 * 14_400_000, 104.0),
+    ]
+    cycle = _snapshot_cycle(
+        "BTC/USDT:USDT", _START, _START + 18_000_000,
+        decision_at=datetime.fromtimestamp((_START + 21_600_000 + 120_000) / 1000, UTC).isoformat(),
+    )
+    source = rule_source(futures_replay.baseline_confirms, [cycle])
+    assert source(candles[0]) is None
+
+    result = run_simulation(
+        candles, proposal_source=rule_source(
+            futures_replay.baseline_confirms, [cycle],
+        ), risk_limits=_limits(), include_sensitivity=False,
+    )
+    entries = [fill for fill in result.fills if fill["kind"] == "entry"]
+    assert entries, "the rule event should become available on a later closed 4h bar"
+    assert entries[0]["candle_open_time"] == candles[2].open_time
+
+
+def test_rule_source_rejects_snapshot_candles_that_are_not_proven_closed():
+    cycle = _snapshot_cycle(
+        "BTC/USDT:USDT", _START, _START,
+        one_hour_closed=False,
+    )
+    source = rule_source(futures_replay.baseline_confirms, [cycle])
+    assert source(_candle(_START, 101.0)) is None
+    assert source.skipped["unclosed_snapshot"] == 1
+
+
+def test_recorded_source_requires_a_real_decision_completion_timestamp():
+    cycle = _snapshot_cycle("BTC/USDT:USDT", _START, _START)
+    source = recorded_source(
+        [cycle], confirmation_rule=futures_replay.baseline_confirms,
+    )
+    assert source(_candle(_START, 101.0)) is None
+    assert source.skipped["missing_decision_timestamp"] == 1
+
+
+def test_recorded_source_scopes_events_by_symbol_and_timeframe():
+    decision_at = datetime.fromtimestamp((_START + 14_400_000 + 120_000) / 1000, UTC).isoformat()
+    btc = _snapshot_cycle("BTC/USDT:USDT", _START, _START, decision_at=decision_at)
+    eth = _snapshot_cycle("ETH/USDT:USDT", _START, _START, decision_at=decision_at)
+    source = recorded_source(
+        [btc, eth], confirmation_rule=futures_replay.baseline_confirms,
+    )
+
+    btc_proposal = source(_symbol_candle("BTC/USDT:USDT", "4h", _START + 14_400_000, 101.0))
+    eth_proposal = source(_symbol_candle("ETH/USDT:USDT", "4h", _START + 14_400_000, 101.0))
+    foreign_timeframe = source(_symbol_candle("BTC/USDT:USDT", "1h", _START, 101.0))
+
+    assert btc_proposal is not None and btc_proposal.ccxt_symbol == "BTC/USDT:USDT"
+    assert eth_proposal is not None and eth_proposal.ccxt_symbol == "ETH/USDT:USDT"
+    assert foreign_timeframe is None
+
+
+def test_recorded_source_skips_conflicting_duplicate_events_without_overwrite():
+    decision_at = datetime.fromtimestamp((_START + 14_400_000 + 120_000) / 1000, UTC).isoformat()
+    first = _snapshot_cycle(
+        "BTC/USDT:USDT", _START, _START, decision_at=decision_at,
+        stop_loss=98.0,
+    )
+    duplicate = _snapshot_cycle(
+        "BTC/USDT:USDT", _START, _START, decision_at=decision_at,
+        stop_loss=97.0,
+    )
+    source = recorded_source(
+        [first, duplicate], confirmation_rule=futures_replay.baseline_confirms,
+    )
+
+    assert source(_candle(_START, 101.0)) is None
+    assert source.skipped["duplicate_event"] == 2

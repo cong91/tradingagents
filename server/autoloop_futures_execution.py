@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -159,6 +160,7 @@ def _process_futures_candidate(
     phase_timestamps: dict | None = None,
     guard_baseline: int | None = None,
     mode: AutoMode | None = None,
+    on_cycle_checkpoint: Callable[[dict], bool | None] | None = None,
 ) -> None:
     """Run futures candidates through a prevalidated closed candle pair.
 
@@ -198,6 +200,24 @@ def _process_futures_candidate(
     cycle_payload = dict(cycle_payload or {})
     decision_data = dict(decision_data or {})
     phase_timestamps = dict(phase_timestamps or {})
+
+    def checkpoint(*, persist_attempt: bool = False) -> None:
+        if on_cycle_checkpoint is not None and cycle_id is not None:
+            saved = on_cycle_checkpoint({
+                "cycle_id": cycle_id, "symbol": context["unified_symbol"],
+                "payload": futures_cycle_telemetry.redact_payload({
+                    **cycle_payload, "phase_timestamps": phase_timestamps,
+                }),
+                "persist_attempt": persist_attempt,
+            })
+            if persist_attempt and saved is False:
+                raise TimeoutError("cycle closed before entry intent could be persisted")
+
+    def entry_evidence(evidence: dict) -> None:
+        cycle_payload.update(evidence)
+        if evidence.get("execution_status") == "uncertain":
+            cycle_payload.pop("executed", None)
+        checkpoint(persist_attempt="entry_provenance" in evidence and "order_id" not in evidence)
     if not cycle_payload:
         cycle_id, four_hour_open, one_hour_open = futures_cycle_telemetry.cycle_identity(context)
         cycle_payload = {
@@ -468,13 +488,34 @@ def _process_futures_candidate(
             timestamp=phase_timestamps["execution_started_at"],
         )
         with telemetry.span("execution_policy", ticker):
+            def execute_guard(execute):
+                def execute_and_checkpoint():
+                    entry_evidence({"execution_status": "uncertain"})
+                    try:
+                        value = execute()
+                    except BaseException:
+                        checkpoint()
+                        raise
+                    entry_evidence({
+                        "execution_status": "executed",
+                        "executed": result.executed,
+                        "order_id": result.order_id,
+                    })
+                    return value
+
+                return autoloop_execution.execute_with_deadline(
+                    execute_and_checkpoint, deadline, cancelled, execution_lock, mode, authorization,
+                )
+
             execution_daily._handle_plan(
                 derivatives,
                 plan,
                 book,
                 result,
-                execute_guard=lambda execute: autoloop_execution.execute_with_deadline(
-                    execute, deadline, cancelled, execution_lock, mode, authorization
+                execute_guard=execute_guard,
+                on_entry_evidence=entry_evidence,
+                check_entry_allowed=lambda: autoloop_execution.raise_if_execution_closed(
+                    deadline, cancelled, "futures entry submission",
                 ),
             )
         # Terminal outcome vocabulary (audit truth): only a venue-confirmed
@@ -519,7 +560,7 @@ def _process_futures_candidate(
             payload=futures_cycle_telemetry.redact_payload(cycle_payload),
             terminal=True,
         )
-    except (autoloop_execution.AutoModeDisabled, AutoAuthorizationError):
+    except (autoloop_execution.AutoModeDisabled, AutoAuthorizationError, TimeoutError):
         raise
     except Exception as exc:
         # This terminal write must carry the complete audit trail: the row is
@@ -563,9 +604,14 @@ def _process_futures_candidate(
                 "signal": signal,
                 "signal_reason": "tradeable_signal",
                 "plan_reason": getattr(result.plan, "reason", None),
-                "execution_status": "failed",
-                "executed": bool(result.executed),
-                "order_id": result.order_id,
+                "execution_status": (
+                    "uncertain" if cycle_payload.get("execution_status") == "uncertain"
+                    else "executed" if cycle_payload.get("execution_status") == "executed"
+                    else "failed"
+                ),
+                **({} if cycle_payload.get("execution_status") == "uncertain"
+                   else {"executed": bool(result.executed)}),
+                "order_id": result.order_id or cycle_payload.get("order_id"),
                 "risk_guard_decisions": risk_decisions,
                 "risk_guard": risk_decisions[-1] if risk_decisions else {
                     "allowed": None, "halted": None, "reason": "not_called",

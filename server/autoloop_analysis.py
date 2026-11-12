@@ -42,7 +42,7 @@ def _process_candidate(
     telemetry: CycleTelemetry | None = None,
     mode: AutoMode | None = None,
     authorization: AuthorizationSnapshot | None = None,
-    on_cycle_checkpoint: Callable[[dict], None] | None = None,
+    on_cycle_checkpoint: Callable[[dict], bool | None] | None = None,
 ) -> DailyResult:
     """Analyze → plan → the engine's confirm policy for one candidate.
 
@@ -69,6 +69,15 @@ def _process_candidate(
     telemetry = telemetry or CycleTelemetry()
     futures_cycle_id: str | None = None
     futures_cycle_payload: dict = {}
+    execution_evidence: dict = {}
+
+    def save_futures_checkpoint(value: dict) -> bool | None:
+        execution_evidence.clear()
+        execution_evidence.update(value.get("payload") or {})
+        if on_cycle_checkpoint is not None:
+            return on_cycle_checkpoint(value)
+        return None
+
     futures_cycle_timestamps: dict[str, str] = {}
     futures_caps: dict[str, float] = {}
     agent_note: str | None = None
@@ -331,6 +340,7 @@ def _process_candidate(
                     guard_baseline=guard_baseline,
                     mode=mode,
                     authorization=authorization,
+                    on_cycle_checkpoint=save_futures_checkpoint,
                 )
             return result
         if deadline is not None:
@@ -359,15 +369,19 @@ def _process_candidate(
             )
     except (autoloop_execution.AutoModeDisabled, AutoAuthorizationError) as exc:
         if futures_cycle_id is not None and autoloop_execution.cycle_writes_allowed(deadline, cancelled):
+            persisted_status = execution_evidence.get("execution_status")
+            uncertain = persisted_status == "uncertain"
+            executed = persisted_status == "executed"
             persist_progress(
                 futures_cycle_id,
-                status="rejected",
-                phase="execution" if result.plan is not None else "analysis",
+                status="completed" if executed else "interrupted" if uncertain else "rejected",
+                phase="entry" if executed else "execution" if result.plan is not None else "analysis",
                 payload={
                     **futures_cycle_payload,
-                    "execution_status": "not_executed",
+                    **execution_evidence,
+                    "execution_status": persisted_status if executed or uncertain else "not_executed",
                     "execution_reason": str(exc),
-                    "executed": False,
+                    **({} if uncertain else {"executed": executed}),
                     "phase_timestamps": futures_cycle_timestamps,
                 },
                 terminal=True,
@@ -389,13 +403,18 @@ def _process_candidate(
             risk_decisions = autoloop_futures_execution._candidate_guard_decisions(derivatives, guard_baseline)
             payload = {
                 **futures_cycle_payload,
+                **execution_evidence,
                 "failure_reason": result.reason,
-                "execution_status": "failed" if current_phase == "execution" else "not_started",
+                "execution_status": (
+                    "uncertain" if execution_evidence.get("execution_status") == "uncertain"
+                    else "executed" if execution_evidence.get("execution_status") == "executed"
+                    else "failed" if current_phase == "execution" else "not_started"
+                ),
                 "risk_guard_decisions": risk_decisions,
                 "risk_guard": risk_decisions[-1] if risk_decisions else {
                     "allowed": None, "halted": None, "reason": "not_called",
                 },
-                "order_id": result.order_id,
+                "order_id": result.order_id or execution_evidence.get("order_id"),
                 "phase_timestamps": {
                     **futures_cycle_timestamps,
                     f"{current_phase}_failed_at": phase_finished,

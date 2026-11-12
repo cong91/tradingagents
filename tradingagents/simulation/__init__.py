@@ -6,6 +6,7 @@ with modeled costs — never a fork. Purely offline: no exchange client, no
 venue URL, no network path; everything produced is labeled a simulation.
 """
 
+from tradingagents.simulation.decision_replay import replay_recorded_decisions
 from tradingagents.simulation.engine import (
     DISCLAIMER,
     SIMULATION_LABEL,
@@ -14,7 +15,6 @@ from tradingagents.simulation.engine import (
     SimulationResult,
     SizingCaps,
     futures_plan,
-    replay_recorded_decisions,
     run_simulation,
 )
 from tradingagents.simulation.fills import AMBIGUITY_POLICIES

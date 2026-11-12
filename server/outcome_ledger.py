@@ -25,7 +25,10 @@ from typing import Any
 
 from server import outcome_store
 from tradingagents.dataflows.config import get_config
-from tradingagents.execution.futures_entry_journal import record_entry_provenance
+from tradingagents.execution.futures_entry_journal import (
+    record_entry_provenance,
+    valid_managed_live_provenance,
+)
 from tradingagents.outcomes.attribution import (
     CycleOrder,
     attribute_exit_fill,
@@ -96,6 +99,8 @@ def account_identity_from_marker(marker: dict) -> str | None:
 
 
 def _parse_iso(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -126,30 +131,63 @@ def _process_cycle(
     payload = cycle.get("payload") if isinstance(cycle.get("payload"), dict) else {}
     order_id = payload.get("order_id")
     symbol = str(cycle.get("symbol") or "")
-    if payload.get("execution_status") != "executed" or not order_id or not symbol:
+    if payload.get("execution_status") not in ("executed", "uncertain") or not symbol:
         return {"cycle_id": cycle.get("cycle_id"), "result": "skipped_not_executed"}
 
-    tasks = outcome_store.find_journal_tasks(symbol, venue_order_id=str(order_id))
-    journal = tasks[0] if tasks else None
+    payload_marker = payload.get("entry_provenance")
+    if payload_marker is None:
+        # Old cycles have no account/intent binding in their payload. An
+        # order ID plus symbol can collide across accounts, even with one
+        # matching journal row, so it is not attribution evidence.
+        return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
+    if (not valid_managed_live_provenance(payload_marker)
+            or payload.get("entry_intent_id") != payload_marker.get("intent_id")
+            or payload_marker.get("symbol") != symbol):
+        return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
+    tasks = outcome_store.find_journal_tasks(symbol, intent_id=payload_marker["intent_id"])
+    tasks = [task for task in tasks if record_entry_provenance(task) == payload_marker]
+    if len(tasks) != 1:
+        return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_ambiguous_journal"}
+    journal = tasks[0]
+    marker = record_entry_provenance(journal)
+    account_id = account_identity_from_marker(marker) if isinstance(marker, dict) else None
+    identity = marker.get("account_identity", {}) if isinstance(marker, dict) else {}
+    if (not valid_managed_live_provenance(marker) or account_id is None
+            or identity.get("type") not in {"futures", "usds_futures"} or marker.get("symbol") != symbol
+            or marker.get("venue_key") != journal.get("venue_key")
+            or marker.get("client_order_id") != journal.get("entry_order_id")
+            or journal.get("close_side") != ("sell" if marker.get("side") == "buy" else "buy")
+            or any(identity.get(key) != journal.get(f"account_identity_{key}")
+                   for key in ("exchange", "profile", "type", "hash"))):
+        return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
+    placed_ids = journal.get("placed_ids") if isinstance(journal.get("placed_ids"), list) else []
+    if order_id is None:
+        if len(placed_ids) != 1 or not isinstance(placed_ids[0], str):
+            return {"cycle_id": cycle.get("cycle_id"), "result": "pending_order_evidence"}
+        order_id = placed_ids[0]
+    elif str(order_id) not in placed_ids:
+        return {"cycle_id": cycle.get("cycle_id"), "result": "pending_order_evidence"}
     cycle_order = CycleOrder(
-        cycle_id=str(cycle.get("cycle_id")),
-        order_id=str(order_id),
-        symbol=symbol,
+        cycle_id=str(cycle.get("cycle_id")), order_id=str(order_id), symbol=symbol,
         journal_task=journal,
     )
-    marker = record_entry_provenance(journal) if journal is not None else None
-    account_id = account_identity_from_marker(marker) if isinstance(marker, dict) else None
-    if cycle_order.client_order_id is None or account_id is None:
-        # No valid marker: the fills cannot be proven managed, so nothing is
-        # written and the cycle is reported for coverage, never attributed.
-        return {"cycle_id": cycle_order.cycle_id, "result": "unattributed_no_marker"}
 
     # Exit evidence: the position's bracket task (keyed by the ENTRY venue
     # order id) holds the stop/target/scale-out order ids the runtime placed,
     # bound to the same account identity — the chain that makes the bot's own
     # exit fills attributable, so realized PnL is never lost to "manual".
     marker_hash = (marker or {}).get("account_identity", {}).get("hash")
-    bracket_task = outcome_store.find_bracket_task(symbol, str(order_id))
+    bracket_tasks = outcome_store.find_bracket_tasks(symbol, str(order_id))
+    bracket_tasks = [task for task in bracket_tasks if (
+        task.get("venue_key") == journal.get("venue_key")
+        and task.get("account_identity_exchange") == identity.get("exchange")
+        and task.get("account_identity_profile") == identity.get("profile")
+        and task.get("account_identity_type") == identity.get("type")
+        and task.get("account_identity_hash") == identity.get("hash")
+    )]
+    if len(bracket_tasks) > 1:
+        return {"cycle_id": cycle_order.cycle_id, "result": "unattributed_ambiguous_bracket"}
+    bracket_task = bracket_tasks[0] if bracket_tasks else None
     exit_evidence = bracket_exit_order_ids(
         bracket_task,
         entry_order_id=str(order_id),
@@ -159,11 +197,50 @@ def _process_cycle(
 
     opened_at = _parse_iso(cycle.get("created_at"))
     if opened_at is None:
-        opened_at = datetime.now(UTC)
-    window = fill_source(account_id, symbol, _ms(opened_at), _ms(datetime.now(UTC)))
+        return {"cycle_id": cycle_order.cycle_id, "result": "unavailable_cycle_timestamp"}
+    now = datetime.now(UTC)
+    if fill_source is _venue_fill_source:
+        window = _venue_fill_source(account_id, symbol, _ms(opened_at), _ms(now),
+                                    expected_venue=journal["venue_key"])
+    else:
+        window = fill_source(account_id, symbol, _ms(opened_at), _ms(now))
     source_status = str(window.get("status") or "unavailable")
     raw_fills = window.get("fills") if isinstance(window.get("fills"), list) else []
-    warnings = [str(item) for item in window.get("warnings") or []]
+    source_warnings = [str(item) for item in window.get("warnings") or []]
+    warnings = list(source_warnings)
+    warnings.extend(str(item) for item in window.get("funding_warnings") or [])
+    actual_start = _parse_iso(window.get("start_at"))
+    actual_end = _parse_iso(window.get("end_at"))
+    source_start = actual_start or opened_at
+    source_end = actual_end or now
+    # The reader accepts millisecond bounds; compare at that same precision.
+    requested_start = datetime.fromtimestamp(_ms(opened_at) / 1000, tz=UTC)
+    requested_end = datetime.fromtimestamp(_ms(now) / 1000, tz=UTC)
+    history_complete = (source_status == "ok" and not warnings and actual_start is not None
+                        and actual_end is not None and source_start <= requested_start
+                        and source_end >= requested_end)
+    seen_fill_ids: set[str] = set()
+    if any(not isinstance(raw, dict) or raw.get("symbol") != symbol for raw in raw_fills):
+        warnings.append("fill_symbol_or_shape_invalid")
+        history_complete = False
+    if (actual_start is None or actual_end is None or source_start > requested_start
+            or source_end < requested_end):
+        history_complete = False
+        warnings.append("history_window_bounds_unverified")
+    if source_start > requested_start:
+        warnings.append("history_start_omits_position_window")
+    funding_events = _funding_rows(window.get("funding"), cycle_order.cycle_id, account_id, opened_at)
+    # Funding observations are account scoped; their presence never proves a
+    # position-level allocation.
+    warnings.append("funding_position_attribution_unknown")
+    if window.get("funding") is None:
+        warnings.append("funding_history_unavailable")
+    elif not funding_events and isinstance(window.get("funding"), list) and window.get("funding"):
+        warnings.append("funding_events_unusable")
+    if ingest and funding_events:
+        outcome_store.record_funding_observations(
+            account_id, journal["venue_key"], identity["type"], symbol, funding_events,
+        )
 
     managed = recovered = unattributed = 0
     fill_rows: list[dict[str, Any]] = []
@@ -185,10 +262,28 @@ def _process_cycle(
         if verdict.attribution == "unattributed":
             unattributed += 1
             continue
+        # Recovered entry orders cannot be exits merely because their side
+        # resembles the close side; their order evidence identifies an entry.
+        expected_side = marker["side"] if str(raw.get("order_id")) not in exit_evidence else (
+            "sell" if marker["side"] == "buy" else "buy"
+        )
+        if raw.get("side") != expected_side:
+            unattributed += 1
+            continue
         managed += verdict.attribution == "managed"
         recovered += verdict.attribution == "recovered"
+        trade_id = raw.get("trade_id")
+        if not isinstance(trade_id, str) or not trade_id:
+            warnings.append("attributed_fill_missing_trade_id")
+            history_complete = False
+            continue
+        if trade_id in seen_fill_ids:
+            warnings.append("duplicate_fill_in_history")
+            history_complete = False
+            continue
+        seen_fill_ids.add(trade_id)
         fill_rows.append({
-            "venue_trade_id": str(raw["trade_id"]),
+            "venue_trade_id": trade_id,
             "venue_order_id": raw.get("order_id"),
             "symbol": symbol,
             "side": raw.get("side"),
@@ -199,26 +294,34 @@ def _process_cycle(
             "fee_currency": raw.get("fee_currency"),
             "realized_pnl": _decimal(raw.get("realized_pnl")),
             "realized_pnl_currency": raw.get("realized_pnl_currency"),
-            "realized_pnl_semantics": REALIZED_PNL_EXCLUDES_FEE,
+            "realized_pnl_semantics": (
+                REALIZED_PNL_EXCLUDES_FEE if identity.get("exchange") == "binance" else None
+            ),
             "occurred_at": raw.get("timestamp"),
         })
     complete_fills = [row for row in fill_rows if None not in (
         row["quantity"], row["price"], row["occurred_at"],
-    ) and row["side"] in ("buy", "sell")]
+    ) and row["side"] in ("buy", "sell") and _parse_iso(row["occurred_at"]) is not None]
+    if len(complete_fills) != len(fill_rows) or unattributed:
+        warnings.append("fill_attribution_incomplete")
+        history_complete = False
     planned_quantity = _decimal(journal.get("quantity"))
     entries, exits_fills = partition_position_fills(side, complete_fills)
+    if not entries:
+        history_complete = False
     filled_quantity = sum((row["quantity"] for row in entries), Decimal(0))
     partial_entry = bool(
         complete_fills and planned_quantity is not None
         and filled_quantity < planned_quantity
     )
+    # A source can only establish completeness for the requested window, not
+    # while it reports unmapped or malformed fills.
+    history_complete = (history_complete and len(complete_fills) == len(fill_rows)
+                        and not unattributed)
     if ingest and complete_fills:
         for row in complete_fills:
             row["role"] = "entry" if row in entries else "exit"
         opened_at = _first_ocurred(entries) or opened_at
-        # closed_at is the last EXIT fill; with no exit fill yet the position
-        # is still open — the ledger must not declare it closed by omission.
-        closed_at = _last_occurred(exits_fills)
         position = {
             "cycle_id": cycle_order.cycle_id,
             "client_order_id": journal.get("entry_order_id"),
@@ -229,7 +332,9 @@ def _process_cycle(
             "planned_quantity": planned_quantity,
             "filled_quantity": filled_quantity,
             "opened_at": opened_at.isoformat(),
-            "closed_at": closed_at.isoformat() if closed_at else None,
+            "closed_at": None,
+            "reconcile": True,
+            "history_complete": history_complete,
             "attribution": "recovered" if recovered and not managed else "managed",
             "strategy_version": cycle.get("strategy_version"),
             "provenance": {
@@ -243,12 +348,9 @@ def _process_cycle(
         exit_rows = _build_exit_rows(
             account_id, cycle_order.cycle_id, position, exits_fills, payload,
         )
-        funding_rows = _funding_rows(
-            window.get("funding"), cycle_order.cycle_id, account_id, opened_at,
-        )
         counts = outcome_store.record_outcome(
             account_id=account_id, position=position,
-            fills=complete_fills, exits=exit_rows, funding=funding_rows,
+            fills=complete_fills, exits=exit_rows, funding=[],
         )
     else:
         counts = {"positions_new": 0, "fills_new": 0, "fills_duplicate": 0,
@@ -260,14 +362,16 @@ def _process_cycle(
         CurrencyAmount(raw.get("realized_pnl_currency"), _decimal(raw.get("realized_pnl")))
         for raw in raw_fills if isinstance(raw, dict)
     ]
+    stored = outcome_store.stored_cycle_fills(account_id, cycle_order.cycle_id) if ingest else []
+    current_ids = {row["venue_trade_id"] for row in complete_fills}
     ledger_realized = [
         CurrencyAmount(row["realized_pnl_currency"], row["realized_pnl"])
-        for row in complete_fills
+        for row in stored if row["venue_trade_id"] in current_ids and row["symbol"] == symbol
     ]
     coverage = build_coverage(
         account_id=account_id,
-        window_start=opened_at.isoformat(),
-        window_end=datetime.now(UTC).isoformat(),
+        window_start=source_start.isoformat(),
+        window_end=source_end.isoformat(),
         fills_found=len(raw_fills),
         attributed_fill_count=len(complete_fills),
         venue_realized=venue_realized,
@@ -290,14 +394,9 @@ def _process_cycle(
     }
 
 
-def _first_ocurred(fills: list[dict]) -> Any:
-    times = sorted(str(row["occurred_at"]) for row in fills if row.get("occurred_at"))
-    return _parse_iso(times[0]) if times else None
-
-
-def _last_occurred(fills: list[dict]) -> Any:
-    times = sorted(str(row["occurred_at"]) for row in fills if row.get("occurred_at"))
-    return _parse_iso(times[-1]) if times else None
+def _first_ocurred(fills: list[dict]) -> datetime | None:
+    times = [_parse_iso(row.get("occurred_at")) for row in fills]
+    return min((moment for moment in times if moment is not None), default=None)
 
 
 def _build_exit_rows(
@@ -314,7 +413,7 @@ def _build_exit_rows(
     target_price = _decimal(proposal.get("take_profit"))
     remaining = position.get("filled_quantity")
     rows: list[dict[str, Any]] = []
-    for fill in sorted(exit_fills, key=lambda row: str(row.get("occurred_at"))):
+    for fill in sorted(exit_fills, key=lambda row: _parse_iso(row.get("occurred_at"))):
         leg = classify_exit_leg(
             exit_price=fill["price"],
             entry_price=entry_price,
@@ -332,6 +431,7 @@ def _build_exit_rows(
         }]
         rows.append({
             "leg": leg,
+            "venue_trade_id": fill["venue_trade_id"],
             "exit_reason": leg,
             "quantity": fill["quantity"],
             "price": fill["price"],
@@ -350,11 +450,10 @@ def _funding_rows(
     account_id: str,
     opened_at: datetime,
 ) -> list[dict[str, Any]]:
-    """Venue funding income rows inside the position window, sign verbatim.
+    """Normalize identified account-level income after the requested start.
 
-    A row without an explicit ``venue_semantics`` is SKIPPED, never defaulted:
-    guessing Binance's sign convention for a future venue would fabricate the
-    meaning of the amounts. The Binance reader sets the semantics explicitly.
+    A valid event is still not evidence that a particular position received it.
+    Rows without a venue semantics string are skipped.
     """
     if not isinstance(funding_events, list):
         return []
@@ -362,13 +461,22 @@ def _funding_rows(
     for event in funding_events:
         if not isinstance(event, dict):
             continue
-        moment = _parse_iso(event.get("timestamp") or event.get("time"))
+        timestamp = event.get("timestamp") if event.get("timestamp") is not None else event.get("time")
+        if type(timestamp) is int:
+            try:
+                moment = datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+            except (OSError, OverflowError, ValueError):
+                continue
+        else:
+            moment = _parse_iso(timestamp)
         if moment is None or moment < opened_at:
             continue
         amount = _decimal(event.get("amount"))
         currency = event.get("currency")
+        event_id = event.get("id")
         semantics = event.get("venue_semantics")
-        if amount is None or not isinstance(currency, str) or not currency:
+        if (amount is None or not isinstance(currency, str) or not currency
+                or not isinstance(event_id, str) or not event_id):
             continue
         if not isinstance(semantics, str) or not semantics:
             logger.warning(
@@ -378,6 +486,7 @@ def _funding_rows(
             )
             continue
         rows.append({
+            "id": event_id,
             "funding_at": moment.isoformat(),
             "amount": amount,
             "currency": currency,
@@ -412,10 +521,19 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
     batch = outcome_store.terminal_cycles_after(
         cursor_updated_at or None, cursor_cycle_id or None, batch_size=batch_size,
     )
+    outcome_store.schedule_existing_positions(batch_size=batch_size)
+    # Discovery and reconciliation have separate budgets, so a steady stream
+    # of new cycles cannot starve old open or recently closed positions.
+    revisits = outcome_store.reconciliation_batch(batch_size=batch_size)
     outcomes: list[dict[str, Any]] = []
+    processed_ids: set[str] = set()
     blocked_index: int | None = None
     for index, cycle in enumerate(batch):
         cycle_id = str(cycle.get("cycle_id"))
+        payload = cycle.get("payload") if isinstance(cycle.get("payload"), dict) else {}
+        if payload.get("execution_status") in ("executed", "uncertain"):
+            outcome_store.schedule_reconciliation(cycle_id)
+        processed_ids.add(cycle_id)
         failure: str | None = None
         try:
             outcomes.append(_process_cycle(cycle, fill_source=fill_source, ingest=True))
@@ -440,7 +558,20 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
     if batch and blocked_index != 0:
         last = batch[-1 if blocked_index is None else blocked_index - 1]
         outcome_store.set_cursor(f"{last['updated_at']}|{last['cycle_id']}")
-    return {"status": "polled", "processed": len(batch), "outcomes": outcomes}
+    reconciled = []
+    for cycle in revisits:
+        cycle_id = str(cycle["cycle_id"])
+        if cycle_id in processed_ids:
+            continue
+        try:
+            reconciled.append(_process_cycle(cycle, fill_source=fill_source, ingest=True))
+        except Exception as exc:  # noqa: BLE001 - a failed revisit must not starve others
+            logger.warning("outcome ledger failed to reconcile %s: %s", cycle_id, exc)
+            reconciled.append({"cycle_id": cycle_id, "result": f"error:{type(exc).__name__}"})
+        finally:
+            outcome_store.set_state(cycle_id, key=f"reconcile:{cycle_id}")
+    return {"status": "polled", "processed": len(batch), "outcomes": outcomes,
+            "reconciled": reconciled}
 
 
 def _bump_attempts(cycle_id: str) -> int:
@@ -474,53 +605,79 @@ def _record_cycle_error(cycle: dict[str, Any], error: repr) -> None:
     outcome_store.upsert_coverage(coverage)
 
 
-def _venue_fill_source(account_id: str, symbol: str, since_ms: int, until_ms: int) -> dict:
+def _venue_fill_source(account_id: str, symbol: str, since_ms: int, until_ms: int, *,
+                       expected_venue: str | None = None) -> dict:
     """Read-only venue history for the window, via the executor's own readers.
 
     Builds the derivatives executor the same way bracket_monitor does. Fills
     come from the bounded trade-history reader; funding income from the
     venue income reader. Both are reads; nothing is sent.
     """
-    del account_id  # the venue read is scoped by the configured account, not by the label
     from server.futures_trade_history import read_futures_trade_history
+    from tradingagents.execution import futures_identity
     from tradingagents.execution.derivatives import DerivativesExecutor
+    from tradingagents.execution.exchange_client import venue_key
 
     config = get_config()
     executor = DerivativesExecutor(config=config)
     bridge = executor._bridge  # the bridge is the executor's venue reader (not a public API)
-    ccxt_symbol = symbol  # cycle symbols are already unified ccxt symbols
+    selected_venue = venue_key(bridge)
+    if expected_venue is not None and selected_venue != expected_venue:
+        return {"status": "unavailable", "fills": [], "funding": None,
+                "warnings": ["venue_mismatch_or_unknown"]}
+    observed = futures_identity.read_futures_account_identity(bridge)
+    if (observed is None or observed.account_type not in {"futures", "usds_futures"}
+            or f"{observed.exchange}:{observed.profile}:{observed.identity_hash}" != account_id):
+        return {"status": "unavailable", "fills": [], "funding": None,
+                "warnings": ["account_identity_mismatch_or_unknown"]}
+    client = bridge.client()
+    credentials = (getattr(client, "apiKey", None), getattr(client, "secret", None))
+    ccxt_symbol = symbol
     history = read_futures_trade_history(bridge, [ccxt_symbol], since_ms, until_ms)
     funding: list[dict] | None = None
     if history["status"] in ("ok", "partial"):
+        from server.futures_trade_history import _endpoint_matches, _profile
         from tradingagents.execution.futures_funding import fetch_funding_income
 
-        client = bridge.client()
+        profile = _profile(bridge)
+        if profile != observed.profile or not _endpoint_matches(client, observed.profile):
+            return {"status": "unavailable", "fills": [], "funding": None,
+                    "warnings": ["funding_venue_endpoint_mismatch"]}
         rows = fetch_funding_income(client, ccxt_symbol, since_ms)
-        if rows:
+        if rows is not None:
             funding = []
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                currency = (row.get("info") or {}).get("incomeAsset")
-                # A row without a currency label is not guessed into USDT:
-                # an unknown currency cannot be bucketed honestly.
-                if not isinstance(currency, str) or not currency:
+                info = row.get("info") if isinstance(row.get("info"), dict) else {}
+                if (row.get("symbol") != symbol or info.get("incomeType") != "FUNDING_FEE"
+                        or type(row.get("timestamp")) is not int
+                        or not since_ms <= row["timestamp"] < until_ms):
                     continue
-                amount = (row.get("amount")
-                          if isinstance(row.get("amount"), (int, float))
-                          else (row.get("info") or {}).get("income"))
-                if amount is None:
+                currency = info.get("asset") or row.get("code") or info.get("incomeAsset")
+                amount = info.get("income") if info.get("income") is not None else row.get("amount")
+                event_id = row.get("id") if row.get("id") is not None else info.get("tranId")
+                if not isinstance(currency, str) or not currency or amount is None or event_id is None:
                     continue
                 funding.append({
+                    "id": str(event_id),
                     "timestamp": row.get("timestamp"),
                     "amount": amount,
                     "currency": currency,
                     "venue_semantics": VENUE_SEMANTICS_BINANCE,
                 })
+    if (bridge.client() is not client or venue_key(bridge) != selected_venue
+            or (getattr(client, "apiKey", None), getattr(client, "secret", None)) != credentials
+            or futures_identity.read_futures_account_identity(bridge) != observed):
+        return {"status": "unavailable", "fills": [], "funding": None,
+                "warnings": ["account_identity_changed_during_read"]}
     return {
         "status": history["status"],
+        "venue_key": selected_venue,
         "fills": list(history["fills"]),
-        "warnings": list(history["warnings"]),
+        "warnings": [*history["warnings"], "funding_history_unverified"],
+        "start_at": history.get("start_at"),
+        "end_at": history.get("end_at"),
         "funding": funding,
     }
 

@@ -208,8 +208,9 @@ def financial_replay(
     if manifest_note is not None:
         manifest["replay"]["note_blocking"] = manifest_note
 
+    artifact_results_dir = results_dir or _default_results_dir()
     summary = run_experiment(
-        results_dir=results_dir, manifest=manifest, split=split,
+        results_dir=artifact_results_dir, manifest=manifest, split=split,
         variants=variants, candles_holdout=holdout_candles,
         risk_limits=risk_limits,
         initial_cash=initial_cash, quote_currency=quote_currency,
@@ -225,7 +226,7 @@ def financial_replay(
     # stored copy so the artifact and the CLI print agree. The digest comes from
     # the LOCKED manifest — a run_experiment re-write would otherwise emit the
     # pre-lock dict with a null digest.
-    directory = artifacts.run_dir(results_dir or _default_results_dir(), run_id)
+    directory = artifacts.run_dir(artifact_results_dir, run_id)
     summary["manifest_digest"] = artifacts.load_manifest(directory).get("manifest_digest")
     artifacts.write_summary(directory, summary)
     if register_run:

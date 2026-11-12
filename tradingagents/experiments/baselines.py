@@ -30,6 +30,7 @@ Hold signal simply proposes nothing; nothing is inferred.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -55,7 +56,11 @@ def _rebuild_context(snapshot: dict | None, symbol: str) -> dict | None:
                                    "1h", symbol)
     four_hour = candle_from_payload(snapshot.get("four_hour") if isinstance(snapshot, dict) else None,
                                     "4h", symbol)
-    if one_hour is None or four_hour is None:
+    if (one_hour is None or four_hour is None or not symbol
+            or one_hour.symbol != symbol or four_hour.symbol != symbol
+            or one_hour.timeframe != "1h" or four_hour.timeframe != "4h"
+            or one_hour.close_time - one_hour.open_time != 3_600_000
+            or four_hour.close_time - four_hour.open_time != 14_400_000):
         return None
 
     def direction(candle: Candle) -> str:
@@ -128,31 +133,152 @@ def _confirmed_entry(
     return _proposal_from_terms({**terms, "signal": signal, "price": price}, symbol)
 
 
+_FOUR_HOUR_MS = 14_400_000
+
+
+def _snapshot_is_explicitly_closed(snapshot: dict) -> bool:
+    return all(
+        isinstance(snapshot.get(key), dict)
+        and snapshot[key].get("is_closed") is True
+        for key in ("one_hour", "four_hour")
+    )
+
+
+def _proposal_terms(payload: dict) -> dict[str, Any] | None:
+    terms = payload.get("agent_proposal")
+    if not isinstance(terms, dict):
+        return None
+    # These values must have been emitted by the agent; the replay may not
+    # manufacture a bracket or entry estimate from a candle.
+    required = ("entry_price", "stop_loss", "take_profit")
+    if any(terms.get(key) is None for key in required):
+        return None
+    return dict(terms)
+
+
+def _timestamp_ms(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        number = float(value)
+        if number != number or abs(number) == float("inf"):
+            return None
+        if abs(number) < 100_000_000_000:
+            number *= 1000
+        return int(number)
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.astimezone(UTC).timestamp() * 1000)
+
+
+def _phase_timestamp(row: dict, payload: dict, name: str) -> Any:
+    phase_timestamps = payload.get("phase_timestamps")
+    if isinstance(phase_timestamps, dict) and phase_timestamps.get(name) is not None:
+        return phase_timestamps[name]
+    if payload.get(name) is not None:
+        return payload[name]
+    return row.get(name)
+
+
+def _decision_availability(
+    row: dict, payload: dict, *, evidence_close_ms: int,
+) -> tuple[int | None, str | None]:
+    """Return when signal and validated agent terms are durably available.
+
+    ``proposal_validated_at`` is the only timestamp accepted for a proposal
+    replay: ``analysis_finished_at`` proves the signal analysis finished, but
+    cannot prove that the proposal terms were present and validated. Both
+    timestamps are checked when present so malformed or reversed lifecycle
+    data fails closed.
+    """
+    analysis_raw = _phase_timestamp(row, payload, "analysis_finished_at")
+    proposal_raw = _phase_timestamp(row, payload, "proposal_validated_at")
+    analysis_ms = _timestamp_ms(analysis_raw) if analysis_raw is not None else None
+    proposal_ms = _timestamp_ms(proposal_raw) if proposal_raw is not None else None
+    if analysis_raw is None or proposal_raw is None:
+        return None, "missing_decision_timestamp"
+    if analysis_ms is None or proposal_ms is None:
+        return None, "invalid_decision_timestamp"
+    if analysis_ms <= evidence_close_ms or proposal_ms <= evidence_close_ms:
+        return None, "timestamp_before_evidence"
+    if proposal_ms < analysis_ms:
+        return None, "timestamp_order"
+    return proposal_ms, None
+
+
+def _activation_open_time(snapshot_open_ms: int, available_ms: int) -> int:
+    """First 4h bar whose close can observe the recorded decision timestamp."""
+    first_close = snapshot_open_ms + _FOUR_HOUR_MS
+    bars_after_snapshot = max(
+        0, (available_ms - first_close + _FOUR_HOUR_MS - 1) // _FOUR_HOUR_MS,
+    )
+    return snapshot_open_ms + bars_after_snapshot * _FOUR_HOUR_MS
+
+
+def _event_fingerprint(event: dict[str, Any]) -> tuple[Any, ...]:
+    terms = event.get("terms") or {}
+    return (
+        event.get("symbol"), event.get("timeframe"), event.get("snapshot_open_ms"),
+        event.get("available_ms"), event.get("signal"),
+        tuple(sorted((str(key), repr(value)) for key, value in terms.items())),
+    )
+
+
+def _deduplicate_events(
+    events: dict[tuple[str, str, int], list[dict[str, Any]]],
+    skipped: dict[str, int],
+) -> dict[tuple[str, str, int], dict[str, Any]]:
+    """Deduplicate exact exports and reject conflicting event identities."""
+    accepted: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for key, candidates in events.items():
+        if len(candidates) == 1:
+            accepted[key] = candidates[0]
+            continue
+        fingerprints = {_event_fingerprint(candidate) for candidate in candidates}
+        if len(fingerprints) == 1:
+            accepted[key] = candidates[0]
+            skipped["duplicate_event"] += len(candidates) - 1
+        else:
+            skipped["duplicate_event"] += len(candidates)
+    return accepted
+
+
 def rule_source(
     rule: Callable[[dict, str], tuple[bool, str]],
     recorded_cycles: list[dict],
     *,
     signal_by_candle: dict[int, dict[str, Any]] | None = None,
 ) -> Callable[[Candle], Proposal | None]:
-    """A deterministic rule baseline built on the REAL production rule.
+    """Build a rule proposal source from point-in-time recorded evidence.
 
-    ``recorded_cycles`` are exported futures_cycles rows; their snapshots give
-    the rule its context at the cycle's own decision time. The returned
-    source proposes on the 4h-candle closes that match a recorded cycle's
-    decision time, so the rule decides exactly what it would have decided
-    that day (point-in-time), with the recorded entry terms as bracket terms.
-
-    Events are keyed by ``(symbol, open_time)``, not open time alone: the
-    export holds many symbols that share a 4h decision time, so an open-time
-    key would silently keep only the last symbol's event and then attach that
-    symbol's prices and bracket terms to a different instrument's candle.
+    This is a counterfactual confirmation-rule baseline, not a claim that the
+    rule would have known the answer at the candle open, and not a replay of
+    the agent's decisions. Terms: recorded ``payload.agent_proposal`` values
+    when the export carries them; otherwise the baseline's own declared
+    direction-respecting bracket from the 4h close (a recorded SHORT must get
+    stop > entry > target, or ``validate_bracket`` refuses every short). The
+    decision is available when the snapshot evidence closed, so activation is
+    the snapshot's own 4h bar — the engine fills at the NEXT bar's open, so
+    no look-ahead enters the fill. ``recorded_source`` (the bot replay) stays
+    strict: it never manufactures terms this baseline is allowed to declare.
     """
+    del signal_by_candle  # retained as an API-compatible, intentionally unused hook
     from server.futures_replay import RULES  # the real production rules, not a fork
 
     if rule not in RULES.values():
         raise ValueError("the rule baseline must use a server.futures_replay.RULES function")
 
-    events: dict[tuple[str, int], dict[str, Any]] = {}
+    skipped = defaultdict(int)
+    candidates: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in recorded_cycles:
         if not isinstance(row, dict):
             continue
@@ -160,42 +286,67 @@ def rule_source(
         snapshot = row.get("snapshot")
         symbol = str(row.get("symbol") or "")
         if not signal or not isinstance(snapshot, dict):
+            skipped["missing_signal_or_snapshot"] += 1
+            continue
+        if not _snapshot_is_explicitly_closed(snapshot):
+            skipped["unclosed_snapshot"] += 1
             continue
         context = _rebuild_context(snapshot, symbol)
         four_hour = context.get("four_hour") if context else None
         if context is None or four_hour is None:
+            skipped["invalid_snapshot"] += 1
             continue
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-        proposal_terms = (payload.get("agent_proposal") if isinstance(payload, dict) else None) or {}
-        # The fallback bracket must respect the signal's direction: a short
-        # (Sell/Underweight) needs stop > entry > target, a long the reverse.
-        # Hardcoding the long shape silently inverted every short bracket, and
-        # the runtime's validate_bracket then refused the entry — a recorded
-        # short could never trade in a simulation built from this source.
+        recorded_terms = _proposal_terms(payload)
         long_side = str(signal) in ("Buy", "Overweight")
-        stop_default = four_hour.close * (0.98 if long_side else 1.02)
-        target_default = four_hour.close * (1.04 if long_side else 0.96)
+        # Fallback bracket respects the signal's direction; hardcoded long
+        # shapes silently inverted every recorded short (see git history).
         terms = {
-            "ticker": row.get("symbol"),
-            "stop_loss": proposal_terms.get("stop_loss", stop_default),
-            "take_profit": proposal_terms.get("take_profit", target_default),
-            "leverage": proposal_terms.get("leverage", 1.0),
-            "risk_fraction": proposal_terms.get("risk_fraction", 0.01),
+            "ticker": row.get("symbol") or symbol,
+            "stop_loss": (recorded_terms or {}).get(
+                "stop_loss", four_hour.close * (0.98 if long_side else 1.02),
+            ),
+            "take_profit": (recorded_terms or {}).get(
+                "take_profit", four_hour.close * (1.04 if long_side else 0.96),
+            ),
+            "leverage": (recorded_terms or {}).get("leverage", 1.0),
+            "risk_fraction": (recorded_terms or {}).get("risk_fraction", 0.01),
         }
-        # The FULL rule context travels with the event: the rule re-decides on
-        # the same evidence it decided on that day, not a 1h-only projection.
-        events[(str(symbol or four_hour.symbol), four_hour.open_time)] = {
-            "signal": str(signal), "terms": terms,
-            "symbol": str(symbol or four_hour.symbol),
+        if recorded_terms is None:
+            skipped["fallback_terms"] += 1
+        # The rule saw closed candles; its verdict is available at that close,
+        # so the activation bar is the snapshot's own bar.
+        available_ms = max(context["one_hour"].close_time, four_hour.close_time)
+        if row.get("confirmation_reason") in ("direction_mismatch", "doji_candle"):
+            skipped["recorded_rejection"] += 1
+            continue
+        activation_open = _activation_open_time(four_hour.open_time, available_ms)
+        candidates[(symbol, "4h", four_hour.open_time)].append({
+            "signal": str(signal),
+            "terms": {**terms, "ticker": row.get("symbol") or symbol},
+            "symbol": symbol,
+            "timeframe": "4h",
             "context": context,
-        }
+            "snapshot_open_ms": four_hour.open_time,
+            "available_ms": available_ms,
+            "activation_open": activation_open,
+        })
+
+    accepted = _deduplicate_events(candidates, skipped)
+    events_by_activation: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for event in accepted.values():
+        activation_key = (event["symbol"], event["timeframe"], event["activation_open"])
+        if activation_key in events_by_activation:
+            skipped["duplicate_event"] += 2
+            events_by_activation.pop(activation_key)
+            continue
+        events_by_activation[activation_key] = event
 
     def source(candle: Candle) -> Proposal | None:
-        if candle.timeframe != "4h":
+        if not candle.is_closed or candle.timeframe != "4h":
             return None
-        # Symbol-scoped lookup: an instrument never trades another's decision.
-        event = events.get((candle.symbol, candle.open_time))
-        if event is None:
+        event = events_by_activation.get((candle.symbol, "4h", candle.open_time))
+        if event is None or candle.close_time < event["available_ms"]:
             return None
         confirmed, _ = rule(event["context"], event["signal"])
         if not confirmed:
@@ -206,6 +357,12 @@ def rule_source(
         )
 
     source.rule_fn = rule  # type: ignore[attr-defined]  # the no-fork pin
+    source.skipped = {key: skipped.get(key, 0) for key in (
+        "missing_signal_or_snapshot", "unclosed_snapshot", "invalid_snapshot",
+        "missing_terms", "fallback_terms", "recorded_rejection", "duplicate_event",
+    )}  # type: ignore[attr-defined]
+    source.built = len(events_by_activation)  # type: ignore[attr-defined]
+    source.counterfactual = True  # type: ignore[attr-defined]
     return source
 
 
@@ -215,25 +372,12 @@ def recorded_source(
     confirmation_rule: Callable[[dict, str], tuple[bool, str]],
     ablation: dict[str, Any] | None = None,
 ) -> Callable[[Candle], Proposal | None]:
-    """The bot as it decided, replayed through the same engine.
+    """Replay recorded agent decisions through the shared simulation engine.
 
-    A recorded cycle proposes when its own snapshot carries explicit entry
-    terms and its recorded review was a pass (same flip vocabulary the engine
-    replay uses: ``direction_mismatch``/``doji_candle`` are recorded
-    rejections). The optional ``ablation`` is a single named knob; only
-    ``memory_on`` (the runtime memory dedup — one proposal per symbol/day,
-    mirroring ``TradingMemoryLog.store_decision``'s idempotency guard) and
-    ``quick_model`` (same decisions, faster fills assumed unchanged) are
-    recognized; an unknown ablation name is refused rather than silently
-    ignored. ``memory_on=False`` switches the dedup off, so repeated entries
-    for the same symbol/day propose instead of being suppressed — the knob
-    changes the proposal set or it is not an ablation.
-
-    Known data limit: the recorded export carries entry terms in
-    ``payload.agent_proposal``; cycles exported without them fall into
-    ``skipped["missing_terms"]``. If the export at hand has no recorded terms
-    at all, this source builds zero proposals — reported honestly via
-    ``built``/``skipped``, never filled with invented stop/target values.
+    A proposal is available only after an explicit ``proposal_validated_at``
+    timestamp proves that the recorded signal and terms existed. Missing or
+    contradictory lifecycle evidence is skipped and reported, never inferred
+    from candle closes or cycle IDs.
     """
     ablation = ablation or {}
     unknown = set(ablation) - set(_KNOWN_ABLATIONS)
@@ -241,12 +385,9 @@ def recorded_source(
         raise ValueError(f"unknown ablation knob(s): {sorted(unknown)}; the manifest names them")
     memory_on = bool(ablation.get("memory_on", True))
 
-    proposals: dict[int, dict[str, Any]] = {}
-    skipped = {"missing_terms": 0, "recorded_rejection": 0, "memory_dedup": 0}
-    # The runtime memory dedup, replayed: the real memory log stores ONE entry
-    # per (ticker, date) — a second decision for the same symbol and day is
-    # suppressed (tradingagents/memory/log.py, store_decision's guard). The
-    # ``memory_on`` ablation toggles exactly that behavior off.
+    proposals: dict[tuple[str, str, int], dict[str, Any]] = {}
+    skipped: dict[str, int] = defaultdict(int)
+    candidates: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
     seen_symbol_day: set[tuple[str, str]] = set()
     for row in recorded_cycles:
         if not isinstance(row, dict):
@@ -255,43 +396,91 @@ def recorded_source(
         snapshot = row.get("snapshot")
         symbol = str(row.get("symbol") or "")
         if not signal or not isinstance(snapshot, dict):
+            skipped["missing_signal_or_snapshot"] += 1
             continue
-        one_hour = candle_from_payload(snapshot.get("one_hour"), "1h", symbol)
-        if one_hour is None:
+        if not _snapshot_is_explicitly_closed(snapshot):
+            skipped["unclosed_snapshot"] += 1
             continue
+        context = _rebuild_context(snapshot, symbol)
+        if context is None:
+            skipped["invalid_snapshot"] += 1
+            continue
+        one_hour = context["one_hour"]
+        four_hour = context["four_hour"]
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-        terms_payload = (payload.get("agent_proposal") if isinstance(payload, dict) else None) or {}
-        price = terms_payload.get("entry_price", one_hour.close)
-        terms = dict(terms_payload)
-        terms["ticker"] = symbol
-        recorded_rejected = row.get("confirmation_reason") in ("direction_mismatch", "doji_candle")
-        if recorded_rejected:
-            skipped["recorded_rejection"] += 1
-            continue
-        proposal = _proposal_from_terms({**terms, "signal": signal, "price": price}, symbol)
-        if proposal is None:
+        terms_payload = _proposal_terms(payload)
+        if terms_payload is None:
             skipped["missing_terms"] += 1
             continue
-        confirmed, _ = confirmation_rule(_rebuild_context(snapshot, symbol) or {}, signal)
+        if row.get("confirmation_reason") in ("direction_mismatch", "doji_candle"):
+            skipped["recorded_rejection"] += 1
+            continue
+        available_ms, reason = _decision_availability(
+            row, payload, evidence_close_ms=max(one_hour.close_time, four_hour.close_time),
+        )
+        if available_ms is None:
+            skipped[reason or "missing_decision_timestamp"] += 1
+            continue
+        confirmed, _ = confirmation_rule(context, signal)
         if not confirmed:
             skipped["recorded_rejection"] += 1
             continue
+        day = datetime.fromtimestamp(one_hour.open_time / 1000, UTC).date().isoformat()
+        activation_open = _activation_open_time(four_hour.open_time, available_ms)
+        event_key = (symbol, "4h", four_hour.open_time)
+        candidates[event_key].append({
+            "proposal": _proposal_from_terms(
+                {
+                    **terms_payload,
+                    "ticker": symbol,
+                    "signal": signal,
+                    "price": terms_payload["entry_price"],
+                },
+                symbol,
+            ),
+            "symbol": symbol,
+            "timeframe": "4h",
+            "snapshot_open_ms": four_hour.open_time,
+            "available_ms": available_ms,
+            "activation_open": activation_open,
+            "signal": signal,
+            "terms": terms_payload,
+        })
+
+    accepted = _deduplicate_events(candidates, skipped)
+    for event in accepted.values():
         if memory_on:
-            day = datetime.fromtimestamp(one_hour.open_time / 1000, UTC).date().isoformat()
-            key = (symbol, day)
+            day = datetime.fromtimestamp(
+                event["snapshot_open_ms"] / 1000, UTC,
+            ).date().isoformat()
+            key = (event["symbol"], day)
             if key in seen_symbol_day:
                 skipped["memory_dedup"] += 1
                 continue
             seen_symbol_day.add(key)
-        proposals[one_hour.open_time] = {
-            "proposal": proposal,
-        }
+        proposal = event.get("proposal")
+        if proposal is None:
+            skipped["missing_terms"] += 1
+            continue
+        activation_key = (event["symbol"], event["timeframe"], event["activation_open"])
+        if activation_key in proposals:
+            skipped["duplicate_event"] += 2
+            proposals.pop(activation_key)
+            continue
+        proposals[activation_key] = {"proposal": proposal}
 
     def source(candle: Candle) -> Proposal | None:
-        event = proposals.get(candle.open_time)
+        if not candle.is_closed or candle.timeframe != "4h":
+            return None
+        event = proposals.get((candle.symbol, "4h", candle.open_time))
         return event["proposal"] if event is not None else None
 
-    source.skipped = skipped  # type: ignore[attr-defined]  # reported honestly
+    source.skipped = {key: skipped.get(key, 0) for key in (
+        "missing_signal_or_snapshot", "unclosed_snapshot", "invalid_snapshot",
+        "missing_terms", "missing_decision_timestamp", "invalid_decision_timestamp",
+        "timestamp_order", "timestamp_before_evidence", "duplicate_event",
+        "recorded_rejection", "memory_dedup",
+    )}  # type: ignore[attr-defined]
     source.built = len(proposals)  # type: ignore[attr-defined]
     return source
 

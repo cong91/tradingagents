@@ -33,6 +33,13 @@ from tradingagents.experiments.walkforward import Split
 # funding is unknown — those repeats are reported, not dropped).
 DEFAULT_METRIC = "net_after_costs.final_equity"
 
+# net_after_costs keys whose value depends on funding the run could not prove;
+# any metric resolving to one of them on a traded run with unproven funding is
+# unproducible, whatever the criteria named.
+_FUNDING_DEPENDENT_KEYS = frozenset({
+    "final_equity", "final_equity_estimate", "funding_received",
+})
+
 # Modules the runner must never import or call (plan: no code promotion).
 _FORBIDDEN_IMPORTS = (
     "server.operator_config",
@@ -67,12 +74,29 @@ def _config_hash(config: dict) -> str:
 
 
 def _metric_value(result: dict[str, Any], metric: str) -> float | None:
-    """Read a dotted metric path off one repeat's report; None stays None."""
+    """Read a dotted metric path; unknown traded funding never becomes numeric.
+
+    The guard is not limited to the default metric: any path resolving through
+    ``net_after_costs`` to a funding-dependent key is unproducible on a traded
+    run whose funding the engine could not prove. Funding-independent keys
+    (fees, ambiguity counts) stay numeric.
+    """
+    net = result.get("net_after_costs")
+    traded = bool(result.get("fills"))
+    funding_unproven = traded and isinstance(net, dict) and (
+        net.get("final_equity_status") == "estimate" or net.get("funding_known") is False
+    )
     value: Any = result
+    final_key = metric.rsplit(".", 1)[-1]
+    through_net = False
     for part in metric.split("."):
         if not isinstance(value, dict) or part not in value:
             return None
         value = value[part]
+        if part == "net_after_costs" and isinstance(value, dict):
+            through_net = True
+    if funding_unproven and through_net and final_key in _FUNDING_DEPENDENT_KEYS:
+        return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)

@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from server.futures_replay import RULES
-    from tradingagents.simulation.engine import replay_recorded_decisions
+    from tradingagents.simulation.decision_replay import replay_recorded_decisions
 
     rule = RULES[args.rule]
     with open(args.fixture, encoding="utf-8") as handle:

@@ -26,7 +26,6 @@ import {
 } from "@/components/ui/card";
 import {
   formatDateTime,
-  formatMoney,
   formatNumber,
   formatPercent,
   formatSignedCurrency,
@@ -189,11 +188,17 @@ function CoverageBlock({ data }: { data: BriefPayload }) {
   );
 }
 
+function ledgerMoney(amount: string | null | undefined, currency: string | null): string {
+  if (amount == null) return "—";
+  return currency ? `${amount} ${currency}` : amount;
+}
+
 function VerifiedBlock({ data }: { data: BriefPayload }) {
   const t = useT();
   const r = t.brief.results;
   const ledger = data.results.ledger;
-  const netRows = ledger.totals?.net_by_currency ?? [];
+  const totals = ledger.totals;
+  const netRows = totals?.net_by_currency ?? [];
 
   // Only the NET TABLE depends on rows existing. Coverage evidence and
   // manual/unlinked fills must render whatever the totals say: an operator
@@ -225,45 +230,73 @@ function VerifiedBlock({ data }: { data: BriefPayload }) {
             </thead>
             <tbody className="divide-y">
               {netRows.map((row) => {
-                const net = num(row.net);
+                // JSON object keys serialize a missing currency as "null".
+                const key = row.currency ?? "null";
+                const realized = totals?.realized_by_currency?.[key];
+                const fee = totals?.fee_by_currency?.[key];
+                const funding = totals?.funding_by_currency?.[key];
+                const negative = row.amount?.startsWith("-") ?? false;
+                const positive = row.amount != null && !negative && /[1-9]/.test(row.amount);
                 return (
-                  <tr key={row.currency ?? "unknown-currency"} data-net-currency={row.currency ?? "null"}>
+                  <tr key={row.currency === null ? "unknown-currency" : `currency:${row.currency}`} data-net-currency={key}>
                     <td className="py-1.5 pr-3 font-mono">{row.currency ?? "—"}</td>
                     <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {num(row.realized) === null ? "—" : formatMoney(num(row.realized), row.currency)}
+                      {ledgerMoney(realized, row.currency)}
                     </td>
                     <td className="py-1.5 pr-3 text-right tabular-nums">
-                      {/* Fees are folded into net only when the venue semantics allow it. */}
-                      {row.fee_known === false
-                        ? r.feeUnknown
-                        : num(row.fees) === null
-                          ? "—"
-                        : formatMoney(num(row.fees), row.currency)}
-                  </td>
-                  <td className="py-1.5 pr-3 text-right tabular-nums">
-                    {row.funding_known === false ? r.fundingUnknown : formatMoney(num(row.funding), row.currency)}
-                  </td>
-                  <td
-                    className={`py-1.5 text-right font-medium tabular-nums ${
-                      toneOf(net) === "profit" ? "text-profit" : toneOf(net) === "loss" ? "text-loss" : ""
-                    }`}
-                  >
-                    {net === null ? r.notEnoughData : formatSignedCurrency(net, row.currency)}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                      {ledgerMoney(fee, row.currency)}
+                      {!row.fee_known ? <span className="block text-xs">{r.feeUnknown}</span> : null}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums">
+                      {funding ? (
+                        <>
+                          <span className="block">{r.fundingReceived}: {ledgerMoney(funding.received, row.currency)}</span>
+                          <span className="block">{r.fundingPaid}: {ledgerMoney(funding.paid, row.currency)}</span>
+                        </>
+                      ) : "—"}
+                      {!row.funding_known ? <span className="block text-xs">{r.fundingUnknown}</span> : null}
+                    </td>
+                    <td
+                      className={`py-1.5 text-right font-medium tabular-nums ${
+                        positive ? "text-profit" : negative ? "text-loss" : ""
+                      }`}
+                    >
+                      {row.amount === null ? r.notEnoughData : `${positive ? "+" : ""}${ledgerMoney(row.amount, row.currency)}`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
       {ledger.funding_unknown_currencies?.length ? (
         <p className="text-xs text-muted-foreground">
-          {r.fundingUnknown}: {ledger.funding_unknown_currencies.join(", ")}
+          {r.fundingUnknown}: {ledger.funding_unknown_currencies.map((currency) => currency ?? r.currencyUnknown).join(", ")}
         </p>
       ) : null}
       <p className="text-xs text-muted-foreground">{r.ledgerNote}</p>
       <CoverageBlock data={data} />
+    </div>
+  );
+}
+
+function FundingObservations({ data }: { data: BriefPayload }) {
+  const r = useT().brief.results;
+  const observations = data.results.ledger.funding_observations;
+  if (!observations?.events.length) return null;
+  return (
+    <div className="space-y-1.5" data-brief-block="funding-observations">
+      <p className="text-xs font-medium">{r.fundingObservations}</p>
+      <p className="text-xs text-muted-foreground">{r.fundingObservationsNote}</p>
+      <ul className="space-y-1 text-xs">
+        {observations.events.map((event) => (
+          <li key={`${event.account_id}:${event.symbol}:${event.venue_income_id}`} className="break-words">
+            {formatDateTime(event.funding_at)} · {event.account_id} · {event.venue_key} · {event.account_type} · {event.symbol} · {ledgerMoney(event.amount, event.currency)}
+          </li>
+        ))}
+      </ul>
+      {observations.truncated ? <p className="text-xs text-muted-foreground">{r.fundingObservationsTruncated}</p> : null}
     </div>
   );
 }
@@ -305,6 +338,7 @@ function ResultsBlock({ data, scope }: { data: BriefPayload; scope: Scope }) {
     <BriefSection title={r.title}>
       <div className="space-y-3">
         <VerifiedBlock data={data} />
+        <FundingObservations data={data} />
         <UnattributedBlock data={data} />
         <div className="space-y-1.5" data-brief-block="estimated">
           <p className="text-xs font-medium">{r.estimatedTitle}</p>

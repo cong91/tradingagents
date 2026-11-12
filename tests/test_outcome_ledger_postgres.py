@@ -190,10 +190,9 @@ def test_mixed_currency_realized_totals_stay_separate(postgres_schema):
     assert totals["fee_by_currency"]["BNB"] == "0.01"
 
 
-def test_net_subtracts_fee_only_with_recorded_exclusion_semantics(postgres_schema):
-    """Finding 5: the fee subtraction decision is recorded in ingestion, not
-    assumed — a currency whose realized fills lack the exclusion semantics
-    keeps its fee OUT of the net and is flagged fee_unknown."""
+def test_summary_requires_fee_semantics_but_does_not_claim_net_without_funding(postgres_schema):
+    """Fee semantics are recorded at ingestion; unknown funding or fee
+    semantics prevent the summary from claiming a net."""
     from server import outcome_store
 
     with_semantics = {
@@ -208,8 +207,9 @@ def test_net_subtracts_fee_only_with_recorded_exclusion_semantics(postgres_schem
         fills=[with_semantics], exits=[], funding=[],
     )
     net_rows = {row["currency"]: row for row in outcome_store.summary()["totals"]["net_by_currency"]}
-    assert net_rows["USDT"]["amount"] == "9.5"  # 10 - 0.5, recorded contract
+    assert net_rows["USDT"]["amount"] is None  # no proof of complete funding
     assert net_rows["USDT"]["fee_known"] is True
+    assert net_rows["USDT"]["funding_known"] is False
 
     without_semantics = {
         **_FILL, "venue_trade_id": "311", "role": "exit", "side": "sell",
@@ -224,9 +224,230 @@ def test_net_subtracts_fee_only_with_recorded_exclusion_semantics(postgres_schem
     )
     summary = outcome_store.summary()
     net_rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
-    assert net_rows["ETH"]["amount"] == "20"  # fee NOT subtracted: unproven
+    assert net_rows["ETH"]["amount"] is None  # an incomplete subtotal is not net
     assert net_rows["ETH"]["fee_known"] is False
     assert "ETH" in summary["fee_unknown_currencies"]
+
+
+def test_summary_does_not_infer_funding_completeness_from_an_event(postgres_schema):
+    from server import outcome_store
+
+    fill = {
+        **_FILL, "role": "exit", "realized_pnl": Decimal("5"),
+        "realized_pnl_currency": "USDT", "realized_pnl_semantics": REALIZED_PNL_EXCLUDES_FEE,
+    }
+    funding = [{
+        "funding_at": "2026-11-10T02:00:00+00:00", "amount": Decimal("0"),
+        "currency": "USDT", "venue_semantics": "binance: income positive = received",
+    }]
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[fill], exits=[], funding=funding,
+    )
+    summary = outcome_store.summary()
+    row = summary["totals"]["net_by_currency"][0]
+    assert summary["totals"]["funding_by_currency"]["USDT"]["received"] == "0"
+    assert row["funding_known"] is False
+    assert row["amount"] is None
+    assert "USDT" in summary["funding_unknown_currencies"]
+
+
+def test_summary_mixed_fee_semantics_fail_closed_across_accounts(postgres_schema):
+    from server import outcome_store
+
+    for index, semantics in enumerate((REALIZED_PNL_EXCLUDES_FEE, None)):
+        fill = {
+            **_FILL, "venue_trade_id": str(400 + index), "role": "exit",
+            "realized_pnl": Decimal("10"), "realized_pnl_currency": "USDT",
+            "realized_pnl_semantics": semantics,
+        }
+        outcome_store.record_outcome(
+            account_id=f"{ACCOUNT_ID}-{index}",
+            position={**_POSITION, "client_order_id": f"ta_mix{index}"},
+            fills=[fill], exits=[], funding=[],
+        )
+    summary = outcome_store.summary()
+    row = summary["totals"]["net_by_currency"][0]
+    assert row["fee_known"] is False
+    assert row["amount"] is None
+    assert "USDT" in summary["fee_unknown_currencies"]
+    assert summary["totals"]["fee_by_currency"]["USDT"] == "0.2"
+
+
+def test_summary_keeps_different_and_unknown_fee_currency_buckets(postgres_schema):
+    from server import outcome_store
+
+    fills = [
+        {**_FILL, "venue_trade_id": "501", "role": "exit", "realized_pnl": Decimal("5"),
+         "realized_pnl_currency": "USDT", "realized_pnl_semantics": REALIZED_PNL_EXCLUDES_FEE,
+         "fee": Decimal("0.0123456789"), "fee_currency": "BNB"},
+        {**_FILL, "venue_trade_id": "502", "fee": Decimal("0.1"), "fee_currency": None},
+    ]
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION), fills=fills, exits=[], funding=[],
+    )
+    summary = outcome_store.summary()
+    rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
+    assert {"USDT", "BNB", None} <= rows.keys()
+    assert all(rows[currency]["amount"] is None for currency in ("USDT", "BNB", None))
+    assert summary["totals"]["fee_by_currency"]["BNB"] == "0.0123456789"
+    assert summary["totals"]["fee_by_currency"][None] == "0.1"
+    assert None in summary["funding_unknown_currencies"]
+
+
+def test_summary_fee_unknown_does_not_poison_another_accounts_currency(postgres_schema):
+    from server import outcome_store
+
+    for index, (currency, semantics, fee) in enumerate((
+        ("USDT", REALIZED_PNL_EXCLUDES_FEE, Decimal("0.1")),
+        ("ETH", None, None),
+    )):
+        fill = {
+            **_FILL, "venue_trade_id": str(600 + index), "role": "exit",
+            "realized_pnl": Decimal("1"), "realized_pnl_currency": currency,
+            "realized_pnl_semantics": semantics, "fee": fee, "fee_currency": currency,
+        }
+        outcome_store.record_outcome(
+            account_id=f"{ACCOUNT_ID}-{index}",
+            position={**_POSITION, "client_order_id": f"ta_independent{index}"},
+            fills=[fill], exits=[], funding=[],
+        )
+    summary = outcome_store.summary()
+    rows = {row["currency"]: row for row in summary["totals"]["net_by_currency"]}
+    assert rows["USDT"]["fee_known"] is True
+    assert rows["ETH"]["fee_known"] is False
+    assert summary["fee_unknown_currencies"] == ["ETH"]
+
+
+def test_summary_missing_fee_does_not_disappear_from_known_bucket(postgres_schema):
+    from server import outcome_store
+
+    fills = [
+        {**_FILL, "venue_trade_id": "701", "role": "exit", "realized_pnl": Decimal("1"),
+         "realized_pnl_currency": "USDT", "realized_pnl_semantics": REALIZED_PNL_EXCLUDES_FEE},
+        {**_FILL, "venue_trade_id": "702", "fee": None, "fee_currency": "USDT"},
+    ]
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION), fills=fills, exits=[], funding=[],
+    )
+    summary = outcome_store.summary()
+    row = summary["totals"]["net_by_currency"][0]
+    assert summary["totals"]["fee_by_currency"]["USDT"] == "0.1"
+    assert row["fee_known"] is False
+    assert row["amount"] is None
+
+
+def test_summary_funding_only_account_does_not_claim_known_fees(postgres_schema):
+    from server import outcome_store
+
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[], exits=[],
+        funding=[{
+            "funding_at": "2026-11-10T02:00:00+00:00", "amount": Decimal("1"),
+            "currency": "USDT", "venue_semantics": "binance: income positive = received",
+        }],
+    )
+    summary = outcome_store.summary()
+    row = summary["totals"]["net_by_currency"][0]
+    assert row["fee_known"] is False
+    assert row["funding_known"] is False
+    assert row["amount"] is None
+
+
+def test_summary_funding_in_other_account_does_not_inherit_fee_coverage(postgres_schema):
+    from server import outcome_store
+
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION),
+        fills=[{
+            **_FILL, "role": "exit", "realized_pnl": Decimal("1"),
+            "realized_pnl_currency": "USDT", "realized_pnl_semantics": REALIZED_PNL_EXCLUDES_FEE,
+        }], exits=[], funding=[],
+    )
+    outcome_store.record_outcome(
+        account_id=f"{ACCOUNT_ID}-other", position=dict(_POSITION), fills=[], exits=[],
+        funding=[{
+            "funding_at": "2026-11-10T02:00:00+00:00", "amount": Decimal("1"),
+            "currency": "USDT", "venue_semantics": "binance: income positive = received",
+        }],
+    )
+    summary = outcome_store.summary()
+    row = summary["totals"]["net_by_currency"][0]
+    assert row["fee_known"] is False
+    assert row["amount"] is None
+
+
+def test_summary_discloses_unattributed_funding_without_merging_legacy(postgres_schema):
+    from server import outcome_store
+
+    outcome_store.record_outcome(
+        account_id=ACCOUNT_ID, position=dict(_POSITION), fills=[], exits=[],
+        funding=[{
+            "funding_at": "2026-11-10T02:00:00+00:00", "amount": Decimal("0.125"),
+            "currency": "USDT", "venue_semantics": "binance: income positive = received",
+        }],
+    )
+    events = [
+        {"id": "income-1", "funding_at": "2026-11-10T02:00:00+00:00",
+         "amount": Decimal("0.125"), "currency": "USDT",
+         "venue_semantics": "binance: income positive = received"},
+        {"id": "income-2", "funding_at": "2026-11-11T02:00:00+00:00",
+         "amount": Decimal("0.000000000000000000123456789"), "currency": "BNB",
+         "venue_semantics": "binance: income positive = received"},
+    ]
+    outcome_store.record_funding_observations(ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events)
+    outcome_store.record_funding_observations(ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events)
+    summary = outcome_store.summary()
+    assert summary["totals"]["funding_by_currency"]["USDT"]["received"] == "0.125"
+    observations = summary["funding_observations"]
+    assert observations["status"] == "partial"
+    assert len(observations["events"]) == 2
+    by_id = {row["venue_income_id"]: row for row in observations["events"]}
+    assert by_id["income-1"]["account_id"] == ACCOUNT_ID
+    assert by_id["income-1"]["symbol"] == "BTC/USDT:USDT"
+    assert Decimal(by_id["income-1"]["amount"]) == Decimal("0.125")
+    assert Decimal(by_id["income-2"]["amount"]) == Decimal("0.000000000000000000123456789")
+    assert by_id["income-2"]["currency"] == "BNB"
+    assert all(row["amount"] is None for row in summary["totals"]["net_by_currency"])
+    filtered = outcome_store.summary(
+        window_start="2026-11-10T00:00:00+00:00", window_end="2026-11-11T00:00:00+00:00",
+    )
+    assert [row["venue_income_id"] for row in filtered["funding_observations"]["events"]] == ["income-1"]
+
+
+def test_summary_exposes_observations_even_without_an_attributed_position(postgres_schema):
+    from server import outcome_store
+
+    outcome_store.record_funding_observations(
+        ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", [{
+            "id": "only-event", "funding_at": "2026-11-10T02:00:00+00:00",
+            "amount": Decimal("-0.5"), "currency": "USDT",
+            "venue_semantics": "binance: income positive = received",
+        }],
+    )
+    summary = outcome_store.summary()
+    assert summary["status"] == "partial"
+    assert summary["totals"]["funding_by_currency"] == {}
+    assert summary["totals"]["net_by_currency"] == []
+    assert summary["funding_observations"]["events"][0]["venue_income_id"] == "only-event"
+
+
+def test_summary_marks_funding_observations_truncated_after_latest_100(postgres_schema):
+    from server import outcome_store
+
+    events = [{
+        "id": f"income-{index:03d}",
+        "funding_at": "2026-11-10T02:00:00+00:00",
+        "amount": Decimal("0.01"), "currency": "USDT",
+        "venue_semantics": "binance: income positive = received",
+    } for index in range(101)]
+    outcome_store.record_funding_observations(
+        ACCOUNT_ID, "binance:demo", "futures", "BTC/USDT:USDT", events,
+    )
+    observations = outcome_store.summary()["funding_observations"]
+    assert observations["status"] == "partial"
+    assert observations["truncated"] is True
+    assert len(observations["events"]) == 100
+    assert observations["events"][0]["venue_income_id"] == "income-000"
 
 
 def test_summary_window_filter_selects_intersecting_coverage_rows(postgres_schema):

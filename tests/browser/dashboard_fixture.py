@@ -25,8 +25,7 @@ FAKE_API = r"""
     JSON.stringify({error: {code: "http_" + status, message: "fixture failure", details: {}}}),
     {status, headers: {"Content-Type": "application/json"}}));
 
-  const netRow = () => ({currency: "USDT", realized: "5", fees: "0.25", funding: null,
-    net: "4.75", funding_known: false, fee_known: true});
+  const netRow = () => ({currency: "USDT", amount: null, funding_known: false, fee_known: true});
   const coverage = status => [{
     account_id: "binance:demo:" + "a".repeat(8), window_start: "2026-11-10T00:00:00Z",
     window_end: "2026-11-10T01:00:00Z", fills_found: 2, status,
@@ -82,11 +81,17 @@ FAKE_API = r"""
              totals: {realized_by_currency: {USDT: "5"}, fee_by_currency: {},
                funding_by_currency: {}, net_by_currency: []},
              funding_unknown_currencies: [], fee_unknown_currencies: [],
+             funding_observations: {status: "partial", events: [], truncated: false},
              coverage: coverage("error")}
           : {status: "partial", positions: {total: 1, closed: 1}, fills: 2,
              totals: {realized_by_currency: {USDT: "5"}, fee_by_currency: {USDT: "0.25"},
                funding_by_currency: {}, net_by_currency: [netRow()]},
              funding_unknown_currencies: ["USDT"], fee_unknown_currencies: [],
+             funding_observations: {status: "partial", truncated: false, events: [{
+               account_id: "binance:demo:fixture", venue_key: "binance:demo", account_type: "futures",
+               symbol: "BTC/USDT:USDT", venue_income_id: "income-1",
+               funding_at: "2026-11-10T00:30:00Z", amount: "-0.000000000123456789",
+               currency: "BNB", venue_semantics: "binance: income positive = received"}]},
              coverage: coverage("partial")},
         estimated: {spot_audit_realized_total: 5, spot_audit_realized_today: 1,
           spot_currency: "USDT", spot_closed_trades: 2, spot_unknown_basis_closes: 0,

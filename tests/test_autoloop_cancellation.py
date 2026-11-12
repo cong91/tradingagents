@@ -11,13 +11,18 @@ from server import (
     autoloop_analysis,
     autoloop_execution,
     autoloop_futures_context,
+    autoloop_kronos,
     futures_cycle_telemetry,
     job_store,
 )
+from server.auto_modes import AutoMode
 from server.autoloop_telemetry import CycleTelemetry
+from tests.execution_derivatives_support import VERIFIED_IDENTITY
 from tradingagents.execution import futures_account
 from tradingagents.execution.futures_account import FuturesAccountSnapshot
+from tradingagents.execution.futures_entry_journal import managed_live_provenance
 from tradingagents.execution.risk import RiskGuard, RiskLimits
+from tradingagents.execution.sizing import PlannedOrder
 from tradingagents.forecast.block import ForecastBlock
 from tradingagents.forecast.contract import GENERATION_FORWARD, STATUS_OK
 
@@ -25,7 +30,10 @@ pytestmark = pytest.mark.unit
 
 
 def _install(monkeypatch, cancelled, *, cancel_at):
-    candle = SimpleNamespace(open=100, high=110, low=90, close=105)
+    candle = SimpleNamespace(
+        open=100, high=110, low=90, close=105,
+        open_time=1_700_000_000_000, close_time=1_700_014_400_000,
+    )
     context = {
         "unified_symbol": "BTC/USDT:USDT", "one_hour": candle, "four_hour": candle,
         "one_hour_open": 1_799_996_400_000, "four_hour_open": 1_799_985_600_000,
@@ -407,3 +415,201 @@ def test_owner_timeout_after_usable_forecast_marks_execution_uncertain(monkeypat
     assert terminal["payload"]["kronos_policy"] == "use"
     assert terminal["payload"]["execution_status"] == "not_started"
     assert terminal["payload"]["executed"] is False
+
+
+@pytest.mark.parametrize("outcome", [
+    "returned", "exception", "timeout", "ack", "cancelled_before_submit", "worker_timeout",
+])
+def test_timeout_owner_accounts_for_inflight_futures_order(monkeypatch, outcome):
+    """The owner waits for the execution result, even after the deadline."""
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="execution")
+    started = threading.Event()
+    finished = threading.Event()
+    submitted = []
+    plan = SimpleNamespace(
+        side="buy", market="derivatives", quantity=1.0, estimated_price=100.0,
+        cost=100.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
+        take_profit=110.0, reason=None,
+    )
+    marker = managed_live_provenance(
+        PlannedOrder(ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", side="buy"),
+        "entry-0123456789abcdef01234567", identity=VERIFIED_IDENTITY, venue="binance:demo",
+    )
+
+    def prepare_forecast(*_args, **kwargs):
+        payload = kwargs["cycle_payload"]
+        payload.update(forecast_started=True, kronos_forecast={"status": "ok"})
+        kwargs["on_cycle_checkpoint"]({
+            "cycle_id": kwargs["cycle_id"], "symbol": "BTC/USDT:USDT",
+            "payload": dict(payload),
+        })
+        return None, ""
+
+    def place_order(*_args, on_entry_evidence=None, check_entry_allowed=None, **_kwargs):
+        if outcome in {"ack", "cancelled_before_submit"}:
+            on_entry_evidence({
+                "entry_intent_id": marker["intent_id"], "entry_provenance": marker,
+                "execution_status": "uncertain",
+            })
+        if outcome != "cancelled_before_submit":
+            submitted.append("entry")
+        started.set()
+        if outcome == "worker_timeout":
+            raise TimeoutError("venue timeout before owner deadline")
+        assert cancelled.wait(5), "owner did not cancel the in-flight call"
+        if outcome == "cancelled_before_submit":
+            check_entry_allowed()
+        if outcome == "exception":
+            raise RuntimeError("ambiguous venue response")
+        if outcome == "timeout":
+            raise TimeoutError("ambiguous venue timeout")
+        if outcome == "ack":
+            on_entry_evidence({
+                "entry_intent_id": marker["intent_id"], "entry_provenance": marker,
+                "execution_status": "uncertain", "protection_state": "unverified",
+                "order_id": "venue-123",
+            })
+            raise RuntimeError("protection unverified")
+        return "venue-123"
+
+    executor.plan_order = lambda *_args, **_kwargs: plan
+    executor.execute_order = place_order
+    executor.auto_mode_enabled = lambda *_args, **_kwargs: True
+    executor.effective_mode = lambda: "live"
+    executor.risk_guard_decisions = [{"allowed": True, "halted": False}]
+    monkeypatch.setattr(autoloop_kronos, "_prepare_forecast", prepare_forecast)
+    monkeypatch.setattr(autoloop_futures_context, "_unified_mark_price", lambda *_args: 100.0)
+    monkeypatch.setattr(autoloop_futures_context, "_confirmation_state", lambda *_args: (True, "aligned"))
+
+    class Graph:
+        def propagate(self, *_args, **_kwargs):
+            return {
+                "futures_execution_intent": "enter",
+                "futures_execution_proposal": {
+                    "margin_mode": "isolated", "leverage": 2,
+                    "risk_fraction": 0.01, "margin_fraction": 0.2,
+                    "stop_loss": 90.0, "take_profit": 110.0, "rationale": "test",
+                },
+            }, "Buy"
+
+    original = autoloop_analysis._process_candidate
+
+    def process(*args, **kwargs):
+        try:
+            result = original(*args, **kwargs)
+            if not started.is_set():
+                raise AssertionError(f"candidate stopped before execution: {result.reason}")
+            return result
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(autoloop_analysis, "_process_candidate", process)
+    try:
+        with pytest.raises(TimeoutError):
+            autoloop._run_candidate_with_timeout(
+                None, {"ticker": "BTC-USD"}, {}, lambda *_: Graph(), executor,
+                time.monotonic() + 0.2, cancelled, threading.Lock(), CycleTelemetry(),
+            )
+        assert started.is_set()
+        assert finished.wait(5)
+        terminal = [write for write in writes if write.get("terminal")]
+        assert len(claims) == 1
+        assert len(terminal) == 1
+        assert writes[-1] is terminal[0]
+        payload = terminal[0]["payload"]
+        assert payload["signal"] == "Buy"
+        assert payload["plan"]["stop_loss"] == 90.0
+        if outcome == "returned":
+            assert payload["execution_status"] == "executed"
+            assert payload["executed"] is True
+            assert payload["order_id"] == "venue-123"
+        elif outcome == "ack":
+            assert payload["execution_status"] == "uncertain"
+            assert payload.get("executed") is not False
+            assert payload["order_id"] == "venue-123"
+            assert payload["protection_state"] == "unverified"
+        else:
+            assert payload["execution_status"] == "uncertain"
+            assert payload.get("executed") is not False
+            assert payload.get("order_id") is None
+        if outcome in {"ack", "cancelled_before_submit"}:
+            assert payload["entry_intent_id"] == marker["intent_id"]
+            assert payload["entry_provenance"] == marker
+            prior = [write for write in writes if write["payload"].get("entry_provenance")]
+            assert not prior[0].get("terminal", False)
+            assert prior[0]["payload"]["entry_provenance"] == marker
+        assert submitted == ([] if outcome == "cancelled_before_submit" else ["entry"])
+    finally:
+        cancelled.set()
+        assert finished.wait(5)
+
+
+@pytest.mark.parametrize("failed_write", ["started", "terminal"])
+def test_cycle_persistence_failure_does_not_erase_successful_order(monkeypatch, failed_write):
+    cancelled = threading.Event()
+    executor, _claims, writes = _install(monkeypatch, cancelled, cancel_at="execution")
+    executor.plan_order = lambda *_args, **_kwargs: SimpleNamespace(
+        side="buy", market="derivatives", quantity=1.0, estimated_price=100.0,
+        cost=100.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
+        take_profit=110.0, reason=None,
+    )
+    executor.execute_order = lambda *_args, **_kwargs: "venue-456"
+    executor.auto_mode_enabled = lambda *_args, **_kwargs: True
+    executor.effective_mode = lambda: "live"
+
+    def prepare_forecast(*_args, **kwargs):
+        kwargs["cycle_payload"].update(forecast_started=True, kronos_forecast={"status": "ok"})
+        return None, ""
+
+    def persist(*_args, **kwargs):
+        if (failed_write == "started" and kwargs.get("phase") == "execution"
+                and not kwargs.get("terminal")
+                and kwargs["payload"].get("execution_status") == "in_progress"):
+            raise OSError("write unavailable")
+        if failed_write == "terminal" and kwargs.get("status") == "completed":
+            raise OSError("terminal write unavailable")
+        writes.append(kwargs)
+
+    monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", persist)
+    monkeypatch.setattr(autoloop_kronos, "_prepare_forecast", prepare_forecast)
+    monkeypatch.setattr(autoloop_futures_context, "_unified_mark_price", lambda *_args: 100.0)
+    monkeypatch.setattr(autoloop_futures_context, "_confirmation_state", lambda *_args: (True, "aligned"))
+
+    class Graph:
+        def propagate(self, *_args, **_kwargs):
+            return {"futures_execution_intent": "enter", "futures_execution_proposal": {
+                "margin_mode": "isolated", "leverage": 2, "risk_fraction": 0.01,
+                "margin_fraction": 0.2, "stop_loss": 90.0, "take_profit": 110.0, "rationale": "test",
+            }}, "Buy"
+
+    checkpoints = []
+    result = autoloop_analysis._process_candidate(
+        None, {"ticker": "BTC-USD"}, {}, lambda *_: Graph(), executor,
+        cancelled=cancelled, on_cycle_checkpoint=checkpoints.append,
+    )
+    if failed_write == "started":
+        assert result.executed is False
+    else:
+        assert result.executed is True
+        assert result.order_id == "venue-456"
+        assert checkpoints[-1]["payload"]["execution_status"] == "executed"
+        assert checkpoints[-1]["payload"]["order_id"] == "venue-456"
+
+
+def test_cancelled_or_disabled_execution_cannot_start_an_order(monkeypatch):
+    cancelled = threading.Event()
+    cancelled.set()
+    submitted = []
+    with pytest.raises(TimeoutError):
+        autoloop_execution.execute_with_deadline(
+            lambda: submitted.append("entry"), None, cancelled, threading.Lock(),
+        )
+    cancelled.clear()
+    monkeypatch.setattr(autoloop_execution, "mode_is_enabled", lambda *_args: False)
+
+    with pytest.raises(autoloop_execution.AutoModeDisabled):
+        autoloop_execution.execute_with_deadline(
+            lambda: submitted.append("entry"), None, cancelled, threading.Lock(), AutoMode.FUTURES,
+        )
+    assert submitted == []

@@ -217,6 +217,17 @@ function reapProcessTree(child) {
       } else {
         const netRows = await get('document.querySelectorAll("[data-net-currency]").length');
         check(netRows === 1, 'expected one net currency row, saw ' + netRows);
+        const cells = await get(`Array.from(document.querySelector('[data-net-currency="USDT"]')
+          .querySelectorAll('td')).map(cell => cell.textContent.trim())`);
+        check(cells[1].includes('5 USDT') && cells[2].includes('0.25 USDT'),
+          'production component totals are not visible: ' + JSON.stringify(cells));
+        check(/funding coverage not confirmed/i.test(cells[3]) && /not enough data/i.test(cells[4]),
+          'unknown funding was presented as a net: ' + JSON.stringify(cells));
+        const observed = await text('[data-brief-block="funding-observations"]');
+        check(observed && observed.includes('-0.000000000123456789 BNB') &&
+          observed.includes('binance:demo:fixture') && observed.includes('BTC/USDT:USDT') &&
+          /not attributed to positions/i.test(observed) && /not included in net/i.test(observed),
+          'unattributed funding observation missing or mislabeled: ' + observed);
       }
 
       // B2: exactly one % on the exposure row and in the limits disclosure.

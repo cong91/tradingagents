@@ -10,7 +10,7 @@ missing currency stays ``None`` — a null means "unknown"; a zero would claim
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
 # JSONB wire format for currency components: Decimal exactness travels as text.
@@ -48,7 +48,15 @@ def add_to_bucket(
     current = bucket[amount.currency]
     if current is None:
         return bucket
-    bucket[amount.currency] = current + amount.amount
+    # The active Decimal context can otherwise round even the initial 0 + value.
+    # Include every place from the larger integer through the smaller exponent,
+    # plus one digit for carry, regardless of the caller's context precision.
+    precision = max(current.adjusted(), amount.amount.adjusted()) - min(
+        current.as_tuple().exponent, amount.amount.as_tuple().exponent
+    ) + 2
+    with localcontext() as context:
+        context.prec = max(context.prec, precision)
+        bucket[amount.currency] = current + amount.amount
     return bucket
 
 

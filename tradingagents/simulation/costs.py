@@ -67,10 +67,13 @@ class CostModel:
 class FundingSeries:
     """A funding rate series with its venue sign semantics recorded.
 
-    ``amounts`` maps settlement timestamps to signed amounts per unit of
-    notional: a positive value pays the position (short receiving funding on
-    Binance), a negative charges it. The semantics string travels with the
-    series so a report can state which convention produced the numbers.
+    ``amounts`` maps settlement timestamps to signed quote-currency amounts for
+    the position's original opened size: a positive value pays the position
+    (short receiving funding on Binance), a negative charges it. After a
+    scale-out, the engine prorates each amount to the remaining quantity.
+    ``notional_scale`` converts feeds expressed in smaller quote units. The
+    semantics string travels with the series so a report can state which
+    convention produced the numbers.
 
     ``known_from_ms``/``known_to_ms`` optionally mark the span the venue
     history actually covers. A window with NO settlement inside that span is
@@ -91,12 +94,32 @@ class FundingSeries:
         Returns None only when the window lies outside the recorded known
         span; a window inside the span with no settlement is a known zero.
         """
-        if self.known_from_ms is not None and end_ms <= self.known_from_ms:
+        if self.known_from_ms is not None and start_ms < self.known_from_ms:
             return None
-        if self.known_to_ms is not None and start_ms >= self.known_to_ms:
+        if self.known_to_ms is not None and end_ms > self.known_to_ms:
             return None
         events = [ts for ts in self.amounts if start_ms <= ts < end_ms]
         return sum(self.amounts[ts] for ts in events) * self.notional_scale
+
+    def received_in_known_span(self, start_ms: int, end_ms: int) -> float:
+        """Sum settlement rates covered by this series, clipping unknown edges."""
+        known_start = max(
+            start_ms, self.known_from_ms if self.known_from_ms is not None else start_ms,
+        )
+        known_end = min(
+            end_ms, self.known_to_ms if self.known_to_ms is not None else end_ms,
+        )
+        if known_start >= known_end:
+            return 0.0
+        events = [ts for ts in self.amounts if known_start <= ts < known_end]
+        return sum(self.amounts[ts] for ts in events) * self.notional_scale
+
+    def covers(self, start_ms: int, end_ms: int) -> bool:
+        """Whether the full half-open window lies within the known span."""
+        return not (
+            self.known_from_ms is not None and start_ms < self.known_from_ms
+            or self.known_to_ms is not None and end_ms > self.known_to_ms
+        )
 
 
 @dataclass
@@ -113,6 +136,7 @@ class CostLedger:
     funding_received: float = 0.0
     funding_events: int = 0
     funding_unknown_windows: int = 0
+    funding_uncertain: bool = False
     funding_available: bool = False
     funding_semantics: str | None = None
     _pending_semantics: set[str] = field(default_factory=set)
@@ -125,12 +149,20 @@ class CostLedger:
         self._pending_semantics.add(series.venue_semantics)
 
     def apply_funding(self, series: FundingSeries, start_ms: int, end_ms: int) -> None:
-        """Fold one window's funding into the ledger; unknown stays unknown."""
+        """Fold a known unit-notional funding rate into the ledger."""
         self.mark_funding_available(series)
         amount = series.received_between(start_ms, end_ms)
         if amount is None:
-            self.funding_unknown_windows += 1
+            self.mark_funding_uncertain(series)
             return
+        self.record_funding(amount)
+
+    def mark_funding_uncertain(self, series: FundingSeries) -> None:
+        self.mark_funding_available(series)
+        self.funding_unknown_windows += 1
+        self.funding_uncertain = True
+
+    def record_funding(self, amount: float) -> None:
         self.funding_received += amount
         self.funding_events += 1
 

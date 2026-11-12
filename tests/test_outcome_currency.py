@@ -25,6 +25,12 @@ def test_bucket_keeps_currencies_separate():
     assert bucket == {"USDT": Decimal("12.5"), "BNB": Decimal("1")}
 
 
+def test_bucket_addition_preserves_digits_beyond_default_decimal_precision():
+    bucket = add_to_bucket({}, CurrencyAmount("USDT", Decimal("12345678901234567890123456789.12345678")))
+    add_to_bucket(bucket, CurrencyAmount("USDT", Decimal("0.00000001")))
+    assert bucket["USDT"] == Decimal("12345678901234567890123456789.12345679")
+
+
 def test_missing_amount_poisons_its_bucket_not_others():
     bucket = add_to_bucket({}, CurrencyAmount("USDT", Decimal("10")))
     bucket = add_to_bucket(bucket, unknown())  # no currency, no amount
