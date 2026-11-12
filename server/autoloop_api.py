@@ -10,7 +10,7 @@ from server import (
     audit as audit_log,
     autoloop,
     daily as daily_mod,
-    job_store,
+    futures_cycle_store,
     runs as runs_mod,
 )
 from server.contract import ApiError, json_body, utc_now_iso
@@ -38,7 +38,7 @@ def _payload() -> dict:
         "modes": mode_gates,
         "gates": mode_gates,
         "last_cycle": autoloop._last_cycle_snapshot(),
-        "cycles": job_store.list_futures_cycles(limit=20),
+        "cycles": futures_cycle_store.list_futures_cycles(limit=20),
     }
 
 
@@ -66,19 +66,19 @@ def get_autoloop_cycles(limit: int = 20, symbol: str | None = None):
     if symbol is not None and not symbol.strip():
         raise ApiError(400, "validation_error", '"symbol" must be a non-empty string when provided')
     symbol_filter = (symbol.strip() or None) if symbol else None
-    summary = job_store.futures_cycle_summary()
+    summary = futures_cycle_store.futures_cycle_summary()
     return {
         "generated_at": utc_now_iso(),
         "items": [
             _cycle_payload(item)
-            for item in job_store.list_futures_cycles(limit=limit, symbol=symbol_filter)
+            for item in futures_cycle_store.list_futures_cycles(limit=limit, symbol=symbol_filter)
         ],
         "summary": {
             **dict.fromkeys(_CYCLE_SUMMARY_BUCKETS, 0),
             **summary,
             "total": sum(summary.values()),
         },
-        "symbols": job_store.futures_cycle_symbol_rollup(),
+        "symbols": futures_cycle_store.futures_cycle_symbol_rollup(),
         "enabled": bool(autoloop._load_state().get("enabled", False)),
         "interval_minutes": autoloop._interval_from(autoloop._load_state()),
         "running_cycle": autoloop._cycle_lock.locked(),

@@ -5,7 +5,7 @@ import pytest
 from server import (
     autoloop_cycle_records,
     autoloop_futures_context,
-    job_store,
+    futures_cycle_store,
 )
 from tests.autoloop_runtime_fixtures import (
     _market_context,
@@ -67,8 +67,8 @@ def test_rejected_cycle_persists_the_candle_snapshot(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updated.update(kwargs)
 
-    monkeypatch.setattr(job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", fake_update)
 
     autoloop_cycle_records._record_futures_cycle_rejection(
         "BNB-USD",
@@ -98,8 +98,8 @@ def test_rejected_cycle_records_a_direction_mismatch(monkeypatch):
         claimed.update(kwargs)
         return True
 
-    monkeypatch.setattr(job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(job_store, "update_futures_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *a, **k: None)
 
     autoloop_cycle_records._record_futures_cycle_rejection(
         "BNB-USD",

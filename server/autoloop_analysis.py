@@ -13,9 +13,9 @@ from server import (
     autoloop_execution,
     autoloop_futures_context,
     autoloop_futures_execution,
+    autoloop_kronos,
     futures_cycle_telemetry,
     job_store,
-    kronos_context,
 )
 from server.auto_modes import AutoMode
 from server.autoloop_telemetry import CycleTelemetry
@@ -28,7 +28,6 @@ from tradingagents.execution.auto_authorization import (
     AutoAuthorizationError,
 )
 from tradingagents.execution.daily import DailyResult
-from tradingagents.forecast.block import ForecastBlock
 
 logger = logging.getLogger(__name__)
 _ANALYSTS_CRYPTO = ("market", "social", "news")
@@ -203,89 +202,17 @@ def _process_candidate(
                 futures_cycle_id, phase="context", payload=futures_cycle_payload,
                 timestamp=futures_cycle_timestamps["decision_context_finished_at"],
             )
-            # Active Kronos context: the pinned model's compact forecast goes
-            # into the SAME execution_context string the Trader and the
-            # Portfolio Manager read, before either of them decides. The mode,
-            # the deadline and the cancellation event are checked on BOTH sides
-            # of the inference, because a 20-200 s model call is exactly the
-            # window in which an operator can close the mode or the cycle can
-            # run out of budget; the inference itself is bounded by the
-            # remaining cycle time (the seam turns the deadline into the
-            # sampler's chunk deadline). No execution lock is taken or held
-            # here: this runs on the candidate's own thread, so bracket
-            # monitoring and position protection are untouched.
-            autoloop_execution.raise_if_mode_disabled(mode, "kronos forecast", authorization)
-            autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} kronos forecast")
-            futures_cycle_payload["forecast_started"] = True
-            futures_cycle_timestamps["forecast_started_at"] = utc_now_iso()
-            futures_cycle_payload["phase_timestamps"] = dict(futures_cycle_timestamps)
-            if on_cycle_checkpoint is not None:
-                on_cycle_checkpoint({
-                    "cycle_id": futures_cycle_id,
-                    "symbol": futures_context["unified_symbol"],
-                    "four_hour_open": four_hour_open,
-                    "one_hour_open": one_hour_open,
-                    "payload": dict(futures_cycle_payload),
-                })
-            with telemetry.span("kronos_active_context", ticker):
-                kronos_block = autoloop_futures_context._kronos_block_for(
-                    derivatives, ticker, futures_context, config,
-                    cycle_id=futures_cycle_id or f"{ticker}:{four_hour_open}",
-                    deadline=deadline, cancelled=cancelled,
-                )
-            autoloop_execution.raise_if_mode_disabled(mode, "kronos forecast", authorization)
-            autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} kronos forecast")
-            if kronos_block is None:
-                kronos_block = ForecastBlock(
-                    symbol=str(futures_context.get("unified_symbol") or ticker),
-                    status="unavailable",
-                    reason="the Kronos forecast path returned no block",
-                )
-            kronos_policy = kronos_context.policy_for(kronos_block)
-            futures_cycle_payload["kronos_forecast"] = kronos_block.as_json()
-            futures_cycle_payload["kronos_policy"] = kronos_policy
-            futures_cycle_timestamps["kronos_finished_at"] = utc_now_iso()
-            futures_cycle_payload["phase_timestamps"] = dict(futures_cycle_timestamps)
-            if on_cycle_checkpoint is not None:
-                on_cycle_checkpoint({
-                    "cycle_id": futures_cycle_id,
-                    "symbol": futures_context["unified_symbol"],
-                    "four_hour_open": four_hour_open,
-                    "one_hour_open": one_hour_open,
-                    "payload": dict(futures_cycle_payload),
-                })
-            if futures_cycle_id is not None and autoloop_execution.cycle_writes_allowed(deadline, cancelled):
-                persist_progress(
-                    futures_cycle_id, phase="context", payload=futures_cycle_payload,
-                    timestamp=futures_cycle_timestamps["kronos_finished_at"],
-                )
-            if kronos_policy == "defer":
-                # The failure policy is real: defer stops this candidate BEFORE
-                # the graph and any LLM call, with the reason persisted on the
-                # claimed cycle. This is not a direction veto — only a missing
-                # or failed forecast defers here.
-                defer_reason = (
-                    f"kronos forecast deferred: status={kronos_block.status} "
-                    f"reason={kronos_block.reason}" if kronos_block is not None
-                    else "kronos forecast deferred: no forecast was produced"
-                )
+            defer_reason, execution_context = autoloop_kronos._prepare_forecast(
+                derivatives, ticker, futures_context, config, execution_context,
+                cycle_id=futures_cycle_id, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+                cycle_payload=futures_cycle_payload, cycle_timestamps=futures_cycle_timestamps,
+                deadline=deadline, cancelled=cancelled, telemetry=telemetry,
+                mode=mode, authorization=authorization, on_cycle_checkpoint=on_cycle_checkpoint,
+                persist_progress=persist_progress,
+            )
+            if defer_reason is not None:
                 result.reason = defer_reason
-                if futures_cycle_id is not None and autoloop_execution.cycle_writes_allowed(deadline, cancelled):
-                    persist_progress(
-                        futures_cycle_id,
-                        status="rejected",
-                        phase="forecast",
-                        payload={
-                            **futures_cycle_payload,
-                            "execution_status": "not_started",
-                            "kronos_defer_reason": defer_reason,
-                            "executed": False,
-                            "phase_timestamps": futures_cycle_timestamps,
-                        },
-                        terminal=True,
-                    )
                 return result
-            execution_context = kronos_context.append_to_context(execution_context, kronos_block)
         autoloop_execution.raise_if_mode_disabled(mode, "analysis", authorization)
         autoloop_execution.raise_if_execution_closed(deadline, cancelled, "analysis")
         with telemetry.span("graph_build", ticker):

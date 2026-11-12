@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from server import autoloop_api, db, job_store, operating_brief
+from server import autoloop_api, brief_activity, db, futures_cycle_store
 
 pytestmark = pytest.mark.unit
 
@@ -55,12 +55,12 @@ def test_forecast_deferrals_are_pipeline_errors_and_have_disjoint_funnel_buckets
                  json.dumps(payload), stamp, stamp),
             )
 
-    summary = job_store.futures_cycle_summary()
+    summary = futures_cycle_store.futures_cycle_summary()
     assert summary == {
         "in_flight": 1, "forecast_deferred": 3, "market_rejected": 1,
         "proposal_rejected": 2, "other": 2, "entered": 1, "execution_failed": 1,
     }
-    rollups = {row["symbol"]: row for row in job_store.futures_cycle_symbol_rollup()}
+    rollups = {row["symbol"]: row for row in futures_cycle_store.futures_cycle_symbol_rollup()}
     assert rollups["BTC"]["forecast_deferred"] == 2
     assert rollups["BTC"]["last_kronos_policy"] == "defer"
     assert rollups["BTC"]["last_kronos_defer_reason"] == "latest forecast failure"
@@ -74,10 +74,10 @@ def test_forecast_deferrals_are_pipeline_errors_and_have_disjoint_funnel_buckets
         assert sum(row[bucket] for row in rollups.values()) == summary.get(bucket, 0)
 
     start = "2026-11-12T00:00:00+00:00"
-    assert operating_brief._cycle_counts(start) == {
+    assert brief_activity._cycle_counts(start) == {
         "cycles_today": 11, "analysed_today": 7, "entries_today": 1,
     }
-    reasons, errors = operating_brief._no_entry_reasons(start)
+    reasons, errors = brief_activity._no_entry_reasons(start)
     assert errors == 4
     assert {row["code"]: row["count"] for row in reasons} == {
         "market_rejected": 1, "proposal_rejected": 2, "other": 2,

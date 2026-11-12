@@ -17,8 +17,8 @@ from server import (
     autoloop_execution,
     autoloop_futures_context,
     autoloop_futures_execution,
+    futures_cycle_store,
     futures_cycle_telemetry,
-    job_store,
 )
 from server.auto_modes import MODE_KEYS, AutoMode
 from server.contract import ApiError
@@ -50,7 +50,7 @@ def mode_state(monkeypatch):
     monkeypatch.setattr(autoloop.control_store, "save_autoloop_state", save)
     monkeypatch.setattr(autoloop, "ensure_started", lambda: starts.append(True))
     monkeypatch.setattr(autoloop, "_wakeup", wakeup)
-    monkeypatch.setattr(job_store, "list_futures_cycles", lambda **_kwargs: [])
+    monkeypatch.setattr(futures_cycle_store, "list_futures_cycles", lambda **_kwargs: [])
     monkeypatch.setattr(autoloop, "_last_cycle", None)
     monkeypatch.setattr(autoloop, "_last_telemetry", None)
     return config, persisted, writes, starts, wakeup

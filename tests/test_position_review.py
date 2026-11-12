@@ -39,6 +39,7 @@ class _FakeStore:
 
     def __init__(self, fail_first: int = 0):
         self.states: dict[str, dict] = {}
+        self.cycle_queries: list[tuple[int, str | None]] = []
         self.fail_first = fail_first
         self.saves: list[tuple[str, int, dict]] = []
 
@@ -57,6 +58,7 @@ class _FakeStore:
         return True
 
     def list_futures_cycles(self, limit=20, symbol=None):
+        self.cycle_queries.append((limit, symbol))
         return list(self.cycles) if hasattr(self, "cycles") else []
 
 
@@ -177,6 +179,7 @@ def test_review_hold_persists_extension_and_audits(monkeypatch):
     store = _FakeStore()
     _seed(store, "TIA/USDT:USDT:sell:entry-1")
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
     verdict = position_review.PositionHoldReview(
         verdict="hold", reasoning="thesis intact", review_after_hours=12.0,
     )
@@ -204,6 +207,7 @@ def test_review_close_persists_without_an_audit(monkeypatch):
     store = _FakeStore()
     _seed(store, "TIA/USDT:USDT:sell:entry-1")
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
     verdict = position_review.PositionHoldReview(
         verdict="close", reasoning="thesis broken",
     )
@@ -227,6 +231,7 @@ def test_structured_fallback_persists_unavailable(monkeypatch):
     store = _FakeStore()
     _seed(store, "TIA/USDT:USDT:sell:entry-1")
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
     monkeypatch.setattr(
         position_review, "create_tier_client",
         lambda config, tier: _FakeClient(ValueError("model answered in prose")),
@@ -249,6 +254,7 @@ def test_worker_crash_persists_unavailable(monkeypatch):
     store = _FakeStore()
     _seed(store, "TIA/USDT:USDT:sell:entry-1")
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("prompt build failed")
@@ -268,6 +274,7 @@ def test_cas_conflict_is_retried(monkeypatch):
     store = _FakeStore(fail_first=1)
     _seed(store, "TIA/USDT:USDT:sell:entry-1")
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
     verdict = position_review.PositionHoldReview(
         verdict="close", reasoning="stagnant",
     )
@@ -290,6 +297,7 @@ def test_cas_conflict_is_retried(monkeypatch):
 def test_missing_position_state_aborts_the_persist(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
     verdict = position_review.PositionHoldReview(
         verdict="close", reasoning="gone",
     )
@@ -349,11 +357,12 @@ def test_entry_thesis_reads_the_latest_executed_cycle(monkeypatch):
         {"payload": {"execution_status": "executed",
                      "agent_decision_note": "older note"}},
     ]
-    monkeypatch.setattr(position_review, "job_store", store)
+    monkeypatch.setattr(position_review, "futures_cycle_store", store)
 
     thesis = position_review._entry_thesis("TIA/USDT:USDT")
 
     assert thesis == "short ZEC: funding turned, OI unwinding"
+    assert store.cycle_queries == [(20, "TIA/USDT:USDT")]
     assert position_review._entry_thesis("") == ""
 
 

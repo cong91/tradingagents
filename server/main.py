@@ -35,9 +35,9 @@ from server import (
     data_source_credentials,
     data_sources,
     experiments_api,
+    futures_cycle_store,
     health,
     history,
-    job_store,
     llm_credentials,
     llm_credentials_api,
     operating_brief,
@@ -140,7 +140,7 @@ def _open_state_db() -> None:
     logger.info("PostgreSQL migrations are up to date")
     daily.reconcile()  # each reconciled orphan writes its own audit line
     runs.reconcile()
-    job_store.reconcile_futures_cycles()
+    futures_cycle_store.reconcile_futures_cycles()
 
 
 @asynccontextmanager

@@ -29,7 +29,7 @@ LEDGER_CURSOR_KEY = "outcome_ledger"
 DEFAULT_BATCH_SIZE = 50
 
 # Terminal futures_cycles statuses the ledger scans. Must stay identical to
-# job_store._FUTURES_TERMINAL_STATUSES; tests/test_outcome_ledger_worker.py
+# futures_cycle_store._FUTURES_TERMINAL_STATUSES; tests/test_outcome_ledger_worker.py
 # pins the two lists together so a drift breaks a test, not the funnel.
 TERMINAL_CYCLE_STATUSES = ("completed", "rejected", "failed", "interrupted")
 

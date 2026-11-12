@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from server import job_store, outcome_ledger, outcome_store
+from server import futures_cycle_store, job_store, outcome_ledger, outcome_store
 from tradingagents.execution.futures_entry_journal import managed_live_provenance
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -66,12 +66,12 @@ def _record_executed_cycle(cycle_id: str, *, order_id: str | None = ORDER_ID,
         },
         "signal": "Buy",
     }
-    assert job_store.claim_futures_cycle(
+    assert futures_cycle_store.claim_futures_cycle(
         cycle_id, symbol=SYMBOL, four_hour_open=four_hour_open,
         one_hour_open=one_hour_open, strategy_version="1",
         payload=payload,
     )
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id, status="completed" if executed else "rejected",
         phase="entry" if executed else "execution",
         payload=payload, terminal=True,
@@ -179,8 +179,8 @@ def test_worker_module_is_independent_of_the_autoloop():
     )
 
 
-def test_terminal_vocabulary_matches_job_store():
-    assert outcome_store.TERMINAL_CYCLE_STATUSES == job_store._FUTURES_TERMINAL_STATUSES
+def test_terminal_vocabulary_matches_futures_cycle_store():
+    assert outcome_store.TERMINAL_CYCLE_STATUSES == futures_cycle_store._FUTURES_TERMINAL_STATUSES
 
 
 def test_disabled_ingest_does_nothing(postgres_schema):
@@ -212,7 +212,7 @@ def ingest_enabled():
 
 def _enable_and_seed() -> None:
     """The cursor sits one hour behind the clock so the cycles the tests
-    claim right now (job_store stamps them with _now) fall after it."""
+    claim right now (futures_cycle_store stamps them with _now) fall after it."""
     seeded = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     outcome_store.set_cursor(f"{seeded}|seed")
 

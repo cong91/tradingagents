@@ -9,6 +9,7 @@ import pytest
 from server import (
     autoloop,
     autoloop_analysis,
+    autoloop_execution,
     autoloop_futures_context,
     futures_cycle_telemetry,
     job_store,
@@ -125,6 +126,201 @@ def test_late_graph_result_or_error_never_adds_a_cycle_write(monkeypatch, graph_
     assert len(claims) == 1
     assert before
     assert writes == before
+
+
+@pytest.mark.parametrize("closed_by", ["cancel", "deadline"])
+def test_forecast_return_after_cycle_closes_does_not_publish_or_write(monkeypatch, closed_by):
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="forecast")
+    deadline = 2_000.0
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(autoloop_execution.time, "monotonic", lambda: clock["now"])
+    checkpoints = []
+
+    def forecast(*_args, **kwargs):
+        assert kwargs["deadline"] == deadline
+        assert kwargs["cancelled"] is cancelled
+        assert checkpoints[-1]["payload"]["forecast_started"] is True
+        assert "kronos_forecast" not in checkpoints[-1]["payload"]
+        if closed_by == "cancel":
+            cancelled.set()
+        else:
+            clock["now"] = deadline
+        return ForecastBlock(symbol="BTC/USDT:USDT", status="unavailable", reason="late")
+
+    def no_graph(*_args):
+        pytest.fail("a closed candidate must not build the decision graph")
+
+    monkeypatch.setattr(autoloop_futures_context, "_kronos_block_for", forecast)
+    with pytest.raises(TimeoutError, match="kronos forecast"):
+        autoloop_analysis._process_candidate(
+            None, {"ticker": "BTC-USD"}, {}, no_graph, executor,
+            deadline=deadline, cancelled=cancelled, on_cycle_checkpoint=checkpoints.append,
+        )
+
+    assert len(claims) == 1
+    assert [write["phase"] for write in writes] == ["market", "context"]
+    assert len(checkpoints) == 3
+    assert all("kronos_forecast" not in checkpoint["payload"] for checkpoint in checkpoints)
+
+
+@pytest.mark.parametrize("closed_by", ["cancel", "deadline"])
+def test_checkpoint_closing_cycle_fences_forecast_writes(monkeypatch, closed_by):
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="forecast")
+    deadline = 2_000.0
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(autoloop_execution.time, "monotonic", lambda: clock["now"])
+    checkpoints = []
+
+    def checkpoint(cycle):
+        checkpoints.append(cycle)
+        if "kronos_forecast" in cycle["payload"]:
+            if closed_by == "cancel":
+                cancelled.set()
+            else:
+                clock["now"] = deadline
+
+    def no_graph(*_args):
+        pytest.fail("a deferred candidate must not build the decision graph")
+
+    monkeypatch.setattr(
+        autoloop_futures_context, "_kronos_block_for",
+        lambda *_args, **_kwargs: ForecastBlock(
+            symbol="BTC/USDT:USDT", status="unavailable", reason="no forecast",
+        ),
+    )
+    result = autoloop_analysis._process_candidate(
+        None, {"ticker": "BTC-USD"}, {}, no_graph, executor,
+        deadline=deadline, cancelled=cancelled, on_cycle_checkpoint=checkpoint,
+    )
+
+    assert result.reason.endswith("no forecast")
+    assert len(claims) == 1
+    assert [write["phase"] for write in writes] == ["market", "context"]
+    assert len(checkpoints) == 4
+    assert checkpoints[-1]["payload"]["kronos_policy"] == "defer"
+
+
+def test_mode_check_precedes_deadline_check_after_forecast(monkeypatch):
+    from server.auto_modes import AutoMode
+
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="forecast")
+    deadline = 2_000.0
+    state = {"now": 1_000.0, "enabled": True}
+    authorization = object()
+    monkeypatch.setattr(autoloop_execution.time, "monotonic", lambda: state["now"])
+
+    def mode_enabled(mode, snapshot):
+        assert mode is AutoMode.FUTURES
+        assert snapshot is authorization
+        return state["enabled"]
+
+    def forecast(*_args, **_kwargs):
+        state.update(now=deadline, enabled=False)
+        return ForecastBlock(symbol="BTC/USDT:USDT", status="unavailable", reason="closed")
+
+    monkeypatch.setattr(autoloop_execution, "mode_is_enabled", mode_enabled)
+    monkeypatch.setattr(autoloop_futures_context, "_kronos_block_for", forecast)
+    with pytest.raises(autoloop_execution.AutoModeDisabled, match="kronos forecast"):
+        autoloop_analysis._process_candidate(
+            None, {"ticker": "BTC-USD"}, {}, lambda *_: pytest.fail("graph built"), executor,
+            deadline=deadline, cancelled=cancelled, mode=AutoMode.FUTURES,
+            authorization=authorization,
+        )
+
+    assert len(claims) == 1
+    assert [write["phase"] for write in writes] == ["market", "context"]
+
+
+def test_forecast_persist_callback_rechecks_write_fence(monkeypatch):
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="forecast")
+    original_writes_allowed = autoloop_execution.cycle_writes_allowed
+    fence_checks = []
+    after_forecast = False
+
+    def checkpoint(cycle):
+        nonlocal after_forecast
+        if "kronos_forecast" in cycle["payload"]:
+            after_forecast = True
+
+    def writes_allowed(deadline, cancellation):
+        if not after_forecast:
+            return original_writes_allowed(deadline, cancellation)
+        fence_checks.append(None)
+        return len(fence_checks) % 2 == 1
+
+    monkeypatch.setattr(autoloop_execution, "cycle_writes_allowed", writes_allowed)
+    monkeypatch.setattr(
+        autoloop_futures_context, "_kronos_block_for",
+        lambda *_args, **_kwargs: ForecastBlock(
+            symbol="BTC/USDT:USDT", status="unavailable", reason="no forecast",
+        ),
+    )
+    result = autoloop_analysis._process_candidate(
+        None, {"ticker": "BTC-USD"}, {}, lambda *_: pytest.fail("graph built"), executor,
+        cancelled=cancelled, on_cycle_checkpoint=checkpoint,
+    )
+
+    assert result.reason.endswith("no forecast")
+    assert len(claims) == 1
+    assert len(fence_checks) == 4
+    assert [write["phase"] for write in writes] == ["market", "context"]
+
+
+@pytest.mark.parametrize("source", ["before", "forecast", "after", "persist", "terminal_persist"])
+@pytest.mark.parametrize("error_type", [TimeoutError, RuntimeError])
+def test_forecast_callback_and_persist_errors_keep_candidate_handling(monkeypatch, source, error_type):
+    cancelled = threading.Event()
+    executor, claims, writes = _install(monkeypatch, cancelled, cancel_at="forecast")
+    checkpoints = []
+
+    def checkpoint(cycle):
+        checkpoints.append(cycle)
+        payload = cycle["payload"]
+        if payload.get("forecast_started"):
+            phase = "after" if "kronos_forecast" in payload else "before"
+            if source == phase:
+                raise error_type("checkpoint failure")
+
+    def forecast(*_args, **_kwargs):
+        if source == "forecast":
+            raise error_type("forecast failure")
+        return ForecastBlock(symbol="BTC/USDT:USDT", status="unavailable", reason="no forecast")
+
+    def persist(*_args, **kwargs):
+        if (source == "persist" and kwargs.get("phase") == "context"
+                and "kronos_forecast" in kwargs["payload"]):
+            raise error_type("persist failure")
+        if kwargs.get("phase") == "forecast" and source == "terminal_persist":
+            raise error_type("terminal persist failure")
+        writes.append(kwargs)
+
+    monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", persist)
+    monkeypatch.setattr(autoloop_futures_context, "_kronos_block_for", forecast)
+    arguments = (
+        None, {"ticker": "BTC-USD"}, {}, lambda *_: pytest.fail("graph built"), executor,
+    )
+    if error_type is TimeoutError:
+        with pytest.raises(TimeoutError, match="failure"):
+            autoloop_analysis._process_candidate(
+                *arguments, cancelled=cancelled, on_cycle_checkpoint=checkpoint,
+            )
+        phases = [write["phase"] for write in writes]
+        assert phases == (["market", "context", "context"] if source == "terminal_persist"
+                          else ["market", "context"])
+    else:
+        result = autoloop_analysis._process_candidate(
+            *arguments, cancelled=cancelled, on_cycle_checkpoint=checkpoint,
+        )
+        assert result.reason.startswith("RuntimeError:")
+        assert writes[-1]["phase"] == "analysis"
+        assert writes[-1]["status"] == "failed"
+        assert writes[-1]["terminal"] is True
+    assert len(claims) == 1
+    assert len(checkpoints) == (3 if source in {"before", "forecast"} else 4)
 
 
 def test_owner_timeout_terminalizes_claimed_forecast_cycle(monkeypatch):

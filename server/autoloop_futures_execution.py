@@ -523,7 +523,7 @@ def _process_futures_candidate(
         raise
     except Exception as exc:
         # This terminal write must carry the complete audit trail: the row is
-        # locked once it lands terminal (job_store._FUTURES_TERMINAL_STATUSES),
+        # locked once it lands terminal (futures_cycle_store._FUTURES_TERMINAL_STATUSES),
         # so the outer handler in _process_candidate cannot add risk_guard
         # afterwards.
         risk_decisions = _candidate_guard_decisions(derivatives, guard_baseline)

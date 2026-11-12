@@ -152,13 +152,13 @@ def test_autoloop_validates_body(client, tmp_path):
 
 def _seed_cycle(cycle_id: str, symbol: str, *, status: str, phase: str,
                 payload: dict | None = None) -> None:
-    from server import job_store
+    from server import futures_cycle_store
 
-    assert job_store.claim_futures_cycle(
+    assert futures_cycle_store.claim_futures_cycle(
         cycle_id, symbol=symbol, four_hour_open="2026-10-25T04:00:00+00:00",
         one_hour_open="2026-10-25T07:00:00+00:00", strategy_version="1",
     )
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id, status=status, phase=phase, payload=payload or {}, terminal=True,
     )
 

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from server import job_store
+from server import futures_cycle_store
 from server.contract import utc_now_iso
 from server.futures_decision_context import effective_futures_leverage_cap
 
@@ -58,7 +58,7 @@ def redact_payload(value: Any) -> Any:
     """Recursively omit credential-shaped fields and scrub recognizable values.
 
     Also folds the payload into JSON-safe types: venue data may carry Decimal,
-    datetime, set or bytes, and ``job_store._json`` would raise TypeError on
+    datetime, set or bytes, and ``futures_cycle_store._json`` would raise TypeError on
     them — a crash here would take the whole cycle claim down.
     """
     if isinstance(value, dict):
@@ -237,7 +237,7 @@ def claim_cycle(
     payload: dict,
     strategy_version: str = "1",
 ) -> bool:
-    return job_store.claim_futures_cycle(
+    return futures_cycle_store.claim_futures_cycle(
         cycle_id,
         symbol=symbol,
         four_hour_open=four_hour_open,
@@ -261,7 +261,7 @@ def persist_progress(
     phase_timestamps[f"{phase}_updated_at"] = timestamp
     if terminal or status != "running":
         phase_timestamps[f"{phase}_finished_at"] = timestamp
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id,
         status=status,
         phase=phase,
@@ -292,7 +292,7 @@ def persist_rejection(
         **dict(payload.get("phase_timestamps") or {}),
         f"{phase}_finished_at": timestamp,
     }
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id,
         status=status,
         phase=phase,

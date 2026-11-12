@@ -9,6 +9,7 @@ safety check remains covered.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from server import (
     autoloop_futures_execution,
     futures_cycle_telemetry,
 )
+from server.autoloop_telemetry import CycleTelemetry
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.trader.trader import create_trader
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -206,11 +208,47 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
     """
 
     seen: dict = {}
+    events: list[str] = []
+    execution_lock = threading.Lock()
+    real_mode_check = autoloop_execution.raise_if_mode_disabled
+    real_deadline_check = autoloop_execution.raise_if_execution_closed
+
+    def check_mode(mode, stage, authorization):
+        if stage == "kronos forecast":
+            events.append("mode")
+        real_mode_check(mode, stage, authorization)
+
+    def check_deadline(deadline, cancelled, stage):
+        if stage == "candidate BTC-USD kronos forecast":
+            events.append("deadline")
+        real_deadline_check(deadline, cancelled, stage)
+
+    def checkpoint(cycle):
+        payload = cycle["payload"]
+        if payload.get("forecast_started"):
+            events.append("checkpoint_after" if "kronos_forecast" in payload else "checkpoint_before")
+            seen[events[-1]] = cycle
+
+    def persist(_cycle_id, **kwargs):
+        payload = kwargs["payload"]
+        if kwargs.get("phase") == "context" and "kronos_forecast" in payload:
+            events.append("persist")
+            seen["persist_payload"] = payload
+            seen["persist_timestamps"] = payload["phase_timestamps"]
+            seen["persist_timestamp"] = kwargs["timestamp"]
+
+    def build_graph(*_args):
+        events.append("build")
+        return Graph()
 
     class Graph:
         def propagate(self, ticker, trade_date, *, asset_type, execution_context, **kwargs):
+            events.append("graph")
             seen["context"] = execution_context
             return {"futures_execution_intent": "abstain"}, "Hold"
+
+    monkeypatch.setattr(autoloop_execution, "raise_if_mode_disabled", check_mode)
+    monkeypatch.setattr(autoloop_execution, "raise_if_execution_closed", check_deadline)
 
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
@@ -231,19 +269,24 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
     ))
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _t, direction: (90.0, 110.0))
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_a, **_k: True)
-    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_a, **_k: None)
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', persist)
     monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *_a, **_k: None)
     monkeypatch.setattr(
         autoloop_futures_execution, '_process_futures_candidate',
         lambda _e, _t, _s, _c, result, **kwargs: setattr(result, "reason", "captured"),
     )
-    # The forecast stage is exercised through its real entry point, with the
-    # model replaced by a recorded draw (no local inference in a unit test).
+    # Replace the forecast at the existing seam to inspect its inputs and timing.
     real_block = _block()
-    monkeypatch.setattr(
-        autoloop_futures_context.kronos_context, "forecast_for_cycle",
-        lambda **kwargs: real_block,
-    )
+
+    def forecast(*args, **kwargs):
+        events.append("forecast")
+        assert execution_lock.acquire(blocking=False)
+        execution_lock.release()
+        seen["forecast_args"] = args
+        seen["forecast_kwargs"] = kwargs
+        return real_block
+
+    monkeypatch.setattr(autoloop_futures_context, "_kronos_block_for", forecast)
     executor = SimpleNamespace(
         _bridge=SimpleNamespace(client=lambda: object()),
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=3.0)),
@@ -254,9 +297,38 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
         "risk_derivatives_max_hold_hours": 24,
         "risk_max_derivatives_leverage": 3.0,
     }
+    telemetry = CycleTelemetry()
     autoloop_analysis._process_candidate(
-        None, {"ticker": "BTC-USD", "asset_type": "crypto"}, config, lambda *_: Graph(), executor,
+        None, {"ticker": "BTC-USD", "asset_type": "crypto"}, config, build_graph, executor,
+        telemetry=telemetry, on_cycle_checkpoint=checkpoint, execution_lock=execution_lock,
     )
+
+    assert events == [
+        "mode", "deadline", "checkpoint_before", "forecast", "mode", "deadline",
+        "checkpoint_after", "persist", "build", "graph",
+    ]
+    before, after = seen["checkpoint_before"], seen["checkpoint_after"]
+    assert {key: before[key] for key in ("cycle_id", "symbol", "four_hour_open", "one_hour_open")} == {
+        key: after[key] for key in ("cycle_id", "symbol", "four_hour_open", "one_hour_open")
+    }
+    assert before["symbol"] == "BTC/USDT:USDT"
+    assert seen["forecast_args"][0] is executor
+    assert seen["forecast_args"][1] == "BTC-USD"
+    assert seen["forecast_args"][2]["unified_symbol"] == before["symbol"]
+    assert seen["forecast_args"][3] is config
+    assert seen["forecast_kwargs"] == {"cycle_id": before["cycle_id"], "deadline": None, "cancelled": None}
+    assert "kronos_forecast" not in before["payload"]
+    assert before["payload"]["phase_timestamps"]["forecast_started_at"]
+    assert after["payload"]["kronos_forecast"] == real_block.as_json()
+    assert after["payload"]["kronos_policy"] == "use"
+    assert after["payload"] is not seen["persist_payload"]
+    assert after["payload"]["phase_timestamps"] is seen["persist_timestamps"]
+    assert after["payload"]["phase_timestamps"]["kronos_finished_at"] == seen["persist_timestamp"]
+    span_events = [
+        event["event"] for event in telemetry.snapshot()["events"]
+        if event["stage"] == "kronos_active_context"
+    ]
+    assert span_events == ["started", "finished"]
 
     context = seen.get("context")
     assert context is not None
@@ -287,7 +359,8 @@ def test_a_timeout_renders_a_readable_status_and_defers_the_candidate():
     assert context.startswith("incumbent") and "status=timeout" in context
 
 
-def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
+@pytest.mark.parametrize("forecast_missing", [False, True])
+def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch, forecast_missing):
     """The failure policy is real: a defer blocks the graph/LLM and persists.
 
     The reproduced failure was that ``kronos_policy='defer'`` was only RECORDED
@@ -302,12 +375,14 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
         raise AssertionError("a deferred candidate must never reach the graph/LLM")
 
     persisted: list[dict] = []
-    monkeypatch.setattr(
-        futures_cycle_telemetry, 'persist_progress',
-        lambda _cid, payload=None, **kwargs: persisted.append(
-            {"payload": dict(payload or {}), **kwargs}
-        ),
-    )
+    persisted_timestamps: list[dict] = []
+
+    def persist(_cid, payload=None, **kwargs):
+        persisted.append({"payload": dict(payload or {}), **kwargs})
+        if kwargs.get("terminal"):
+            persisted_timestamps.append(payload["phase_timestamps"])
+
+    monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", persist)
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
@@ -327,12 +402,13 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
     ))
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _t, direction: (90.0, 110.0))
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_a, **_k: True)
-    failed = ForecastBlock(
+    checkpoints: list[dict] = []
+    failed = None if forecast_missing else ForecastBlock(
         symbol="BTC/USDT:USDT", status=STATUS_TIMEOUT,
         reason="Kronos inference exceeded its 600s chunk deadline",
     )
     monkeypatch.setattr(
-        autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_kwargs: failed,
+        autoloop_futures_context, "_kronos_block_for", lambda *_args, **_kwargs: failed,
     )
     executor = SimpleNamespace(
         _bridge=SimpleNamespace(client=lambda: object()),
@@ -347,11 +423,15 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
             "risk_derivatives_max_hold_hours": 24,
             "risk_max_derivatives_leverage": 3.0,
         },
-        _graph_builder, executor,
+        _graph_builder, executor, on_cycle_checkpoint=checkpoints.append,
     )
     assert built == [], "the graph (and any LLM call) must not run for a deferred candidate"
     assert result.reason is not None and "deferred" in result.reason
-    assert result.reason.endswith("chunk deadline")
+    assert result.reason.endswith("no block" if forecast_missing else "chunk deadline")
+    forecast_checkpoints = [row for row in checkpoints if row["payload"].get("forecast_started")]
+    assert len(forecast_checkpoints) == 2
+    assert "kronos_forecast" not in forecast_checkpoints[0]["payload"]
+    assert forecast_checkpoints[1]["payload"]["kronos_policy"] == "defer"
     terminal = [row for row in persisted if row.get("terminal")]
     assert terminal, "the defer reason must be persisted on the claimed cycle"
     final = terminal[-1]
@@ -359,7 +439,13 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
     assert final["payload"]["execution_status"] == "not_started"
     assert "kronos_defer_reason" in final["payload"]
     assert final["payload"]["kronos_policy"] == "defer"
-    assert final["payload"]["kronos_forecast"]["status"] == STATUS_TIMEOUT
+    assert final["payload"]["kronos_forecast"]["status"] == (
+        "unavailable" if forecast_missing else STATUS_TIMEOUT
+    )
+    assert final["payload"]["kronos_defer_reason"] == result.reason
+    assert final["payload"]["executed"] is False
+    assert final["payload"]["phase_timestamps"]["kronos_finished_at"]
+    assert persisted_timestamps[-1] is not forecast_checkpoints[-1]["payload"]["phase_timestamps"]
 
 
 def test_a_forecast_client_failure_is_recorded_as_defer(monkeypatch):
@@ -497,8 +583,6 @@ def test_closing_the_mode_mid_inference_stops_the_candidate(monkeypatch):
 
 def test_the_forecast_block_is_recorded_on_the_cycle_payload(monkeypatch):
     """The cycle keeps the evidence, so the dashboard can show what was seen."""
-    from server.autoloop_telemetry import CycleTelemetry
-
     persisted: list[dict] = []
     monkeypatch.setattr(
         futures_cycle_telemetry, 'persist_progress',

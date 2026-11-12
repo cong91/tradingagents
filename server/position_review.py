@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from server import job_store
+from server import futures_cycle_store, job_store
 from server.autoloop_futures_context import _futures_derivative_metrics
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
@@ -381,7 +381,7 @@ def _entry_thesis(symbol: str) -> str:
     if not symbol:
         return ""
     try:
-        rows = job_store.list_futures_cycles(limit=20, symbol=symbol)
+        rows = futures_cycle_store.list_futures_cycles(limit=20, symbol=symbol)
     except Exception:
         return ""
     for row in rows:

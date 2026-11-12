@@ -6,14 +6,69 @@ and the durable futures_cycles row: these tests pin the redaction contract
 and the timestamp/terminal behavior of the persistence helpers.
 """
 
+import json
+from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
-from server import futures_cycle_telemetry as fct
+from server import futures_cycle_store, futures_cycle_telemetry as fct
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution.risk import RiskLimits
+
+
+@pytest.mark.unit
+def test_claim_cycle_normalizes_dataclasses_through_store(monkeypatch):
+    @dataclass
+    class Snapshot:
+        note: str
+        values: tuple[int, ...]
+
+    class Connection:
+        def execute(self, query, params):
+            self.query, self.params = query, params
+            return SimpleNamespace(rowcount=1)
+
+    connection = Connection()
+    monkeypatch.setattr(futures_cycle_store.db, "session", lambda: nullcontext(connection))
+    monkeypatch.setattr(futures_cycle_store, "_now", lambda: "now")
+
+    assert fct.claim_cycle(
+        "cycle", symbol="BTC", four_hour_open="4h", one_hour_open="1h",
+        strategy_version="1", payload={"snapshot": Snapshot("thesis ✓", (1, 2))},
+    )
+    assert "ON CONFLICT (cycle_id) DO NOTHING" in connection.query
+    assert json.loads(connection.params[5]) == {"snapshot": {"note": "thesis ✓", "values": [1, 2]}}
+    assert connection.params[6:] == ("now", "now")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", futures_cycle_store._FUTURES_TERMINAL_STATUSES)
+def test_cycle_store_does_not_overwrite_terminal_status(monkeypatch, status):
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            return SimpleNamespace(fetchone=lambda: {"status": status, "phase": "entry", "payload": {}})
+
+    connection = Connection()
+    monkeypatch.setattr(futures_cycle_store.db, "session", lambda: nullcontext(connection))
+    futures_cycle_store.update_futures_cycle("cycle", status="running", phase="entry")
+    assert len(connection.calls) == 1
+    assert "FOR UPDATE" in connection.calls[0][0]
+
+
+@pytest.mark.unit
+def test_cycle_store_merges_nested_payload_without_erasing_recorded_values():
+    existing = {"signal": "Buy", "nested": {"reason": "recorded", "count": 1}}
+    assert futures_cycle_store._merge_payload(
+        existing, {"signal": None, "nested": {"reason": None, "count": 2}},
+    ) == {"signal": "Buy", "nested": {"reason": "recorded", "count": 2}}
+    assert existing["nested"]["count"] == 1
 
 
 @pytest.mark.unit
@@ -86,7 +141,7 @@ def test_redact_sensitive_text_scrubs_secrets_inside_exception_prose():
 
 @pytest.mark.unit
 def test_redact_payload_folds_non_json_types():
-    """Venue payloads may carry Decimal/datetime/set/bytes; job_store._json
+    """Venue payloads may carry Decimal/datetime/set/bytes; futures_cycle_store._json
     would raise TypeError on them and take the whole cycle claim down."""
     import decimal
 
@@ -216,7 +271,7 @@ def test_cycle_identity_requires_candle_opens():
 @pytest.mark.unit
 def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
     """Redaction happens inside the persistence helpers: whatever reaches
-    job_store is already stripped of credential-shaped keys."""
+    futures_cycle_store is already stripped of credential-shaped keys."""
     claimed, updates = {}, []
 
     def fake_claim(cycle_id, **kwargs):
@@ -226,8 +281,8 @@ def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     assert fct.claim_cycle(
         "futures:BTC/USDT:USDT:x:y:1",
@@ -261,7 +316,7 @@ def test_forecast_paths_survive_cycle_persistence_redaction(monkeypatch):
     block = ForecastBlock(symbol="BTC/USDT:USDT", status="ok", ohlc_paths=(path,))
     updates = []
     monkeypatch.setattr(
-        fct.job_store, "update_futures_cycle", lambda _cycle_id, **kwargs: updates.append(kwargs),
+        fct.futures_cycle_store, "update_futures_cycle", lambda _cycle_id, **kwargs: updates.append(kwargs),
     )
 
     fct.persist_progress(
@@ -283,8 +338,8 @@ def test_persist_progress_terminal_stamps_finished_at(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     fct.persist_progress(
         "futures:BTC/USDT:USDT:x:y:1", phase="analysis",
@@ -307,8 +362,8 @@ def test_persist_rejection_marks_terminal_and_redacts(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     fct.persist_rejection(
         "futures:BTC/USDT:USDT:x:y:1",

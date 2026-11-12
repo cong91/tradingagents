@@ -10,6 +10,7 @@ from server import (
     autoloop_cycle_records,
     autoloop_futures_context,
     autoloop_futures_execution,
+    futures_cycle_store,
     futures_cycle_telemetry,
     job_store,
 )
@@ -618,9 +619,9 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
     executor.audit_plan = lambda *args, **kwargs: None
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
-    # The terminal write goes straight through job_store (not the patched
+    # The terminal write goes straight through futures_cycle_store (not the patched
     # persist alias), so patch it at the module seam like the telemetry tests.
-    monkeypatch.setattr(job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         autoloop_cycle_records, '_record_futures_cycle_rejection',
         lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),
@@ -697,7 +698,7 @@ def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monk
     )
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         autoloop_cycle_records, '_record_futures_cycle_rejection',
         lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),

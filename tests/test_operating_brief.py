@@ -28,18 +28,18 @@ def _seed_cycle(cycle_id: str, *, status: str, phase: str, payload: dict,
     """Seed one terminal cycle. ``hour`` varies the candle pair: futures_cycles
     is UNIQUE on (symbol, 4h_open, 1h_open, strategy_version), so two cycles in
     one test must sit on different candles — exactly as the runtime claims them."""
-    from server import job_store
+    from server import futures_cycle_store
 
     candle = f"2026-11-10T{hour:02d}:00:00+00:00"
-    assert job_store.claim_futures_cycle(
+    assert futures_cycle_store.claim_futures_cycle(
         cycle_id,
         symbol="BTC/USDT:USDT",
         four_hour_open=candle,
         one_hour_open=candle,
         strategy_version="1",
     )
-    job_store.update_futures_cycle(cycle_id, status=status, phase=phase,
-                                  payload=payload, terminal=True)
+    futures_cycle_store.update_futures_cycle(cycle_id, status=status, phase=phase,
+                                            payload=payload, terminal=True)
 
 
 def _seed_coverage(*, status: str, warnings: list[str], manual: int,
@@ -114,6 +114,90 @@ def fake_portfolio(monkeypatch):
         return body
 
     return _install
+
+
+# ---------------------------------------------------------------------------
+# projection unit tests without the PostgreSQL-backed server fixture
+
+
+class TestBriefProjections:
+    @pytest.fixture(autouse=True)
+    def _server_state(self):
+        pass
+
+    def test_activity_degrades_when_funnel_read_fails(self, monkeypatch):
+        from server import brief_activity
+
+        start = "2026-11-12T00:00:00Z"
+        calls = []
+
+        def broken_counts(value):
+            calls.append(value)
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr(brief_activity, "_cycle_counts", broken_counts)
+        monkeypatch.setattr(
+            brief_activity, "_no_entry_reasons", lambda value: pytest.fail("unexpected second read")
+        )
+        section = brief_activity._activity_section(start)
+
+        assert calls == [start]
+        assert section == {
+            "scope": "futures",
+            "window": "today_utc",
+            "cycles_today": None,
+            "analysed_today": None,
+            "entries_today": None,
+            "no_entry_top_reasons": [],
+            "pipeline_error_cycles": None,
+            "reason": "the cycle funnel could not be read: RuntimeError",
+            "note": brief_activity._NO_ENTRY_NOTE,
+        }
+
+    def test_brief_passes_utc_cutoff_at_activity_position(self, monkeypatch):
+        from server import brief_active_forecast, brief_activity, operating_brief
+
+        events = []
+
+        def record(name, result):
+            def call(*args):
+                events.append((name, args))
+                return result
+            return call
+
+        monkeypatch.setattr(operating_brief, "_read_portfolio", record("portfolio", {}))
+        monkeypatch.setattr(operating_brief, "_status_section", record("status", {}))
+        monkeypatch.setattr(operating_brief, "_results_section", record("results", {}))
+        monkeypatch.setattr(operating_brief, "_risk_section", record("risk", {}))
+        monkeypatch.setattr(operating_brief, "_today_start_iso", record("cutoff", "2026-11-12T00:00:00Z"))
+        monkeypatch.setattr(brief_activity, "_activity_section", record("activity", {}))
+        monkeypatch.setattr(operating_brief, "utc_now_iso", record("generated_at", "now"))
+        monkeypatch.setattr(operating_brief, "_funnel_section", record("funnel", {}))
+        monkeypatch.setattr(brief_active_forecast, "_active_forecast_section", record("forecast", {}))
+        monkeypatch.setattr(operating_brief, "_experiments_section", record("experiments", {}))
+        monkeypatch.setattr(operating_brief, "_needs_attention", record("attention", []))
+
+        operating_brief.build_brief()
+
+        assert [name for name, _ in events] == [
+            "portfolio", "status", "results", "risk", "cutoff", "activity",
+            "generated_at", "funnel", "forecast", "experiments", "attention",
+        ]
+        assert events[5][1] == ("2026-11-12T00:00:00Z",)
+
+    def test_active_forecast_reports_read_failure(self, monkeypatch):
+        from server import brief_active_forecast
+
+        def broken_read():
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr(brief_active_forecast.db, "read", broken_read)
+        assert brief_active_forecast._active_forecast_section() == {
+            "state": "error",
+            "status": "error",
+            "reason": "the recorded forecasts could not be read: RuntimeError",
+            "note": brief_active_forecast._ACTIVE_FORECAST_NOTE,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -347,10 +431,10 @@ def test_brief_no_entry_reasons_carry_a_sample_cycle_and_top_three(client):
 
 
 def test_brief_excludes_in_flight_cycles_from_no_entry(client):
-    from server import job_store
+    from server import futures_cycle_store
 
     # claim only: status 'claimed' — the decision has not been made yet.
-    job_store.claim_futures_cycle(
+    futures_cycle_store.claim_futures_cycle(
         "cycle-running", symbol="BTC/USDT:USDT", four_hour_open="2026-11-10T00:00:00+00:00",
         one_hour_open="2026-11-10T00:00:00+00:00", strategy_version="1",
     )
@@ -562,7 +646,7 @@ def test_brief_active_forecast_is_empty_when_no_cycle_recorded_one(client, monke
 
 
 def test_brief_active_forecast_survives_a_read_failure(client, monkeypatch):
-    import server.operating_brief as brief
+    import server.brief_active_forecast as forecast
 
 
     class Broken:
@@ -572,7 +656,7 @@ def test_brief_active_forecast_survives_a_read_failure(client, monkeypatch):
         def __exit__(self, *_):
             return False
 
-    monkeypatch.setattr(brief.db, "read", lambda: Broken())
-    section = brief._active_forecast_section()
+    monkeypatch.setattr(forecast.db, "read", lambda: Broken())
+    section = forecast._active_forecast_section()
     assert section["state"] == "error"
     assert "could not be read" in section["reason"]

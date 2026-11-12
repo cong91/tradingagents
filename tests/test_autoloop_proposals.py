@@ -7,7 +7,7 @@ from server import (
     autoloop_candidates,
     autoloop_cycle_records,
     autoloop_futures_execution,
-    job_store,
+    futures_cycle_store,
 )
 from tests.autoloop_runtime_fixtures import (
     _agent_proposal,
@@ -81,8 +81,6 @@ def test_bearish_rating_never_bypasses_missing_or_non_entry_intent(
 def test_futures_entry_without_agent_proposal_is_refused():
     """The decision agents own the futures terms: without a proposal the cycle
     records the refusal instead of falling back to code-chosen leverage."""
-    from server import job_store
-
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_futures_execution._process_futures_candidate(
         _NoopDerivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
@@ -91,7 +89,7 @@ def test_futures_entry_without_agent_proposal_is_refused():
 
     assert result.plan is None and result.executed is False
     assert result.reason.startswith("agent_proposal_missing")
-    (cycle,) = job_store.list_futures_cycles(limit=1)
+    (cycle,) = futures_cycle_store.list_futures_cycles(limit=1)
     assert cycle["status"] == "rejected" and cycle["phase"] == "proposal"
 
 
@@ -114,8 +112,8 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
         def audit_plan(self, *args, **kwargs):
             return None
 
-    monkeypatch.setattr(job_store, "claim_futures_cycle", lambda *a, **k: True)
-    monkeypatch.setattr(job_store, "update_futures_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(futures_cycle_store, "claim_futures_cycle", lambda *a, **k: True)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *a, **k: None)
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_futures_execution._process_futures_candidate(
         Derivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
