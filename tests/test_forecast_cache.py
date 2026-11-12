@@ -9,7 +9,7 @@ cutoff, and the setting that can flip a direction (the band-spread bound).
 Pinned here:
 
 - the key changes with candles' CONTENT (same timestamps, edited close),
-  venue scope, cutoff, seed, model revision, artifact hash, mode and every
+  venue scope, cutoff, seed, model revision, artifact hash, and every
   classification-affecting setting (paths, temperature, horizon, band bound);
 - a cached block is served only for the same identity, and a new closed bar
   misses;
@@ -37,7 +37,7 @@ from tradingagents.forecast.contract import (
 from tradingagents.forecast.inputs import series_problem
 from tradingagents.forecast.sampler import MIN_PATHS
 from tradingagents.forecast.service import KronosForecastService
-from tradingagents.forecast.settings import MODE_CONTEXT_ONLY, ForecastSettings
+from tradingagents.forecast.settings import ForecastSettings
 
 pytestmark = pytest.mark.unit
 
@@ -68,7 +68,7 @@ def _series(
 
 
 def _settings(**overrides) -> ForecastSettings:
-    base = {"enabled": True, "mode": MODE_CONTEXT_ONLY, "paths": MIN_PATHS}
+    base = {"paths": MIN_PATHS, "lookback_bars": 96}
     base.update(overrides)
     return ForecastSettings(**base)
 
@@ -87,6 +87,7 @@ class _FakeSampler:
             reference = candles[-1].close
             drawn = tuple(
                 {
+                    "opens": [reference + 2.0 * (step / max(1, bars - 1)) for step in range(bars)],
                     "closes": [reference + 2.0 * (step / max(1, bars - 1)) for step in range(bars)],
                     "highs": [reference + 3.0] * bars,
                     "lows": [reference - 1.0] * bars,
@@ -280,6 +281,23 @@ def test_a_historical_decision_never_serves_the_cache():
         "the historical decision drew fresh (cache bypassed)"
     )
     assert len(sampler.calls) == 1, "the live entry was never served into the replay"
+
+
+def test_delayed_cutoff_does_not_shift_first_predicted_close():
+    series = _series()
+    delayed = CandleSeries(
+        symbol=series.symbol, candles=series.candles,
+        as_of=series.as_of + timedelta(minutes=30),
+    )
+    sampler = _FakeSampler()
+    service = _service(sampler, created_at=series.as_of + timedelta(hours=4, minutes=1))
+
+    first = service.forecast(delayed, seed=3)
+    second = service.forecast(delayed, seed=3)
+
+    assert first.generation_kind == GENERATION_RETROSPECTIVE
+    assert second.generation_kind == GENERATION_RETROSPECTIVE
+    assert len(sampler.calls) == 2
 
 
 def test_a_live_decision_still_reuses_the_cache():

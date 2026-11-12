@@ -85,9 +85,9 @@ FROM base AS runtime
 ENV PYTHONUNBUFFERED=1 \
     TRADINGAGENTS_IN_DOCKER=1 \
     HOME=/home/appuser \
-    TRADINGAGENTS_SHADOW_KRONOS_PYTHON=/home/appuser/tradingagents-research/kronos-venv/bin/python \
-    TRADINGAGENTS_SHADOW_KRONOS_SOURCE=/home/appuser/tradingagents-research/kronos-src \
-    TRADINGAGENTS_SHADOW_KRONOS_MODELS=/home/appuser/tradingagents-research/models \
+    TRADINGAGENTS_KRONOS_PYTHON=/home/appuser/tradingagents-research/kronos-venv/bin/python \
+    TRADINGAGENTS_KRONOS_SOURCE=/home/appuser/tradingagents-research/kronos-src \
+    TRADINGAGENTS_KRONOS_MODELS=/home/appuser/tradingagents-research/models \
     CUDA_VISIBLE_DEVICES= \
     PATH="/opt/venv/bin:$PATH"
 

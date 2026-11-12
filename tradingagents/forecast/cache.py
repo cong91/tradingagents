@@ -52,9 +52,9 @@ def cache_key(
       decision had not seen;
     - ``data_digest`` is the OHLCV content of the window, so a corrected price
       at the same timestamp misses;
-    - ``settings.as_params()`` carries every knob that changes what the numbers
-      mean (paths, temperature, top_p, horizon, lookback, the band-spread
-      bound), with ``mode`` alongside;
+    - ``settings.as_params()`` carries every derived input that changes what the
+      numbers mean (paths, temperature, top_p, horizon, lookback, and the
+      band-spread bound);
     - ``model_revision`` and ``artifact_hash`` pin which model and which
       verified artifacts drew the numbers, and ``seed`` pins the draws.
     """
@@ -67,7 +67,6 @@ def cache_key(
         "data_digest": data_digest,
         "params": settings.as_params(),
         "profile": settings.profile,
-        "mode": settings.mode,
         "model_revision": model_revision,
         "artifact_hash": artifact_hash,
         "seed": int(seed),

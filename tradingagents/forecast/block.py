@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from tradingagents.dataflows.market_data import Candle
+from tradingagents.forecast.artifact import MAX_PATHS
 from tradingagents.forecast.contract import CALIBRATION_SAMPLE_RATIO, DISTRIBUTION_MODEL, STATUS_OK
 
 
@@ -43,6 +44,12 @@ class ForecastBlock:
     created_at: str | None = None
     calibration_label: str = CALIBRATION_SAMPLE_RATIO
     distribution_kind: str = DISTRIBUTION_MODEL
+    ohlc_quality: dict[str, Any] = field(default_factory=lambda: {
+        "status": "unknown",
+        "reason": "Forecast OHLC quality was not assessed; do not use it for stop/target analysis.",
+    })
+    ohlc_provenance: dict[str, Any] = field(default_factory=dict)
+    ohlc_paths: tuple[dict[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -69,6 +76,10 @@ class ForecastBlock:
             "direction_ratio": self.direction_ratio,
             "band": self.band,
             "band_spread_ratio": self.band_spread_ratio,
+            "signal_basis": "close_only",
+            "ohlc_quality": self.ohlc_quality,
+            "ohlc_provenance": self.ohlc_provenance,
+            "ohlc_paths": list(self.ohlc_paths[:MAX_PATHS]),
             "reference_close": self.reference_close,
             "data_open_time": self.data_open_time,
             "as_of": self.as_of,

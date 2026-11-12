@@ -12,6 +12,8 @@ review: docs/research/kronos-active-review-20261111.vi.md
 
 # Kronos đã vào đường quyết định thật — báo cáo triển khai
 
+> **Lưu trữ lịch sử — đã thay thế 2026-11-12:** Công tắc `kronos_active_enabled`, Shadow và các tùy chọn dự báo cũ trong báo cáo này không còn là hợp đồng hiện hành. Kronos luôn được thử cho ứng viên Futures đủ điều kiện; chỉ chọn cặp model/tokenizer và hoãn khi không có dự báo hợp lệ. Xem `AGENTS.md` và `docs/operator-guide.md`.
+
 Tài liệu này mô tả trạng thái code SAU khi triển khai VÀ SAU vòng sửa lỗi ngày
 2026-11-11: dự báo Kronos được đưa vào ngữ cảnh futures **trước khi** Trader và
 Portfolio Manager quyết định, qua một forecast core trung lập mà cả shadow lẫn

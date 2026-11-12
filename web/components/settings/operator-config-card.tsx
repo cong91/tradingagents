@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { LoaderCircleIcon, RotateCcwIcon, SaveIcon, ShieldAlertIcon, TriangleAlertIcon } from "lucide-react";
+import { LoaderCircleIcon, RotateCcwIcon, SaveIcon, ShieldAlertIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,9 +19,7 @@ import {
   operatorGateKeys,
   operatorRiskGroup,
   operatorSection,
-  type KronosStatus,
   type OperatorRiskGroup,
-  type OperatorSection,
   type OperatorSettingRow,
   type OperatorValue,
 } from "./operator-config-types";
@@ -111,8 +109,6 @@ function OperatorRow({ row, controller }: { row: OperatorSettingRow; controller:
   const meta = t.settings.settingMeta[row.key];
   const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : meta?.label ?? row.label;
   const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : meta?.hint ?? row.hint;
-  // Every managed switch (Auto modes AND the Kronos context switch) renders as
-  // a switch control; which section owns it is the visual separation.
   const switchControl = row.gate;
   const pending = controller.changed.includes(row.key);
   const invalid = controller.invalidKeys.includes(row.key);
@@ -137,8 +133,6 @@ function OperatorRow({ row, controller }: { row: OperatorSettingRow; controller:
             {row.override ? c.overridden : c.noOverride}
           </Badge>
           {row.gate ? (
-            // Not the same badge as the Auto modes: Kronos is a context switch,
-            // never an order-arming mode — the words must not imply otherwise.
             <Badge variant="outline">
               {isOperatorGateKey(row.key) ? c.gate : c.contextSwitch}
             </Badge>
@@ -237,7 +231,7 @@ function OperatorSectionView({
   section,
   controller,
 }: {
-  section: OperatorSection;
+  section: "modes" | "risk";
   controller: OperatorConfigController;
 }) {
   const t = useT();
@@ -274,27 +268,22 @@ function OperatorSectionView({
   }
 
   const rows = payload.settings.filter((row) => operatorSection(row) === section);
-  // Defensive: a controller built before the forecast section existed (or a
-  // stub) has no change list for it — an empty list renders an empty section,
-  // never a crash on the whole settings screen.
   const changes = controller.sectionChanges[section] ?? [];
   const groups = section === "modes"
     ? [{ id: "gates", title: "", rows }]
-    : section === "forecast"
-      ? [{ id: "forecast", title: "", rows }]
-      : riskOrder.map((id) => ({
-          id,
-          title: c.riskGroups[id],
-          rows: rows.filter((row) => operatorRiskGroup(row.key) === id),
-        })).filter((group) => group.rows.length > 0);
+    : riskOrder.map((id) => ({
+        id,
+        title: c.riskGroups[id],
+        rows: rows.filter((row) => operatorRiskGroup(row.key) === id),
+      })).filter((group) => group.rows.length > 0);
   const labels = changes.map((key) => t.settings.gateLabels[key] ?? key).join(", ");
   const feedback = controller.feedback[section];
   const hasInvalid = changes.some((key) => controller.invalidKeys.includes(key));
   const gateKeys = operatorGateKeys(payload.settings);
   const sectionGateChange = changes.some((key) => gateKeys.has(key));
-  const reasonInputId = section === "modes" ? "operator-gate-reason" : "operator-forecast-reason";
+  const reasonInputId = "operator-gate-reason";
   return (
-    <Card id={section === "modes" ? "operator-config" : section === "forecast" ? "operator-forecast" : "operator-risk"}>
+    <Card id={section === "modes" ? "operator-config" : "operator-risk"}>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <ShieldAlertIcon className="size-4" aria-hidden="true" />
@@ -319,7 +308,6 @@ function OperatorSectionView({
             </Button>
           </div>
         ) : null}
-        {section === "forecast" && payload.kronos ? <KronosStatusPanel kronos={payload.kronos} /> : null}
         {groups.map((group) => (
           <OperatorRowsGroup
             key={group.id}
@@ -332,10 +320,10 @@ function OperatorSectionView({
         {sectionGateChange ? (
           <div className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
             <p className="text-sm font-medium">
-              {section === "modes" ? c.gateChanges(labels) : c.forecastChanges(labels)}
+              {c.gateChanges(labels)}
             </p>
             <p className="text-xs text-muted-foreground">
-              {section === "modes" ? c.gateWarning : c.forecastWarning}
+              {c.gateWarning}
             </p>
             <label className="flex min-touch items-center gap-2 text-sm">
               <input
@@ -348,7 +336,7 @@ function OperatorSectionView({
               {c.confirm}
             </label>
             <label htmlFor={reasonInputId} className="text-sm font-medium">
-              {section === "modes" ? c.reasonLabel : c.forecastReasonLabel}
+              {c.reasonLabel}
             </label>
             <input
               id={reasonInputId}
@@ -396,84 +384,10 @@ function OperatorSectionView({
   );
 }
 
-/**
- * Read-only Kronos status beside the switch: what the next cycle would actually
- * run under. Every line comes from the same sources the decision path reads
- * (engine config + pinned-artifact verification) — the panel never starts a
- * model and never invents a readiness claim.
- */
-function KronosStatusPanel({ kronos }: { kronos: KronosStatus }) {
-  const t = useT();
-  const k = t.settings.kronos;
-  const readableNumber = (value: number | null): string =>
-    value === null ? "—" : String(value);
-  return (
-    <section className="space-y-2 rounded-lg border p-3 text-sm" data-kronos-status>
-      <div className="flex flex-wrap items-center gap-2">
-        <h3 className="text-sm font-semibold">{k.stateTitle}</h3>
-        <Badge variant={kronos.enabled ? "secondary" : "outline"} data-kronos-enabled={kronos.enabled}>
-          {kronos.enabled ? k.on : k.off}
-        </Badge>
-        <Badge
-          variant={kronos.readiness.status === "ready" ? "outline" : "destructive"}
-          data-kronos-readiness={kronos.readiness.status}
-        >
-          {kronos.readiness.status === "ready" ? k.modelReady : k.modelUnavailable}
-        </Badge>
-      </div>
-      {kronos.readiness.reason ? (
-        <p role="alert" className="flex items-start gap-2 break-words text-xs text-destructive">
-          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-          {kronos.readiness.reason}
-        </p>
-      ) : null}
-      {kronos.settings_problem ? (
-        <p role="alert" className="flex items-start gap-2 break-words text-xs text-destructive">
-          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-          {kronos.settings_problem}
-        </p>
-      ) : null}
-      <dl className="space-y-1.5">
-        <div className="grid gap-1 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)] sm:items-baseline">
-          <dt className="text-xs text-muted-foreground">{k.modeLabel}</dt>
-          <dd className="text-sm">
-            <span className="font-mono">{kronos.mode}</span>
-            <span className="block text-xs text-muted-foreground">
-              {kronos.mode === "context_only" ? k.contextOnlyMeaning : k.modeMeaning(kronos.mode)}
-            </span>
-          </dd>
-        </div>
-        <div className="grid gap-1 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)] sm:items-baseline">
-          <dt className="text-xs text-muted-foreground">{k.failurePolicyLabel}</dt>
-          <dd className="text-sm">
-            <span className="font-mono">{kronos.failure_policy}</span>
-            <span className="block text-xs text-muted-foreground">{k.failurePolicyMeaning(kronos.failure_policy)}</span>
-          </dd>
-        </div>
-        <div className="grid gap-1 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)] sm:items-baseline">
-          <dt className="text-xs text-muted-foreground">{k.modelLabel}</dt>
-          <dd className="font-mono text-sm">{kronos.model.repo} @ {kronos.model.model_revision.slice(0, 12)}</dd>
-        </div>
-        <div className="grid gap-1 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)] sm:items-baseline">
-          <dt className="text-xs text-muted-foreground">{k.scopeLabel}</dt>
-          <dd className="text-sm">
-            {k.scopeValue(kronos.timeframe, `${kronos.horizon_hours === null ? "—" : kronos.horizon_hours}`, readableNumber(kronos.paths), readableNumber(kronos.temperature), readableNumber(kronos.lookback_bars), readableNumber(kronos.max_batch_rows), readableNumber(kronos.max_band_spread_ratio))}
-          </dd>
-        </div>
-      </dl>
-      <p className="text-xs text-muted-foreground">{k.contextNote}</p>
-    </section>
-  );
-}
-
 export function OperatorModes({ controller }: { controller: OperatorConfigController }) {
   return <OperatorSectionView section="modes" controller={controller} />;
 }
 
 export function OperatorRisk({ controller }: { controller: OperatorConfigController }) {
   return <OperatorSectionView section="risk" controller={controller} />;
-}
-
-export function OperatorForecast({ controller }: { controller: OperatorConfigController }) {
-  return <OperatorSectionView section="forecast" controller={controller} />;
 }

@@ -3,7 +3,7 @@
 Plan: docs/plans/trading-research-delivery-20261110.md
 
 Usage:
-    .venv/Scripts/python.exe scripts/verify_research_delivery.py --stage ledger|experiments|dashboard|shadow
+    .venv/Scripts/python.exe scripts/verify_research_delivery.py --stage ledger|experiments|dashboard|kronos
     .venv/Scripts/python.exe scripts/verify_research_delivery.py --full
 
 Guarantees required by the plan:
@@ -25,10 +25,10 @@ part that has not been implemented yet), FAIL (anything else, including a
 conditional part that ran and failed). A part that ran and failed can never land
 in SKIPPED, and a full run with any FAIL exits 1: no fake pass.
 
-The shadow stage and ``--full`` require the real pinned model: an absent isolated
-interpreter or weight file fails the run with the concrete reason rather than
-skipping the smoke, because a green shadow stage over a model that never ran is
-the exact fake pass this runner exists to prevent.
+The active Kronos stage and ``--full`` require the real pinned model: an absent
+isolated interpreter or weight file fails the run with the concrete reason rather
+than skipping the smoke, because a green Kronos stage over a model that never ran
+is the exact fake pass this runner exists to prevent.
 """
 
 from __future__ import annotations
@@ -85,18 +85,6 @@ _STAGES: dict[str, list[str]] = {
         "tests/test_settings_field_accessibility.py",
         "tests/test_research_delivery_verification.py",
     ],
-    "shadow": [
-        "tests/test_shadow_forecasts.py",
-        "tests/test_shadow_worker.py",
-        "tests/test_shadow_isolation.py",
-        "tests/test_shadow_replay.py",
-    ],
-    # Active Kronos: the neutral forecast core mirrored by concern (inputs /
-    # cache / sampler / context), the decision-path wiring, the settings
-    # ownership and API boundary, the BL-9 metric_name contract it depends on,
-    # and the shadow isolation pins (the active path imports
-    # tradingagents.forecast, never the shadow layer, so those pins must stay
-    # green).
     "kronos": [
         "tests/test_forecast_inputs.py",
         "tests/test_forecast_cache.py",
@@ -104,7 +92,6 @@ _STAGES: dict[str, list[str]] = {
         "tests/test_forecast_context.py",
         "tests/test_kronos_decision_integration.py",
         "tests/test_kronos_decision_settings.py",
-        "tests/test_shadow_isolation.py",
         "tests/test_financial_experiment_cli.py",
         "tests/test_experiments_registry.py",
     ],
@@ -115,7 +102,7 @@ _STAGES: dict[str, list[str]] = {
 # drive the ASGI app against the ledger/cycle stores, so they need it too — and
 # without the DSN postgres_schema SKIPS, which would let the stage go green while
 # nothing ran.
-_STAGE_NEEDS_PG = {"ledger": True, "experiments": True, "dashboard": True, "shadow": True}
+_STAGE_NEEDS_PG = {"ledger": True, "experiments": True, "dashboard": True}
 
 _WEB_DIR = _REPO / "web"
 
@@ -294,8 +281,6 @@ def run_stage(stage: str) -> int:
     print(f"[stage:{stage}] mapped files: {len(present)} present, {len(missing)} missing")
     if stage == "dashboard":
         return _run_dashboard_stage(present, missing)
-    if stage == "shadow":
-        return _run_shadow_stage(present, missing)
     if stage == "kronos":
         return _run_kronos_stage(present, missing)
     if not present:
@@ -312,63 +297,14 @@ def run_stage(stage: str) -> int:
     return _run_pytest(present)
 
 
-def _run_shadow_stage(present: list[str], missing: list[str]) -> int:
-    """Shadow gate: the observation suite plus the REAL local model smoke.
-
-    The smoke part is deliberately not a skip. Plan §6.5 allows the model test to
-    decline only when the optional package is genuinely absent — but the ask for
-    this stage says an unavailable model must be an EXPLICIT NONPASS, not a silent
-    skip, because a green shadow stage over a model that never ran is exactly the
-    fake pass this runner exists to prevent. So:
-
-    - the suite runs in the disposable PostgreSQL with ``reject_skips``;
-    - the smoke test must pass, be ASSERTED to have run (zero collected or an
-      all-skipped selection is a FAIL), and its own failure to find the pinned
-      environment fails the stage with the reason printed.
-    """
-    results: list[tuple[str, int, str]] = []
-    if not present:
-        return _not_implemented("shadow", missing, present)
-    print(f"[stage:shadow] observation suite with disposable PostgreSQL ({len(present)} file(s))")
-    try:
-        with _TestPostgres() as postgres:
-            assert postgres.dsn is not None
-            results.append(("shadow-suite", _run_pytest(
-                present, env=_child_env(postgres.dsn), reject_skips=True,
-                label="shadow-suite",
-            ), _summary_of("shadow-suite")))
-    except _Failure as exc:
-        print(f"[pg] {exc}")
-        results.append(("shadow-suite", 1, "(PostgreSQL unavailable)"))
-
-    print("[stage:shadow] real local Kronos inference smoke")
-    smoke_code = _shadow_inference_smoke()
-    results.append(("shadow-model-smoke", smoke_code, _summary_of("shadow-model-smoke")))
-
-    for name, code, summary in results:
-        verdict = "PASS" if code == 0 else ("SKIPPED" if code == 2 else "FAIL")
-        print(f"  {verdict:7s} {name}{summary}")
-    if any(code not in (0, 2) for _, code, _ in results):
-        print("stage shadow FAILED")
-        if {n: c for n, c, _ in results}.get("shadow-model-smoke", 0) != 0:
-            print("  the model smoke must run the real pinned model; an unavailable "
-                  "environment is a failure here by design (see the reason above)")
-        return 1
-    if any(code == 2 for _, code, _ in results):
-        print("stage shadow not implemented yet (exit 2)")
-        return 2
-    print("stage shadow OK")
-    return 0
-
-
 def _run_kronos_stage(present: list[str], missing: list[str]) -> int:
     """Active-Kronos gate: the suite with PG, plus the REAL pinned model smoke.
 
-    Same rule as the shadow stage: the smoke part is not a skip. An absent
-    isolated interpreter or weight file fails the stage with the concrete
-    reason, because a green kronos stage over a model that never ran would fake
-    exactly the property this stage exists to prove — that the decision path's
-    forecast block is drawn by the real pinned model.
+    The smoke part is not a skip. An absent isolated interpreter or weight file
+    fails the stage with the concrete reason, because a green Kronos stage over
+    a model that never ran would fake exactly the property this stage exists to
+    prove — that the decision path's forecast block is drawn by the real pinned
+    model.
     """
     results: list[tuple[str, int, str]] = []
     if not present:
@@ -588,26 +524,6 @@ def _browser_offline_check() -> int:
     )
 
 
-def _shadow_inference_smoke() -> int:
-    """Real local inference; a missing environment is a FAILURE, not a skip.
-
-    ``tests/test_shadow_kronos_smoke.py`` is marked ``smoke``/``integration``, and
-    pyproject's addopts deselect integration by default — so the runner passes
-    ``-m "smoke and integration"`` explicitly (without it pytest collects nothing
-    and exits 0, which would be a fake pass) and treats a reported skip as a
-    failure (``reject_skips``): the stage may not go green over a model that
-    never ran.
-    """
-    smoke = _REPO / "tests" / "test_shadow_kronos_smoke.py"
-    if not smoke.exists():
-        print("[shadow:smoke] not implemented yet (tests/test_shadow_kronos_smoke.py missing)")
-        return 2
-    return _run_pytest(
-        ["-m", "smoke and integration", "tests/test_shadow_kronos_smoke.py"],
-        reject_skips=True, label="shadow-model-smoke",
-    )
-
-
 def run_full() -> int:
     """Everything: ruff, smoke imports, pytest with PG, migration integration, web."""
     failed: list[str] = []
@@ -659,9 +575,6 @@ def run_full() -> int:
     note("browser-offline", _browser_offline_check())
     _cleanup_web_build()
 
-    print("=== full: shadow local inference smoke ===")
-    note("shadow-smoke", _shadow_inference_smoke())
-
     print("=== full: kronos active inference smoke ===")
     note("kronos-smoke", _kronos_active_inference_smoke())
 
@@ -686,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--stage", choices=sorted(_STAGES), help="run one delivery stage")
     group.add_argument("--full", action="store_true",
-                       help="ruff + smoke imports + pytest with PG + migration integration + web trio + conditional browser/shadow checks")
+                       help="ruff + smoke imports + pytest with PG + migration integration + web trio + conditional browser/Kronos checks")
     args = parser.parse_args(argv)
 
     os.chdir(_REPO)

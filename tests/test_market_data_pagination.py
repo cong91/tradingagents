@@ -204,7 +204,7 @@ def test_kronos_context_history_uses_paginated_closed_candles():
         [_row(4), _row(5)],
         [_row(6), _row(7)],
     ], cap=2)
-    settings = ForecastSettings(enabled=True, timeframe="1h", lookback_bars=4)
+    settings = ForecastSettings(profile="small_base", timeframe="1h", lookback_bars=4)
 
     candles = kronos_context.history_for(
         exchange, "BTC/USDT:USDT", settings, as_of=_AS_OF,

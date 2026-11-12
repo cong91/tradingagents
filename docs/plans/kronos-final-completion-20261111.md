@@ -1,5 +1,7 @@
 # Hoàn thiện Kronos và tách trách nhiệm — 2026-11-11
 
+> **Lưu trữ lịch sử — đã thay thế 2026-11-12:** Yêu cầu về `kronos_active_enabled`, công tắc Kronos và Shadow trong kế hoạch này không còn hiệu lực. Kronos luôn được sử dụng cho ứng viên Futures đủ điều kiện; chỉ chọn cặp model/tokenizer, và hoãn ứng viên khi không có dự báo hợp lệ. Xem quy định hiện hành trong `AGENTS.md` và `docs/operator-guide.md`.
+
 Người dùng yêu cầu đóng bốn điểm còn lại (fixture khi mở thủ công, browser test đúng công tắc Kronos, lookback >200 và deadline pipe write), đồng thời duyệt tách settings/rendering khỏi forecast service và tách autoloop khi cần. Phê duyệt này áp dụng cho đợt code local hiện tại; không phải cho deploy, bật Auto/Kronos runtime, sửa venue/risk, giao dịch hoặc commit/push.
 
 ## Kết quả cần đạt

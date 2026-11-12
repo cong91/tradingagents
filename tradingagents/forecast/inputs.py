@@ -20,9 +20,10 @@ def series_problem(series: CandleSeries, timeframe: str, *, lookback_bars: int) 
 
     - ``as_of`` must be timezone-aware (a naive cutoff would silently mean the
       host's local time) and the candles must all name the requested symbol;
-    - every bar closed at or before ``as_of``, and the NEWEST closed bar of the
-      grid is present: a series ending a day ago is stale even though no bar
-      crosses the cutoff, and staleness is refused, not forecast through;
+    - every bar has the requested timeframe's duration and closed at or before
+      ``as_of``; the NEWEST closed bar of the grid is present: a series ending
+      a day ago is stale even though no bar crosses the cutoff, and staleness
+      is refused, not forecast through;
     - prices are finite and positive, volume is finite and non-negative, and
       each bar's order is sane (high >= max(open, close) >= min >= low);
     - the window is gap-free on the closed-bar grid.
@@ -44,6 +45,13 @@ def series_problem(series: CandleSeries, timeframe: str, *, lookback_bars: int) 
         return f"candles are not all {timeframe}: {sorted(timeframes)}"
     if not all(candle.is_closed for candle in candles):
         return "a forming candle was supplied; only closed candles may be used"
+    step = _timeframe_ms(timeframe)
+    for index, candle in enumerate(candles):
+        if candle.close_time - candle.open_time != step:
+            return (
+                f"candle {index} has a duration inconsistent with the {timeframe} "
+                f"timeframe (expected {step} ms)"
+            )
     cutoff_ms = int(series.as_of.timestamp() * 1000)
     late = [candle for candle in candles if candle.close_time > cutoff_ms]
     if late:
@@ -51,7 +59,6 @@ def series_problem(series: CandleSeries, timeframe: str, *, lookback_bars: int) 
             f"a candle closing at {late[0].close_time} is after the decision moment "
             f"{cutoff_ms}; the series would contain a bar that had not closed"
         )
-    step = _timeframe_ms(timeframe)
     newest_closed = cutoff_ms - (cutoff_ms % step)
     if candles[-1].close_time < newest_closed:
         age = newest_closed - candles[-1].close_time

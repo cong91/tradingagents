@@ -326,6 +326,25 @@ def list_futures_cycles(limit: int = 20, symbol: str | None = None) -> list[dict
     return [dict(row) for row in rows]
 
 
+_FUTURES_CYCLE_BUCKET_SQL = """CASE
+    WHEN status = 'completed' AND phase = 'entry'
+         AND payload->>'execution_status' = 'executed'
+         AND COALESCE(payload->>'executed', 'true') <> 'false' THEN 'entered'
+    WHEN status IN ('claimed', 'running') THEN 'in_flight'
+    WHEN payload->>'execution_status' = 'failed' THEN 'execution_failed'
+    WHEN status IN ('interrupted', 'recovery_pending', 'failed') THEN 'interrupted'
+    WHEN status = 'rejected' AND phase = 'market' THEN 'market_rejected'
+    WHEN status = 'rejected' AND phase = 'confirmation' THEN 'confirmation_rejected'
+    WHEN status = 'rejected' AND phase = 'proposal' THEN 'proposal_rejected'
+    WHEN status = 'rejected' AND phase = 'forecast'
+         AND payload->>'kronos_policy' = 'defer' THEN 'forecast_deferred'
+    WHEN payload->>'execution_status' = 'awaiting_approval' THEN 'awaiting_approval'
+    WHEN payload->>'execution_status' = 'risk_rejected' THEN 'risk_rejected'
+    WHEN payload->>'execution_status' = 'not_executed' THEN 'not_executed'
+    ELSE 'other'
+END"""
+
+
 def futures_cycle_summary() -> dict[str, int]:
     """Outcome funnel over every recorded cycle row.
 
@@ -341,24 +360,8 @@ def futures_cycle_summary() -> dict[str, int]:
     """
     with db.read() as conn:
         rows = conn.execute(
-            """SELECT CASE
-                     WHEN status = 'completed' AND phase = 'entry'
-                          AND payload->>'execution_status' = 'executed'
-                          AND COALESCE(payload->>'executed', 'true') <> 'false'
-                          THEN 'entered'
-                     WHEN status IN ('claimed', 'running') THEN 'in_flight'
-                     WHEN payload->>'execution_status' = 'failed' THEN 'execution_failed'
-                     WHEN status IN ('interrupted', 'recovery_pending', 'failed') THEN 'interrupted'
-                     WHEN status = 'rejected' AND phase = 'market' THEN 'market_rejected'
-                     WHEN status = 'rejected' AND phase = 'confirmation' THEN 'confirmation_rejected'
-                     WHEN status = 'rejected' AND phase = 'proposal' THEN 'proposal_rejected'
-                     WHEN payload->>'execution_status' = 'awaiting_approval' THEN 'awaiting_approval'
-                     WHEN payload->>'execution_status' = 'risk_rejected' THEN 'risk_rejected'
-                     WHEN payload->>'execution_status' = 'not_executed' THEN 'not_executed'
-                     ELSE 'other'
-                   END AS bucket,
-                   count(*) AS count
-               FROM futures_cycles GROUP BY 1"""
+            f"""SELECT {_FUTURES_CYCLE_BUCKET_SQL} AS bucket, count(*) AS count
+                FROM futures_cycles GROUP BY 1"""
         ).fetchall()
     return {row["bucket"]: row["count"] for row in rows}
 
@@ -367,34 +370,23 @@ def futures_cycle_symbol_rollup() -> list[dict]:
     """Per-symbol funnel counts plus the newest cycle's signal and reasons."""
     with db.read() as conn:
         rows = conn.execute(
-            """SELECT symbol,
+            f"""WITH classified AS (
+                   SELECT *, {_FUTURES_CYCLE_BUCKET_SQL} AS bucket FROM futures_cycles
+               )
+               SELECT symbol,
                       count(*) AS total,
-                      count(*) FILTER (WHERE status = 'completed' AND phase = 'entry'
-                                       AND payload->>'execution_status' = 'executed'
-                                       AND COALESCE(payload->>'executed', 'true') <> 'false') AS entered,
-                      count(*) FILTER (WHERE payload->>'execution_status' = 'awaiting_approval') AS awaiting_approval,
-                      count(*) FILTER (WHERE payload->>'execution_status' = 'risk_rejected') AS risk_rejected,
-                      count(*) FILTER (WHERE payload->>'execution_status' = 'not_executed') AS not_executed,
-                      count(*) FILTER (WHERE payload->>'execution_status' = 'failed') AS execution_failed,
-                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'proposal') AS proposal_rejected,
-                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'confirmation') AS confirmation_rejected,
-                      count(*) FILTER (WHERE status = 'rejected' AND phase = 'market') AS market_rejected,
-                      count(*) FILTER (WHERE status IN ('claimed', 'running')) AS in_flight,
-                      count(*) FILTER (WHERE (status IN ('interrupted', 'recovery_pending')
-                                              OR (status = 'failed'
-                                                  AND COALESCE(payload->>'execution_status', '') <> 'failed'))
-                                             AND COALESCE(payload->>'execution_status', '') <> 'failed') AS interrupted,
-                      count(*) FILTER (WHERE NOT (
-                                           (status = 'completed' AND phase = 'entry'
-                                            AND payload->>'execution_status' = 'executed'
-                                            AND COALESCE(payload->>'executed', 'true') <> 'false')
-                                           OR status IN ('claimed', 'running')
-                                           OR payload->>'execution_status'
-                                              IN ('failed', 'awaiting_approval', 'risk_rejected', 'not_executed')
-                                           OR status IN ('interrupted', 'recovery_pending', 'failed')
-                                           OR (status = 'rejected'
-                                               AND phase IN ('market', 'confirmation', 'proposal'))
-                                         )) AS other,
+                      count(*) FILTER (WHERE bucket = 'entered') AS entered,
+                      count(*) FILTER (WHERE bucket = 'awaiting_approval') AS awaiting_approval,
+                      count(*) FILTER (WHERE bucket = 'risk_rejected') AS risk_rejected,
+                      count(*) FILTER (WHERE bucket = 'not_executed') AS not_executed,
+                      count(*) FILTER (WHERE bucket = 'execution_failed') AS execution_failed,
+                      count(*) FILTER (WHERE bucket = 'proposal_rejected') AS proposal_rejected,
+                      count(*) FILTER (WHERE bucket = 'confirmation_rejected') AS confirmation_rejected,
+                      count(*) FILTER (WHERE bucket = 'market_rejected') AS market_rejected,
+                      count(*) FILTER (WHERE bucket = 'forecast_deferred') AS forecast_deferred,
+                      count(*) FILTER (WHERE bucket = 'in_flight') AS in_flight,
+                      count(*) FILTER (WHERE bucket = 'interrupted') AS interrupted,
+                      count(*) FILTER (WHERE bucket = 'other') AS other,
                       max(updated_at) AS last_updated,
                       (array_agg(status ORDER BY updated_at DESC))[1] AS last_status,
                       (array_agg(phase ORDER BY updated_at DESC))[1] AS last_phase,
@@ -405,11 +397,13 @@ def futures_cycle_symbol_rollup() -> list[dict]:
                       (array_agg(COALESCE(payload->>'execution_reason', payload->>'plan_reason',
                                           payload->>'failure_reason')
                                  ORDER BY updated_at DESC))[1] AS last_execution_reason,
+                      (array_agg(payload->>'kronos_policy' ORDER BY updated_at DESC))[1] AS last_kronos_policy,
+                      (array_agg(payload->>'kronos_defer_reason' ORDER BY updated_at DESC))[1] AS last_kronos_defer_reason,
                       (array_agg(payload->>'signal' ORDER BY updated_at DESC))[1] AS last_signal,
                       (array_agg(payload->>'signal_reason' ORDER BY updated_at DESC))[1] AS last_signal_reason,
                       (array_agg(payload->>'market_rejection_reason' ORDER BY updated_at DESC))[1] AS last_market_rejection_reason,
                       (array_agg(payload->>'confirmation_reason' ORDER BY updated_at DESC))[1] AS last_confirmation_reason
-               FROM futures_cycles
+               FROM classified
                GROUP BY symbol
                ORDER BY last_updated DESC"""
         ).fetchall()

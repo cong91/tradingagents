@@ -1,15 +1,13 @@
-"""S5: the ACTIVE path runs the real pinned model and produces a decision block.
+"""The active path runs the real pinned model and produces a decision block.
 
-Companion to ``test_shadow_kronos_smoke.py``: that one proves the shadow adapter
-runs the model; this one proves the ACTIVE service does — the same pinned
-weights through ``tradingagents.forecast`` (the package the decision path
-imports), ending in the rendered block the Trader/PM prompts will carry.
+The service uses the pinned weights through ``tradingagents.forecast``, the
+package the decision path imports, and renders the block the Trader/PM prompts
+will carry.
 
-Like the shadow smoke, an absent isolated environment is a FAILURE, never a
-skip: a green kronos stage printed over a model that never ran is exactly the
-fake pass the runner exists to prevent. The fixture is deterministic closed
-candles (mechanism, not alpha); the model runs for real through its isolated
-interpreter.
+An absent isolated environment is a FAILURE, never a skip: a green Kronos stage
+printed over a model that never ran is exactly the fake pass the runner exists
+to prevent. The fixture is deterministic closed candles (mechanism, not alpha);
+the model runs for real through its isolated interpreter.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ from tradingagents.forecast.block import CandleSeries
 from tradingagents.forecast.rendering import render_forecast_block
 from tradingagents.forecast.sampler import KronosSampler, SamplerSettings
 from tradingagents.forecast.service import KronosForecastService
-from tradingagents.forecast.settings import ForecastSettings, settings_from_config
+from tradingagents.forecast.settings import ForecastSettings
 
 pytestmark = [pytest.mark.smoke, pytest.mark.integration]
 
@@ -45,10 +43,10 @@ SYMBOL = "BTC/USDT:USDT"
 # the fixture, not the runtime property.
 _NOW_MS = int(datetime.now(UTC).timestamp() * 1000)
 _LAST_OPEN_MS = _NOW_MS - (_NOW_MS % STEP_MS) - STEP_MS
-START_MS = _LAST_OPEN_MS - 95 * STEP_MS
+START_MS = _LAST_OPEN_MS - 511 * STEP_MS
 
 
-def _fixture_candles(count: int = 96) -> list[Candle]:
+def _fixture_candles(count: int = 512) -> list[Candle]:
     """A deterministic closed 4h series (no randomness, no recorded data)."""
     candles = []
     price = 42_000.0
@@ -90,9 +88,7 @@ def _environment_problem() -> str | None:
 
 
 def _settings(**overrides) -> ForecastSettings:
-    base = {"enabled": True, "paths": MIN_PATHS}
-    base.update(overrides)
-    return ForecastSettings(**base)
+    return ForecastSettings(profile="small_base", paths=MIN_PATHS, **overrides)
 
 
 def test_the_active_service_runs_the_real_model_into_a_decision_block():
@@ -103,9 +99,8 @@ def test_the_active_service_runs_the_real_model_into_a_decision_block():
     candles = tuple(_fixture_candles())
     as_of = datetime.fromtimestamp(candles[-1].close_time / 1000, UTC)
     service = KronosForecastService.from_config({
-        "kronos_active_enabled": True, "kronos_active_paths": MIN_PATHS,
-        "kronos_active_temperature": 0.5, "kronos_active_horizon_hours": 24,
-        "kronos_active_timeframe": "4h",
+        "kronos_active_profile": "small_base",
+        "risk_derivatives_max_hold_hours": 24,
     })
     try:
         block = service.forecast(
@@ -155,8 +150,8 @@ def test_the_active_cycle_path_reads_history_through_the_cutoff():
             return rows
 
     config = {
-        "kronos_active_enabled": True, "kronos_active_paths": MIN_PATHS,
-        "kronos_active_temperature": 0.5,
+        "kronos_active_profile": "small_base",
+        "risk_derivatives_max_hold_hours": 24,
     }
     as_of = datetime.fromtimestamp(rows[-1][0] / 1000, UTC) + timedelta(hours=4)
     try:
@@ -174,7 +169,7 @@ def test_the_active_cycle_path_reads_history_through_the_cutoff():
     assert block.latency_ms is not None and block.latency_ms > 0
     context = kronos_context.append_to_context("Futures equity: 1,000 USDT", block)
     assert context.index("Futures equity") < context.index("Kronos forecast")
-    assert kronos_context.policy_for(block, settings_from_config(config)) == "use"
+    assert kronos_context.policy_for(block) == "use"
 
 
 def test_no_model_library_leaks_into_the_repo_venv():

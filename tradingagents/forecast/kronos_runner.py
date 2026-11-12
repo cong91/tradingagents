@@ -203,6 +203,8 @@ def main() -> int:
 
     tokenizer = KronosTokenizer.from_pretrained(f"{model_dir}/{tokenizer_name}")
     model = Kronos.from_pretrained(f"{model_dir}/{model_name}")
+    model.eval()
+    tokenizer.eval()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     predictor = KronosPredictor(
         model, tokenizer, device=device, max_context=profile["max_context"],

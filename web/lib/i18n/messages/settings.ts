@@ -65,16 +65,7 @@ const settingMetaVi = {
   exec_quote_currency: { label: "Đồng tiền báo giá", hint: "Ví dụ: USDT." },
   exec_base_url: { label: "URL sàn đang dùng", hint: "Chỉ đọc. Đổi endpoint và đúng cặp API key/secret trong .env rồi khởi động lại backend để chuyển Demo/production." },
   exec_sandbox: { label: "Sandbox cho sàn khác Binance", hint: "Binance chọn Demo hoặc production bằng URL phía trên; chế độ này chỉ áp dụng các sàn khác." },
-  kronos_active_mode: { label: "Chế độ dự báo Kronos", hint: "context_only: khối dự báo chỉ là dữ liệu ngữ cảnh trước khi Trader/PM quyết định; không có chế độ lọc theo hướng." },
-  kronos_active_profile: { label: "Hồ sơ model Kronos", hint: "Chỉ chọn một cặp model/tokenizer đã được kiểm chứng; thay đổi áp dụng cho phiên chu kỳ mới." },
-  kronos_active_timeframe: { label: "Khung nến dự báo", hint: "Nến đóng của khung này là đầu vào; 1h hoặc 4h." },
-  kronos_active_horizon_hours: { label: "Chu kỳ dự báo", unit: "giờ", hint: "Phải là bội của khung nến và trong giới hạn 72 nến của model." },
-  kronos_active_paths: { label: "Số đường mẫu", hint: "Từ 16 đến 32; dưới 16 service từ chối thay vì báo một tỉ lệ mẫu." },
-  kronos_active_temperature: { label: "Temperature sampler", hint: "Một phần bản sắc dự báo — cache chia theo temperature; 0.5 đo ổn định hơn 1.0." },
-  kronos_active_lookback_bars: { label: "Số nến lookback", hint: "Từ 32 đến 512 nến trong context của model." },
-  kronos_active_max_batch_rows: { label: "Batch tối đa mỗi lần gọi", unit: "dòng", hint: "80 dòng đo 874 MiB peak, tăng 13% thời gian so với gọi không chia." },
-  kronos_active_failure_policy: { label: "Chính sách khi dự báo lỗi", hint: "defer: hoãn ứng viên trước lượt gọi LLM; pass_through: tiếp tục không có dự báo, lỗi ghi rõ trong ngữ cảnh." },
-  kronos_active_max_band_spread_ratio: { label: "Ngưỡng band rộng", hint: "Band rộng hơn tỉ lệ này được đánh dấu unclear; chỉ báo cáo, không loại ứng viên." },
+  kronos_active_profile: { label: "Cặp model và tokenizer", hint: "Chọn một trong các cặp đã cài đặt. Thay đổi áp dụng từ chu kỳ mới." },
 } satisfies Record<string, Meta>;
 
 const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
@@ -138,16 +129,7 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   exec_quote_currency: { label: "Quote currency", hint: "E.g. USDT." },
   exec_base_url: { label: "Active exchange URL", hint: "Read-only. Change the endpoint and the matching API key/secret in .env, then restart the backend to switch Demo/production." },
   exec_sandbox: { label: "Sandbox for non-Binance exchanges", hint: "Binance picks Demo or production via the URL above; this mode only applies to other exchanges." },
-  kronos_active_mode: { label: "Kronos forecast mode", hint: "context_only: the forecast block is decision-context data before the Trader/PM decide; there is no direction-filter mode." },
-  kronos_active_profile: { label: "Kronos model profile", hint: "Choose one verified model/tokenizer pair; changes apply to new cycles." },
-  kronos_active_timeframe: { label: "Forecast timeframe", hint: "Closed candles of this timeframe feed the model; 1h or 4h." },
-  kronos_active_horizon_hours: { label: "Forecast horizon", unit: "hours", hint: "Must be a whole number of timeframe bars and inside the model's 72-bar bound." },
-  kronos_active_paths: { label: "Sample paths", hint: "16 to 32; below 16 the service refuses instead of reporting a sample ratio." },
-  kronos_active_temperature: { label: "Sampler temperature", hint: "Part of the forecast identity — the cache splits per temperature; 0.5 measured more stable than 1.0." },
-  kronos_active_lookback_bars: { label: "Lookback bars", hint: "32 to 512 bars within the model context." },
-  kronos_active_max_batch_rows: { label: "Max batch rows", unit: "rows", hint: "80 rows measured an 874 MiB peak, 13% slower than the un-chunked call." },
-  kronos_active_failure_policy: { label: "Failure policy", hint: "defer: the candidate is held back BEFORE the LLM call; pass_through: the cycle continues without a forecast, the failure stated in its context." },
-  kronos_active_max_band_spread_ratio: { label: "Band-spread bound", hint: "A band wider than this ratio marks the forecast unclear; reported only, never a candidate filter." },
+  kronos_active_profile: { label: "Model and tokenizer pair", hint: "Choose an installed pair. Changes apply to new cycles." },
 };
 
 export const vi = {
@@ -163,12 +145,10 @@ export const vi = {
     auto_futures_enabled: "Auto Futures",
     auto_spot: "Auto Spot",
     auto_futures: "Auto Futures",
-    kronos_active_enabled: "Kronos làm ngữ cảnh quyết định",
   } as Record<string, string>,
   gateHints: {
     auto_spot_enabled: "Trạng thái tự động giao dịch Spot.",
     auto_futures_enabled: "Trạng thái tự động giao dịch Futures.",
-    kronos_active_enabled: "Công tắc vận hành: dự báo Kronos vào ngữ cảnh trước khi quyết định. Không phải công tắc đặt lệnh.",
   } as Record<string, string>,
   groups: {
     llm: {
@@ -188,35 +168,28 @@ export const vi = {
     },
   },
   kronos: {
-    stateTitle: "Trạng thái dự báo Kronos",
-    on: "Đang bật",
-    off: "Đang tắt",
-    modelReady: "Model sẵn sàng — artifact ghim đã được kiểm theo nội dung",
-    modelUnavailable: "Model không khả dụng",
-    modeLabel: "Chế độ",
-    contextOnlyMeaning:
-      "context_only: khối dự báo chỉ là DỮ LIỆU ngữ cảnh được chèn TRƯỚC khi Trader/Portfolio Manager quyết định. Không ứng viên nào bị cắt theo hướng dự báo, không nới risk/leverage, không thay đổi luồng xác nhận hay RiskGuard. Đây là tỉ lệ mẫu của model, không phải xác suất, và không phải lệnh.",
-    modeMeaning: (mode: string) => `Chế độ hiện tại: ${mode}.`,
-    failurePolicyLabel: "Hành vi khi dự báo lỗi",
-    failurePolicyMeaning: (policy: string) =>
-      policy === "defer"
-        ? "defer (mặc định): ứng viên bị hoãn TRƯỚC lượt gọi LLM và lý do được ghi vào chu kỳ; chu kỳ không chạy khi không có dự báo."
-        : policy === "pass_through"
-          ? "pass_through: chu kỳ tiếp tục KHÔNG có dự báo; lỗi vẫn được ghi rõ trong ngữ cảnh — không có dự báo không phải “đã kiểm tra”."
-          : `Chính sách hiện tại: ${policy}.`,
+    staleStatus: "Đây là dữ liệu đã tải trước đó; trạng thái hiện tại có thể đã thay đổi.",
+    readinessLabel: "Tệp mô hình",
+    modelReadyShort: "Sẵn sàng",
+    modelUnavailableShort: "Chưa sẵn sàng",
+    profileLabel: "Cặp model / tokenizer",
+    detailsTitle: "Xem chi tiết kỹ thuật",
     modelLabel: "Model ghim",
     profileOptions: {
       small_base: "Kronos-small + Kronos-Tokenizer-base",
       mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
     },
     scopeLabel: "Phạm vi dự báo",
-    scopeValue: (timeframe: string, horizon: string, paths: string, temperature: string, lookback: string, batch: string, band: string) =>
-      `${timeframe} nến đóng · horizon ${horizon}h · ${paths} đường mẫu · T=${temperature} · lookback ${lookback} nến · batch ${batch} dòng · band ≤ ${band}`,
+    scopeSummary: (timeframe: string, lookback: string, horizon: string, paths: string) =>
+      `Dữ liệu: ${lookback} nến ${timeframe} đã đóng · Dự báo: ${horizon} giờ · ${paths} đường mẫu`,
+    profileStatusMismatch: "Trạng thái này thuộc cặp model khác; hãy làm mới trước khi sử dụng thông tin readiness.",
+    parameterLabel: "Thông số tự suy ra",
+    maxContextLabel: "Context tối đa",
+    temperatureLabel: "Temperature",
+    tokenizerLabel: "Tokenizer ghim",
+    sourceRevisionLabel: "Phiên bản mã nguồn",
     contextNote:
-      "Bảng trạng thái chỉ đọc, lấy từ cùng nguồn chu kỳ sẽ dùng (cấu hình engine + kiểm artifact ghim trên đĩa) — không chạy model. Sửa tham số ở nhóm “Tham số dự báo Kronos” bên dưới; thay đổi áp dụng cho phiên chu kỳ mới.",
-    tuningTitle: "Tham số dự báo Kronos",
-    tuningDescription:
-      "Cấu hình engine của dự báo active. Máy chủ từ chối giá trị không chạy được (đúng giới hạn model) trước khi áp dụng; thay đổi áp dụng cho phiên chu kỳ mới.",
+      "Kronos luôn được dùng trong phân tích Futures và bổ sung dự báo cho Trader và Portfolio Manager. Nó không lọc ứng viên theo hướng dự báo, không tự đặt lệnh và không nới giới hạn rủi ro. Các thông số dự báo được tự suy ra từ cặp đã chọn.",
   },
   screen: {
     loadingDescription: "Đang tải cài đặt…",
@@ -241,7 +214,6 @@ export const vi = {
       system: "Giao diện & nâng cao",
     },
     advanced: "Cài đặt nâng cao",
-    kronosTuning: "Tham số dự báo Kronos (nâng cao)",
     otherRisk: "Các giới hạn và bảo vệ bổ sung",
     loadingRisk: "Đang kiểm tra các giới hạn rủi ro…",
     operatorUnavailable: "Không thể xác định các giới hạn do máy chủ quản lý. Hãy thử tải lại trước khi chỉnh rủi ro.",
@@ -463,6 +435,7 @@ export const vi = {
     titleFull: "Override vận hành (PostgreSQL)",
     loading: "Đang tải từ PostgreSQL…",
     loadFailed: "Không tải được override vận hành",
+    kronosUnavailable: "Không đọc được trạng thái Kronos từ máy chủ. Hãy thử tải lại.",
     description:
       "Các cổng vận hành và trần rủi ro được lưu trong PostgreSQL, tồn tại qua restart và hiển thị theo trạng thái hiệu lực. Không còn file JSON nào phải sửa tay.",
     groups: {
@@ -472,9 +445,9 @@ export const vi = {
           "Trạng thái Auto Spot và Auto Futures phản ánh cấu hình máy chủ. Thay đổi cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
       },
       forecast: {
-        title: "Kronos — dự báo ngữ cảnh",
+        title: "Kronos — hỗ trợ phân tích",
         description:
-          "Công tắc vận hành cho dự báo Kronos trong ngữ cảnh quyết định. Tách khỏi Auto Spot/Futures: nó không đặt lệnh và không phải công tắc Auto. Thay đổi cần xác nhận và lý do, được ghi audit.",
+          "Thêm dự báo giá từ Kronos vào phân tích Futures.",
       },
       risk: {
         title: "Trần rủi ro vận hành",
@@ -515,9 +488,6 @@ export const vi = {
     gateChanges: (keys: string) => `Thay đổi chế độ tự động: ${keys}`,
     gateWarning:
       "Các chế độ này cho phép bot tạo vị thế Spot hoặc Futures mới. Cần xác nhận và lý do; cả hai được ghi vào nhật ký thao tác.",
-    forecastChanges: (keys: string) => `Thay đổi công tắc dự báo Kronos: ${keys}`,
-    forecastWarning:
-      "Công tắc này thay đổi ngữ cảnh mà chu kỳ tự động đọc TRƯỚC khi quyết định (thêm chi phí suy luận model cho mỗi ứng viên futures). Nó KHÔNG mở cổng đặt lệnh và không phải công tắc Auto Spot/Futures. Cần xác nhận và lý do; cả hai được ghi vào nhật ký thao tác.",
     forecastReasonLabel: "Lý do thay đổi công tắc dự báo",
     confirm: "Tôi hiểu và xác nhận thay đổi cổng",
     reasonPlaceholder: "Lý do (bắt buộc, ví dụ: chạy demo theo yêu cầu vận hành)",
@@ -542,12 +512,10 @@ export const en: typeof vi = {
     auto_futures_enabled: "Auto Futures",
     auto_spot: "Auto Spot",
     auto_futures: "Auto Futures",
-    kronos_active_enabled: "Kronos as decision context",
   },
   gateHints: {
     auto_spot_enabled: "Auto Spot automation status from server configuration.",
     auto_futures_enabled: "Auto Futures automation status from server configuration.",
-    kronos_active_enabled: "Managed switch: the Kronos forecast enters the context before a decision. Not an order-arming switch.",
   },
   groups: {
     llm: {
@@ -567,35 +535,28 @@ export const en: typeof vi = {
     },
   },
   kronos: {
-    stateTitle: "Kronos forecast status",
-    on: "On",
-    off: "Off",
-    modelReady: "Model ready — pinned artifacts verified by content",
-    modelUnavailable: "Model unavailable",
-    modeLabel: "Mode",
-    contextOnlyMeaning:
-      "context_only: the forecast block is CONTEXT DATA inserted BEFORE the Trader/Portfolio Manager decide. No candidate is cut by the forecast direction, no risk/leverage is relaxed, and the confirmation flow and RiskGuard are untouched. It is a model sample ratio, not a probability, and not an order.",
-    modeMeaning: (mode) => `Current mode: ${mode}.`,
-    failurePolicyLabel: "Behaviour when a forecast fails",
-    failurePolicyMeaning: (policy) =>
-      policy === "defer"
-        ? "defer (default): the candidate is held back BEFORE the LLM call and the reason is recorded on the cycle; the cycle never runs without a forecast."
-        : policy === "pass_through"
-          ? "pass_through: the cycle continues WITHOUT a forecast; the failure is stated in its context — a missing forecast is not a passed check."
-          : `Current policy: ${policy}.`,
+    staleStatus: "This is previously loaded data; the current status may have changed.",
+    readinessLabel: "Model files",
+    modelReadyShort: "Ready",
+    modelUnavailableShort: "Not ready",
+    profileLabel: "Model / tokenizer pair",
+    detailsTitle: "View technical details",
     modelLabel: "Pinned model",
     profileOptions: {
       small_base: "Kronos-small + Kronos-Tokenizer-base",
       mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
     },
     scopeLabel: "Forecast scope",
-    scopeValue: (timeframe, horizon, paths, temperature, lookback, batch, band) =>
-      `${timeframe} closed candles · horizon ${horizon}h · ${paths} sample paths · T=${temperature} · lookback ${lookback} bars · batch ${batch} rows · band ≤ ${band}`,
+    scopeSummary: (timeframe, lookback, horizon, paths) =>
+      `Input: ${lookback} closed ${timeframe} candles · Forecast: ${horizon} hours · ${paths} sample paths`,
+    profileStatusMismatch: "This status belongs to a different model pair; refresh before relying on readiness information.",
+    parameterLabel: "Automatically derived parameters",
+    maxContextLabel: "Maximum context",
+    temperatureLabel: "Temperature",
+    tokenizerLabel: "Pinned tokenizer",
+    sourceRevisionLabel: "Source revision",
     contextNote:
-      "This status panel is read-only and built from the same sources the cycle would use (engine config + on-disk pinned-artifact verification) — no model is started. Edit the parameters in “Kronos forecast parameters” below; changes apply to new cycles.",
-    tuningTitle: "Kronos forecast parameters",
-    tuningDescription:
-      "Engine configuration of the active forecast. The server refuses values the model cannot run (bounds enforced) before applying anything; changes apply to new cycles.",
+      "Kronos is always used in Futures analysis and provides a forecast for the Trader and Portfolio Manager. It does not filter candidates by forecast direction, place orders or relax risk limits. Forecast parameters are derived automatically from the selected pair.",
   },
   screen: {
     loadingDescription: "Loading settings…",
@@ -620,7 +581,6 @@ export const en: typeof vi = {
       system: "Interface & advanced",
     },
     advanced: "Advanced settings",
-    kronosTuning: "Kronos forecast parameters (advanced)",
     otherRisk: "Additional limits and protection",
     loadingRisk: "Checking managed risk limits…",
     operatorUnavailable: "Managed risk limits could not be loaded. Retry before editing risk settings.",
@@ -841,6 +801,7 @@ export const en: typeof vi = {
     titleFull: "Operator overrides (PostgreSQL)",
     loading: "Loading from PostgreSQL…",
     loadFailed: "Could not load operator overrides",
+    kronosUnavailable: "Could not read Kronos status from the server. Try refreshing.",
     description:
       "Operational gates and risk caps are stored in PostgreSQL, survive restarts, and are shown by effective status. There is no JSON file to edit by hand anymore.",
     groups: {
@@ -850,9 +811,9 @@ export const en: typeof vi = {
           "Auto Spot and Auto Futures reflect server configuration. Changes require a confirmation and a reason; every change is recorded in the operator log.",
       },
       forecast: {
-        title: "Kronos — forecast context",
+        title: "Kronos — analysis support",
         description:
-          "Managed operator switch for the Kronos forecast in the decision context. Kept separate from Auto Spot/Futures: it places no orders and is not an Auto switch. Changes need a confirmation and a reason and are audited.",
+          "Add a Kronos price forecast to Futures analysis.",
       },
       risk: {
         title: "Operational risk caps",
@@ -893,9 +854,6 @@ export const en: typeof vi = {
     gateChanges: (keys) => `Automation mode changes: ${keys}`,
     gateWarning:
       "These modes allow the bot to create new Spot or Futures positions. A confirmation and reason are required and recorded in the operator log.",
-    forecastChanges: (keys) => `Kronos forecast switch change: ${keys}`,
-    forecastWarning:
-      "This switch changes the context an automated cycle reads BEFORE deciding (extra model inference per futures candidate). It does NOT arm orders and is not an Auto Spot/Futures switch. A confirmation and reason are required; both are recorded in the operator log.",
     forecastReasonLabel: "Reason for changing the forecast switch",
     confirm: "I understand and confirm the gate change",
     reasonPlaceholder: "Reason (required, e.g. demo run requested by operations)",

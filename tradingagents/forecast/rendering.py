@@ -35,6 +35,16 @@ def render_forecast_block(block: ForecastBlock) -> str:
     spread = (
         f"{block.band_spread_ratio:.4f}" if block.band_spread_ratio is not None else "unavailable"
     )
+    quality = block.ohlc_quality
+    quality_reason = quality.get("reason")
+    quality_lines = [
+        f"  OHLC quality={quality.get('status', 'unknown')} "
+        f"corrected_bars={quality.get('corrected_bar_count', 'unknown')} "
+        f"corrected_paths={quality.get('corrected_path_count', 'unknown')} "
+        f"algorithm={quality.get('algorithm', 'unknown')}"
+    ]
+    if quality_reason:
+        quality_lines.append(f"  OHLC warning: {quality_reason}")
     return "\n".join([
         header,
         f"  symbol={block.symbol} timeframe={block.timeframe} "
@@ -43,11 +53,13 @@ def render_forecast_block(block: ForecastBlock) -> str:
         f"  generation_kind={block.generation_kind} anchor_close={block.reference_close}",
         f"  paths={block.paths} per_path_samples={block.per_path_samples} "
         f"temperature={block.temperature}",
+        f"  direction_label={block.direction or 'unavailable'} signal_basis=close_only",
         f"  direction: up={counts.get('up', 0)}/{block.paths} "
         f"({ratios.get('up', 0.0):.3f}) "
         f"down={counts.get('down', 0)}/{block.paths} ({ratios.get('down', 0.0):.3f}) "
         f"flat={counts.get('flat', 0)}/{block.paths} ({ratios.get('flat', 0.0):.3f})",
         f"  end_close {band_text}   band_spread={spread}",
+        *quality_lines,
         f"  model={block.model_revision} artifact={_short(block.artifact_hash)}",
         f"  generated_at={block.created_at or 'unavailable'}",
         f"  latency_ms={_ms(block.latency_ms)} status={block.status} "

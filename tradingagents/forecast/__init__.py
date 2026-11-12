@@ -1,21 +1,9 @@
-"""Neutral forecast core: the budgeted Kronos model both consumers share.
+"""Active Kronos forecast core for the Futures decision path.
 
-This package owns the contract, the pinned-artifact verification, the bounded
-isolated sampler and the service that turns closed candles into a decision-grade
-block. It is deliberately NOT part of ``tradingagents.shadow``: the shadow layer
-is observation-only and a test pins that the graph, the agents and the autoloop
-never import it, so a model the decision path reads has to live somewhere the
-decision path may import.
-
-Two consumers, one core:
-
-- ``server/shadow_worker.py`` records observations from it (off by default,
-  never touching an order);
-- ``server/autoloop.py`` puts the compact block into the futures execution
-  context BEFORE the Trader and the Portfolio Manager decide.
-
-The core itself decides nothing: it answers "what did the pinned model sample
-from candles that had already closed", and both callers decide what that means.
+This package owns the forecast contract, pinned-artifact verification, bounded
+isolated sampling, and the service that turns closed candles into a
+decision-grade block. The core decides nothing: it supplies model context
+before the Trader and Portfolio Manager decide.
 """
 
 from __future__ import annotations
@@ -61,12 +49,10 @@ from tradingagents.forecast.sampler import (
     SamplerSettings,
     plan_batches,
 )
-from tradingagents.forecast.service import FILTER_MODE_REFUSAL, KronosForecastService
+from tradingagents.forecast.service import KronosForecastService
 from tradingagents.forecast.settings import (
     DEFAULT_HORIZON_HOURS,
     DEFAULT_TIMEFRAME,
-    MODE_CONTEXT_ONLY,
-    MODE_FILTER,
     ForecastSettings,
     settings_from_config,
 )
@@ -77,7 +63,6 @@ __all__ = [
     "CandleSeries",
     "DEFAULT_HORIZON_HOURS",
     "DEFAULT_TIMEFRAME",
-    "FILTER_MODE_REFUSAL",
     "ForecastAttempt",
     "ForecastBlock",
     "ForecastCache",
@@ -92,8 +77,6 @@ __all__ = [
     "MAX_PATHS",
     "MIN_LOOKBACK_BARS",
     "MIN_PATHS",
-    "MODE_CONTEXT_ONLY",
-    "MODE_FILTER",
     "MODEL_REPO",
     "MODEL_REVISION",
     "PathSummary",

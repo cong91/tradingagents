@@ -133,6 +133,7 @@ Response 200:
 
 - `gates_readonly` báo hai chế độ và `any_auto_enabled` là OR của chúng. `effective_exec_mode` được tính bằng bridge standalone; **không dùng giá trị này để suy ra managed entry có gửi tới venue hay không**.
 - `settings[]` phản ánh `_ENV_OVERRIDES`; `exec_base_url` xuất hiện read-only dù được đọc từ `TRADINGAGENTS_EXEC_BASE_URL`. PUT key này → `403 forbidden_key`. `exec_sandbox` chỉ dùng cho sandbox của sàn khác, không chọn Binance venue.
+- Kronos luôn được thử cho ứng viên Futures đủ điều kiện (§19). `kronos_active_profile` là key chọn cặp model-tokenizer được xác minh; PUT profile rỗng hoặc không thuộc registry → `422 validation_error`. `GET /api/operator-config` trả readiness và thông số suy ra trong `kronos`; không còn switch bật/tắt Kronos hoặc policy `pass_through`.
 - `settings[]` bao gồm các numeric policy `risk_derivatives_*`: `profit_protection_enabled` (default true, chỉ quản lý state do bot mở), `break_even_r`=1, `lock_profit_r`=2, `trail_start_r`=3, `trail_distance_r`=1, `target_extension_r`=1, `min_stop_move_r`=0.1, `mark_max_age_seconds`=120. Scale-out: `scale_out_enabled`=false, `scale_out_first_r`=1, `scale_out_first_fraction`=0.33, `scale_out_second_r`=2, `scale_out_second_fraction`=0.33. Chúng không thuộc `gates_readonly` và không tự mở gate.
 - Profit-protection thresholds là bội số của R (entry thực tế tới initial stop). Backend yêu cầu các R dương, `break_even < lock_profit < trail_start`; giá trị sai không gọi venue và trả state `invalid_policy_config` ở monitor. `min_stop_move_r` chặn thay SL khi chênh lệch quá nhỏ; `mark_max_age_seconds` khiến mark cũ trả `mark_stale` và không mutate. Monitor cũng từ chối khi account không phải One-way (`hedge_mode_unsupported`) hoặc không đọc được position mode (`position_mode_unavailable`).
 - Với Binance, `exec_base_url` chỉ chấp nhận HTTPS API host Demo hoặc production được allowlist. URL được chọn quyết định credential pair: Demo dùng `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET`; production dùng `BINANCE_API_KEY`/`BINANCE_SECRET`. Demo là default. Đổi profile cần sửa URL + đúng pair trong `.env` rồi restart; API GET chỉ expose URL và status/mask, PUT không đổi được URL.
@@ -214,9 +215,9 @@ Trạng thái: loading · empty (n/a) · error · stale (n/a — action).
 
 ## 2. Watchlist — `GET /api/watchlist`, `POST /api/watchlist`, `DELETE /api/watchlist/{symbol}`
 
-Nguồn: `exec_watchlist` default `["BTC-USD","ETH-USD"]` (`default_config.py:233-234`); chuẩn hóa biên giới của daily runner (`daily.py:95-111`).
+Nguồn: `exec_watchlist` default `["BTC-USD","ETH-USD"]` (`tradingagents/default_config.py`); chuẩn hóa ticker tại biên giới daily runner.
 
-Lưu trữ: engine đọc `exec_watchlist` từ config; vì key không env-overridable, API layer giữ state trong PostgreSQL (bảng `control_watchlist`, `server/control_store.py`) và sync vào `DEFAULT_CONFIG["exec_watchlist"]` khi khởi động server và sau mỗi ghi. Endpoint `run_daily(watchlist=…)` nhận watchlist tường minh (`daily.py:114-128`) nên truyền trực tiếp, không phụ thuộc file.
+Lưu trữ: API đọc/ghi PostgreSQL, bảng `control_watchlist` (`server/control_store.py`); sau mỗi ghi, `server/watchlist.py` đồng bộ `DEFAULT_CONFIG["exec_watchlist"]` trong process. Lúc server khởi động, `ensure_seeded()` ghi defaults khi bảng rỗng; bảng đã có dữ liệu không được đồng bộ ngược vào `DEFAULT_CONFIG` tại bước này. `POST /api/daily` không có `tickers` đọc danh sách hiện hành trực tiếp từ database (`current_symbols()`), không phụ thuộc bản config đã chụp.
 
 ### GET /api/watchlist
 
@@ -232,7 +233,7 @@ Response 200:
 }
 ```
 
-Trạng thái: loading · **empty** (`symbols: []` — daily runner sẽ bỏ qua tất cả) · error 500 (file hỏng → cố gắng khôi phục từ config default, kèm `warning`) · stale 60s.
+Trạng thái: loading · **empty** (`symbols: []`; `POST /api/daily` không có `tickers` và `auto=false` trả 400) · error 500 khi đọc database thất bại · stale 60s. Watchlist rỗng hợp lệ trong phiên nhưng được seed lại từ defaults khi server khởi động.
 
 ### POST /api/watchlist
 
@@ -579,7 +580,7 @@ hoặc quét tự động (rev 4) — **một nút bấm, server tự tìm mã**
 { "auto": true, "top_n": 5, "mode": "live" }
 ```
 
-- `tickers` bỏ qua/null → dùng `exec_watchlist` hiện hành (`daily.py:127-128`); normalize tại biên giới (strip, drop rỗng, dedupe giữ thứ tự — như `_normalize_watchlist`, `daily.py:95-111`); ticker rỗng sau strip → 400.
+- `tickers` bỏ qua/null → dùng watchlist hiện hành từ PostgreSQL (`server/daily.py:create_daily_job` → `watchlist.current_symbols()`); ticker tường minh được normalize tại biên giới (strip, drop rỗng, dedupe giữ thứ tự); danh sách rỗng sau normalize → 400.
 - `auto` (rev 4, đã implement): `true` → **bỏ qua watchlist**. Worker chạy bước sàng lọc rẻ trước (`server/daily.py:_screen_candidates` → `tradingagents/dataflows/screening.py`):
   - **Universe crypto** (rev 4.1): ccxt public (`fetch_tickers` trên `exec_exchange_id`, mặc định binance — không cần API key), **top 40 theo `quoteVolume` 24h** (mẫu VolumePairlist của freqtrade — lọc stablecoin USDC/USD1/FDUSD/…, floor 5M USDT), map về dạng pipeline `BASE-USD`. Chọn theo khối lượng, không theo vốn hóa — universe chứa cả mover ít người biết.
   - **Universe cổ phiếu** (rev 4.1): `yfinance.screen` với `region=us + intradaymarketcap>2B + fiftytwowkpercentchange>0`, **sort theo `fiftytwowkpercentchange` giảm dần** (tilt George-Hwang 52-week-high: chỉ lấy mã đang mạnh theo năm, không phải danh sách vốn hóa lớn nhất); screener lỗi → fallback danh sách tĩnh lớn-cap (~38 mã liquid) nên outage không chặn auto-scan.
@@ -922,7 +923,7 @@ Response 200:
 ```
 
 - `pending_only=true` → chỉ entry `pending` (chưa settle — `decision_log.py:69-71`).
-- `decision_excerpt` giới hạn ~500 ký tự; UI mở chi tiết qua `run_artifacts.state_log` (endpoint đọc file markdown/json chi tiết là phần mở rộng tương lai — ngoài scope 18 endpoint này, xem §11).
+- `decision_excerpt` giới hạn ~500 ký tự; UI mở chi tiết qua `run_artifacts.state_log` (endpoint đọc file markdown/json chi tiết là phần mở rộng tương lai, ngoài phạm vi hợp đồng này).
 
 Trạng thái: loading · **empty** (log trống hoặc chưa có run nào) · error 500 (file hỏng → trả phần parse được + `warning` liệt kê dòng lỗi) · stale 60s.
 
@@ -996,42 +997,57 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 
 ## 10. Bảng tổng hợp endpoint
 
+Các mô tả chi tiết của các surface gốc nằm ở các mục tương ứng; các route bổ sung có nguồn trong bảng. Đếm từng cặp method/path được đăng ký trong `server/main.py` và router của nó, gồm cả SSE. Các route tài liệu do FastAPI cung cấp (`/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`) không thuộc count này.
+
 | # | Method | Path | Ghi đè engine? |
 |---|--------|------|----------------|
-| 1 | GET   | `/api/settings`                  | đọc config + env, mask credential |
-| 2 | PUT   | `/api/settings`                  | set_config in-memory + upsert PostgreSQL `control_engine_settings`; cấm key gate |
-| 3 | GET   | `/api/watchlist`                 | file state riêng, sync `exec_watchlist` |
-| 4 | POST  | `/api/watchlist`                 | " |
-| 5 | DELETE| `/api/watchlist/{symbol}`        | " |
-| 6 | POST  | `/api/runs`                      | dựng `TradingAgentsGraph` + stream như CLI; chỉ phân tích |
-| 7 | GET   | `/api/runs/{id}`                 | state nội bộ + artifacts trên đĩa |
-| 8 | GET   | `/api/runs/{id}/events` (SSE)    | stream chunks như `cli/run.py:226-323` |
-| 9 | POST  | `/api/daily`                     | cần Auto Spot; phân tích + plan + enqueue, không execute (§5) |
-| 10| GET   | `/api/daily`                     | lịch sử job (database) + `active_job_id` — băng "đang chạy" của UI (§5 rev 7) |
-| 10a| GET  | `/api/daily/{job_id}`            | poll state job + `DailyResult`-shaped results; live hoặc từ database |
-| 10b| POST | `/api/daily/{job_id}/cancel`     | dừng job đang chạy, giải phóng worker lock ngay (§5 rev 7) |
-| 11| GET   | `/api/portfolio`                 | `sync_portfolio` + replay FIFO audit log (§6) |
-| 12| GET   | `/api/approvals`                 | queue mới của API layer |
-| 13| POST  | `/api/approvals/{id}/approve`    | chỉ Spot, kiểm tra Auto Spot và gửi tới venue đã cấu hình (§4) |
-| 14| POST  | `/api/approvals/{id}/reject`     | audit-only, không đụng exchange |
-| 15| GET   | `/api/audit`                     | đọc `exec_log_path` phân trang |
-| 16| GET   | `/api/history`                   | decision log + run tree |
-| 17| GET   | `/api/backtest`                  | `results_dir/backtest/*` + summarize |
-| 18| GET   | `/api/health`                    | mode/halt/key status |
-| 19| GET   | `/api/performance`               | đọc execution audit: brackets, sự kiện execute gần đây, skipped_lines (§12) |
-| 19a| GET  | `/api/performance/fills`          | đọc một trang/mã Binance USD-M Futures trong phạm vi audit-selected (§12) |
-| 20| GET   | `/api/autoloop`                  | state scheduler cùng `modes` và `gates` theo thị trường (§13) |
-| 21| POST  | `/api/autoloop`                  | đặt interval; `enabled` hiệu lực suy ra từ mode, 409 `mode_closed` nếu yêu cầu bật khi cả hai tắt (§13) |
-| 22| POST  | `/api/autoloop/run-now`          | chạy một chu kỳ cho các mode đang bật; 409 `mode_closed` nếu cả hai tắt (§13, §15) |
-| 23| POST  | `/api/halt`                      | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay |
-| 24| POST  | `/api/halt/reset`                | append `{"event": "halt_reset"}` |
-| 25| GET   | `/api/runs`                      | lịch sử run (database) + `active_run_id` (§3 rev 7) |
-| 26| GET   | `/api/outcomes`                  | sổ kết quả ròng read-only từ `outcome_*` (§16); rỗng → `unavailable`, không bao giờ 0 PnL |
-| 27| GET   | `/api/experiments`               | registry thí nghiệm read-only: run đã đăng ký + verdict so sánh (§17); rỗng → `unavailable` |
-| 28| GET   | `/api/experiments/{run_id}`      | một run: manifest đã khóa, per-repeat rows, comparisons (§17); run lạ → `unavailable` |
-| 29| GET   | `/api/shadow`                    | quan sát shadow read-only từ `shadow_*` (§19); rỗng → `unavailable`; tỷ lệ hướng là tỷ lệ mẫu, không phải xác suất |
+| 1 | GET | `/api/settings` | đọc config + env, mask credential (§1) |
+| 2 | PUT | `/api/settings` | set_config in-memory + upsert PostgreSQL `control_engine_settings`; cấm key gate (§1) |
+| 3 | GET | `/api/settings/events` (SSE) | gợi ý refetch settings (§1) |
+| 4 | GET | `/api/snapshot/events` (SSE) | gợi ý vô hiệu hoá snapshot (`server/snapshot_events.py`) |
+| 5 | GET | `/api/operator-config` | đọc operator overrides, modes và readiness Kronos (§1) |
+| 6 | PUT | `/api/operator-config` | lưu operator overrides; mode cần confirm + reason (§1) |
+| 7 | DELETE | `/api/operator-config/{key}` | reset operator override (§1) |
+| 8 | GET | `/api/watchlist` | đọc PostgreSQL `control_watchlist` (§2) |
+| 9 | POST | `/api/watchlist` | thêm symbol, lưu PostgreSQL và sync `DEFAULT_CONFIG` (§2) |
+| 10 | DELETE | `/api/watchlist/{symbol}` | xóa symbol, lưu PostgreSQL và sync `DEFAULT_CONFIG` (§2) |
+| 11 | POST | `/api/runs` | dựng `TradingAgentsGraph` + stream như CLI; chỉ phân tích (§3) |
+| 12 | GET | `/api/runs` | lịch sử run (database) + `active_run_id` (§3) |
+| 13 | GET | `/api/runs/{run_id}` | state nội bộ + artifacts trên đĩa (§3) |
+| 14 | GET | `/api/runs/{run_id}/events` (SSE) | stream chunks (§3) |
+| 15 | POST | `/api/daily` | cần Auto Spot; phân tích + plan + enqueue, không execute (§5) |
+| 16 | GET | `/api/daily` | lịch sử job (database) + `active_job_id` (§5) |
+| 17 | GET | `/api/daily/{job_id}` | poll state job + kết quả; live hoặc từ database (§5) |
+| 18 | POST | `/api/daily/{job_id}/cancel` | dừng job đang chạy, giải phóng worker lock (§5) |
+| 19 | GET | `/api/portfolio` | snapshot danh mục (§6) |
+| 20 | GET | `/api/approvals` | queue của API layer (§4) |
+| 21 | POST | `/api/approvals/{approval_id}/approve` | chỉ Spot, kiểm tra Auto Spot và gửi tới venue đã cấu hình (§4) |
+| 22 | POST | `/api/approvals/{approval_id}/reject` | audit-only, không đụng exchange (§4) |
+| 23 | GET | `/api/audit` | đọc `exec_log_path` phân trang (§7) |
+| 24 | GET | `/api/history` | decision log + run tree (§8) |
+| 25 | GET | `/api/backtest` | `results_dir/backtest/*` + summarize (§8) |
+| 26 | GET | `/api/health` | mode/halt/key status (§9) |
+| 27 | GET | `/api/performance` | đọc execution audit (§12) |
+| 28 | GET | `/api/performance/fills` | đọc một trang/mã Binance USD-M Futures trong phạm vi audit-selected (§12) |
+| 29 | GET | `/api/autoloop` | state scheduler cùng `modes` và `gates` theo thị trường (§13) |
+| 30 | POST | `/api/autoloop` | đặt interval; `enabled` hiệu lực suy ra từ mode (§13) |
+| 31 | POST | `/api/autoloop/run-now` | chạy một chu kỳ cho các mode đang bật (§13, §15) |
+| 32 | GET | `/api/autoloop/cycles` | danh sách, summary và symbol rollup của Futures cycle (`server/autoloop_api.py`) |
+| 33 | POST | `/api/halt` | append `{"event": "halt"}` — RiskGuard mọi process chặn hôm nay (§13) |
+| 34 | POST | `/api/halt/reset` | append `{"event": "halt_reset"}` (§13) |
+| 35 | GET | `/api/data-sources` | trạng thái credential nguồn dữ liệu, không trả cookie (`server/data_sources.py`) |
+| 36 | PUT | `/api/data-sources/{provider}` | lưu cookie nguồn dữ liệu đã mã hóa (`server/data_sources.py`) |
+| 37 | DELETE | `/api/data-sources/{provider}` | xóa cookie đã lưu của provider (`server/data_sources.py`) |
+| 38 | GET | `/api/llm-config` | catalog provider, cấu hình tier và trạng thái key đã mask (`server/llm_credentials_api.py`) |
+| 39 | GET | `/api/llm-credentials` | metadata credential theo tier/provider, không trả key thô (`server/llm_credentials_api.py`) |
+| 40 | PUT | `/api/llm-credentials/{tier}/{provider}` | mã hóa và lưu một API key (`server/llm_credentials_api.py`) |
+| 41 | DELETE | `/api/llm-credentials/{tier}/{provider}` | xóa key đã lưu của tier/provider (`server/llm_credentials_api.py`) |
+| 42 | GET | `/api/outcomes` | sổ kết quả ròng read-only từ `outcome_*` (§16) |
+| 43 | GET | `/api/experiments` | registry thí nghiệm read-only (§17) |
+| 44 | GET | `/api/experiments/{run_id}` | manifest, per-repeat rows và comparisons (§17) |
+| 45 | GET | `/api/brief` | operating brief, gồm active Kronos forecast (§18–19) |
 
-**endpointCount = 32.**
+**endpointCount = 45** (cặp method/path).
 
 ---
 
@@ -1039,7 +1055,7 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 15s + auto-poll.
 
 1. **Approval queue chưa tồn tại trong engine** — `daily.py:186-201` chỉ audit `awaiting_approval` rồi thoát; queue là state mới, persist thật tại `server/data/approvals.jsonl` (tmp+replace — `approvals.py:65-73`). Khi server restart giữa chừng, item `pending` khôi phục từ file; item đang ở `approved` (claimed, §4) khi sập **có thể đã gửi lệnh thật** — đối soát qua engine audit + venue, không tự hồi. Pipeline approve→execute đã implement từ rev 3.1 (`approvals.py:241-333`) — trước đó approve chỉ claim rồi dừng, để item ở dead-end `approved` vĩnh viễn (review finding, đã xoá).
 2. **Job/run là state trong database, không phải in-memory** (rev 7 — đã sửa). `server/data/control.db` (SQLite, stdlib `sqlite3`, WAL) lưu `jobs`/`job_results`/`runs`/`run_events`. Restart server không mất lịch sử: `GET /api/daily/{id}` và `GET /api/runs/{id}` đọc lại từ DB, và stream của một run đã xong replay được từ `run_events`. Job/run bị process chết bỏ lại ở `running` được set `interrupted` lúc khởi động (`main.py:_open_state_db` → `daily.reconcile()` / `runs.reconcile()`, mỗi cái ghi một audit line) — vì worker lock suy ra từ status, không reconcile thì job mồ côi sẽ trả 409 cho mọi job sau, vĩnh viễn và vô hình. Engine audit (`exec_log_path`) **vẫn là JSONL**: đó là contract replay của RiskGuard xuyên process, không phải state của API layer.
-3. **`exec_watchlist` không env-overridable** (`default_config.py:38-41`) — persistence phải là file riêng của API layer, không phải `.env`; mọi nơi đọc watchlist phải đi qua layer này hoặc sync vào `DEFAULT_CONFIG` lúc khởi động, nếu không CLI và UI sẽ trôi về default `["BTC-USD","ETH-USD"]` (đã làm ở `watchlist.py:39-44`).
+3. **`exec_watchlist` không env-overridable** — API lưu trong PostgreSQL `control_watchlist`, seed defaults nếu bảng rỗng lúc startup và sync `DEFAULT_CONFIG` sau mỗi ghi; `POST /api/daily` đọc trực tiếp từ bảng (`server/watchlist.py`, `server/daily.py`). Cấu hình process đã chụp và process CLI riêng không tự đồng bộ từ bảng này.
 4. **Operator modes không thuộc settings engine.** Hai công tắc Auto Spot/Futures chỉ ghi qua `/api/operator-config`, có confirm + reason và audit. `exec_live` không thuộc allowlist ghi của hai settings API và không phải điều kiện gửi lệnh managed; standalone vẫn có thể dùng nó để chọn dry/live.
 5. **`.env` không còn bị ghi từ API** (migration `0006`): settings PUT persist vào PostgreSQL `control_engine_settings`, nạp lại lúc boot giữa tầng env và tầng operator override; `.env` thuần cấu hình triển khai (bí mật, venue URL) và chỉ đổi kèm restart. Lỗi persistence giờ là lỗi PostgreSQL thông thường (500).
 6. **`set_config` process-wide** (`dataflows/config.py`, gọi tại `trading_graph.py:65`) — v1 serialize 1 job/run qua worker lock; muốn song song phải tách process (subprocess per job) — quyết định để sau v1.
@@ -1303,9 +1319,9 @@ CLI consumer: `tradingagents experiments` in cùng payload (yêu cầu `TRADINGA
 
 ## 18. Operating brief — `GET /api/brief` (rev 1)
 
-Một aggregate **chỉ đọc** cho bản tin vận hành trên dashboard (`/`): việc cần xử lý, kết quả đã đối soát, rủi ro đang mở, hoạt động hôm nay, quan sát shadow, thí nghiệm gần nhất. Không có route POST/PUT/DELETE (403/405/415); không đổi state; **không tự gọi sàn** — phần tài khoản dùng lại đúng lần đọc hiển thị của `/api/portfolio` nên mỗi màn vẫn chỉ đọc tài khoản một lần. `read_only: true` trong payload.
+Một aggregate **chỉ đọc** cho bản tin vận hành trên dashboard (`/`): việc cần xử lý, kết quả đã đối soát, rủi ro đang mở, hoạt động hôm nay, dự báo Kronos active của cycle gần nhất, thí nghiệm gần nhất. Không có route POST/PUT/DELETE (403/405/415); không đổi state; **không tự gọi sàn** — phần tài khoản dùng lại đúng lần đọc hiển thị của `/api/portfolio` nên mỗi màn vẫn chỉ đọc tài khoản một lần. `read_only: true` trong payload.
 
-**Cấu trúc:** `generated_at`, `stale_after` (30), `disclaimer`, `status`, `funnel`, `results`, `risk`, `activity`, `experiments`, `portfolio`, `needs_attention`.
+**Cấu trúc:** `generated_at`, `stale_after` (30), `disclaimer`, `status`, `funnel`, `results`, `risk`, `activity`, `active_forecast`, `experiments`, `portfolio`, `needs_attention`.
 
 **Truthfulness (bất biến test — `tests/test_operating_brief.py`):**
 
@@ -1317,10 +1333,11 @@ Một aggregate **chỉ đọc** cho bản tin vận hành trên dashboard (`/`)
 - `risk.heat.value_pct` **luôn `null`** kèm lý do: risk-at-stop của từng vị thế không nằm trong snapshot vị thế, nên heat không được tuyên bố.
 - `risk.protection` đếm từ **cycle đã executed hôm nay** (theo `updated_at` UTC), có `scope`; `open_positions_verified: false` vì vị thế sàn không có binding bền vững tới lệnh vào (xem §6) — không suy đoán mức bảo vệ từng vị thế.
 - `risk.limits` là **hiển thị chỉ đọc** của hạn mức operator đã cấu hình; không có đường ghi từ endpoint này.
-- `activity` tách hai nhóm: `no_entry_top_reasons[]` (top 3, không có tín hiệu / bị loại hợp lệ, kèm `sample_cycle_id`) và `pipeline_error_cycles` (failed/interrupted/timeout) — **không bao giờ gộp**. Cycle đang bay (`claimed/running`) bị loại khỏi cả hai. `activity.scope: "futures"`, `window: "today_utc"`.
-- `activity.shadow.state` ∈ `ok | disabled | empty | error` — **tên đúng loại "chưa có gì"**, vì ba loại này là ba sự thật khác nhau và UI render một câu riêng cho mỗi loại: `disabled` (công tắc `shadow_observations_enabled` đang tắt), `empty` (worker đang bật nhưng chưa ghi được dòng nào), `error` (lần đọc store thất bại). Trước đây một câu chung đã nói "chưa bật" cho cả ba, tức **nói sai cấu hình của operator** khi worker thực ra đang bật. Payload cũ không có `state` → UI rơi về câu trung tính, không mặc định là "đã tắt".
-- `activity.shadow.status: "unavailable"` khi worker shadow đang tắt (`shadow_observations_enabled = False`) kèm lý do, hoặc khi chưa có quan sát nào trong `shadow_forecasts`; `providers` (danh sách cấu hình) và `kronos` (model tùy chọn có cài trong môi trường cách ly hay không, kèm lý do) luôn được công bố để operator biết vì sao chưa có quan sát — không bịa dự báo.
-- `activity.shadow` khi đã bật: `totals` (đếm theo status), `providers_detail[]` (đếm theo nguồn: `attempts`, `verdicts`, `evaluations`), `observations[]` (5 dòng gần nhất: symbol/timeframe/horizon/provider/direction/status/generation_kind/outcome_group). **Tỷ lệ hướng là tỷ lệ mẫu trên số đường của mô hình**, in kèm mẫu số — không bao giờ là xác suất đã hiệu chỉnh; `distribution_kind: "deterministic_rule"` không có tỷ lệ/khoảng/độ phân tán nên không hiển thị chúng.
+- `activity` tách hai nhóm: `no_entry_top_reasons[]` (top 3, không có tín hiệu / bị loại hợp lệ, kèm `sample_cycle_id`) và `pipeline_error_cycles` (failed/interrupted/timeout hoặc forecast bị hoãn) — **không bao giờ gộp**. Forecast bị hoãn trước graph không tính vào `analysed_today`. Cycle đang bay (`claimed/running`) bị loại khỏi cả hai. `activity.scope: "futures"`, `window: "today_utc"`.
+- `GET /api/autoloop/cycles` đếm forecast lỗi ở bucket `forecast_deferred` trong `summary` và từng `symbols[]`; lý do mới nhất nằm ở `last_kronos_defer_reason`, chi tiết từng cycle giữ `payload.kronos_defer_reason`.
+- Forecast hợp lệ phải là quyết định forward-only: block hồi cứu không được đưa vào context active.
+- Khi forecast trả trạng thái lỗi, cycle ghi block và hoãn ứng viên trước graph/LLM nếu cycle còn cho phép ghi; không có fallback/pass-through.
+- Horizon và lookback được suy ra từ max-hold và profile; timeframe cố định là nến Futures 4h đã đóng.
 - `experiments` lấy từ registry (§17); khi rỗng → `unavailable` + lý do; verdict pass-through, **không có promotion**.
 - `portfolio` là **body nguyên vẹn của `/api/portfolio`** (giữ `generated_at`, snapshot metadata, warnings, `positions_read`) để card dùng lại mà không mất hợp đồng/source freshness. Lần đọc danh mục thất bại → `portfolio: null` và chỉ section đó suy giảm; brief vẫn trả 200.
 - `needs_attention[]` được **dedup ở server** theo `kind` (một mục một kind, priority thấp nhất thắng), sắp theo `priority` 1→3, mỗi mục có `message_code` (i18n), `detail` (nguyên văn) và `link` nội bộ. Sổ rỗng **không** sinh mục "ledger unavailable" (đã có ở khối results) — tránh dạy operator bỏ qua danh sách cảnh báo.
@@ -1330,20 +1347,26 @@ Consumer web: `web/components/overview/brief/` (card + scope filter UI-local) v�
 
 ---
 
-## 19. Shadow observations — `GET /api/shadow` (rev 1)
+## 19. Active Kronos forecast — `active_forecast` trong `GET /api/brief`
 
-Aggregate **chỉ đọc** trên các bảng `shadow_*` (migration 0010, plan §6). Không có route ghi; không gọi provider; không đọc sàn; **không bao giờ tác động lệnh, hạn mức rủi ro hay protection** — worker shadow chạy độc lập sau khi cycle đã terminal.
+`active_forecast` là block chỉ đọc của cycle Futures gần nhất đã ghi `kronos_forecast`.
+Kronos chạy trực tiếp trong decision path trước graph/LLM khi ứng viên đủ điều kiện;
+block này mô tả đúng dữ liệu cycle đã nhận, không phải một worker quan sát riêng.
 
-**Cấu trúc:** `status`, `reason`, `totals` (đếm `rows/ok/unavailable/errors/timeouts/retrospective` + `first_data_open_time`/`last_data_open_time`), `providers[]` (mỗi nguồn: `attempts`, `verdicts`, `evaluations`), `evaluations[]` (bản thô theo status), `recent[]` (20 dòng mới nhất, kèm evaluation join), `generated_at`, `read_only: true`, `disclaimer`.
+**Cấu trúc:** `state`, `status`, `note`, và `reason` khi rỗng/lỗi. Khi có block,
+response thêm `cycle_id`, `symbol`, `quote_currency`, `policy`, `defer_reason`,
+`recorded_at` và `forecast`. `state` gồm `ok`, `empty`, `error`, `stale`,
+`unavailable`. Trong decision path hiện tại, policy là `use` hoặc `defer`:
+block hợp lệ được đưa vào context; artifact, history, timeout hoặc lỗi khác làm
+ứng viên hoãn trước graph/LLM. Trường `policy` của brief đọc nguyên giá trị đã
+lưu nên có thể là `null` hoặc mang giá trị lịch sử như `pass_through`.
 
-**Truthfulness (bất biến test — `tests/test_shadow_forecasts.py`, `tests/test_shadow_worker.py`):**
+Forecast hợp lệ giữ `signal_basis: "close_only"`, tỷ lệ hướng đi kèm số đường mẫu,
+`band`, `band_spread_ratio`, `horizon_hours`, `timeframe`, `paths`, provenance model,
+độ trễ, và `ohlc_quality`. Tỷ lệ mẫu không phải xác suất đã hiệu chỉnh; block không
+phải lệnh, veto hay kết quả lợi nhuận. Không có state hoặc policy nào để bật/tắt
+Kronos ở đây; operator chỉ chọn profile model-tokenizer đã xác minh trong Cấu hình.
 
-- Bảng rỗng → `status: "unavailable"`, `totals: null`, `providers: []` kèm lý do — **không bao giờ "0% đồng ý"**.
-- `calibration_label` đi kèm từng dòng: `model_sample_ratio_not_probability` (mô hình) hoặc `deterministic_rule_no_distribution` (bộ lọc). Tỷ lệ hướng chỉ là **tỷ lệ mẫu trên N đường** với `sample_count` + `per_path_sample_count = 1`; không có trường nào được đặt tên/probability.
-- `generation_kind`: `forward` chỉ khi dự báo được tạo **trước khi nến dự báo đầu tiên đóng**; replay muộn là `retrospective` và được đếm riêng trong `totals.retrospective`.
-- `outcome_group` ∈ `executed | rejected | abstained`, suy từ `execution_status` đã ghi của cycle; status lạ không bao giờ được nâng thành `executed`.
-- `status` của một dòng ∈ `ok | unavailable | error | timeout`; dòng thất bại có `paths: []`, `samples: {}` và `reason` — không có dự báo "gần đúng".
-- `evaluation_status` chỉ có khi horizon 24h đã thực sự đóng đủ; `net_r` chỉ có khi ledger đã join, kèm `net_r_reason`.
-- `band_coverage` = **close cuối kỳ** có nằm trong band p10–p90 (band là phân phối của end-close, không phải hành lang từng nến); `null` với quy tắc cố định (không có khoảng). Câu hỏi "cả đường đi có nằm trong band" trả lời riêng ở `realized.band_held_throughout`, và `realized.band_semantics` nói rõ định nghĩa đang dùng.
-- `providers[].evaluations.stop_first_rate_mean` dùng `worst-first` của `tradingagents.simulation.fills.match_exit`; mẫu số là **các path thực sự chạm một mức** (`realized.stop_first_measured_paths`), path không chạm stop lẫn target bị loại chứ không bị tính là "target first"; số ca mơ hồ được công bố trong `realized.stop_first_ambiguity_count`.
-- `?limit` phải là số nguyên dương và ≤ 200; vi phạm → 400 `validation_error` (không phải 500 từ PostgreSQL).
+Dữ liệu lịch sử trong các bảng `shadow_*` và migration `0010_shadow_forecasts.sql`
+được giữ nguyên để bảo toàn lịch sử database, nhưng không còn là API/UI surface của
+ứng dụng hiện tại.

@@ -112,7 +112,6 @@ FAKE_API = r"""
         analysed_today: 4, entries_today: 2, pipeline_error_cycles: 1,
         no_entry_top_reasons: [{code: "market_rejected", reason: "no_tradeable_signal",
           count: 1, sample_cycle_id: "futures:BTC/USDT:USDT:1"}],
-        shadow: shadowBlock(state),
         note: "No-signal and pipeline failure are counted separately."},
       active_forecast: activeForecast(state),
       experiments: {status: "ok", total: 1,
@@ -134,15 +133,13 @@ FAKE_API = r"""
     active_run_id: null, pending_approvals: state.approvals || 0});
 
   // The ACTIVE forecast block: the forecast the most recent recorded cycle
-  // actually saw — separate from shadow rows, and each state rendered as its
-  // own thing. `state` keys the sentence, so every state must be reachable.
+  // actually saw, with each state rendered as its own thing.
   function activeForecast(s) {
     const want = s.forecastState || "ok";
     const base = {cycle_id: "futures:BTC/USDT:USDT:1", symbol: "BTC/USDT:USDT",
       quote_currency: "USDT", policy: "use", defer_reason: null,
       recorded_at: "2026-11-10T09:25:00Z",
       note: "Observation labels only; nothing here is a profit claim."};
-    if (want === "off") return {state: "off", status: "off", reason: null, ...base, forecast: null};
     if (want === "empty") return {state: "empty", status: "unavailable",
       reason: "no recorded cycle has a Kronos forecast yet; nothing is claimed",
       ...base, forecast: null};
@@ -151,6 +148,23 @@ FAKE_API = r"""
       ...base, forecast: null};
     const forecast = {symbol: "BTC/USDT:USDT", status: "ok", reason: null,
       direction: "up", calibration_label: "sample_ratio", distribution_kind: "model_samples",
+      signal_basis: "close_only",
+      ohlc_quality: s.forecastQuality === "corrected"
+        ? {status: "corrected", algorithm: "ohlc_wick_bounds_v1", version: 1,
+           corrected_bar_count: 3, corrected_path_count: 2,
+           changed_field_counts: {highs: 3, lows: 1},
+           absolute_delta_by_field: {highs: {total: 12.5, max: 2.5}, lows: {total: 4, max: 1.5}},
+           reason: "Model wick bounds were applied before path summary."}
+        : s.forecastQuality === "unknown"
+          ? {status: "unknown", algorithm: null, version: null,
+             corrected_bar_count: null, corrected_path_count: null,
+             changed_field_counts: null, absolute_delta_by_field: null,
+             reason: "Legacy forecast did not include OHLC quality metadata."}
+          : {status: "consistent", algorithm: null, version: null,
+             corrected_bar_count: 0, corrected_path_count: 0,
+             changed_field_counts: {highs: 0, lows: 0},
+             absolute_delta_by_field: {highs: {total: 0, max: 0}, lows: {total: 0, max: 0}},
+             reason: null},
       direction_counts: {up: 9, down: 5, flat: 2},
       direction_ratio: {up: 0.5625, down: 0.3125, flat: 0.125},
       band: {low: 58000, p50: 60100, high: 62500}, band_spread_ratio: 0.0765,
@@ -168,47 +182,6 @@ FAKE_API = r"""
     return {state: "ok", status: "ok", reason: null, ...base, forecast};
   }
 
-  // The four shadow states the server can report. `state` is what the UI keys
-  // its sentence on, so each one must be reachable here.
-  function shadowBlock(s) {
-    const want = s.shadowState || "ok";
-    const kronos = s.shadowKronos
-      ? {available: true, reason: null}
-      : {available: false, reason: "the isolated Kronos interpreter is absent (fixture)"};
-    if (want === "disabled") {
-      return {state: "disabled", status: "unavailable",
-        reason: "shadow observations are off (shadow_observations_enabled is False); no observation is being recorded",
-        providers: ["filter:donchian_breakout"], kronos: kronos, observations: []};
-    }
-    if (want === "empty") {
-      return {state: "empty", status: "unavailable",
-        reason: "no shadow observation has been recorded; nothing is claimed",
-        providers: ["filter:donchian_breakout"], kronos: kronos, observations: [],
-        totals: null, providers_detail: []};
-    }
-    if (want === "error") {
-      return {state: "error", status: "unavailable",
-        reason: "the shadow observations could not be read: OperationalError",
-        providers: ["filter:donchian_breakout"], kronos: kronos, observations: []};
-    }
-    return {state: "ok", status: "ok",
-      providers: ["filter:donchian_breakout"],
-      kronos: kronos,
-      totals: {rows: 3, ok: 2, unavailable: 0, errors: 1, timeouts: 0,
-        retrospective: 0, first_data_open_time: "2026-11-10T06:00:00Z",
-        last_data_open_time: "2026-11-10T09:00:00Z"},
-      providers_detail: [{
-        provider: "filter:donchian_breakout",
-        distribution_kind: "deterministic_rule",
-        attempts: {rows: 3, ok: 2, unavailable: 0, error: 1, timeout: 0},
-        verdicts: {up: 1, down: 1, flat: 0},
-        evaluations: {rows: 0, direction_scored: 0, direction_hits: 0,
-          band_scored: 0, band_inside: 0, net_r_rows: 0, stop_first_rate_mean: null}}],
-      observations: [{symbol: "BTC/USDT:USDT", timeframe: "1h", horizon_hours: 24,
-        provider: "filter:donchian_breakout", direction: "up", status: "ok",
-        generation_kind: "forward", outcome_group: "rejected", note: null}],
-      note: "Observations only; sample ratios are not probabilities."};
-  }
   window.__apiRequests = [];
   const original = window.fetch.bind(window);
   window.fetch = (url, init = {}) => {

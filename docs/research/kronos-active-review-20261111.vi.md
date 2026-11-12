@@ -1,5 +1,7 @@
 # Rà nghiệm thu Kronos active — 2026-11-11
 
+> **Lưu trữ lịch sử — đã thay thế 2026-11-12:** Các nhận định và đề xuất về công tắc `kronos_active_enabled`, Shadow và `pass_through` trong báo cáo này không còn hiệu lực. Quy định hiện hành tại `AGENTS.md`: Kronos luôn được thử cho ứng viên Futures đủ điều kiện, không có công tắc hay Shadow; nếu không có dự báo hợp lệ thì hoãn ứng viên.
+
 Trạng thái: có lỗi chặn đã tái hiện offline; chưa là bàn giao hoàn tất. Phạm vi vẫn là ledger/mô phỏng, experiments, dashboard và Kronos làm đầu vào thật trước Trader/PM. Không deploy, không đổi Auto/venue/risk runtime, không đặt lệnh, không commit/push.
 
 ## Bằng chứng đã tái hiện

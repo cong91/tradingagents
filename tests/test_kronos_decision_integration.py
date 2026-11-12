@@ -1,24 +1,9 @@
 """F2: the active Kronos block reaches the REAL Trader and PM prompts.
 
-The requirement this file exists to prove is reachability, not plumbing: the
-compact forecast must be inside the string that the actual Trader prompt and the
-actual Portfolio Manager prompt are built from, BEFORE either decides — not only
-written to a cycle payload.
-
-So the test drives the REAL agent node functions (``create_trader`` /
-``create_portfolio_manager``) with a RECORDING fake LLM and asserts the rendered
-forecast text appears in the messages they send. A cycle-payload assertion would
-pass even if no agent ever saw the number, which is exactly the failure mode a
-"shadow-only" implementation has.
-
-The rest of the file pins the boundaries around that path:
-
-- with the feature OFF, no model is started and the execution context is
-  byte-identical to the incumbent one;
-- the mode is checked AFTER the inference, so closing the mode mid-call stops
-  the candidate instead of using its result;
-- no execution lock is taken by the forecast stage;
-- a failure renders a status the agents can read and never becomes a passed gate.
+The forecast is unconditional for eligible Futures candidates. This suite proves
+that its compact block reaches the real agent prompts and that failures defer a
+candidate before graph/LLM construction, while the separate Auto Futures mode
+safety check remains covered.
 """
 
 from __future__ import annotations
@@ -39,11 +24,11 @@ from server import (
 )
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.trader.trader import create_trader
-from tradingagents.dataflows.market_data import Candle
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution import futures_account
 from tradingagents.execution.futures_account import FuturesAccountSnapshot
 from tradingagents.execution.risk import RiskGuard, RiskLimits
-from tradingagents.forecast.block import CandleSeries, ForecastBlock
+from tradingagents.forecast.block import ForecastBlock
 from tradingagents.forecast.contract import STATUS_OK, STATUS_TIMEOUT
 from tradingagents.forecast.service import KronosForecastService
 from tradingagents.forecast.settings import ForecastSettings
@@ -51,24 +36,6 @@ from tradingagents.forecast.settings import ForecastSettings
 pytestmark = pytest.mark.unit
 
 _FOUR_HOUR_MS = 14_400_000
-
-
-def _series(count: int = 96, *, close: float = 74_200.0) -> CandleSeries:
-    step = _FOUR_HOUR_MS
-    last = 1_800_000_000_000 - (1_800_000_000_000 % step)
-    opens = [last - step * (count - 1 - index) for index in range(count)]
-    candles = tuple(
-        Candle(
-            symbol="BTC/USDT:USDT", timeframe="4h", open_time=open_time,
-            close_time=open_time + step, open=close - 1.0, high=close + 1.0,
-            low=close - 2.0, close=close, volume=10.0, is_closed=True,
-        )
-        for open_time in opens
-    )
-    return CandleSeries(
-        symbol="BTC/USDT:USDT", candles=candles,
-        as_of=datetime.fromtimestamp((opens[-1] + step) / 1000, UTC),
-    )
 
 
 class _RecordingLLM:
@@ -121,8 +88,9 @@ class _GoodSampler:
                 move = 30.0 if index < ups else -30.0
                 end = reference + move
                 drawn.append({
-                    "closes": [reference, end], "highs": [max(reference, end)],
-                    "lows": [min(reference, end)], "seed": 5000 + index,
+                    "opens": [reference, end], "closes": [reference, end],
+                    "highs": [max(reference, end), max(reference, end)],
+                    "lows": [min(reference, end), min(reference, end)], "seed": 5000 + index,
                 })
             out.append(SampledSymbol(
                 symbol=symbol, status=STATUS_OK, paths=tuple(drawn),
@@ -152,7 +120,7 @@ def _block(**overrides) -> ForecastBlock:
 
 
 def _service(sampler=None, **overrides) -> KronosForecastService:
-    settings = {"enabled": True, "paths": 16}
+    settings = {"paths": 16, "lookback_bars": 96}
     settings.update(overrides)
     return KronosForecastService(
         sampler=sampler if sampler is not None else _GoodSampler(),
@@ -281,7 +249,9 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=3.0)),
     )
     config = {
-        "kronos_active_enabled": True, "kronos_active_paths": 16,
+        **DEFAULT_CONFIG,
+        "kronos_active_profile": "small_base",
+        "risk_derivatives_max_hold_hours": 24,
         "risk_max_derivatives_leverage": 3.0,
     }
     autoloop_analysis._process_candidate(
@@ -296,33 +266,10 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
     assert context.index("Futures equity") < context.index("Kronos forecast")
 
 
-# -- off / failure / boundary ----------------------------------------------
+# -- failure / boundary -------------------------------------------------------
 
 
-def test_the_feature_off_leaves_the_context_byte_identical(monkeypatch):
-    from server.kronos_context import append_to_context
-
-    incumbent = "Futures Account and Market Context:\nline one\nline two"
-    assert append_to_context(incumbent, None) == incumbent
-    assert append_to_context("", None) == ""
-
-    called = {"forecast": 0}
-
-    def _never(**_kwargs):
-        called["forecast"] += 1
-        raise AssertionError("a disabled feature must not forecast")
-
-    monkeypatch.setattr(autoloop_futures_context.kronos_context, "forecast_for_cycle", _never)
-    block = autoloop_futures_context._kronos_block_for(
-        SimpleNamespace(_bridge=SimpleNamespace(client=lambda: object())),
-        "BTC-USD", {"unified_symbol": "BTC/USDT:USDT"}, {"kronos_active_enabled": False},
-        cycle_id="c1",
-    )
-    assert block is None
-    assert called["forecast"] == 0
-
-
-def test_a_timeout_renders_a_readable_status_and_is_not_a_passed_gate():
+def test_a_timeout_renders_a_readable_status_and_defers_the_candidate():
     from server.kronos_context import append_to_context, policy_for
     from tradingagents.forecast.rendering import render_forecast_block
 
@@ -334,11 +281,8 @@ def test_a_timeout_renders_a_readable_status_and_is_not_a_passed_gate():
     assert "status=timeout" in rendered
     assert "reason=" in rendered and "not a passed check" in rendered
     assert "paths=" not in rendered, "a failed block must not show a sample count"
-    settings = ForecastSettings(enabled=True, failure_policy="defer")
-    assert policy_for(block, settings) == "defer"
-    assert policy_for(None, settings) == "use"
-    assert policy_for(block, ForecastSettings(enabled=True, failure_policy="pass_through")) == "pass"
-    # Deferring never means the block became a veto: the caller keeps the candidate.
+    assert policy_for(block) == "defer"
+    assert policy_for(None) == "defer"
     context = append_to_context("incumbent", block)
     assert context.startswith("incumbent") and "status=timeout" in context
 
@@ -397,7 +341,12 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
     # failure_policy defaults to defer; the candidate must stop here.
     result = autoloop_analysis._process_candidate(
         None, {"ticker": "BTC-USD", "asset_type": "crypto"},
-        {"kronos_active_enabled": True, "risk_max_derivatives_leverage": 3.0},
+        {
+            **DEFAULT_CONFIG,
+            "kronos_active_profile": "small_base",
+            "risk_derivatives_max_hold_hours": 24,
+            "risk_max_derivatives_leverage": 3.0,
+        },
         _graph_builder, executor,
     )
     assert built == [], "the graph (and any LLM call) must not run for a deferred candidate"
@@ -413,19 +362,15 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch):
     assert final["payload"]["kronos_forecast"]["status"] == STATUS_TIMEOUT
 
 
-def test_pass_through_continues_with_the_failure_in_the_context(monkeypatch):
-    """pass_through is explicit: the cycle continues WITHOUT a forecast, and the
-    failure is stated in the context the agents read — never a silent pass."""
-    from server.autoloop_telemetry import CycleTelemetry
-
-    seen: dict = {}
-
-    class Graph:
-        def propagate(self, ticker, trade_date, *, asset_type, execution_context="", **_kwargs):
-            seen["context"] = execution_context
-            return {"futures_execution_intent": "abstain"}, "Hold"
-
-    monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
+def test_a_forecast_client_failure_is_recorded_as_defer(monkeypatch):
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        futures_cycle_telemetry, "persist_progress",
+        lambda _cid, payload=None, **kwargs: persisted.append(
+            {"payload": dict(payload or {}), **kwargs}
+        ),
+    )
+    monkeypatch.setattr(autoloop_futures_context, "_closed_futures_context", lambda *_: {
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -434,7 +379,7 @@ def test_pass_through_continues_with_the_failure_in_the_context(monkeypatch):
         "four_hour_close": 1.0, "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
     })
-    monkeypatch.setattr(futures_account, 'read_futures_account', lambda *_a, **_k: (
+    monkeypatch.setattr(futures_account, "read_futures_account", lambda *_a, **_k: (
         FuturesAccountSnapshot(
             equity=1_000.0, available_balance=900.0, wallet_balance=950.0,
             unrealized_pnl=0.0, equity_currency="USDT",
@@ -442,33 +387,30 @@ def test_pass_through_continues_with_the_failure_in_the_context(monkeypatch):
             positions_scope_complete=True,
         )
     ))
-    monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _t, direction: (90.0, 110.0))
-    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_a, **_k: True)
-    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_a, **_k: None)
-    monkeypatch.setattr(autoloop_cycle_records, '_record_futures_cycle_rejection', lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        autoloop_futures_execution, '_process_futures_candidate',
-        lambda _e, _t, _s, _c, result, **kwargs: setattr(result, "reason", "captured"),
-    )
-    monkeypatch.setattr(
-        autoloop_futures_context.kronos_context, "forecast_for_cycle",
-        lambda **_k: ForecastBlock(
-            symbol="BTC/USDT:USDT", status=STATUS_TIMEOUT, reason="deadline",
-        ),
-    )
+    monkeypatch.setattr(autoloop_futures_context, "_bracket_prices", lambda _t, direction: (90.0, 110.0))
+    monkeypatch.setattr(futures_cycle_telemetry, "claim_cycle", lambda *_a, **_k: True)
+    monkeypatch.setattr(autoloop_analysis.job_store, "futures_position_stops", lambda: {})
+
+    def fail_client():
+        raise RuntimeError("forecast venue unavailable")
+
+    def fail_graph(*_args):
+        pytest.fail("a client failure must defer before graph construction")
+
     executor = SimpleNamespace(
-        _bridge=SimpleNamespace(client=lambda: object()),
+        _bridge=SimpleNamespace(client=fail_client),
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=3.0)),
     )
-    autoloop_analysis._process_candidate(
+    result = autoloop_analysis._process_candidate(
         None, {"ticker": "BTC-USD", "asset_type": "crypto"},
-        {"kronos_active_enabled": True, "kronos_active_failure_policy": "pass_through",
-         "risk_max_derivatives_leverage": 3.0},
-        lambda *_: Graph(), executor, telemetry=CycleTelemetry(),
+        {**DEFAULT_CONFIG, "risk_max_derivatives_leverage": 3.0}, fail_graph, executor,
     )
-    context = seen.get("context") or ""
-    assert "status=timeout" in context, "the failure must be stated in the context"
-    assert "not a passed check" in context
+
+    assert "forecast venue unavailable" in result.reason
+    terminal = [row for row in persisted if row.get("terminal")]
+    assert terminal[-1]["payload"]["kronos_policy"] == "defer"
+    assert terminal[-1]["payload"]["kronos_forecast"]["status"] == "error"
+    assert "forecast venue unavailable" in terminal[-1]["payload"]["kronos_defer_reason"]
 
 
 def test_the_forecast_stage_takes_no_execution_lock(monkeypatch):
@@ -541,7 +483,12 @@ def test_closing_the_mode_mid_inference_stops_the_candidate(monkeypatch):
     with pytest.raises(autoloop_execution.AutoModeDisabled) as raised:
         autoloop_analysis._process_candidate(
             None, {"ticker": "BTC-USD", "asset_type": "crypto"},
-            {"kronos_active_enabled": True, "risk_max_derivatives_leverage": 3.0},
+            {
+                **DEFAULT_CONFIG,
+                "kronos_active_profile": "small_base",
+                "risk_derivatives_max_hold_hours": 24,
+                "risk_max_derivatives_leverage": 3.0,
+            },
             lambda *_: Graph(), executor, mode=AutoMode.FUTURES,
         )
     assert order == ["forecast"], "the graph must not run after the mode closed"
@@ -587,7 +534,12 @@ def test_the_forecast_block_is_recorded_on_the_cycle_payload(monkeypatch):
     )
     autoloop_analysis._process_candidate(
         None, {"ticker": "BTC-USD", "asset_type": "crypto"},
-        {"kronos_active_enabled": True, "risk_max_derivatives_leverage": 3.0},
+        {
+            **DEFAULT_CONFIG,
+            "kronos_active_profile": "small_base",
+            "risk_derivatives_max_hold_hours": 24,
+            "risk_max_derivatives_leverage": 3.0,
+        },
         lambda *_: object(), executor, telemetry=CycleTelemetry(),
     )
     with_forecast = [row for row in persisted if row.get("kronos_forecast")]

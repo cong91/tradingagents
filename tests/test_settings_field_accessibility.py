@@ -78,8 +78,8 @@ def test_kronos_profile_select_has_closed_options_and_accessible_descriptions():
         "value": "small_base", "error": "Profile unavailable",
     }]
     labels = {
-        "en": ("Kronos model profile", "Kronos-small + Kronos-Tokenizer-base", "Kronos-mini + Kronos-Tokenizer-2k"),
-        "vi": ("Hồ sơ model Kronos", "Kronos-small + Kronos-Tokenizer-base", "Kronos-mini + Kronos-Tokenizer-2k"),
+        "en": ("Model and tokenizer pair", "Kronos-small + Kronos-Tokenizer-base", "Kronos-mini + Kronos-Tokenizer-2k"),
+        "vi": ("Cặp model và tokenizer", "Kronos-small + Kronos-Tokenizer-base", "Kronos-mini + Kronos-Tokenizer-2k"),
     }
     for language, (label, small, mini) in labels.items():
         result = subprocess.run(
@@ -108,15 +108,15 @@ def test_kronos_profile_select_has_closed_options_and_accessible_descriptions():
         assert "<input" not in markup
 
 
-def test_kronos_field_keeps_limit_unit_and_error_descriptions():
+def test_numeric_field_keeps_limit_unit_and_error_descriptions():
     web = require_web_renderer()
     cases = [
         {
             "row": {
-                "key": "kronos_active_horizon_hours", "type": "int", "editable": True,
+                "key": "risk_derivatives_max_hold_hours", "type": "int", "editable": True,
                 "value": 24, "default": 24, "source": "default", "env_var": "TEST_HORIZON",
             },
-            "value": "25", "error": "Must be a whole number of 4h candles",
+            "value": "invalid", "error": "Must be a number",
         },
         {
             "row": {
@@ -137,9 +137,9 @@ def test_kronos_field_keeps_limit_unit_and_error_descriptions():
     field = horizon.inputs[0]
     assert field["aria-invalid"] == "true"
     assert field["aria-describedby"].split() == [
-        "setting-kronos_active_horizon_hours-hint",
-        "setting-kronos_active_horizon_hours-unit",
-        "setting-kronos_active_horizon_hours-error",
+        "setting-risk_derivatives_max_hold_hours-hint",
+        "setting-risk_derivatives_max_hold_hours-unit",
+        "setting-risk_derivatives_max_hold_hours-error",
     ]
     assert set(field["aria-describedby"].split()) <= horizon.ids
     assert "aria-describedby" not in unknown.inputs[0]

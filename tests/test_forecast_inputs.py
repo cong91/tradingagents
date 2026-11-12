@@ -47,9 +47,6 @@ from tradingagents.forecast.sampler import (
 )
 from tradingagents.forecast.service import KronosForecastService
 from tradingagents.forecast.settings import (
-    FAILURE_POLICIES,
-    MODE_CONTEXT_ONLY,
-    MODE_FILTER,
     ForecastSettings,
     settings_from_config,
 )
@@ -89,7 +86,7 @@ def _series(
 
 
 def _settings(**overrides) -> ForecastSettings:
-    base = {"enabled": True, "mode": MODE_CONTEXT_ONLY, "paths": MIN_PATHS}
+    base = {"paths": MIN_PATHS, "lookback_bars": 96}
     base.update(overrides)
     return ForecastSettings(**base)
 
@@ -129,6 +126,7 @@ class _FakeSampler:
                     for step in range(bars)
                 ]
                 drawn.append({
+                    "opens": list(closes),
                     "closes": closes,
                     "highs": [value + 1.0 for value in closes],
                     "lows": [value - 1.0 for value in closes],
@@ -212,6 +210,25 @@ def test_a_stale_series_is_refused_even_without_a_late_bar():
 def test_a_series_ending_on_the_newest_closed_bar_is_not_stale():
     series = _series()
     assert series_problem(series, "4h", lookback_bars=96) is None
+
+
+def test_a_wrong_candle_duration_is_refused_before_sampling():
+    series = _series()
+    last = series.candles[-1]
+    broken_last = _candle(last.open_time, close_time=last.close_time + _ONE_HOUR_MS)
+    broken = CandleSeries(
+        symbol=series.symbol,
+        candles=(*series.candles[:-1], broken_last),
+        as_of=series.as_of + timedelta(hours=1),
+    )
+    sampler = _FakeSampler()
+
+    reason = series_problem(broken, "4h", lookback_bars=96)
+    block = _service(sampler).forecast(broken, seed=1)
+
+    assert reason is not None and "duration" in reason
+    assert block.status == STATUS_UNAVAILABLE
+    assert sampler.calls == []
 
 
 # -- price and volume sanity -------------------------------------------------
@@ -327,7 +344,6 @@ def test_settings_bounds_are_honored_before_any_inference():
         "batch rows over ceiling": _settings(max_batch_rows=MAX_BATCH_ROWS + 1),
         "non-finite band spread": _settings(max_band_spread_ratio=float("nan")),
         "non-positive band spread": _settings(max_band_spread_ratio=0.0),
-        "unknown failure policy": _settings(failure_policy="context_only"),
     }
     for label, settings in problems.items():
         assert settings.settings_problem() is not None, label
@@ -338,13 +354,10 @@ def test_settings_bounds_are_honored_before_any_inference():
         ).forecast(_series(), seed=1)
         assert block.status == STATUS_UNAVAILABLE, label
         assert sampler.calls == [], label
-    # The failure-policy vocabulary has no fake knob: exactly the two behaviors.
-    assert FAILURE_POLICIES == ("defer", "pass_through")
-    assert settings_from_config({"kronos_active_failure_policy": "context_only"}) \
-        .settings_problem() is not None, "the retired knob is refused as a setting"
+    assert settings_from_config({}).profile == "small_base"
 
 
-def test_the_sampler_settings_floor_is_a_budget_statement_not_a_skill_claim():
+def test_a_sampler_floor_is_refused_before_inference():
     assert validate_settings(SamplerSettings(paths=MIN_PATHS - 1)) is not None
     assert validate_settings(SamplerSettings(paths=MIN_PATHS)) is None
     service = _service(paths=3)
@@ -352,14 +365,6 @@ def test_the_sampler_settings_floor_is_a_budget_statement_not_a_skill_claim():
     assert block.status == STATUS_UNAVAILABLE
     assert block.reason is not None and "floor" in block.reason
     assert block.band == {}, "a refused forecast must not carry numbers"
-
-
-def test_filter_mode_is_refused_with_the_measured_reason():
-    service = _service(mode=MODE_FILTER)
-    block = service.forecast(_series(), seed=1)
-    assert block.status == STATUS_UNAVAILABLE
-    assert block.reason is not None
-    assert "10 seeds" in block.reason and "8/10" in block.reason
 
 
 # -- result acceptance -------------------------------------------------------
@@ -464,16 +469,6 @@ def test_a_narrow_band_keeps_the_majority_direction():
     assert block.status == STATUS_OK
     assert block.direction in ("up", "down", "flat")
     assert sum(block.direction_counts.values()) == block.paths
-
-
-def test_a_disabled_service_returns_unavailable_and_does_not_call_the_sampler():
-    sampler = _FakeSampler()
-    service = KronosForecastService(
-        sampler=sampler, settings=ForecastSettings(enabled=False), artifact_hash="a" * 64,
-    )
-    block = service.forecast(_series(), seed=1)
-    assert block.status == STATUS_UNAVAILABLE
-    assert sampler.calls == [], "a disabled feature must not reach the model"
 
 
 @pytest.mark.parametrize("status", [STATUS_UNAVAILABLE, "timeout", STATUS_ERROR])

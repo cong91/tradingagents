@@ -218,7 +218,7 @@ const MEASURE = `(() => {
     await cmd('Page.enable'); await cmd('Runtime.enable');
     await cmd('Page.addScriptToEvaluateOnNewDocument', {
       // The fixture API reads its scenario knobs from this object; the capture
-      // uses the defaults (brief ok, active forecast ok, shadow ok).
+      // uses the defaults (brief ok, active forecast ok).
       source: 'window.__FIXTURE_STATE__ = {};\n' +
               'window.__consoleErrors = [];\n' +
               'window.addEventListener("error", e => window.__consoleErrors.push(String(e.message)));'});

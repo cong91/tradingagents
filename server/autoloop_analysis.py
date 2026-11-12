@@ -28,6 +28,7 @@ from tradingagents.execution.auto_authorization import (
     AutoAuthorizationError,
 )
 from tradingagents.execution.daily import DailyResult
+from tradingagents.forecast.block import ForecastBlock
 
 logger = logging.getLogger(__name__)
 _ANALYSTS_CRYPTO = ("market", "social", "news")
@@ -42,6 +43,7 @@ def _process_candidate(
     telemetry: CycleTelemetry | None = None,
     mode: AutoMode | None = None,
     authorization: AuthorizationSnapshot | None = None,
+    on_cycle_checkpoint: Callable[[dict], None] | None = None,
 ) -> DailyResult:
     """Analyze → plan → the engine's confirm policy for one candidate.
 
@@ -146,10 +148,26 @@ def _process_candidate(
             ):
                 result.reason = "duplicate futures signal skipped"
                 return result
+            if on_cycle_checkpoint is not None:
+                on_cycle_checkpoint({
+                    "cycle_id": futures_cycle_id,
+                    "symbol": futures_context["unified_symbol"],
+                    "four_hour_open": four_hour_open,
+                    "one_hour_open": one_hour_open,
+                    "payload": dict(futures_cycle_payload),
+                })
             persist_progress(
                 futures_cycle_id, phase="market", payload=futures_cycle_payload,
                 timestamp=futures_cycle_timestamps["market_context_finished_at"],
             )
+            if on_cycle_checkpoint is not None:
+                on_cycle_checkpoint({
+                    "cycle_id": futures_cycle_id,
+                    "symbol": futures_context["unified_symbol"],
+                    "four_hour_open": four_hour_open,
+                    "one_hour_open": one_hour_open,
+                    "payload": dict(futures_cycle_payload),
+                })
             # The open-heat cap reads Position.stop_loss; the venue book does
             # not carry stops, so the persisted entry state supplies them.
             futures_portfolio = build_futures_portfolio(
@@ -198,6 +216,17 @@ def _process_candidate(
             # monitoring and position protection are untouched.
             autoloop_execution.raise_if_mode_disabled(mode, "kronos forecast", authorization)
             autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} kronos forecast")
+            futures_cycle_payload["forecast_started"] = True
+            futures_cycle_timestamps["forecast_started_at"] = utc_now_iso()
+            futures_cycle_payload["phase_timestamps"] = dict(futures_cycle_timestamps)
+            if on_cycle_checkpoint is not None:
+                on_cycle_checkpoint({
+                    "cycle_id": futures_cycle_id,
+                    "symbol": futures_context["unified_symbol"],
+                    "four_hour_open": four_hour_open,
+                    "one_hour_open": one_hour_open,
+                    "payload": dict(futures_cycle_payload),
+                })
             with telemetry.span("kronos_active_context", ticker):
                 kronos_block = autoloop_futures_context._kronos_block_for(
                     derivatives, ticker, futures_context, config,
@@ -206,14 +235,25 @@ def _process_candidate(
                 )
             autoloop_execution.raise_if_mode_disabled(mode, "kronos forecast", authorization)
             autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} kronos forecast")
-            kronos_policy = kronos_context.policy_for(
-                kronos_block, kronos_context.settings_for(config),
-            )
-            if kronos_block is not None:
-                futures_cycle_payload["kronos_forecast"] = kronos_block.as_json()
-                futures_cycle_payload["kronos_policy"] = kronos_policy
+            if kronos_block is None:
+                kronos_block = ForecastBlock(
+                    symbol=str(futures_context.get("unified_symbol") or ticker),
+                    status="unavailable",
+                    reason="the Kronos forecast path returned no block",
+                )
+            kronos_policy = kronos_context.policy_for(kronos_block)
+            futures_cycle_payload["kronos_forecast"] = kronos_block.as_json()
+            futures_cycle_payload["kronos_policy"] = kronos_policy
             futures_cycle_timestamps["kronos_finished_at"] = utc_now_iso()
             futures_cycle_payload["phase_timestamps"] = dict(futures_cycle_timestamps)
+            if on_cycle_checkpoint is not None:
+                on_cycle_checkpoint({
+                    "cycle_id": futures_cycle_id,
+                    "symbol": futures_context["unified_symbol"],
+                    "four_hour_open": four_hour_open,
+                    "one_hour_open": one_hour_open,
+                    "payload": dict(futures_cycle_payload),
+                })
             if futures_cycle_id is not None and autoloop_execution.cycle_writes_allowed(deadline, cancelled):
                 persist_progress(
                     futures_cycle_id, phase="context", payload=futures_cycle_payload,

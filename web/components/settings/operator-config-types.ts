@@ -53,10 +53,7 @@ export type OperatorDraft = Record<string, OperatorValue>;
 export type OperatorSection = "modes" | "risk" | "forecast";
 export type OperatorRiskGroup = "general" | "futures" | "protection" | "advanced";
 
-/** Each operator row belongs to exactly one editable section. The managed
- * forecast switch (group "forecast") gets its own section: it is a deliberate
- * operator write with confirm+reason+audit like the modes, but it lives in the
- * AI/forecasting area and never arms an order. */
+/** Each operator row belongs to exactly one editable section. */
 export function operatorSection(row: OperatorSettingRow): OperatorSection {
   if (row.group === "forecast") return "forecast";
   return row.gate ? "modes" : "risk";
@@ -93,10 +90,7 @@ export function isOperatorGateKey(key: string): key is OperatorGateKey {
   return key === OPERATOR_GATE_KEYS[0] || key === OPERATOR_GATE_KEYS[1];
 }
 
-/** The keys whose write is a deliberate operator gate (confirm + reason +
- * audit): the two Auto modes AND the Kronos context switch. Order-arming stays
- * exclusive to the Auto modes (MODE_KEYS); this set only drives the UI's
- * confirmation machinery. */
+/** Collect server-declared gates for confirmation and audit. */
 export function operatorGateKeys(settings: readonly OperatorSettingRow[]): Set<string> {
   return new Set(settings.filter((row) => row.gate).map((row) => row.key));
 }
@@ -104,21 +98,13 @@ export function operatorGateKeys(settings: readonly OperatorSettingRow[]): Set<s
 export type KronosProfileId = "small_base" | "mini_2k";
 
 export type KronosStatus = {
-  enabled: boolean;
   profile_id: KronosProfileId;
-  max_context: number | null;
-  lookback_min: number | null;
-  lookback_max: number | null;
-  mode: string;
   timeframe: string;
   horizon_hours: number | null;
+  lookback_bars: number | null;
+  max_context: number | null;
   paths: number | null;
   temperature: number | null;
-  lookback_bars: number | null;
-  max_batch_rows: number | null;
-  failure_policy: string;
-  max_band_spread_ratio: number | null;
-  settings_problem: string | null;
   readiness: { status: "ready" | "unavailable"; reason: string | null };
   model: {
     source_revision: string;

@@ -33,9 +33,9 @@ import {
   pnlTone,
 } from "@/lib/format";
 import { useT } from "@/lib/i18n";
-import type { Messages } from "@/lib/i18n";
 import type { PanelState } from "@/components/overview/use-panel";
 
+import { ActiveForecastBlock } from "./active-forecast-block";
 import { AttentionList } from "./attention-list";
 import { BriefDetails, BriefSection, ScalarRow } from "./brief-section";
 import { ScopeFilter } from "./scope-filter";
@@ -44,7 +44,6 @@ import {
   asNumber,
   inScope,
   type BriefPayload,
-  type BriefShadow,
   type Scope,
 } from "./contract";
 
@@ -506,24 +505,6 @@ function RiskBlock({ data, scope }: { data: BriefPayload; scope: Scope }) {
 // activity
 
 
-/** The truthful line for each kind of "nothing recorded yet". */
-function shadowStateCopy(t: Messages, shadow: BriefShadow): string {
-  const a = t.brief.activity;
-  switch (shadow.state) {
-    case "disabled":
-      return a.shadowDisabled;
-    case "error":
-      return a.shadowReadFailed;
-    case "empty":
-      return a.shadowEmpty;
-    default:
-      // An older payload without `state` falls back to the neutral line rather
-      // than claiming the worker is off.
-      return a.shadowUnavailable;
-  }
-}
-
-
 function ActivityBlock({ data, scope }: { data: BriefPayload; scope: Scope }) {
   const t = useT();
   const a = t.brief.activity;
@@ -604,295 +585,6 @@ function ActivityBlock({ data, scope }: { data: BriefPayload; scope: Scope }) {
               </li>
             ))}
           </ul>
-        )}
-      </div>
-
-      <div className="space-y-1" data-brief-block="shadow">
-        <p className="text-xs font-medium">{a.shadowTitle}</p>
-        {activity.shadow.status === "ok" ? (
-          <ShadowDetail shadow={activity.shadow} />
-        ) : (
-          // One sentence per state. The server names which kind of "nothing"
-          // this is, so an operator with the worker enabled is never told it is
-          // disabled (which is what one shared line used to say).
-          <div data-shadow-state={activity.shadow.state ?? "empty"}>
-            <p className="text-sm text-muted-foreground">{shadowStateCopy(t, activity.shadow)}</p>
-            {activity.shadow.reason ? (
-              <p className="text-xs text-muted-foreground">{activity.shadow.reason}</p>
-            ) : null}
-          </div>
-        )}
-        {activity.shadow.kronos ? (
-          <p className="text-xs text-muted-foreground" data-shadow-kronos={activity.shadow.kronos.available}>
-            {activity.shadow.kronos.available ? a.shadowKronosReady : a.shadowKronosAbsent}
-            {activity.shadow.kronos.reason ? (
-              <span className="block">{activity.shadow.kronos.reason}</span>
-            ) : null}
-          </p>
-        ) : null}
-      </div>
-    </BriefSection>
-  );
-}
-
-/**
- * Shadow observations, compact: per-provider counts plus the newest rows.
- *
- * The ratio the model reports is a SAMPLE ratio over N paths, so it is printed
- * as "2/3" beside its denominator and the calibration note — never as a bare
- * percentage. A deterministic rule shows no ratio at all: it has no
- * distribution, and printing one would invent it.
- */
-function ShadowDetail({ shadow }: { shadow: BriefShadow }) {
-  const t = useT();
-  const a = t.brief.activity;
-  const providers = shadow.providers_detail ?? [];
-  const observations = shadow.observations ?? [];
-  return (
-    <div className="space-y-1.5 text-xs" data-brief-block="shadow-detail">
-      {providers.map((block) => (
-        <div
-          key={block.provider}
-          data-shadow-provider={block.provider}
-          className="rounded-lg border border-dashed px-2 py-1.5"
-        >
-          <p className="font-mono">{block.provider}</p>
-          <p className="text-muted-foreground">
-            {a.shadowAttempts(String(block.attempts.ok), String(block.attempts.rows))}
-            {block.attempts.error + block.attempts.timeout + block.attempts.unavailable > 0
-              ? ` · ${a.shadowFailed}: ${block.attempts.error + block.attempts.timeout + block.attempts.unavailable}`
-              : ""}
-          </p>
-          {block.distribution_kind === "model_samples" && block.attempts.ok > 0 ? (
-            <p className="font-mono text-muted-foreground">
-              {a.shadowVerdicts}: {block.verdicts.up}/{block.attempts.ok} ·{" "}
-              {block.verdicts.down}/{block.attempts.ok} · {block.verdicts.flat}/{block.attempts.ok}
-            </p>
-          ) : null}
-          {block.distribution_kind === "deterministic_rule" ? (
-            <p className="text-muted-foreground">{a.shadowRuleNote}</p>
-          ) : null}
-        </div>
-      ))}
-      {observations.length > 0 ? (
-        <ul className="space-y-1">
-          {observations.map((row, index) => (
-            <li key={`${row.symbol}-${row.provider}-${index}`} className="text-muted-foreground">
-              <span className="font-mono">{row.symbol}</span> · {row.timeframe} ·{" "}
-              {row.horizon_hours}h ·{" "}
-              {a.shadowLatest(row.symbol, row.direction ?? row.status)}
-              {row.generation_kind === "retrospective" ? ` (${a.shadowRetrospective})` : ""}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      <p className="text-muted-foreground">{a.shadowRatioNote}</p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// active kronos forecast
-
-
-/**
- * The ACTIVE Kronos forecast of the most recent recorded cycle — its own
- * section, deliberately separate from the shadow block above (shadow rows are
- * recorded OUTSIDE the decision path and can never stand in for what a live
- * cycle actually saw). Compact by default; the numbers live behind a native
- * <details>. A failed block carries NO numbers, so nothing is printed that
- * could be read as a forecast, and no LLM-call saving or profit is claimed.
- */
-function ActiveForecastBlock({ data, scope }: { data: BriefPayload; scope: Scope }) {
-  const t = useT();
-  const a = t.brief.activeForecast;
-  const block = data.active_forecast;
-  const forecast = block.forecast ?? null;
-
-  // The active forecast covers the derivatives path only; in Spot scope this
-  // block says so instead of pretending to cover Spot.
-  if (!inScope(scope, "futures")) {
-    return (
-      <BriefSection title={a.title}>
-        <p className="text-sm text-muted-foreground">{t.brief.scope.futuresOnly}</p>
-      </BriefSection>
-    );
-  }
-
-  const stateLine = (): string | null => {
-    switch (block.state) {
-      case "off": return a.off;
-      case "empty": return a.empty;
-      case "error": return a.readFailed;
-      case "unavailable": return a.unavailable;
-      case "stale": return a.stale;
-      case "ok": return a.ok;
-      default: return null;
-    }
-  };
-
-  const barsOf = (): string | null => {
-    const hours = forecast?.horizon_hours;
-    const timeframe = forecast?.timeframe ?? null;
-    const step = timeframe ? /^(\d+)h$/.exec(timeframe) : null;
-    if (hours == null || !step) return null;
-    return String(Math.floor(hours / Number(step[1])));
-  };
-
-  const iso = (epochMs: unknown): string | null => {
-    const value = num(epochMs);
-    if (value === null) return null;
-    return formatDateTime(new Date(value).toISOString());
-  };
-
-  const directionText = (): string | null => {
-    const counts = forecast?.direction_counts ?? null;
-    const ratios = forecast?.direction_ratio ?? null;
-    const paths = num(forecast?.paths);
-    if (!counts || Object.keys(counts).length === 0) return null;
-    const denominator = paths !== null ? String(paths) : null;
-    return (["up", "down", "flat"] as const)
-      .map((key) => {
-        const count = num(counts[key]);
-        const ratio = ratios ? num(ratios[key]) : null;
-        if (count === null) return null;
-        const head = denominator ? `${key} ${count}/${denominator}` : `${key} ${count}`;
-        return ratio !== null ? `${head} (${formatNumber(ratio, { maximumFractionDigits: 3 })})` : head;
-      })
-      .filter((part): part is string => part !== null)
-      .join(" · ") || null;
-  };
-
-  // Parsed once, so the render guards stay narrowable by TypeScript.
-  const horizonHours = num(forecast?.horizon_hours);
-  const spread = num(forecast?.band_spread_ratio);
-  const latencyMs = num(forecast?.latency_ms);
-
-  return (
-    <BriefSection title={a.title} note={block.note ?? null}>
-      <div data-brief-block="active-forecast" data-active-forecast-state={block.state}>
-        {block.state === "off" || block.state === "empty" || block.state === "error" ? (
-          <div className="space-y-1" data-active-forecast-nothing={block.state}>
-            <p className="text-sm text-muted-foreground">{stateLine()}</p>
-            {block.reason ? (
-              <p className="break-words text-xs text-muted-foreground">{a.reason(block.reason)}</p>
-            ) : null}
-          </div>
-        ) : (
-          <div className="space-y-1.5">
-            <p className="text-sm text-muted-foreground">{stateLine()}</p>
-            <dl className="space-y-1.5">
-              <ScalarRow
-                label={a.symbolLabel}
-                value={forecast?.symbol ?? block.symbol ?? null}
-                unknownLabel={t.brief.states.unavailable}
-              />
-              <div data-active-forecast-policy>
-                <ScalarRow
-                  label={a.policyLabel}
-                  value={
-                    block.policy
-                      ? a.policy[block.policy] ?? block.policy
-                      : null
-                  }
-                  unknownLabel={t.brief.states.unavailable}
-                />
-              </div>
-            </dl>
-            {block.defer_reason ? (
-              <p className="break-words text-xs text-muted-foreground">{a.deferReason(block.defer_reason)}</p>
-            ) : null}
-            {forecast && block.state !== "unavailable" && forecast.status === "ok" ? (
-              <BriefDetails summary={a.detailSummary}>
-                <dl className="space-y-1.5">
-                  <ScalarRow
-                    label={a.directionLabel}
-                    value={directionText()}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.horizonTitle}
-                    value={horizonHours === null
-                      ? null
-                      : a.horizonLabel(String(horizonHours), barsOf() ?? "—")}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.pathsTitle}
-                    value={forecast.paths === null || forecast.paths === undefined
-                      ? null
-                      : a.pathsLabel(String(forecast.paths), String(num(forecast.per_path_samples) ?? "—"))}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.cutoffLabel}
-                    value={forecast.as_of ? formatDateTime(forecast.as_of) : null}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.dataOpenLabel}
-                    value={iso(forecast.data_open_time)}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.generatedLabel}
-                    value={forecast.created_at ? formatDateTime(forecast.created_at) : null}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.recordedLabel}
-                    value={block.recorded_at ? formatDateTime(block.recorded_at) : null}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={forecast.band ? a.bandTitle(block.quote_currency ?? null) : null}
-                    value={
-                      forecast.band
-                        ? (["low", "p50", "high"] as const)
-                            .map((key) => {
-                              const value = num(forecast.band?.[key]);
-                              return value === null
-                                ? null
-                                : `${key} ${formatMoney(value, block.quote_currency ?? null)}`;
-                            })
-                            .filter((part): part is string => part !== null)
-                            .join(" · ") || null
-                        : null
-                    }
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.spreadTitle}
-                    value={spread === null
-                      ? null
-                      : formatNumber(spread, { maximumFractionDigits: 4 })}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.latencyTitle}
-                    value={latencyMs === null
-                      ? null
-                      : `${formatNumber(latencyMs, { maximumFractionDigits: 0 })} ms`}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                  <ScalarRow
-                    label={a.modelTitle}
-                    value={forecast.model_revision ?? null}
-                    unknownLabel={t.brief.states.unavailable}
-                  />
-                </dl>
-              </BriefDetails>
-            ) : (
-              <div className="space-y-1" data-active-forecast-failed>
-                {block.reason || forecast?.reason ? (
-                  <p className="break-words text-xs text-muted-foreground">
-                    {a.reason(block.reason ?? forecast?.reason ?? "")}
-                  </p>
-                ) : null}
-                <p className="text-xs text-muted-foreground">{a.noNumbers}</p>
-              </div>
-            )}
-          </div>
         )}
       </div>
     </BriefSection>
@@ -1007,8 +699,7 @@ export function BriefCard({
               <ResultsBlock data={state.data} scope={scope} />
               <RiskBlock data={state.data} scope={scope} />
               <ActivityBlock data={state.data} scope={scope} />
-              {/* The ACTIVE forecast is its own section — it never merges into
-                  the shadow rows above, which are observation-only. */}
+              {/* The ACTIVE forecast is its own section. */}
               <ActiveForecastBlock data={state.data} scope={scope} />
             </div>
 

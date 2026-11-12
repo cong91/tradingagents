@@ -311,56 +311,16 @@ function reapProcessTree(child) {
         results.b6 = 'halt stated once (attention), no fallback banner';
       }
 
-      // Stage 4 shadow slot: each "nothing recorded yet" state must render its
-      // OWN sentence. Before this, one shared line said "not enabled" even when
-      // the worker was enabled, which is a false statement about the operator's
-      // configuration.
-      const shadowState = await get(
-        `(document.querySelector("[data-shadow-state]") || {}).getAttribute
-           ? document.querySelector("[data-shadow-state]").getAttribute("data-shadow-state")
-           : null`);
-      const shadowText = await get(
-        `(() => { const e = document.querySelector("[data-brief-block=\\"shadow\\"]");
-          return e ? e.textContent : null; })()`);
-      check(shadowText, 'shadow block missing from the brief');
-      if (state.shadowState === 'disabled') {
-        check(shadowState === 'disabled', 'expected shadow state disabled, saw ' + shadowState);
-        check(/disabled|off/i.test(shadowText), 'disabled copy missing: ' + shadowText);
-        check(!/no observation has been recorded/i.test(shadowText),
-          'disabled state used the empty-state sentence: ' + shadowText);
-      } else if (state.shadowState === 'empty') {
-        check(shadowState === 'empty', 'expected shadow state empty, saw ' + shadowState);
-        check(/no observation has been recorded|no observation has been/i.test(shadowText),
-          'empty copy missing: ' + shadowText);
-        check(!/disabled in Settings|Observation is off/i.test(shadowText),
-          'EMPTY state wrongly told the operator observation is off: ' + shadowText);
-      } else if (state.shadowState === 'error') {
-        check(shadowState === 'error', 'expected shadow state error, saw ' + shadowState);
-        check(/could not read/i.test(shadowText), 'read-failure copy missing: ' + shadowText);
-        check(!/Observation is off/i.test(shadowText),
-          'READ-FAILURE state wrongly said observation is off: ' + shadowText);
-      } else {
-        // Populated: provider counts carry a denominator and the calibration
-        // note rides along, so a sample ratio cannot be read as a probability.
-        const providerEl = await get(
-          `document.querySelectorAll("[data-shadow-provider]").length`);
-        check(providerEl === 1, 'expected one shadow provider block, saw ' + providerEl);
-        check(/not a calibrated probability/i.test(shadowText),
-          'calibration note missing beside the ratio: ' + shadowText);
-        check(/no ratio, band or dispersion/i.test(shadowText),
-          'deterministic-rule note missing: ' + shadowText);
-        const kronos = await get(
-          `(document.querySelector("[data-shadow-kronos]") || {}).getAttribute
-             ? document.querySelector("[data-shadow-kronos]").getAttribute("data-shadow-kronos")
-             : null`);
-        check(kronos === String(Boolean(state.shadowKronos)),
-          'kronos availability not reported truthfully: ' + kronos);
-      }
-      results.shadow = JSON.stringify({state: shadowState});
+      // Historical observation storage is intentionally absent from the dashboard.
+      const shadowBlocks = await get(
+        `document.querySelectorAll("[data-brief-block=\\"shadow\\"]").length`);
+      check(shadowBlocks === 0, 'Unexpected historical observation block: ' + shadowBlocks);
+      check(!/shadow observations|observation is off|no observation has been recorded/i.test(bodyText),
+        'Historical observation copy is visible in the dashboard: ' + bodyText);
+      results.historicalObservationBlock = 'absent from the dashboard';
 
-      // The ACTIVE forecast block: its own section, separate from the shadow
-      // block, one per page, keyed by state. Every state the server can report
-      // must render its own sentence.
+      // The ACTIVE forecast block: the forecast the latest recorded cycle
+      // actually used, with its own state and section.
       const activeState = await get(
         `document.querySelector("[data-brief-block=\\"active-forecast\\"]")
            ?.getAttribute("data-active-forecast-state") ?? null`);
@@ -369,15 +329,7 @@ function reapProcessTree(child) {
         `document.querySelector("[data-active-forecast-nothing]")?.getAttribute("data-active-forecast-nothing") ?? null`);
       const activeFailed = await get(
         `!!document.querySelector("[data-active-forecast-failed]")`);
-      const shadowBlocks = await get(
-        `document.querySelectorAll("[data-brief-block=\\"shadow\\"]").length`);
-      check(shadowBlocks === 1, 'expected exactly one shadow block, saw ' + shadowBlocks);
-      if (state.forecastState === 'off') {
-        check(activeState === 'off', 'expected active forecast state off, saw ' + activeState);
-        check(activeNothing === 'off', 'the off state must render its own sentence');
-        check(/Off in Settings/i.test(bodyText),
-          'the off state does not say the switch is off: ' + JSON.stringify(results));
-      } else if (state.forecastState === 'empty') {
+      if (state.forecastState === 'empty') {
         check(activeState === 'empty', 'expected active forecast state empty, saw ' + activeState);
         check(activeNothing === 'empty', 'the empty state must render its own sentence');
         check(/no recorded cycle has a Kronos forecast/i.test(bodyText),
@@ -418,13 +370,55 @@ function reapProcessTree(child) {
         check(/USDT/.test(detailText), 'the band unit (quote currency) is missing: ' + detailText);
         check(/2,512|2512/.test(detailText), 'wall latency missing: ' + detailText);
         check(/kronos-fixture/.test(detailText), 'model revision missing: ' + detailText);
+        check(/close-only \/ model sample not probability/.test(detailText),
+          'close-only/model-sample disclaimer missing: ' + detailText);
+        const quality = await get(`(() => {
+          const block = document.querySelector('[data-brief-block="active-forecast"]');
+          const rows = Array.from(block?.querySelectorAll('dt') || []);
+          const text = fragment => {
+            const dt = rows.find(row => row.textContent.trim().includes(fragment));
+            return dt?.parentElement?.textContent || '';
+          };
+          return {ohlc: text('OHLC'), bars: text('Corrected bars'),
+            paths: text('Corrected paths'), changed: text('Changed wick fields'),
+            delta: text('Absolute delta')};
+        })()`);
+        const qualityState = state.forecastQuality || 'consistent';
+        if (qualityState === 'corrected') {
+          check(/OHLC corrected|OHLC đã hiệu chỉnh/.test(quality.ohlc),
+            'corrected OHLC label missing: ' + JSON.stringify(quality));
+          check(/ohlc_wick_bounds_v1/.test(detailText),
+            'correction algorithm missing: ' + detailText);
+          check(/3/.test(quality.bars) && /2/.test(quality.paths),
+            'corrected counts missing: ' + JSON.stringify(quality));
+          check(/high 3.*low 1/.test(quality.changed),
+            'changed wick counts missing: ' + JSON.stringify(quality));
+          check(/12[.,]5|2[.,]5|4|1[.,]5/.test(quality.delta),
+            'absolute deltas missing: ' + JSON.stringify(quality));
+        } else if (qualityState === 'unknown') {
+          check(/Not enough data|Chưa đủ dữ liệu/.test(quality.ohlc),
+            'unknown OHLC label missing: ' + JSON.stringify(quality));
+          check(/Not enough data|Chưa đủ dữ liệu/.test(quality.bars) &&
+                /Not enough data|Chưa đủ dữ liệu/.test(quality.paths),
+            'unknown correction counts were not fail-safe: ' + JSON.stringify(quality));
+          check(/Not enough data|Chưa đủ dữ liệu/.test(quality.delta),
+            'unknown absolute delta was not fail-safe: ' + JSON.stringify(quality));
+          check(/Legacy forecast did not include OHLC quality metadata/.test(detailText),
+            'unknown OHLC reason missing: ' + detailText);
+        } else {
+          check(/Model raw|OHLC raw/.test(quality.ohlc),
+            'consistent/raw OHLC label missing: ' + JSON.stringify(quality));
+          check(/0/.test(quality.bars) && /0/.test(quality.paths),
+            'consistent correction counts missing: ' + JSON.stringify(quality));
+          check(/total 0|max 0|tổng 0|tối đa 0/.test(quality.delta),
+            'consistent delta missing: ' + JSON.stringify(quality));
+        }
         check(/\d{1,2}\/\d{1,2}\/\d{2,4}/.test(detailText),
           'cutoff/generated/recorded times missing: ' + detailText);
         const policy = await text('[data-active-forecast-policy]');
         check(/placed into the decision context/.test(policy),
           'the use policy is not stated: ' + policy);
-        // The active forecast is its own section heading — it must not merge
-        // into the shadow block.
+      // The active forecast is its own section heading.
         const activeTitle = await get(`(() => {
           const block = document.querySelector("[data-brief-block=\\"active-forecast\\"]");
           const section = block && block.closest('section');
@@ -539,17 +533,12 @@ SCENARIOS = {
     "brief_error": {"name": "brief_error", "brief": 500, "halted": True, "approvals": 2},
     "halted": {"name": "halted", "halted": True, "approvals": 2},
     "production_venue": {"name": "production_venue", "venueProfile": "production"},
-    # Stage 4: each "nothing recorded yet" state must say its own thing.
-    "shadow_disabled": {"name": "shadow_disabled", "shadowState": "disabled"},
-    "shadow_empty": {"name": "shadow_empty", "shadowState": "empty"},
-    "shadow_error": {"name": "shadow_error", "shadowState": "error"},
-    "shadow_kronos_ready": {"name": "shadow_kronos_ready", "shadowState": "ok",
-                            "shadowKronos": True},
-    # Stage 5 active forecast: the ok numbers ride the ready scenario; here the
-    # off switch renders its own sentence and nothing pretends a forecast ran.
-    "forecast_off": {"name": "forecast_off", "forecastState": "off"},
+    # Active forecast states remain covered.
+    "forecast_empty": {"name": "forecast_empty", "forecastState": "empty"},
     # A forecast whose window fully elapsed: history, not a current sample.
     "forecast_stale": {"name": "forecast_stale", "forecastState": "stale"},
+    "forecast_corrected": {"name": "forecast_corrected", "forecastQuality": "corrected"},
+    "forecast_unknown_quality": {"name": "forecast_unknown_quality", "forecastQuality": "unknown"},
 }
 
 

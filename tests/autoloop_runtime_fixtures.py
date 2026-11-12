@@ -23,6 +23,7 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.execution import futures_account
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.futures_account import FuturesAccountSnapshot
+from tradingagents.forecast.block import ForecastBlock
 from tradingagents.portfolio import PortfolioContext
 
 _STOP, _TAKE = 80246.0, 86562.0
@@ -304,6 +305,15 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
         lambda config: ExchangeBridge(config=config, exchange_factory=_StubVenue),
     )
     monkeypatch.setattr(_StubDerivVenue, "candle_direction", candle_direction)
+    # These cycle tests exercise execution and telemetry; model inference has
+    # separate coverage, so supply a recorded forward forecast at that seam.
+    monkeypatch.setattr(
+        autoloop_futures_context.kronos_context,
+        "forecast_for_cycle",
+        lambda **kwargs: ForecastBlock(
+            symbol=kwargs["symbol"], status="ok", generation_kind="forward",
+        ),
+    )
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices',
                         lambda ticker, direction="long": (
                             (_STUB_PRICE - 1_000.0, _STUB_PRICE + 1_000.0)

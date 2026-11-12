@@ -1,4 +1,4 @@
-"""Production-browser coverage for the managed Kronos Settings switch."""
+"""Production-browser coverage for the profile-only Kronos Settings surface."""
 
 from __future__ import annotations
 
@@ -21,95 +21,86 @@ from tests.support.node_renderer import require_web_renderer
 
 SETTINGS_FIXTURE_SCRIPT = r"""
 (() => {
+  window.__consoleErrors = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => {
+    window.__consoleErrors.push(args.map(String).join(" "));
+    originalConsoleError.apply(console, args);
+  };
+  window.addEventListener("error", event => window.__consoleErrors.push(String(event.message)));
+  window.addEventListener("unhandledrejection", event => window.__consoleErrors.push(String(event.reason)));
   const auto = {auto_spot_enabled: true, auto_futures_enabled: false};
-  let kronosEnabled = false;
   const requests = [];
   const eventSources = new Set();
-  const row = (key, value, type = "bool", gate = true, group = "forecast") => ({
+  const settingRows = [
+    {key: "kronos_active_profile", env_var: "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE",
+      value: "small_base", default: "small_base", type: "str", editable: true, source: "default"},
+    {key: "quick_think_llm", env_var: "TRADINGAGENTS_QUICK_THINK_LLM",
+      value: "fixture-model", default: "fixture-model", type: "str", editable: true, source: "default"},
+  ];
+  const row = (key, value, type = "bool", gate = true, group = "gates") => ({
     key, type, gate, group, value, default: value, label: key, hint: key,
     override: value !== false, stored_value: value, updated_at: null, updated_by: null,
   });
-  const operatorPayload = () => ({
-    generated_at: "2026-11-11T12:00:00Z",
-    settings: [
-      row("auto_spot_enabled", auto.auto_spot_enabled, "bool", true, "gates"),
-      row("auto_futures_enabled", auto.auto_futures_enabled, "bool", true, "gates"),
-      row("kronos_active_enabled", kronosEnabled),
-    ],
-    allowlist: ["auto_spot_enabled", "auto_futures_enabled", "kronos_active_enabled"],
-    gates: {auto_spot: auto.auto_spot_enabled, auto_futures: auto.auto_futures_enabled,
+  const operatorPayload = () => {
+    const mini = settingRows.find(item => item.key === "kronos_active_profile")?.value === "mini_2k";
+    return {
+      generated_at: "2026-11-12T12:00:00Z",
+      settings: [
+        row("auto_spot_enabled", auto.auto_spot_enabled, "bool", true),
+        row("auto_futures_enabled", auto.auto_futures_enabled, "bool", true),
+      ],
+      allowlist: ["auto_spot_enabled", "auto_futures_enabled"],
+      gates: {auto_spot: auto.auto_spot_enabled, auto_futures: auto.auto_futures_enabled,
+        any_auto_enabled: auto.auto_spot_enabled || auto.auto_futures_enabled},
+      effective_exec_mode: "dry",
+      kronos: {
+        profile_id: mini ? "mini_2k" : "small_base", timeframe: "4h",
+        horizon_hours: 24, lookback_bars: mini ? 2048 : 512,
+        max_context: mini ? 2048 : 512, paths: 16, temperature: 0.5,
+        readiness: {status: "unavailable", reason: "fixture model unavailable"},
+        model: {
+          source_revision: "source-revision", model_revision: "model-revision",
+          repo: mini ? "NeoQuasar/Kronos-mini" : "NeoQuasar/Kronos-small",
+          tokenizer_repo: mini ? "NeoQuasar/Kronos-Tokenizer-2k" : "NeoQuasar/Kronos-Tokenizer-base",
+          tokenizer_revision: "tokenizer-revision",
+        },
+      },
+    };
+  };
+  const settingsPayload = () => ({generated_at: "2026-11-12T12:00:00Z",
+    settings: settingRows, credentials: [],
+    gates_readonly: {auto_spot: auto.auto_spot_enabled, auto_futures: auto.auto_futures_enabled,
       any_auto_enabled: auto.auto_spot_enabled || auto.auto_futures_enabled},
-    effective_exec_mode: "dry",
-    kronos: {enabled: kronosEnabled, mode: "context_only", timeframe: "4h",
-      horizon_hours: 24, paths: 16, temperature: 0.5, lookback_bars: 96,
-      max_batch_rows: 80, failure_policy: "defer", max_band_spread_ratio: 0.15,
-      settings_problem: null,
-      readiness: {status: "unavailable", reason: "fixture model unavailable"},
-      profile_id: "small_base", max_context: 512, lookback_min: 32, lookback_max: 512,
-      model: {source_revision: "source", model_revision: "revision123456789",
-        repo: "NeoQuasar/Kronos-small", tokenizer_repo: "NeoQuasar/Kronos-Tokenizer-base",
-        tokenizer_revision: "tokenizer-revision"}},
-  });
-  const settingRows = [
-    {key: "kronos_active_profile", env_var: "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE", value: "small_base",
-      default: "small_base", type: "str", editable: true, source: "default"},
-    {key: "kronos_active_paths", env_var: "TRADINGAGENTS_KRONOS_ACTIVE_PATHS", value: 16,
-      default: 16, type: "int", editable: true, source: "default"},
-  ];
-  const settingsPayload = () => ({generated_at: "2026-11-11T12:00:00Z", settings: settingRows,
-    credentials: [], gates_readonly: {auto_spot: auto.auto_spot_enabled,
-      auto_futures: auto.auto_futures_enabled}, effective_exec_mode: "dry"});
+    effective_exec_mode: "dry"});
   const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {
     status, headers: {"Content-Type": "application/json"}}));
   window.fixtureRequests = requests;
-  window.fixtureBackend = {
-    auto,
-    get kronosEnabled() { return kronosEnabled; },
-    setKronosEnabled(value) {
-      kronosEnabled = value;
-      for (const source of eventSources) source.dispatch("changed");
-    },
-  };
   window.fetch = async (input, init = {}) => {
     const path = new URL(typeof input === "string" ? input : input.url, location.href).pathname;
     const method = (init.method || "GET").toUpperCase();
     requests.push({path, method, body: init.body ? JSON.parse(init.body) : null});
     if (path === "/api/operator-config" && method === "GET") return json(operatorPayload());
-    if (path === "/api/operator-config" && method === "PUT") {
-      const body = JSON.parse(init.body);
-      if (body.settings.kronos_active_enabled !== undefined) {
-        if (body.confirm !== true || !body.reason) return json({error: {
-          code: "gate_confirmation_required", message: "confirm and reason required", details: {}}}, 412);
-        kronosEnabled = body.settings.kronos_active_enabled;
-      }
-      if (body.settings.auto_spot_enabled !== undefined) auto.auto_spot_enabled = body.settings.auto_spot_enabled;
-      if (body.settings.auto_futures_enabled !== undefined) auto.auto_futures_enabled = body.settings.auto_futures_enabled;
-      return json(operatorPayload());
-    }
+    if (path === "/api/operator-config" && method === "PUT") return json(operatorPayload());
     if (path === "/api/settings" && method === "GET") return json(settingsPayload());
     if (path === "/api/settings" && method === "PUT") {
       const body = JSON.parse(init.body);
-      if (body.settings.kronos_active_paths !== undefined && body.settings.kronos_active_paths < 16) return json({error: {
-        code: "validation_error", message: "invalid Kronos tuning", details: {
-          fields: {kronos_active_paths: "paths must be between 16 and 32"}}}}, 422);
-      for (const [key, value] of Object.entries(body.settings)) {
-        const setting = settingRows.find(row => row.key === key);
+      for (const [key, value] of Object.entries(body.settings || {})) {
+        const setting = settingRows.find(item => item.key === key);
         if (setting) setting.value = value;
       }
-      return json({...settingsPayload(), applied_at: "2026-11-11T12:01:00Z"});
+      for (const source of eventSources) source.dispatch("changed");
+      return json({...settingsPayload(), applied_at: "2026-11-12T12:01:00Z"});
     }
     if (path === "/api/health") return json({halted_today: false, audit_log_readable: true});
-    if (path === "/api/autoloop") return json({generated_at: "2026-11-11T12:00:00Z", enabled: false,
-      interval_minutes: 1440, running_cycle: false, modes: {auto_spot: auto.auto_spot_enabled,
-        auto_futures: auto.auto_futures_enabled, any_auto_enabled: auto.auto_spot_enabled || auto.auto_futures_enabled},
-      last_cycle: null});
-    if (path === "/api/llm-config") return json({generated_at: "2026-11-11T12:00:00Z", providers: {},
+    if (path === "/api/autoloop") return json({generated_at: "2026-11-12T12:00:00Z", enabled: false,
+      interval_minutes: 1440, running_cycle: false,
+      modes: {auto_spot: auto.auto_spot_enabled, auto_futures: auto.auto_futures_enabled,
+        any_auto_enabled: auto.auto_spot_enabled || auto.auto_futures_enabled}, last_cycle: null});
+    if (path === "/api/llm-config") return json({generated_at: "2026-11-12T12:00:00Z", providers: {},
       tiers: {quick: {provider: "", model: "", backend_url: null}, deep: {provider: "", model: "", backend_url: null}}});
-    if (path === "/api/data-sources") return json({generated_at: "2026-11-11T12:00:00Z",
-      providers: [{provider: "reddit", configured: false, decryptable: false, valid: false,
-        cookie_count: 0, cookie_names: [], updated_at: null, updated_by: null},
-        {provider: "x", configured: false, decryptable: false, valid: false,
-        cookie_count: 0, cookie_names: [], updated_at: null, updated_by: null}], key_path: "fixture"});
+    if (path === "/api/data-sources") return json({generated_at: "2026-11-12T12:00:00Z",
+      providers: [], key_path: "fixture"});
     return json({detail: "fixture route not found"}, 404);
   };
   window.EventSource = class {
@@ -118,14 +109,11 @@ SETTINGS_FIXTURE_SCRIPT = r"""
       const listeners = this.listeners.get(name) || [];
       listeners.push(listener); this.listeners.set(name, listeners);
     }
-    dispatch(name) {
-      for (const listener of this.listeners.get(name) || []) listener(new Event(name));
-    }
+    dispatch(name) { for (const listener of this.listeners.get(name) || []) listener(new Event(name)); }
     close() { eventSources.delete(this); }
   };
 })();
 """
-
 
 BROWSER_DRIVER = r"""
 const {spawn, execSync} = require('node:child_process');
@@ -134,192 +122,89 @@ const path = require('node:path');
 const browser = process.env.TEST_BROWSER;
 const base = process.env.TEST_BASE;
 const profile = process.env.TEST_PROFILE;
-const COMMAND_TIMEOUT = 20000;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 function check(value, message) { if (!value) throw new Error(message); }
-function timeout(promise, ms, message) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => { timer=setTimeout(() => reject(new Error(message)), ms); }),
-  ]).finally(() => clearTimeout(timer));
-}
-async function until(fn, message, ms = 20000) {
-  const stop = Date.now() + ms;
-  while (Date.now() < stop) { const result = await fn(); if (result) return result; await wait(50); }
+async function until(fn, message, timeout = 30000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { const value = await fn(); if (value) return value; await wait(50); }
   throw new Error('Timed out: ' + message);
 }
 function reap(child) {
   if (!child?.pid) return;
-  if (process.platform === 'win32') {
-    try { execSync(`taskkill /pid ${child.pid} /T /F`, {stdio: 'ignore'}); return; } catch {}
-  }
+  if (process.platform === 'win32') { try { execSync(`taskkill /pid ${child.pid} /T /F`, {stdio: 'ignore'}); return; } catch {} }
   try { child.kill('SIGKILL'); } catch {}
 }
 (async () => {
   const chrome = spawn(browser, ['--headless=new', '--disable-gpu', '--no-first-run',
-    '--disable-extensions', '--disable-background-networking', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
+    '--disable-extensions', '--disable-background-networking',
+    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
     '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank'], {stdio: 'ignore'});
   let ws;
   const pending = new Map();
   try {
     const portFile = path.join(profile, 'DevToolsActivePort');
     const port = await until(() => fs.existsSync(portFile) && fs.readFileSync(portFile, 'utf8').split('\n')[0], 'Chrome CDP port');
-    const version = await timeout(fetch('http://127.0.0.1:' + port + '/json/version').then(response => response.json()),
-      COMMAND_TIMEOUT, 'CDP version timeout');
+    const version = await (await fetch('http://127.0.0.1:' + port + '/json/version')).json();
     ws = new WebSocket(version.webSocketDebuggerUrl);
-    await timeout(new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; }), 15000, 'CDP socket timeout');
+    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
     let id = 0;
     ws.onmessage = event => {
-      const message = JSON.parse(event.data);
-      if (!message.id) return;
-      const entry = pending.get(message.id);
-      if (!entry) return;
-      pending.delete(message.id); clearTimeout(entry.timer);
+      const message = JSON.parse(event.data); const entry = pending.get(message.id);
+      if (!entry) return; pending.delete(message.id);
       if (message.error) entry.reject(new Error(message.error.message)); else entry.resolve(message.result);
     };
     const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
-      const next = ++id;
-      const timer = setTimeout(() => { pending.delete(next); reject(new Error('CDP timeout: ' + method)); }, COMMAND_TIMEOUT);
-      pending.set(next, {resolve, reject, timer});
+      const next = ++id; const timer = setTimeout(() => { pending.delete(next); reject(new Error('CDP timeout: ' + method)); }, 20000);
+      pending.set(next, {resolve: value => { clearTimeout(timer); resolve(value); }, reject});
       ws.send(JSON.stringify({id: next, method, params, ...(sessionId ? {sessionId} : {})}));
     });
     const target = await send('Target.createTarget', {url: 'about:blank'});
     const attached = await send('Target.attachToTarget', {targetId: target.targetId, flatten: true});
     const cmd = (method, params = {}) => send(method, params, attached.sessionId);
     await cmd('Page.enable'); await cmd('Runtime.enable');
-    await cmd('Page.addScriptToEvaluateOnNewDocument', {source: 'window.__consoleErrors=[];window.addEventListener("error",e=>window.__consoleErrors.push(e.message));'});
+    await cmd('Page.navigate', {url: base + '/settings'});
     const evaluate = async expression => {
       const result = await cmd('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true, userGesture: true});
-      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text + ': ' + (result.exceptionDetails.exception?.description || ''));
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
       return result.result.value;
     };
     const get = expression => evaluate('(' + expression + ')');
-    await cmd('Page.navigate', {url: base + '/settings'});
-    await until(() => get('document.readyState === "complete"'), 'Settings page load');
+    await until(() => get('document.readyState === "complete"'), 'settings page load');
     await until(() => get('document.getElementById("operator-auto_spot_enabled") !== null'), 'operator config load');
     await evaluate(`document.querySelector('a[href="#ai"]').click()`);
-    await until(() => get('document.getElementById("operator-kronos_active_enabled") !== null'), 'Kronos switch visible');
-    const initial = await get(`(() => ({auto: document.getElementById('operator-auto_spot_enabled').checked,
-      futures: document.getElementById('operator-auto_futures_enabled').checked,
-      title: document.getElementById('operator-forecast').textContent,
-      inAutomation: document.getElementById('automation').textContent.includes('Kronos'),
-      aria: document.getElementById('operator-kronos_active_enabled').getAttribute('aria-describedby')}))()`);
-    check(/Kronos/.test(initial.title), 'Kronos forecast card not findable in AI section');
-    check(!initial.inAutomation, 'Kronos switch appeared in Automation beside Auto modes');
-    check(initial.auto && !initial.futures, 'fixture Auto initial state incorrect');
-    check(initial.aria.includes('operator-kronos_active_enabled-status'), 'switch status relationship missing');
-    await until(() => get('document.getElementById("setting-kronos_active_profile") !== null'), 'Kronos profile select');
-    const profileOptions = await get(`Array.from(document.getElementById('setting-kronos_active_profile').options)
-      .map(option => ({value: option.value, label: option.textContent.trim()}))`);
-    check(profileOptions.length === 2 && profileOptions[0].value === 'small_base' && profileOptions[1].value === 'mini_2k',
-      'profile dropdown options must be closed to verified profiles');
-    check(/Kronos-small/.test(profileOptions[0].label) && /Kronos-Tokenizer-base/.test(profileOptions[0].label),
-      'small_base label must name both model and tokenizer');
-    check(/Kronos-mini/.test(profileOptions[1].label) && /Kronos-Tokenizer-2k/.test(profileOptions[1].label),
-      'mini_2k label must name both model and tokenizer');
-
-    await evaluate(`document.getElementById('setting-kronos_active_profile').value = 'mini_2k';
-      document.getElementById('setting-kronos_active_profile').dispatchEvent(new Event('change',{bubbles:true}));`);
-    const profileSave = `Array.from(document.querySelectorAll('#ai button')).find(button => button.textContent.includes('Save settings'))`;
-    await until(() => get('!' + profileSave + '.disabled'), 'profile save enabled');
-    await evaluate(profileSave + '.click()');
-    await until(() => get(`window.fixtureRequests.some(row => row.path === '/api/settings' && row.method === 'PUT' && row.body.settings.kronos_active_profile === 'mini_2k')`),
-      'generic Kronos profile settings PUT');
-    check(await get(`window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT').length === 0`),
-      'profile selection must not use operator-config or confirmation');
-    check(await get('document.getElementById("setting-kronos_active_profile").value === "mini_2k"'),
-      'saved profile value not reflected in field');
-    await evaluate(`document.getElementById('setting-kronos_active_profile').value = 'small_base';
-      document.getElementById('setting-kronos_active_profile').dispatchEvent(new Event('change',{bubbles:true}));`);
-    await until(() => get('!' + profileSave + '.disabled'), 'profile undo enabled');
-    const discardProfile = `Array.from(document.querySelectorAll('#ai button')).find(button => button.textContent.includes('Discard changes'))`;
-    await evaluate(discardProfile + '.click()');
-    await until(() => get('document.getElementById("setting-kronos_active_profile").value === "mini_2k"'), 'profile undo');
-
-    await evaluate('document.getElementById("operator-kronos_active_enabled").click()');
-    await until(() => get('document.getElementById("operator-forecast-reason") !== null'), 'Kronos confirmation');
-    const saveButton = `Array.from(document.querySelectorAll('#operator-forecast button')).find(button => button.textContent.includes('Save'))`;
-    check(await get(saveButton + '.disabled'), 'Kronos save enabled before confirmation and reason');
-    await evaluate(`document.querySelector('#operator-forecast input[type="checkbox"]:not([id])').click()`);
-    await evaluate(`(() => { const input=document.getElementById('operator-forecast-reason');
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'test context only');
-      input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`);
-    await until(() => get('!' + saveButton + '.disabled'), 'confirmed Save enabled');
-    await evaluate(saveButton + '.click()');
-    await until(() => get('window.fixtureBackend.kronosEnabled === true'), 'Kronos enabled save');
-    const saved = await get(`(() => ({requests: window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT'),
-      auto: window.fixtureBackend.auto, status: document.querySelector('[data-kronos-enabled="true"]') !== null}))()`);
-    check(saved.requests.length === 1, 'expected one operator-config PUT');
-    check(Object.keys(saved.requests[0].body.settings).join(',') === 'kronos_active_enabled', 'PUT changed keys other than Kronos');
-    check(saved.requests[0].body.confirm === true && saved.requests[0].body.reason === 'test context only', 'confirmation/reason body incorrect');
-    check(saved.status && saved.auto.auto_spot_enabled && !saved.auto.auto_futures_enabled, 'save changed Auto settings or failed status refresh');
-
-    await evaluate('document.getElementById("operator-kronos_active_enabled").click()');
-    await until(() => get('document.getElementById("operator-forecast-reason") !== null'), 'Kronos disable confirmation');
-    const undoButton = `Array.from(document.querySelectorAll('#operator-forecast button')).find(button => button.textContent.includes('Undo'))`;
-    await evaluate(undoButton + '.click()');
-    await until(() => get('document.getElementById("operator-kronos_active_enabled").checked === true'), 'Kronos undo');
-    check(await get('window.fixtureBackend.kronosEnabled === true'), 'Undo changed persisted Kronos state');
-
-    await evaluate('document.getElementById("operator-kronos_active_enabled").click()');
-    await until(() => get('document.getElementById("operator-forecast-reason") !== null'), 'Kronos disable draft');
-    await evaluate(`document.querySelector('#operator-forecast input[type="checkbox"]:not([id])').click()`);
-    await evaluate(`(() => { const input=document.getElementById('operator-forecast-reason');
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'disable in fixture');
-      input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`);
-    await until(() => get('!' + saveButton + '.disabled'), 'confirmed disable enabled');
-    await evaluate(saveButton + '.click()');
-    await until(() => get('window.fixtureBackend.kronosEnabled === false'), 'Kronos disable save');
-    check(await get('window.fixtureBackend.auto.auto_spot_enabled && !window.fixtureBackend.auto.auto_futures_enabled'), 'disable changed Auto modes');
-
-    await evaluate('document.getElementById("operator-kronos_active_enabled").click()');
-    await until(() => get('document.getElementById("operator-forecast-reason") !== null'), 'Kronos conflict draft');
-    await evaluate(`document.querySelector('#operator-forecast input[type="checkbox"]:not([id])').click()`);
-    await evaluate(`(() => { const input=document.getElementById('operator-forecast-reason');
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'authorization before server refresh');
-      input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`);
-    await until(() => get('!' + saveButton + '.disabled'), 'conflict draft initially authorized');
-    await evaluate('window.fixtureBackend.setKronosEnabled(true)');
-    const reviewButton = `Array.from(document.querySelectorAll('#operator-forecast button')).find(button => button.textContent.includes('Load latest data'))`;
-    await until(() => get(reviewButton + ' !== undefined'), 'Kronos server-ahead warning');
-    const conflict = await get(`(() => ({draft: document.getElementById('operator-kronos_active_enabled').checked,
-      confirm: document.querySelector('#operator-forecast input[type="checkbox"]:not([id])').checked,
-      reason: document.getElementById('operator-forecast-reason').value,
-      puts: window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT').length}))()`);
-    check(conflict.draft && !conflict.confirm && conflict.reason === '', 'server change lost draft or retained stale authorization');
-    check(await get(saveButton + '.disabled'), 'server-ahead state allowed a stale save');
-    await evaluate(saveButton + '.click()');
-    check(await get(`window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT').length === ${conflict.puts}`),
-      'server-ahead state sent a stale PUT');
-    await evaluate(reviewButton + '.click()');
-    await until(() => get('document.getElementById("operator-forecast-reason") === null && document.querySelector(\'[data-kronos-enabled="true"]\') !== null'),
-      'review acknowledges the matching server value without another write');
-    check(await get('window.fixtureBackend.auto.auto_spot_enabled && !window.fixtureBackend.auto.auto_futures_enabled'), 'Kronos conflict changed Auto modes');
-    check(await get(`window.fixtureRequests.filter(row=>row.path==='/api/operator-config'&&row.method==='PUT').length === ${conflict.puts}`),
-      'review of server data wrote a switch value');
-
-    const tuningDetails = `Array.from(document.querySelectorAll('#ai details')).find(details => details.querySelector('summary')?.textContent.includes('Kronos'))`;
-    await evaluate(tuningDetails + '.open = true');
-    await until(() => get('document.getElementById("setting-kronos_active_paths") !== null'), 'Kronos tuning field');
-    await evaluate(`(() => { const input=document.getElementById('setting-kronos_active_paths');
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'3');
-      input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`);
-    await evaluate(`Array.from(document.querySelectorAll('#ai button')).find(button=>button.textContent.includes('Save settings')).click()`);
-    await until(() => get('document.getElementById("setting-kronos_active_paths-error") !== null'), 'domain 422 field error');
-    const domain = await get(`(() => ({invalid: document.getElementById('setting-kronos_active_paths').getAttribute('aria-invalid'),
-      error: document.getElementById('setting-kronos_active_paths-error').textContent,
-      autoSpot: window.fixtureBackend.auto.auto_spot_enabled, autoFutures: window.fixtureBackend.auto.auto_futures_enabled,
-      puts: window.fixtureRequests.filter(row=>row.path==='/api/settings'&&row.method==='PUT').length}))()`);
-    check(domain.invalid === 'true' && /between 16 and 32/.test(domain.error), 'domain error not mapped to Kronos field');
-    check(domain.puts === 2 && domain.autoSpot && !domain.autoFutures, 'domain error mutated unrelated state');
-    check(await get('window.__consoleErrors.length === 0'), 'browser console error: ' + await get('window.__consoleErrors'));
-    process.stdout.write(JSON.stringify({result: 'pass', initial, saved, domain}));
+    await until(() => get('document.getElementById("setting-kronos_active_profile") !== null'), 'Kronos profile selector');
+    const initial = await get(`(() => ({
+      options: Array.from(document.getElementById('setting-kronos_active_profile').options).map(option => option.value),
+      value: document.getElementById('setting-kronos_active_profile').value,
+      status: document.querySelector('[data-kronos-status]')?.textContent || '',
+      readiness: document.querySelector('[data-kronos-readiness]')?.getAttribute('data-kronos-readiness'),
+      switch: document.getElementById('operator-kronos_active_enabled'),
+      tuning: document.getElementById('setting-kronos_active_paths'),
+      model: document.querySelector('[data-kronos-status]')?.textContent.includes('Kronos-small + Kronos-Tokenizer-base')
+    }))()`);
+    check(JSON.stringify(initial.options) === JSON.stringify(['small_base', 'mini_2k']), 'profile options are not closed');
+    check(initial.value === 'small_base', 'small_base is not the initial profile');
+    check(initial.readiness === 'unavailable', 'readiness state is missing');
+    check(initial.model, 'model-tokenizer pair is not shown');
+    check(!initial.switch && !initial.tuning, 'retired switch or tuning field is visible');
+    await evaluate(`(() => { const select = document.getElementById('setting-kronos_active_profile'); select.value = 'mini_2k'; select.dispatchEvent(new Event('change', {bubbles: true})); })()`);
+    await until(() => get('document.querySelectorAll("[data-settings-action=\\"save\\"]").length > 0'), 'profile save bar');
+    await evaluate(`Array.from(document.querySelectorAll('#operator-forecast button')).find(button => /Save settings|Lưu cài đặt/.test(button.textContent)).click()`);
+    await until(() => get('window.fixtureRequests.some(row => row.path === "/api/settings" && row.method === "PUT")'), 'profile PUT');
+    const saved = await get(`(() => ({
+      body: window.fixtureRequests.find(row => row.path === '/api/settings' && row.method === 'PUT')?.body,
+      value: document.getElementById('setting-kronos_active_profile').value,
+      text: document.querySelector('[data-kronos-status]')?.textContent || ''
+    }))()`);
+    check(JSON.stringify(saved.body?.settings) === JSON.stringify({kronos_active_profile: 'mini_2k'}), 'profile save sent retired settings');
+    check(saved.value === 'mini_2k', 'mini_2k selection was not retained');
+    check(saved.text.includes('Kronos-mini + Kronos-Tokenizer-2k'), 'mini_2k readiness did not refresh');
+    const consoleErrors = await get('window.__consoleErrors || []');
+    check(consoleErrors.length === 0, 'browser console errors: ' + JSON.stringify(consoleErrors));
+    process.stdout.write(JSON.stringify({result: 'pass', initial, saved}));
   } finally {
-    for (const entry of pending.values()) clearTimeout(entry.timer);
-    pending.clear();
-    if (ws?.readyState <= 1) ws.close();
-    reap(chrome);
+    for (const entry of pending.values()) entry.reject(new Error('driver closing'));
+    pending.clear(); if (ws?.readyState <= 1) ws.close(); reap(chrome);
   }
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });
 """
@@ -342,7 +227,7 @@ def _port() -> int:
 
 
 @pytest.mark.integration
-def test_kronos_operator_switch_in_production_browser(tmp_path):
+def test_kronos_profile_in_production_browser(tmp_path):
     web = require_web_renderer()
     browser = _browser()
     if browser is None:

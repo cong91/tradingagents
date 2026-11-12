@@ -234,22 +234,12 @@ health 15s, audit 10s, lịch sử 60s, lịch sử khớp lệnh 5 phút
   **lý do chính không vào lệnh** (top 3, kèm mã chu kỳ mẫu để tra ở Hoạt động bot), và
   **chu kỳ lỗi đường ống** — nhóm này **tách riêng** khỏi "không có tín hiệu": bot quyết
   định không vào lệnh là bình thường, pipeline lỗi mới là sự cố.
-- **Quan sát (shadow)** — lớp ghi quan sát **chỉ để nghiên cứu**: lệnh, hạn mức rủi ro
-  và protection của bot **không bao giờ** đọc những dòng này (worker chạy độc lập sau
-  khi cycle đã kết thúc). Mục này nói rõ **ba trạng thái "chưa có gì" khác nhau**, vì
-  chúng là ba sự thật khác nhau:
-  - *Chưa bật* — công tắc `shadow_observations_enabled` đang tắt trong Cấu hình.
-  - *Đang bật nhưng chưa ghi được quan sát nào* — worker chạy, chưa có dòng nào.
-  - *Không đọc được dữ liệu quan sát* — lần đọc thất bại.
-
-  Kèm theo: **nhà cung cấp đang cấu hình** (mặc định `filter:donchian_breakout` — bộ lọc
-  rẻ), và **model Kronos có cài trong môi trường cách ly hay không**. Khi đã có dữ liệu,
-  mục này in **số lần thử / số thành công theo từng nguồn** (không phải tỷ lệ) và
-  **tỷ lệ hướng kèm mẫu số** (ví dụ `up 2/3`) — kèm câu ghi chú rằng đó là **tỷ lệ mẫu
-  trên số đường của mô hình, không phải xác suất đã hiệu chỉnh**. Bộ lọc cố định chỉ cho
-  một kết luận nên **không hiện tỷ lệ nào**; dòng ghi hồi tố (`retrospective`) được dán
-  nhãn riêng, không trình bày như dự báo trực tiếp. Chi tiết đầy đủ: màn này chỉ tóm tắt,
-  dữ liệu gốc ở `GET /api/shadow` (`docs/ui-api-contract.md` §19).
+- **Dự báo Kronos** — block chỉ đọc của chu kỳ Futures gần nhất. Kronos được chạy
+  trực tiếp trước graph/LLM khi ứng viên đủ điều kiện; operator chỉ chọn cặp
+  model-tokenizer đã xác minh. Thời gian 4h, lookback và horizon được suy ra từ
+  profile và thời gian giữ tối đa. Dự báo hợp lệ được đưa vào context; nếu artifact,
+  dữ liệu, hoặc deadline không sẵn sàng thì ứng viên được hoãn trước lượt gọi LLM.
+  Block này là ngữ cảnh model, không phải lệnh, veto hay xác suất đã hiệu chỉnh.
 - **So sánh phiên bản (ngoài mẫu)** — thí nghiệm đã đăng ký, kèm câu ghi chú rằng so
   sánh là mô phỏng, có ghép cặp, **không phải kết luận thắng và không tự áp dụng**.
 - **Lọc phạm vi** `Tất cả / Spot / Futures` — thu hẹp cả bản tin lẫn các card bên dưới

@@ -1,13 +1,9 @@
-"""The forecast vocabulary, shared by every consumer — shadow and decision paths.
+"""The forecast vocabulary used by the active Futures decision path.
 
-This module is deliberately neutral: it is the contract a forecast request and
-its answer are written in, and nothing here is observation-only. The shadow
-worker imports it to record observations; the decision path imports it to build
-the context the Trader/Portfolio Manager read before they decide. Neither role
-is privileged, and neither may add a field the other would misread.
+This module defines the request and answer contract for forecasts consumed by
+Trader and Portfolio Manager context. It carries no observation-only behavior.
 
-The labels that keep a forecast honest live here, so both consumers share one
-definition:
+The labels that keep a forecast honest live here:
 
 - a request carries only CLOSED candles and states the exact timeframe and
   horizon it asks about;
@@ -95,25 +91,28 @@ class ForecastRequest:
 class PathSummary:
     """One sampled path in the model's own units, in draw order.
 
-    ``closes``/``highs``/``lows`` keep the whole horizon bar by bar so a later
+    ``opens``/``closes``/``highs``/``lows`` keep the whole horizon bar by bar so a later
     evaluation can ask which protective level the path touched FIRST — an
     end-point summary alone cannot answer that, and interpolating it would
     invent the ordering. A deterministic rule leaves them empty.
 
     ``path_low``/``path_high`` are the extremes of the whole path (the lowest low
-    and highest high). They were once named ``min_close``/``max_close``, which
+    and highest high) when every sampled path has consistent OHLC ordering;
+    otherwise both are unavailable for every path. They were once named
+    ``min_close``/``max_close``, which
     described something else entirely: the minimum/maximum CLOSE is a different
     number whenever a wick extends beyond every close, and a reader comparing the
     name against ``closes`` would have drawn the wrong conclusion.
     """
 
     end_close: float
-    path_low: float
-    path_high: float
+    path_low: float | None
+    path_high: float | None
     direction: str  # "up" | "down" | "flat"
     closes: tuple[float, ...] = ()
     highs: tuple[float, ...] = ()
     lows: tuple[float, ...] = ()
+    opens: tuple[float, ...] = ()
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -121,6 +120,7 @@ class PathSummary:
             "path_low": self.path_low,
             "path_high": self.path_high,
             "direction": self.direction,
+            "opens": list(self.opens),
             "closes": list(self.closes),
             "highs": list(self.highs),
             "lows": list(self.lows),

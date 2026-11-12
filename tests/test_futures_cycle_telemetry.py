@@ -249,6 +249,31 @@ def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
 
 
 @pytest.mark.unit
+def test_forecast_paths_survive_cycle_persistence_redaction(monkeypatch):
+    from tradingagents.forecast.block import ForecastBlock
+    from tradingagents.forecast.ohlc import normalize_ohlc_path
+
+    path = normalize_ohlc_path({
+        "opens": [100.0], "highs": [98.0], "lows": [99.0],
+        "closes": [100.0], "seed": 42,
+    }, index=0, horizon_bars=1)
+    assert path is not None
+    block = ForecastBlock(symbol="BTC/USDT:USDT", status="ok", ohlc_paths=(path,))
+    updates = []
+    monkeypatch.setattr(
+        fct.job_store, "update_futures_cycle", lambda _cycle_id, **kwargs: updates.append(kwargs),
+    )
+
+    fct.persist_progress(
+        "futures:BTC/USDT:USDT:x:y:1", phase="context",
+        payload={"kronos_forecast": block.as_json(), "api_key": "secret"},
+    )
+
+    assert updates[0]["payload"]["kronos_forecast"]["ohlc_paths"] == [path]
+    assert "api_key" not in updates[0]["payload"]
+
+
+@pytest.mark.unit
 def test_persist_progress_terminal_stamps_finished_at(monkeypatch):
     updates = []
 

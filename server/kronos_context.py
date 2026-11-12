@@ -19,9 +19,8 @@ The boundaries this module holds:
 - **It never holds a lock.** No ``execution_lock`` is passed in or acquired; the
   inference happens on the candidate's own thread, before the graph is built, so
   bracket monitoring and position protection are untouched.
-- **Off is off.** With ``kronos_active_enabled`` false, nothing is read, the
-  model is never started, and the caller's execution context is byte-identical
-  to what it was.
+- **Every candidate gets an attempt.** A missing or failed forecast defers the
+  Futures candidate before graph construction and LLM analysis.
 - **Scoped lifecycle ownership.** When no service is supplied, this module
   builds one for the call and closes it in ``finally`` — on success, on error
   and on timeout. Nothing is cached across candidates and no global pool
@@ -35,10 +34,8 @@ The boundaries this module holds:
   duration, so this is not an end-to-end cycle deadline. The caller checks
   ``cancelled`` and the remaining budget again after the forecast returns.
   Nothing here takes or blocks an execution/protection lock.
-- **Failure is a status in the context.** ``unavailable``/``timeout``/``error``
-  render as a status line the agents can read. The cycle continues or defers
-  per the operator's failure policy; nothing pretends a missing forecast was a
-  passed check.
+- **Failure defers the candidate.** ``unavailable``/``timeout``/``error`` are
+  recorded on the cycle; the graph and LLM do not run without a forecast.
 - **Research output stays out of active decisions.** A block whose
   ``generation_kind`` is ``retrospective`` — drawn after its own first
   predicted bar closed — is converted to an explicit failure here. A
@@ -110,25 +107,12 @@ def forecast_for_cycle(
     deadline: float | None = None,
     cancelled: threading.Event | None = None,
 ) -> ForecastBlock | None:
-    """One block for one symbol, or None when the feature is off.
+    """Produce one forecast block, returning a status when inference cannot run.
 
-    ``None`` means "the operator did not enable this", and the caller must leave
-    its context exactly as it was — an empty string appended to a decision
-    context would change the prompt for every candidate.
-
-    Ownership: when ``service`` is None, one is built here for THIS call and
-    closed in ``finally`` — success, error and timeout all close it. A caller
-    that owns a service passes it in and keeps the close obligation itself.
-
-    Budget: when constructing an owned service, the current remaining cycle
-    time caps the sampler's pipe deadline. No service is built if that time is
-    already spent. Artifact verification and history reads take additional time;
-    the caller checks the deadline and cancellation again after this call.
-    A supplied service keeps the deadline configured by its owner.
+    A service created here is closed by this call. The remaining cycle budget
+    bounds its sampler, while the caller rechecks cancellation after the call.
     """
     settings = settings_for(config)
-    if not settings.enabled:
-        return None
     started = time.perf_counter()
     owned = service is None
     if owned:
@@ -159,6 +143,23 @@ def forecast_for_cycle(
             symbol=symbol, candles=candles,
             as_of=as_of if as_of.tzinfo else as_of.replace(tzinfo=UTC),
         )
+        if cancelled is not None and cancelled.is_set():
+            return ForecastBlock(
+                symbol=symbol, status=STATUS_UNAVAILABLE,
+                reason="the cycle was cancelled after history was read; no inference was started",
+            )
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ForecastBlock(
+                    symbol=symbol, status=STATUS_UNAVAILABLE,
+                    reason="the cycle deadline was reached after history was read; no inference was started",
+                )
+            if owned:
+                service.close()
+                service = KronosForecastService.from_config(
+                    config, chunk_deadline_seconds=remaining,
+                )
         seed = stable_seed(cycle_id, "kronos_active")
         block = service.forecast(series, seed=seed)
         block = _out_of_active_decisions(block, symbol)
@@ -205,12 +206,7 @@ def _with_latency(block: ForecastBlock, measured_ms: float) -> ForecastBlock:
 
 
 def append_to_context(execution_context: str, block: ForecastBlock | None) -> str:
-    """Append the rendered block to a decision context; off adds nothing.
-
-    ``None`` (feature disabled) returns the context UNCHANGED, including when the
-    context is empty — so a cycle with the feature off produces the same string,
-    and therefore the same run signature, as before the feature existed.
-    """
+    """Append a forecast or failure status to the decision context."""
     if block is None:
         return execution_context
     rendered = render_forecast_block(block)
@@ -219,27 +215,11 @@ def append_to_context(execution_context: str, block: ForecastBlock | None) -> st
     return f"{execution_context}\n\n{rendered}"
 
 
-def policy_for(block: ForecastBlock | None, settings: ForecastSettings) -> str:
-    """What the cycle must do about a block: ``use``, ``defer`` or ``pass``.
-
-    ``defer`` is the honest default for a failure: the cycle has no forecast for
-    this candidate, which is different from having one that was checked. With
-    ``defer``, the CALLER stops the candidate before the graph/LLM and
-    persists the reason; with ``pass_through``, the cycle continues with the
-    failure stated in its context. There is no ``context_only`` failure policy:
-    it had no behavior distinct from ``defer`` (``mode`` is where the context
-    contract is named), and a knob with no difference is not a choice.
-
-    Never returns a value that would cut a candidate: the direction gate is not
-    used (see the module docstring), so every outcome keeps the candidate.
-    """
+def policy_for(block: ForecastBlock | None) -> str:
+    """Return ``use`` only for a valid forecast; otherwise defer the candidate."""
     if block is None:
-        return "use"  # feature off: the incumbent path
-    if block.ok:
-        return "use"
-    if settings.failure_policy == "pass_through":
-        return "pass"
-    return "defer"
+        return "defer"
+    return "use" if block.ok else "defer"
 
 
 __all__ = [

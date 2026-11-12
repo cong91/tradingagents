@@ -12,10 +12,14 @@ export function SaveBar({
   controller,
   keys,
   scope = "settings",
+  scopeLabel,
+  suppressUncertainMessage = false,
 }: {
   controller: SettingsController;
   keys?: readonly string[];
   scope?: string;
+  scopeLabel?: string;
+  suppressUncertainMessage?: boolean;
 }) {
   const { dirtyKeys, saveState, serverAhead, reviewing, resetChanges, save, reviewLatest } = controller;
   const included = (key: string) => !keys || keys.includes(key);
@@ -36,7 +40,7 @@ export function SaveBar({
   } else if (activeState.kind === "failed") {
     statusText = activeState.message;
   } else if (activeState.kind === "uncertain") {
-    statusText = c.uncertain;
+    statusText = suppressUncertainMessage ? "" : c.uncertain;
   } else if (dirtyCount > 0) {
     statusText = c.unsaved(dirtyCount);
   } else if (activeState.kind === "saved") {
@@ -76,6 +80,7 @@ export function SaveBar({
           <Button
             variant="outline"
             className="min-touch"
+            aria-label={scopeLabel ? `${c.discard} — ${scopeLabel}` : undefined}
             onClick={() => resetChanges(keys)}
             disabled={saving || dirtyCount === 0}
           >
@@ -83,6 +88,8 @@ export function SaveBar({
           </Button>
           <Button
             className="min-touch"
+            aria-label={scopeLabel ? `${c.submit} — ${scopeLabel}` : undefined}
+            data-settings-action="save"
             onClick={() => void save(keys, scope)}
             disabled={saving || reviewing || dirtyCount === 0 || activeState.kind === "uncertain" || serverAhead}
           >

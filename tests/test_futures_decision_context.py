@@ -22,6 +22,8 @@ from tradingagents.execution import futures_account
 from tradingagents.execution.futures_account import FuturesAccountSnapshot, FuturesPosition
 from tradingagents.execution.risk import RiskGuard, RiskLimits
 from tradingagents.execution.sizing import PlannedOrder
+from tradingagents.forecast.block import ForecastBlock
+from tradingagents.forecast.contract import GENERATION_FORWARD, STATUS_OK
 from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
@@ -409,11 +411,30 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
     ),))
     seen = {}
     executor = SimpleNamespace(
-        _bridge=object(),
+        _bridge=SimpleNamespace(client=lambda: object()),
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=risk_cap)),
     )
-    monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: _market_context())
+    forecast = ForecastBlock(
+        symbol="BTC/USDT:USDT", status=STATUS_OK, direction="up",
+        direction_counts={"up": 12, "down": 3, "flat": 1},
+        direction_ratio={"up": 0.75, "down": 0.1875, "flat": 0.0625},
+        band={"low": 100.0, "p50": 106.0, "high": 110.0},
+        band_spread_ratio=10 / 105, reference_close=105.0,
+        data_open_time=1_792_987_200_000, as_of="2026-10-26T08:00:00+00:00",
+        horizon_hours=24, timeframe="4h", paths=16,
+        generation_kind=GENERATION_FORWARD, temperature=0.5, profile="small_base",
+        model_revision="NeoQuasar/Kronos-small@901c26c13326", artifact_hash="a" * 64,
+        created_at="2026-10-26T08:00:00+00:00", latency_ms=100.0,
+    )
+    monkeypatch.setattr(
+        autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_: forecast,
+    )
+    monkeypatch.setattr(
+        autoloop_futures_context, '_closed_futures_context',
+        lambda *_: _market_context(four_hour_open=1_792_987_200_000),
+    )
     monkeypatch.setattr(futures_account, 'read_futures_account', lambda *_args, **_kwargs: account)
+    monkeypatch.setattr(job_store, "futures_position_stops", lambda: {})
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _, direction: BRACKETS[direction])
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)

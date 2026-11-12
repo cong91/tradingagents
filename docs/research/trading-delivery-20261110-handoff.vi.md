@@ -9,6 +9,8 @@ status: hoàn tất code local và finishing pass; full runner exit 0; workflow 
 
 # Bàn giao bốn hạng mục và Kronos tham gia quyết định
 
+> **Cập nhật 2026-11-12 — nội dung lịch sử được thay thế:** Các mô tả bên dưới về `GET /api/shadow`, worker/switch Shadow, switch `kronos_active_enabled` và policy `pass_through` phản ánh delivery ngày 2026-11-11, không còn là hành vi hiện tại. Kronos luôn được thử cho ứng viên Futures đủ điều kiện; thiếu hoặc lỗi forecast khiến ứng viên được hoãn trước graph/LLM. Dữ liệu lịch sử được giữ nguyên. Xem [hợp đồng API hiện tại](../ui-api-contract.md) và [hướng dẫn vận hành](../operator-guide.md).
+
 Code của ledger/mô phỏng futures, experiments, dashboard và Kronos làm đầu vào trước Trader/Portfolio Manager đã được lưu trên nhánh hiện tại. Run `dwfrun-42ff3c4d-888e-4bd8-a1a0-1e4082f0632c` đã đi qua phần kiểm chứng tổng thể, rồi lỗi ở lời gọi bàn giao cuối vì agent kết thúc mà không gọi `submit_result`. Workflow vẫn có trạng thái **errored**; tài liệu này khôi phục phần bàn giao từ code, báo cáo và trạng thái các bước đã lưu, không thay đổi hay chạy lại workflow.
 
 Sau đó người dùng duyệt hoàn thiện bốn gap và tách forecast/autoloop. Finishing pass ngày 2026-11-11 đã đóng các điểm đó bằng code và regression; full runner trực tiếp **exit 0**. Kết quả, ranh giới module và các giới hạn kiểm chứng mới nằm tại `docs/research/kronos-final-completion-20261111.vi.md`; §5–6 dưới đây đã cập nhật theo lượt này.

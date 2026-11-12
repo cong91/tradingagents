@@ -43,8 +43,6 @@ from server import (
     outcome_store,
     portfolio as portfolio_module,
     portfolio_snapshot,
-    shadow_store,
-    shadow_worker,
 )
 from server.contract import utc_now_iso
 from server.settings import effective_exec_mode
@@ -408,7 +406,6 @@ def _activity_section() -> dict[str, Any]:
             "entries_today": None,
             "no_entry_top_reasons": [],
             "pipeline_error_cycles": None,
-            "shadow": _shadow_section(),
             "reason": f"the cycle funnel could not be read: {type(exc).__name__}",
             "note": _NO_ENTRY_NOTE,
         }
@@ -418,7 +415,6 @@ def _activity_section() -> dict[str, Any]:
         **counts,
         "no_entry_top_reasons": reasons,
         "pipeline_error_cycles": pipeline_errors,
-        "shadow": _shadow_section(),
         "note": _NO_ENTRY_NOTE,
     }
 
@@ -439,8 +435,10 @@ def _cycle_counts(start: str) -> dict[str, Any]:
     with db.read() as conn:
         row = conn.execute(
             f"""SELECT count(*) AS cycles,
-                       count(*) FILTER (WHERE status NOT IN ('rejected') OR phase <> 'market'
-                                        OR {_entered}) AS analysed,
+                       count(*) FILTER (WHERE (status NOT IN ('rejected') OR phase <> 'market'
+                                                 OR {_entered})
+                                        AND NOT (status = 'rejected' AND phase = 'forecast'
+                                                 AND COALESCE(payload->>'kronos_policy', '') = 'defer')) AS analysed,
                        count(*) FILTER (WHERE {_entered}) AS entries
                 FROM futures_cycles WHERE updated_at >= %s""",
             (start,),
@@ -465,6 +463,8 @@ def _no_entry_reasons(start: str) -> tuple[list[dict[str, Any]], int]:
                    CASE
                      WHEN status IN ('failed', 'interrupted', 'recovery_pending') THEN 'pipeline_error'
                      WHEN payload->>'execution_status' = 'failed' THEN 'pipeline_error'
+                     WHEN status = 'rejected' AND phase = 'forecast'
+                          AND payload->>'kronos_policy' = 'defer' THEN 'pipeline_error'
                      WHEN status = 'rejected' AND phase = 'market' THEN 'market_rejected'
                      WHEN status = 'rejected' AND phase = 'confirmation' THEN 'confirmation_rejected'
                      WHEN status = 'rejected' AND phase = 'proposal' THEN 'proposal_rejected'
@@ -482,7 +482,7 @@ def _no_entry_reasons(start: str) -> tuple[list[dict[str, Any]], int]:
                WHERE updated_at >= %s
                  AND status <> ALL(%s)
                  AND NOT (status = 'completed' AND phase = 'entry'
-                          AND payload->>'execution_status' = 'executed'
+                          AND COALESCE(payload->>'execution_status', '') = 'executed'
                           AND COALESCE(payload->>'executed', 'true') <> 'false')
                GROUP BY 1, 2
                ORDER BY n DESC, code ASC""",
@@ -503,90 +503,6 @@ def _no_entry_reasons(start: str) -> tuple[list[dict[str, Any]], int]:
             "sample_cycle_id": row["sample_cycle_id"],
         })
     return reasons[:3], pipeline_errors
-
-
-def _shadow_section() -> dict[str, Any]:
-    """Shadow observations (stage 4): what has been recorded, or why nothing has.
-
-    The section reports only what the ``shadow_*`` tables hold. While the worker
-    is off, or when no provider is installed here, the honest answer is
-    ``unavailable`` with the reason — an unobserved model is never rendered as a
-    forecast, and a sample ratio is never rendered as a probability.
-
-    ``state`` names WHICH kind of nothing this is, because they are not the same
-    thing and must not share one sentence: ``disabled`` (the worker is switched
-    off), ``empty`` (on, but nothing recorded yet) and ``error`` (the read
-    failed). The UI renders a different line for each.
-    """
-    try:
-        from tradingagents.shadow.kronos import KronosProvider
-
-        kronos_problem = KronosProvider().unavailable_reason()
-    except Exception as exc:  # importing the adapter must not break the brief
-        kronos_problem = f"the Kronos adapter could not be inspected: {type(exc).__name__}"
-
-    if not shadow_worker.observations_enabled():
-        return {
-            "state": "disabled",
-            "status": "unavailable",
-            "reason": "shadow observations are off (shadow_observations_enabled is False); "
-                      "no observation is being recorded",
-            "providers": shadow_worker.providers(),
-            "kronos": {"available": kronos_problem is None, "reason": kronos_problem},
-            "observations": [],
-        }
-    try:
-        summary = shadow_store.summary(limit=5)
-    except Exception as exc:
-        logger.warning("brief: shadow observations unreadable: %r", exc)
-        return {
-            "state": "error",
-            "status": "unavailable",
-            "reason": f"the shadow observations could not be read: {type(exc).__name__}",
-            "providers": shadow_worker.providers(),
-            "kronos": {"available": kronos_problem is None, "reason": kronos_problem},
-            "observations": [],
-        }
-    return {
-        # No rows yet is its own state: the worker IS on, so "not enabled" would
-        # be a false statement about the operator's own configuration.
-        "state": "empty" if summary.get("status") != "ok" else "ok",
-        "status": summary.get("status"),
-        "reason": summary.get("reason"),
-        "providers": shadow_worker.providers(),
-        "kronos": {"available": kronos_problem is None, "reason": kronos_problem},
-        "totals": summary.get("totals"),
-        # Per-provider counts (not rates): the dashboard renders them beside the
-        # calibration note, so a sample ratio cannot be read as a probability.
-        "providers_detail": summary.get("providers") or [],
-        "observations": _shadow_observation_lines(summary.get("recent") or []),
-        "note": (
-            "Observations only; directions are sample ratios over model paths, not "
-            "calibrated probabilities, and nothing here reaches an order."
-        ),
-    }
-
-
-def _shadow_observation_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The newest observations, flattened for the brief's compact list.
-
-    Only identity and labels travel here — no prices, no PnL. The detailed rows
-    stay on ``GET /api/shadow``.
-    """
-    lines = []
-    for row in rows[:5]:
-        lines.append({
-            "symbol": row.get("symbol"),
-            "timeframe": row.get("timeframe"),
-            "horizon_hours": row.get("horizon_hours"),
-            "provider": row.get("provider"),
-            "direction": row.get("direction"),
-            "status": row.get("status"),
-            "generation_kind": row.get("generation_kind"),
-            "outcome_group": row.get("outcome_group"),
-            "note": row.get("reason"),
-        })
-    return lines
 
 
 def _quote_currency_of(symbol: str | None) -> str | None:
@@ -629,29 +545,7 @@ _ACTIVE_FORECAST_NOTE = (
 
 
 def _active_forecast_section() -> dict[str, Any]:
-    """The ACTIVE Kronos forecast (its own block, separate from shadow rows).
-
-    Reads the latest persisted futures cycle that recorded a
-    ``kronos_forecast`` payload. ``state`` names which situation this is, and
-    they are not interchangeable: ``off`` (the operator switch is off), ``empty``
-    (on, but no cycle has recorded one yet), ``error`` (the read failed),
-    ``stale`` (the recorded window has fully elapsed), ``unavailable`` (the
-    recorded block itself failed) and ``ok``. Shadow observations never
-    substitute for this block: they are recorded outside the decision path.
-    """
-    from server.kronos_context import settings_for
-
-    config = get_config()
-    try:
-        settings = settings_for(config)
-    except Exception as exc:  # a broken settings read must not blank the brief
-        logger.warning("brief: active forecast settings unreadable: %r", exc)
-        return {"state": "error", "status": "error",
-                "reason": f"the Kronos settings could not be read: {type(exc).__name__}",
-                "note": _ACTIVE_FORECAST_NOTE}
-    if not settings.enabled:
-        return {"state": "off", "status": "off", "reason": None,
-                "note": _ACTIVE_FORECAST_NOTE}
+    """Return the forecast recorded by the latest Futures decision cycle."""
 
     try:
         with db.read() as conn:
@@ -856,9 +750,7 @@ def build_brief() -> dict[str, Any]:
         "results": results,
         "risk": risk,
         "activity": activity,
-        # The ACTIVE forecast is its own top-level block (never a shadow row):
-        # shadow observations are recorded outside the decision path and cannot
-        # stand in for what a live cycle actually saw.
+        # The active forecast is a separate top-level block for the latest cycle.
         "active_forecast": _active_forecast_section(),
         "experiments": _experiments_section(),
         # The portfolio body rides along verbatim so the dashboard can render

@@ -52,8 +52,6 @@ from server import (
     runs,
     settings,
     settings_events,
-    shadow_api,
-    shadow_worker,
     snapshot_events,
     watchlist,
 )
@@ -177,10 +175,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Outcome ledger worker: reads recorded cycles + venue READ history only;
     # no-op while outcome_ledger_ingest_enabled stays False (plan §2.6).
     outcome_ledger.start()
-    # Shadow observation worker: off by default, reads recorded cycles + closed
-    # candles only, and never reaches an order, a risk limit or protection
-    # (plan §6.4). Its failures cannot fail a cycle.
-    shadow_worker.start()
     try:
         yield
     finally:
@@ -188,7 +182,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         position_monitor.stop()
         bracket_monitor.stop()
         outcome_ledger.stop()
-        shadow_worker.stop()
 
 
 app = FastAPI(title="TradingAgents Control Panel", version="0.1.0", lifespan=lifespan)
@@ -236,6 +229,5 @@ for _router in (
     outcomes_api.router,
     experiments_api.router,
     operating_brief.router,
-    shadow_api.router,
 ):
     app.include_router(_router)

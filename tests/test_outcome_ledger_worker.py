@@ -155,8 +155,7 @@ def _raising_source(message: str = "venue down"):
 
 
 def test_worker_module_is_independent_of_the_autoloop():
-    """The worker must not import autoloop, and the autoloop must not import
-    the worker or the shadow layer (plan §2.6 wiring boundary)."""
+    """The outcome worker remains isolated from the autoloop."""
     import ast
 
     def imported_modules(path: Path) -> set[str]:
@@ -175,9 +174,7 @@ def test_worker_module_is_independent_of_the_autoloop():
         Path(__file__).parents[1] / "server" / "autoloop.py"
     )
     assert not any(
-        name.startswith(("server.outcome_ledger", "server.outcome_store",
-                         "tradingagents.outcomes", "server.shadow",
-                         "tradingagents.shadow"))
+        name.startswith(("server.outcome_ledger", "server.outcome_store", "tradingagents.outcomes"))
         for name in autoloop_imports
     )
 

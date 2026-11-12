@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -25,26 +24,26 @@ from tradingagents.forecast.contract import (
     direction_of,
 )
 from tradingagents.forecast.inputs import series_problem
-from tradingagents.forecast.sampler import KronosSampler, SampledSymbol, SamplerSettings, percentile
-from tradingagents.forecast.settings import (
-    MODE_FILTER,
-    MODES,
-    ForecastSettings,
-    settings_from_config,
+from tradingagents.forecast.ohlc import (
+    aggregate_ohlc_provenance,
+    normalize_ohlc_path,
+    ohlc_path_problem,
+    ohlc_quality,
 )
+from tradingagents.forecast.sampler import (
+    KronosSampler,
+    SampledSymbol,
+    SamplerSettings,
+    percentile,
+)
+from tradingagents.forecast.settings import ForecastSettings, settings_from_config
 
 logger = logging.getLogger(__name__)
 
 
-FILTER_MODE_REFUSAL = (
-    "a hard direction gate is not stable enough to cut candidates: at the merge "
-    "scale (10 symbols x 10 seeds, identical candles, only the seed changed) the "
-    "verdict held for 2/10 symbols at T=1.0 and 3/10 at T=0.5, both below the "
-    "8/10 bar. Kronos therefore contributes CONTEXT to the decision, never a veto."
-)
-
-
 class _Sampler(Protocol):
+
+
     def sample(self, requests: list[tuple[str, str, int, tuple[Candle, ...], int]]) -> list[SampledSymbol]: ...
 
 
@@ -80,21 +79,9 @@ def _paths_problem(
             "a request is satisfied only by the exact number of independent draws"
         )
     for index, path in enumerate(paths):
-        for name in ("closes", "highs", "lows"):
-            values = path.get(name)
-            if not isinstance(values, list) or len(values) != horizon_bars:
-                return (
-                    f"path {index} {name} does not cover the {horizon_bars}-bar horizon "
-                    f"(got {len(values) if isinstance(values, list) else type(values).__name__})"
-                )
-            for value in values:
-                if not isinstance(value, (int, float)) or isinstance(value, bool):
-                    return f"path {index} {name} carries a non-numeric value"
-                if not math.isfinite(value) or value <= 0:
-                    return f"path {index} {name} carries a non-finite or non-positive price {value!r}"
-        highs, lows = path["highs"], path["lows"]
-        if any(high < low for high, low in zip(highs, lows, strict=True)):
-            return f"path {index} has a bar whose high is below its low"
+        problem = ohlc_path_problem(path, index=index, horizon_bars=horizon_bars)
+        if problem is not None:
+            return problem
     return None
 
 
@@ -144,13 +131,11 @@ class KronosForecastService:
     def from_config(cls, config: dict[str, Any], **kwargs: Any) -> KronosForecastService:
         """Build the service the operator configured; no model is loaded here.
 
-        The pinned source and weights are VERIFIED by content before any child
-        process exists — the same memoized ``verify_artifacts`` the shadow
-        consumer runs — so an unavailable environment or a hash mismatch
-        surfaces as ``unavailable`` BEFORE spawning instead of loading
-        something the pins never described. The block's ``artifact_hash`` is
-        the digest of the hashes that were actually checked; when verification
-        failed, it stays None (an expected hash is never labelled as checked).
+        The pinned source and weights are verified by content before any child
+        process exists. An unavailable environment or a hash mismatch surfaces
+        as ``unavailable`` before spawning instead of loading something the pins
+        never described. The block's ``artifact_hash`` is the digest of hashes
+        actually checked; when verification failed, it stays None.
         """
         from tradingagents.forecast.artifact import (
             artifact_digest_from,
@@ -213,18 +198,14 @@ class KronosForecastService:
         step_hours = TIMEFRAME_HOURS.get(self.settings.timeframe)
         if not step_hours:
             return None
-        return series.as_of.astimezone(UTC) + timedelta(hours=step_hours)
+        return datetime.fromtimestamp(
+            series.candles[-1].close_time / 1000, UTC,
+        ) + timedelta(hours=step_hours)
 
     def forecast(self, series: CandleSeries, *, seed: int) -> ForecastBlock:
         """One symbol's block, from the cache when the identity matches."""
         settings = self.settings
         symbol = series.symbol
-        if not settings.enabled:
-            return _failure(symbol, STATUS_UNAVAILABLE, "active Kronos forecasting is disabled")
-        if settings.mode == MODE_FILTER:
-            return _failure(symbol, STATUS_UNAVAILABLE, FILTER_MODE_REFUSAL)
-        if settings.mode not in MODES:
-            return _failure(symbol, STATUS_UNAVAILABLE, f"unknown Kronos mode {settings.mode!r}")
         problem = settings.settings_problem()
         if problem is not None:
             return _failure(symbol, STATUS_UNAVAILABLE, problem)
@@ -303,7 +284,20 @@ class KronosForecastService:
         )
         if problem is not None:
             return _failure(series.symbol, STATUS_ERROR, problem)
-        paths = [dict(path) for path in sampled.paths]
+        normalized_paths: list[dict[str, Any]] = []
+        for index, path in enumerate(sampled.paths):
+            normalized = normalize_ohlc_path(
+                path, index=index,
+                horizon_bars=settings.horizon_hours // TIMEFRAME_HOURS.get(settings.timeframe, 0),
+            )
+            if normalized is None:
+                return _failure(series.symbol, STATUS_ERROR, "the sampled OHLC path could not be normalized")
+            if normalized.get("seed") != path.get("seed"):
+                normalized["seed"] = path.get("seed")
+            normalized_paths.append(normalized)
+        paths = normalized_paths
+        quality = ohlc_quality(paths)
+        provenance = aggregate_ohlc_provenance(paths)
         reference = series.candles[-1].close
         counts, ratios = _directions(paths, reference)
         ends = [float(path["closes"][-1]) for path in paths]
@@ -330,6 +324,9 @@ class KronosForecastService:
             direction_ratio=ratios,
             band={"low": low, "p50": percentile(ends, 0.5), "high": high},
             band_spread_ratio=spread,
+            ohlc_quality=quality,
+            ohlc_provenance=provenance,
+            ohlc_paths=tuple(paths),
             reference_close=reference,
             data_open_time=series.candles[-1].open_time,
             as_of=series.as_of.isoformat(),

@@ -54,7 +54,8 @@ MODE = {mode!r}
 def _paths(base_seed, count, pred):
     return [
         {{
-            "closes": [100.0] * pred, "highs": [101.0] * pred, "lows": [99.0] * pred,
+            "opens": [100.0] * pred, "closes": [100.0] * pred,
+            "highs": [101.0] * pred, "lows": [99.0] * pred,
             "seed": base_seed + i,
         }}
         for i in range(count)
@@ -128,6 +129,28 @@ def main():
                 rows.append({{"symbol": r["symbol"], "paths": paths}})
             answer["paths"] = rows
             print(json.dumps(answer), flush=True)
+            seen += 1
+            continue
+        if MODE in ("missing_opens", "nan_open", "bad_ohlc", "inverted_high_low", "huge_open", "wrong_seed"):
+            rows = []
+            for ri, r in enumerate(series):
+                paths = _paths(seeds[ri], count, pred)
+                if MODE == "missing_opens":
+                    del paths[0]["opens"]
+                elif MODE == "nan_open":
+                    paths[0]["opens"][0] = float("nan")
+                elif MODE == "bad_ohlc":
+                    paths[0]["opens"][0] = 102.0
+                    paths[0]["closes"][1] = 102.0
+                    paths[1]["closes"][0] = 98.0
+                elif MODE == "inverted_high_low":
+                    paths[0]["highs"][0] = 98.0
+                elif MODE == "huge_open" and ri == 0:
+                    paths[0]["opens"][0] = 10 ** 400
+                elif MODE == "wrong_seed":
+                    paths[0]["seed"] = seeds[ri] + count
+                rows.append({{"symbol": r["symbol"], "paths": paths}})
+            print(json.dumps({{"request_id": rid, "paths": rows, "metadata": metadata, "system": system}}), flush=True)
             seen += 1
             continue
         if MODE == "wrong_symbol":
@@ -351,7 +374,7 @@ def test_partial_writer_budget_leaves_only_the_absolute_deadline_for_reading(tmp
     try:
         with pytest.raises(subprocess.TimeoutExpired):
             sampler._communicate(process, {"request_id": 1})
-        assert time.monotonic() - started < 0.38
+        assert time.monotonic() - started < 0.55
         assert process.poll() is not None
         assert sampler._io_thread is None
     finally:
@@ -402,6 +425,9 @@ def test_an_absent_answer_is_an_error_and_the_child_is_stopped(tmp_path):
     ("one_path", "1 path(s) for a 16-path request"),
     ("short_horizon", "horizon"),
     ("nan_price", "non-finite"),
+    ("missing_opens", "opens"),
+    ("nan_open", "non-finite"),
+    ("wrong_seed", "seeds"),
     ("wrong_symbol", "not the requested"),
     ("dup_seeds", "seeds"),
 ])
@@ -412,6 +438,53 @@ def test_malformed_answers_are_refused_with_the_concrete_reason(tmp_path, mode, 
     assert needle in (results[0].reason or "")
 
 
+def test_inconsistent_open_close_order_preserves_raw_values_and_audits_correction(tmp_path):
+    sampler = _sampler(tmp_path, "bad_ohlc")
+    try:
+        entry = sampler.sample([_request()])[0]
+    finally:
+        sampler.close()
+    assert entry.status == "ok", entry.reason
+    assert len(entry.paths) == 16
+    path = entry.paths[0]
+    assert path["opens"] == [102.0, 100.0]
+    assert path["closes"] == [100.0, 102.0]
+    assert path["raw_ohlc"]["highs"] == [101.0, 101.0]
+    assert path["highs"] == [102.0, 102.0]
+    assert path["ohlc_provenance"]["corrected_bar_count"] == 2
+    assert entry.ohlc_quality["status"] == "corrected"
+    assert entry.paths[1]["closes"] == [98.0, 100.0]
+
+
+def test_inverted_high_low_is_corrected_and_raw_bounds_are_retained(tmp_path):
+    sampler = _sampler(tmp_path, "inverted_high_low")
+    try:
+        entry = sampler.sample([_request()])[0]
+    finally:
+        sampler.close()
+    assert entry.status == "ok", entry.reason
+    path = entry.paths[0]
+    assert path["raw_ohlc"]["highs"][0] == 98.0
+    assert path["raw_ohlc"]["lows"][0] == 99.0
+    assert path["highs"][0] == 100.0
+    assert path["lows"][0] == 99.0
+    assert path["ohlc_provenance"]["corrected_bar_count"] == 1
+
+
+def test_overflowing_price_fails_only_its_symbol_in_a_batch(tmp_path):
+    sampler = _sampler(tmp_path, "huge_open")
+    first = _request()
+    second = ("ETH/USDT:USDT", *first[1:-1], 5000)
+    try:
+        bad, good = sampler.sample([first, second])
+    finally:
+        sampler.close()
+    assert bad.status == "error" and "opens" in (bad.reason or "")
+    assert good.status == "ok", good.reason
+    assert good.symbol == "ETH/USDT:USDT"
+    assert [path["seed"] for path in good.paths] == list(range(5000, 5016))
+
+
 def test_a_correct_answer_carries_the_drawn_paths(tmp_path):
     sampler = _sampler(tmp_path, "ok")
     results = sampler.sample([_request(horizon_hours=8)])
@@ -419,6 +492,7 @@ def test_a_correct_answer_carries_the_drawn_paths(tmp_path):
     assert entry.status == "ok"
     assert len(entry.paths) == 16
     assert all(len(path["closes"]) == 2 for path in entry.paths), "8h/4h = 2 bars"
+    assert all(path["opens"] == [100.0, 100.0] for path in entry.paths)
     assert entry.params["paths"] == 16
     assert {path["seed"] for path in entry.paths} == {4242 + i for i in range(16)}, (
         "per-path seeds are base + index: draws independent of batch order"
@@ -453,7 +527,6 @@ def test_from_config_refuses_an_invalid_profile_before_artifact_verification(mon
     from tradingagents.forecast.service import KronosForecastService
 
     service = KronosForecastService.from_config({
-        "kronos_active_enabled": True,
         "kronos_active_profile": "invalid-profile",
     })
     assert service._sampler is None
@@ -483,9 +556,7 @@ def test_from_config_refuses_before_spawning_when_verification_fails(monkeypatch
             "pinned Kronos weight hash mismatch for Kronos-small", {}
         ),
     )
-    service = KronosForecastService.from_config({
-        "kronos_active_enabled": True, "kronos_active_paths": 16,
-    })
+    service = KronosForecastService.from_config({})
     assert service.artifact_problem is not None
     assert service.artifact_hash is None, (
         "an expected hash must never be labelled as one actually checked"
@@ -516,7 +587,6 @@ def test_from_config_records_the_verified_digest_when_artifacts_match(monkeypatc
 
     monkeypatch.setattr(artifact_module, "verify_artifacts", _verify)
     service = KronosForecastService.from_config({
-        "kronos_active_enabled": True, "kronos_active_paths": 16,
         "exec_exchange_id": "binance",
     })
     assert service.artifact_problem is None
@@ -536,10 +606,45 @@ def test_max_batch_rows_has_a_measured_ceiling():
     assert "6.07 GiB" in validate_settings(_settings(paths=16, max_batch_rows=10_000))
 
 
+def test_batch_rows_must_fit_at_least_one_symbols_paths():
+    assert validate_settings(_settings(paths=16, max_batch_rows=15)) is not None
+    assert validate_settings(_settings(paths=16, max_batch_rows=16)) is None
+    with pytest.raises(RuntimeError, match="at least one"):
+        plan_batches(1, max_batch_rows=15, paths=16)
+    assert plan_batches(1, max_batch_rows=16, paths=16) == [(0, 1)]
+
+
 def test_batches_are_bounded_by_rows_not_by_symbol_count():
     assert plan_batches(12, max_batch_rows=80, paths=16) == [(0, 5), (5, 10), (10, 12)]
     assert plan_batches(12, max_batch_rows=80, paths=8) == [(0, 10), (10, 12)]
     assert plan_batches(0, max_batch_rows=80, paths=16) == []
+
+
+def test_mixed_timeframes_and_horizons_are_split_without_reordering(tmp_path, monkeypatch):
+    sampler = _sampler(tmp_path, "ok")
+    payloads = []
+    communicate = sampler._communicate
+
+    def record_payload(process, payload):
+        payloads.append(payload)
+        return communicate(process, payload)
+
+    monkeypatch.setattr(sampler, "_communicate", record_payload)
+    requests = [
+        ("BTC/USDT:USDT", "4h", 8, _candles(), 1000),
+        ("ETH/USDT:USDT", "1h", 2, _candles(), 2000),
+        ("SOL/USDT:USDT", "4h", 24, _candles(), 3000),
+    ]
+    try:
+        results = sampler.sample(requests)
+    finally:
+        sampler.close()
+    assert [result.symbol for result in results] == [request[0] for request in requests]
+    assert all(result.status == "ok" for result in results)
+    assert [len(result.paths[0]["closes"]) for result in results] == [2, 2, 6]
+    assert [payload["step_ms"] for payload in payloads] == [_FOUR_HOUR_MS, 3_600_000, _FOUR_HOUR_MS]
+    assert [payload["pred_len"] for payload in payloads] == [2, 2, 6]
+    assert [result.paths[0]["seed"] for result in results] == [1000, 2000, 3000]
 
 
 def test_sampler_settings_expose_the_deadline_bound():

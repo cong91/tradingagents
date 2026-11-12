@@ -360,112 +360,6 @@ def test_brief_excludes_in_flight_cycles_from_no_entry(client):
     assert payload["activity"]["cycles_today"] == 1
 
 
-def test_brief_shadow_slot_is_honestly_unavailable_while_off(client):
-    """With the worker off, the slot says so and claims no observation."""
-    shadow = client.get("/api/brief").json()["activity"]["shadow"]
-    assert shadow["status"] == "unavailable"
-    # `state` names WHICH kind of nothing this is: the UI renders a different
-    # sentence per state, because "off" and "on but empty" are different facts.
-    assert shadow["state"] == "disabled"
-    assert "shadow_observations_enabled is False" in shadow["reason"]
-    assert shadow["observations"] == []
-    # The configured provider and the optional model's availability are stated,
-    # so an operator can see why nothing is being observed.
-    assert shadow["providers"] == ["filter:donchian_breakout"]
-    assert "available" in shadow["kronos"]
-
-
-def test_brief_shadow_slot_distinguishes_empty_from_disabled(client):
-    """Enabled with no rows yet is `empty`, never `disabled`.
-
-    One shared sentence told an operator with the worker ON that it was OFF,
-    which is a false claim about their own configuration.
-    """
-    from tradingagents.dataflows.config import set_config
-
-    set_config({"shadow_observations_enabled": True})
-    try:
-        # No rows recorded: the store answers unavailable for its own reason.
-        shadow = client.get("/api/brief").json()["activity"]["shadow"]
-        assert shadow["state"] == "empty"
-        assert "no shadow observation has been recorded" in shadow["reason"]
-        assert "shadow_observations_enabled is False" not in shadow["reason"]
-    finally:
-        set_config({"shadow_observations_enabled": False})
-
-
-def test_brief_shadow_slot_reports_a_read_failure_as_error(client, monkeypatch):
-    """A store failure is its own state, not "off" and not "empty"."""
-    from server import shadow_store
-    from tradingagents.dataflows.config import set_config
-
-    set_config({"shadow_observations_enabled": True})
-
-    def boom(*_args, **_kwargs):
-        raise RuntimeError("synthetic store failure")
-
-    monkeypatch.setattr(shadow_store, "summary", boom)
-    try:
-        shadow = client.get("/api/brief").json()["activity"]["shadow"]
-        assert shadow["state"] == "error"
-        assert "could not be read" in shadow["reason"]
-        assert "RuntimeError" in shadow["reason"]
-    finally:
-        set_config({"shadow_observations_enabled": False})
-
-
-def test_brief_shadow_slot_reports_recorded_observations(client, postgres_schema):
-    """Turned on with observations recorded, the slot reports counts, not rates."""
-    from datetime import UTC, datetime
-
-    from server import shadow_store
-    from tradingagents.dataflows.config import set_config
-    from tradingagents.dataflows.market_data import Candle
-    from tradingagents.shadow.filters import FilterProvider
-    from tradingagents.shadow.provider import ForecastRequest
-    from tradingagents.shadow.recorder import build_observation
-
-    set_config({"shadow_observations_enabled": True})
-    try:
-        candles = tuple(
-            Candle(
-                symbol="BTC/USDT:USDT", timeframe="1h",
-                open_time=1_700_000_000_000 + index * 3_600_000,
-                close_time=1_700_000_000_000 + (index + 1) * 3_600_000,
-                open=100.0 + index, high=101.5 + index, low=99.0 + index,
-                close=100.8 + index, volume=10.0 + index, is_closed=True,
-            )
-            for index in range(6)
-        )
-        provider = FilterProvider("donchian_breakout")
-        request = ForecastRequest(
-            symbol="BTC/USDT:USDT", timeframe="1h", horizon_hours=24,
-            candles=candles, as_of="2023-11-15T06:00:00+00:00", seed=7,
-        )
-        row = build_observation(
-            provider=provider, request=request, attempt=provider.forecast(request),
-            prediction_created_at=datetime.now(UTC),
-            decision_moment=datetime(2023, 11, 15, 6, tzinfo=UTC),
-            cycle_id="futures:BTC/USDT:USDT:t", execution_status="risk_rejected",
-        )
-        assert shadow_store.record_forecast(row)
-
-        shadow = client.get("/api/brief").json()["activity"]["shadow"]
-        assert shadow["status"] == "ok"
-        assert shadow["totals"]["rows"] == 1
-        assert shadow["totals"]["ok"] == 1
-        block = shadow["providers_detail"][0]
-        assert block["provider"] == "filter:donchian_breakout"
-        assert block["distribution_kind"] == "deterministic_rule"
-        # Counts, not a ratio: a deterministic rule has no distribution.
-        assert block["attempts"]["rows"] == 1
-        assert shadow["observations"][0]["symbol"] == "BTC/USDT:USDT"
-        assert shadow["observations"][0]["outcome_group"] == "rejected"
-        assert "not calibrated probabilities" in shadow["note"]
-    finally:
-        set_config({"shadow_observations_enabled": False})
-
-
 def test_brief_marks_the_activity_window_and_scope(client):
     activity = client.get("/api/brief").json()["activity"]
     # Cycles are the derivatives path; saying "futures" avoids implying Spot cover.
@@ -580,7 +474,7 @@ def test_brief_carries_the_funnel_buckets(client):
 
 
 # ---------------------------------------------------------------------------
-# active kronos forecast: its own block, never a shadow row
+# active kronos forecast: latest recorded Futures cycle
 
 
 def _forecast_block(*, as_of=None, status="ok") -> dict:
@@ -620,25 +514,7 @@ def _seed_forecast_cycle(cycle_id: str, block: dict, *, policy: str = "use") -> 
     })
 
 
-def _enable_active_forecast(monkeypatch) -> None:
-    from server import kronos_context
-    from tradingagents.forecast.settings import settings_from_config
-
-    monkeypatch.setattr(
-        kronos_context, "settings_for",
-        lambda config: settings_from_config({**config, "kronos_active_enabled": True}),
-    )
-
-
-def test_brief_active_forecast_is_off_while_the_switch_is_off(client):
-    section = client.get("/api/brief").json()["active_forecast"]
-    assert section["state"] == "off"
-    assert section["status"] == "off"
-    assert "forecast" not in section
-
-
-def test_brief_active_forecast_reports_the_latest_recorded_cycle(client, monkeypatch):
-    _enable_active_forecast(monkeypatch)
+def test_brief_active_forecast_reports_the_latest_recorded_cycle(client):
     _seed_forecast_cycle("cycle-fc-1", _forecast_block(), policy="use")
     section = client.get("/api/brief").json()["active_forecast"]
     assert section["state"] == "ok"
@@ -660,7 +536,6 @@ def test_brief_active_forecast_reports_the_latest_recorded_cycle(client, monkeyp
 def test_brief_active_forecast_marks_an_elapsed_window_as_stale(client, monkeypatch):
     from datetime import UTC, datetime, timedelta
 
-    _enable_active_forecast(monkeypatch)
     stale_block = _forecast_block(as_of=datetime.now(UTC) - timedelta(hours=48))
     _seed_forecast_cycle("cycle-fc-stale", stale_block)
     section = client.get("/api/brief").json()["active_forecast"]
@@ -669,7 +544,6 @@ def test_brief_active_forecast_marks_an_elapsed_window_as_stale(client, monkeypa
 
 
 def test_brief_active_forecast_keeps_a_failed_block_numberless(client, monkeypatch):
-    _enable_active_forecast(monkeypatch)
     _seed_forecast_cycle("cycle-fc-fail", _forecast_block(status="unavailable"))
     section = client.get("/api/brief").json()["active_forecast"]
     assert section["state"] == "unavailable"
@@ -682,7 +556,6 @@ def test_brief_active_forecast_keeps_a_failed_block_numberless(client, monkeypat
 
 
 def test_brief_active_forecast_is_empty_when_no_cycle_recorded_one(client, monkeypatch):
-    _enable_active_forecast(monkeypatch)
     section = client.get("/api/brief").json()["active_forecast"]
     assert section["state"] == "empty"
     assert "nothing is claimed" in section["reason"]
@@ -691,7 +564,6 @@ def test_brief_active_forecast_is_empty_when_no_cycle_recorded_one(client, monke
 def test_brief_active_forecast_survives_a_read_failure(client, monkeypatch):
     import server.operating_brief as brief
 
-    _enable_active_forecast(monkeypatch)
 
     class Broken:
         def __enter__(self):

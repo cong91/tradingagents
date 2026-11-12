@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 from server import (
@@ -19,6 +20,7 @@ from server import (
     autoloop_futures_context,
     control_store,
     daily as daily_mod,
+    futures_cycle_telemetry,
     runs as runs_mod,
 )
 from server.auto_modes import AutoMode
@@ -31,6 +33,8 @@ from tradingagents.execution.auto_authorization import (
     capture_process_config,
 )
 from tradingagents.execution.daily import DailyResult
+from tradingagents.forecast.block import ForecastBlock
+from tradingagents.forecast.contract import STATUS_TIMEOUT
 
 MIN_INTERVAL_MINUTES = 15
 
@@ -249,6 +253,86 @@ def _run_cycle_locked(graph_builder: Callable | None = None) -> None:
         _cycle_lock.release()
 
 
+def _terminalize_timed_out_cycle(
+    checkpoint: dict | None,
+    *,
+    reason: str,
+    stage: str,
+) -> None:
+    """Close a Futures claim from the owner after a child timeout."""
+    if not isinstance(checkpoint, dict):
+        return
+    cycle_id = checkpoint.get("cycle_id")
+    if not cycle_id:
+        return
+    payload = deepcopy(checkpoint.get("payload") or {})
+    forecast = payload.get("kronos_forecast")
+    usable_forecast = isinstance(forecast, dict) and forecast.get("status") == "ok"
+    forecast_started = bool(payload.get("forecast_started"))
+    timestamps = dict(payload.get("phase_timestamps") or {})
+    finished_at = utc_now_iso()
+    timestamps.setdefault("kronos_finished_at", finished_at)
+    timestamps["timeout_finished_at"] = finished_at
+    payload["phase_timestamps"] = timestamps
+    if not forecast_started:
+        payload.update({
+            "timeout_reason": reason,
+            "interrupted_reason": f"Futures cycle interrupted before Kronos forecast: {reason}",
+            "execution_status": "not_started",
+            "executed": False,
+        })
+        phase = "context" if "candidate_start" not in stage else "market"
+        terminal_status = "interrupted"
+    elif usable_forecast:
+        phase = (
+            "execution" if "execution" in stage or "planning" in stage
+            else "analysis" if "graph" in stage or "analysis" in stage
+            else "context"
+        )
+        payload["kronos_policy"] = "use"
+        payload["timeout_reason"] = reason
+        payload["interrupted_reason"] = (
+            f"Futures cycle interrupted after usable Kronos forecast: {reason}"
+        )
+        if phase != "execution":
+            payload["execution_status"] = "not_started"
+            payload["executed"] = False
+        else:
+            payload["execution_status"] = "uncertain"
+            payload.pop("executed", None)
+        terminal_status = "interrupted"
+    elif not usable_forecast:
+        if not isinstance(forecast, dict):
+            forecast = ForecastBlock(
+                symbol=str(checkpoint.get("symbol") or ""),
+                status=STATUS_TIMEOUT,
+                reason=reason,
+            ).as_json()
+            payload["kronos_forecast"] = forecast
+        status = str(forecast.get("status") or STATUS_TIMEOUT)
+        forecast_reason = str(forecast.get("reason") or reason)
+        payload.update({
+            "kronos_policy": "defer",
+            "execution_status": "not_started",
+            "kronos_defer_reason": (
+                f"kronos forecast deferred: status={status} reason={forecast_reason}"
+            ),
+            "executed": False,
+        })
+        phase = "forecast"
+        terminal_status = "rejected"
+    try:
+        futures_cycle_telemetry.persist_progress(
+            cycle_id,
+            status=terminal_status,
+            phase=phase,
+            payload=payload,
+            terminal=True,
+        )
+    except Exception:
+        logger.exception("failed to terminalize timed-out Futures cycle %s", cycle_id)
+
+
 def _run_candidate_with_timeout(
     bridge: Any,
     candidate: dict,
@@ -264,6 +348,48 @@ def _run_candidate_with_timeout(
 ) -> DailyResult:
     """Run one candidate off-cycle so an LLM stall cannot hold the lock."""
     result_queue: queue.Queue = queue.Queue(maxsize=1)
+    checkpoint_lock = threading.Lock()
+    checkpoint: dict | None = None
+    timeout_state_lock = threading.Lock()
+    timeout_requested = threading.Event()
+    barrier_released = threading.Event()
+    terminalized = threading.Event()
+    timeout_reason: str | None = None
+    timeout_stage = "candidate_timeout"
+
+    def current_checkpoint() -> dict | None:
+        with checkpoint_lock:
+            return deepcopy(checkpoint)
+
+    def terminalize_once() -> None:
+        if terminalized.is_set():
+            return
+        snapshot = current_checkpoint()
+        if snapshot is None:
+            return
+        with timeout_state_lock:
+            if terminalized.is_set():
+                return
+            terminalized.set()
+            reason = timeout_reason or "cycle execution timed out"
+            stage = timeout_stage
+        _terminalize_timed_out_cycle(snapshot, reason=reason, stage=stage)
+
+    def save_checkpoint(value: dict) -> None:
+        nonlocal checkpoint
+        with checkpoint_lock:
+            checkpoint = deepcopy(value)
+        if timeout_requested.is_set() and barrier_released.is_set():
+            terminalize_once()
+
+    def request_timeout(reason: str, stage: str) -> None:
+        nonlocal timeout_reason, timeout_stage
+        with timeout_state_lock:
+            timeout_reason = reason
+            timeout_stage = stage
+            timeout_requested.set()
+        if barrier_released.is_set():
+            terminalize_once()
 
     def worker() -> None:
         try:
@@ -271,7 +397,7 @@ def _run_candidate_with_timeout(
                 bridge, candidate, config, build_graph, derivatives,
                 deadline=deadline, cancelled=cancelled,
                 execution_lock=execution_lock, telemetry=telemetry, mode=mode,
-                authorization=authorization,
+                authorization=authorization, on_cycle_checkpoint=save_checkpoint,
             ))
         except BaseException as exc:
             result_queue.put(exc)
@@ -287,13 +413,24 @@ def _run_candidate_with_timeout(
         stage = snapshot["active_stage"] or snapshot["last_stage"] or "candidate_start"
         node = snapshot.get("active_node")
         node_context = f" in node {node}" if node and stage != f"graph_node:{node}" else ""
-        with execution_lock:
-            pass
-        raise TimeoutError(
+        timeout_reason = (
             f"cycle timed out during candidate {candidate.get('ticker')} "
             f"stage {stage}{node_context} after {autoloop_execution.CYCLE_TIMEOUT_SECONDS:.0f}s"
-        ) from exc
+        )
+        request_timeout(timeout_reason, stage)
+        with execution_lock:
+            pass
+        barrier_released.set()
+        terminalize_once()
+        raise TimeoutError(timeout_reason) from exc
     if isinstance(outcome, BaseException):
+        if isinstance(outcome, TimeoutError):
+            cancelled.set()
+            request_timeout(str(outcome), "candidate_timeout")
+            with execution_lock:
+                pass
+            barrier_released.set()
+            terminalize_once()
         raise outcome
     return outcome
 

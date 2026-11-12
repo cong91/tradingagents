@@ -165,35 +165,11 @@ export const vi = {
     reasonCount: (n: string) => `${n} lần`,
     pipelineErrors: "Chu kỳ lỗi đường ống",
     pipelineErrorsNote: "Tách riêng khỏi nhóm “không có tín hiệu”.",
-    shadowTitle: "Quan sát (shadow)",
-    // Ba trạng thái "chưa có gì" phải nói ba câu khác nhau: tắt khác với bật
-    // nhưng chưa ghi được, và khác với đọc lỗi. Gộp một câu từng nói sai cấu
-    // hình của người vận hành ("chưa bật" khi thực ra đang bật).
-    shadowDisabled: "Chưa bật quan sát (đang tắt trong Cấu hình) — chưa ghi dự báo nào.",
-    shadowEmpty: "Đang bật nhưng chưa ghi được quan sát nào.",
-    shadowReadFailed: "Không đọc được dữ liệu quan sát.",
-    shadowUnavailable: "Chưa có dự báo nào được ghi.",
-    shadowAttempts: (ok: string, rows: string) => `${ok}/${rows} lần thành công`,
-    shadowFailed: "Lần thử lỗi",
-    shadowVerdicts: "Hướng (số đường / tổng)",
-    shadowRetrospective: "Ghi hồi tố",
-    shadowRatioNote:
-      "Tỷ lệ hướng là tỷ lệ mẫu trên số đường của mô hình — không phải xác suất đã hiệu chỉnh.",
-    shadowRuleNote:
-      "Quy tắc cố định chỉ cho một kết luận nên không có tỷ lệ, khoảng hay độ phân tán.",
-    shadowKronosReady: "Model Kronos đã cài trong môi trường cách ly",
-    shadowKronosAbsent: "Chưa cài model Kronos (bộ lọc rẻ vẫn đang quan sát)",
-    shadowLatest: (symbol: string, label: string) => `${symbol}: ${label}`,
   },
 
-  // Khối ACTIVE Kronos: dự báo thật của chu kỳ đã ghi gần nhất — KHÁC các dòng
-  // quan sát shadow (được ghi ngoài đường quyết định và không thay thế được
-  // khối này). Không bao giờ hiện tiết kiệm LLM call cho context_only và không
-  // gán lợi nhuận cho Kronos.
   activeForecast: {
     title: "Dự báo Kronos (chu kỳ gần nhất)",
-    off: "Đang tắt trong Cấu hình — không đọc gì, không chạy model, chu kỳ giữ nguyên như trước.",
-    empty: "Đang bật nhưng chưa có chu kỳ nào ghi dự báo Kronos.",
+    empty: "Chưa có chu kỳ nào ghi dự báo Kronos.",
     readFailed: "Không đọc được dữ liệu dự báo đã ghi.",
     unavailable: "Chu kỳ gần nhất không có dự báo dùng được.",
     stale: "Cửa sổ dự báo đã hết — mọi nến dự đoán đã đóng; đây là lịch sử, không phải mẫu hiện tại.",
@@ -204,7 +180,6 @@ export const vi = {
     policy: {
       use: "đã đưa vào ngữ cảnh quyết định",
       defer: "hoãn ứng viên trước lượt gọi LLM",
-      pass: "tiếp tục không có dự báo",
     } as Record<string, string>,
     deferReason: (text: string) => `Lý do hoãn: ${text}`,
     symbolLabel: "Mã",
@@ -221,6 +196,25 @@ export const vi = {
     bandTitle: (currency: string | null) => currency ? `Band giá đóng cuối (${currency})` : "Band giá đóng cuối (đơn vị chưa rõ)",
     spreadTitle: "Độ rộng band",
     latencyTitle: "Thời gian thực tế (gồm cold start)",
+    signalBasisLabel: "Cơ sở tín hiệu",
+    signalBasisCloseOnly: "close-only",
+    signalBasisNote: "close-only / model sample not probability",
+    ohlcQualityTitle: "OHLC",
+    ohlcMethodTitle: "Nguồn/phương pháp OHLC",
+    correctedBarsTitle: "Số nến đã hiệu chỉnh",
+    correctedPathsTitle: "Số đường đã hiệu chỉnh",
+    changedFieldsTitle: "Trường wick đã đổi",
+    absoluteDeltaTitle: "Độ lệch tuyệt đối",
+    ohlcReason: (text: string) => `Ghi chú OHLC: ${text}`,
+    ohlcQuality: {
+      consistent: "OHLC raw từ model, hợp lệ; chưa hiệu chỉnh",
+      corrected: "OHLC đã hiệu chỉnh bằng bounded wick correction",
+      unknown: "Chưa đủ dữ liệu về chất lượng OHLC",
+      rawMethod: "Model raw (chưa hiệu chỉnh)",
+      correctedMethod: "ohlc_wick_bounds_v1 (version 1)",
+      changedFields: (high: string, low: string) => `high ${high} · low ${low}`,
+      deltaField: (field: string, total: string, max: string) => `${field}: tổng ${total}, tối đa ${max}`,
+    },
     modelTitle: "Model ghim",
     detailSummary: "Số liệu dự báo (tỉ lệ mẫu, band, độ trễ)",
     note:
@@ -408,34 +402,11 @@ export const en: typeof vi = {
     reasonCount: (n) => `${n}×`,
     pipelineErrors: "Pipeline-error cycles",
     pipelineErrorsNote: "Counted separately from “no signal”.",
-    shadowTitle: "Shadow observations",
-    // The three "nothing yet" states are not interchangeable: switched off is a
-    // different fact from on-but-nothing-recorded, and both differ from a failed
-    // read. One shared sentence once told an enabled operator it was disabled.
-    shadowDisabled: "Observation is off (disabled in Settings) — no forecast recorded.",
-    shadowEmpty: "Enabled, but no observation has been recorded yet.",
-    shadowReadFailed: "Could not read the observation data.",
-    shadowUnavailable: "No forecast recorded yet.",
-    shadowAttempts: (ok: string, rows: string) => `${ok}/${rows} successful`,
-    shadowFailed: "Failed attempts",
-    shadowVerdicts: "Direction (paths / total)",
-    shadowRetrospective: "Recorded retrospectively",
-    shadowRatioNote:
-      "A direction ratio is a sample ratio over the model's paths — not a calibrated probability.",
-    shadowRuleNote: "A deterministic rule has one verdict; no ratio, band or dispersion.",
-    shadowKronosReady: "Kronos model installed in its isolated environment",
-    shadowKronosAbsent: "Kronos model not installed (the cheap filter still observes)",
-    shadowLatest: (symbol: string, label: string) => `${symbol}: ${label}`,
   },
 
-  // The ACTIVE Kronos block: the real forecast of the most recent recorded
-  // cycle — NOT a shadow row (shadow observations are recorded outside the
-  // decision path and cannot stand in for this). Never shows LLM-call savings
-  // for context_only and never attributes profit to Kronos.
   activeForecast: {
     title: "Kronos forecast (latest recorded cycle)",
-    off: "Off in Settings — nothing is read, no model runs, and the cycle is exactly what it was.",
-    empty: "Enabled, but no recorded cycle has a Kronos forecast yet.",
+    empty: "No recorded cycle has a Kronos forecast yet.",
     readFailed: "Could not read the recorded forecast data.",
     unavailable: "The latest recorded cycle has no usable forecast.",
     stale: "The forecast window has fully elapsed — every predicted bar has closed; this is history, not a current sample.",
@@ -446,7 +417,6 @@ export const en: typeof vi = {
     policy: {
       use: "placed into the decision context",
       defer: "candidate held back before the LLM call",
-      pass: "continues without a forecast",
     } as Record<string, string>,
     deferReason: (text) => `Defer reason: ${text}`,
     symbolLabel: "Symbol",
@@ -463,6 +433,25 @@ export const en: typeof vi = {
     bandTitle: (currency: string | null) => currency ? `End-close band (${currency})` : "End-close band (unknown unit)",
     spreadTitle: "Band spread",
     latencyTitle: "Wall time (including cold start)",
+    signalBasisLabel: "Signal basis",
+    signalBasisCloseOnly: "close-only",
+    signalBasisNote: "close-only / model sample not probability",
+    ohlcQualityTitle: "OHLC",
+    ohlcMethodTitle: "OHLC source/method",
+    correctedBarsTitle: "Corrected bars",
+    correctedPathsTitle: "Corrected paths",
+    changedFieldsTitle: "Changed wick fields",
+    absoluteDeltaTitle: "Absolute delta",
+    ohlcReason: (text) => `OHLC note: ${text}`,
+    ohlcQuality: {
+      consistent: "Model raw, valid OHLC; uncorrected",
+      corrected: "OHLC corrected with bounded wick correction",
+      unknown: "Not enough data to determine OHLC quality",
+      rawMethod: "Model raw (uncorrected)",
+      correctedMethod: "ohlc_wick_bounds_v1 (version 1)",
+      changedFields: (high, low) => `high ${high} · low ${low}`,
+      deltaField: (field, total, max) => `${field}: total ${total}, max ${max}`,
+    },
     modelTitle: "Pinned model",
     detailSummary: "Forecast numbers (sample ratios, band, latency)",
     note:

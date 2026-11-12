@@ -11,10 +11,9 @@ that live at this seam:
   remaining CYCLE budget bounds it (no inference starts after the deadline,
   and the sampler's chunk deadline never exceeds what is left), with the
   cancellation event checked before the work;
-- ``kronos_policy='defer'`` was recorded but never acted on: the policy
-  vocabulary is pinned here (``use``/``defer``/``pass``), and a retrospective
-  draw is converted to an explicit failure so research output stays out of
-  active decisions;
+- ``kronos_policy='defer'`` is applied before graph construction: an invalid or
+  missing forecast stops the Futures candidate, and retrospective draws stay
+  out of active decisions;
 - ``history_for`` keeps the cutoff discipline: only closed bars at ``as_of``.
 
 Unit tests: the service is a fake, the venue is a stub, no model, no network.
@@ -30,11 +29,14 @@ import pytest
 
 from server import kronos_context
 from tradingagents.dataflows.market_data import Candle
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.forecast.block import CandleSeries, ForecastBlock
 from tradingagents.forecast.contract import (
     GENERATION_FORWARD,
     GENERATION_RETROSPECTIVE,
+    STATUS_ERROR,
     STATUS_OK,
+    STATUS_TIMEOUT,
     STATUS_UNAVAILABLE,
 )
 from tradingagents.forecast.settings import ForecastSettings
@@ -44,8 +46,9 @@ pytestmark = pytest.mark.unit
 _FOUR_HOUR_MS = 14_400_000
 
 _CONFIG = {
-    "kronos_active_enabled": True, "kronos_active_paths": 16,
-    "kronos_active_timeframe": "4h", "kronos_active_horizon_hours": 24,
+    **DEFAULT_CONFIG,
+    "kronos_active_profile": "small_base",
+    "risk_derivatives_max_hold_hours": 24,
 }
 
 
@@ -56,7 +59,7 @@ class _OwnedService:
         self.block = block
         self.raises = raises
         self.closed = False
-        self.settings = ForecastSettings(enabled=True)
+        self.settings = ForecastSettings(lookback_bars=96)
 
     def forecast(self, series: CandleSeries, *, seed: int) -> ForecastBlock:
         if self.raises is not None:
@@ -227,7 +230,7 @@ def test_a_cancelled_cycle_reports_the_stop_before_the_work():
 def test_the_history_read_cuts_at_the_decision_moment():
     venue = _StubVenue()
     candles = kronos_context.history_for(
-        venue, "BTC/USDT:USDT", ForecastSettings(enabled=True),
+        venue, "BTC/USDT:USDT", ForecastSettings(lookback_bars=96),
         as_of=_as_of(),
     )
     assert candles, "the stub venue supplies closed candles"
@@ -240,7 +243,7 @@ def test_the_history_read_cuts_at_the_decision_moment():
 def test_the_history_read_honors_a_configured_large_lookback(lookback):
     venue = _StubVenue(_candles(count=lookback))
     candles = kronos_context.history_for(
-        venue, "BTC/USDT:USDT", ForecastSettings(enabled=True, lookback_bars=lookback),
+        venue, "BTC/USDT:USDT", ForecastSettings(lookback_bars=lookback),
         as_of=_as_of(),
     )
     assert venue.limits == [lookback]
@@ -250,7 +253,7 @@ def test_the_history_read_honors_a_configured_large_lookback(lookback):
 def test_insufficient_configured_history_is_returned_for_input_validation():
     venue = _StubVenue(_candles(count=201))
     candles = kronos_context.history_for(
-        venue, "BTC/USDT:USDT", ForecastSettings(enabled=True, lookback_bars=256),
+        venue, "BTC/USDT:USDT", ForecastSettings(lookback_bars=256),
         as_of=_as_of(),
     )
     assert venue.limits == [256]
@@ -278,7 +281,7 @@ def test_a_retrospective_draw_is_never_fed_to_an_active_decision():
     assert block.band == {}, "a research draw must not enter the prompt with numbers"
 
 
-def test_a_forward_draw_passes_through_unchanged():
+def test_an_active_forward_draw_is_accepted():
     block = kronos_context.forecast_for_cycle(
         service=_OwnedService(_ok_block()), exchange=_StubVenue(), symbol="BTC/USDT:USDT",
         config=_CONFIG, as_of=_as_of(), cycle_id="c1",
@@ -290,29 +293,52 @@ def test_a_forward_draw_passes_through_unchanged():
 
 
 def test_the_policy_vocabulary_has_no_fake_knob():
-    settings = ForecastSettings(enabled=True, failure_policy="defer")
-    assert kronos_context.policy_for(None, settings) == "use"
-    assert kronos_context.policy_for(_ok_block(), settings) == "use"
-    failed = ForecastBlock(symbol="BTC/USDT:USDT", status=STATUS_UNAVAILABLE, reason="r")
-    assert kronos_context.policy_for(failed, settings) == "defer"
-    passthrough = ForecastSettings(enabled=True, failure_policy="pass_through")
-    assert kronos_context.policy_for(failed, passthrough) == "pass"
-    # context_only is retired as a failure policy: it had no behavior distinct
-    # from defer, and an unknown value must not silently mean one of the two.
-    unknown = ForecastSettings(enabled=True, failure_policy="context_only")
-    assert kronos_context.policy_for(failed, unknown) == "defer"
-    assert unknown.settings_problem() is not None
+    settings = ForecastSettings()
+    assert kronos_context.policy_for(None) == "defer"
+    assert kronos_context.policy_for(_ok_block()) == "use"
+    for status in (STATUS_UNAVAILABLE, STATUS_TIMEOUT, STATUS_ERROR):
+        failed = ForecastBlock(symbol="BTC/USDT:USDT", status=status, reason="r")
+        assert kronos_context.policy_for(failed) == "defer"
+    assert settings.settings_problem() is None
 
 
-def test_off_is_off_and_the_context_is_untouched():
-    off_config = {**_CONFIG, "kronos_active_enabled": False}
+def test_active_forecast_is_always_attempted_for_an_eligible_futures_candidate():
     service = _OwnedService(_ok_block())
     block = kronos_context.forecast_for_cycle(
         service=service, exchange=_StubVenue(), symbol="BTC/USDT:USDT",
-        config=off_config, as_of=_as_of(), cycle_id="c1",
+        config=_CONFIG, as_of=_as_of(), cycle_id="c1",
     )
-    assert block is None
-    assert not service.closed, "off never touched the supplied service"
-    incumbent = "Futures equity: 1,000 USDT"
-    assert kronos_context.append_to_context(incumbent, None) == incumbent
-    assert kronos_context.append_to_context("", None) == ""
+    assert block is not None and block.status == STATUS_OK
+    assert not service.closed, "a caller-owned service keeps its own close obligation"
+
+
+def test_forecast_settings_derive_full_context_and_horizon_from_max_hold():
+    settings = kronos_context.settings_for({
+        **DEFAULT_CONFIG,
+        "kronos_active_profile": "mini_2k",
+        "risk_derivatives_max_hold_hours": 50.5,
+    })
+
+    assert settings.profile == "mini_2k"
+    assert settings.timeframe == "4h"
+    assert settings.lookback_bars == 2048
+    assert settings.horizon_hours == 48
+    assert settings.paths == 16
+    assert settings.temperature == 0.5
+    assert not hasattr(settings, "enabled")
+
+
+@pytest.mark.parametrize(
+    ("max_hold_hours", "expected_horizon"),
+    [
+        (0, 24), (2, 4), (72, 72), (500, 288),
+        (None, 24), ("invalid", 24), (float("nan"), 24), (float("inf"), 24),
+    ],
+)
+def test_forecast_horizon_is_derived_and_bounded(max_hold_hours, expected_horizon):
+    settings = kronos_context.settings_for({
+        **DEFAULT_CONFIG,
+        "risk_derivatives_max_hold_hours": max_hold_hours,
+    })
+
+    assert settings.horizon_hours == expected_horizon

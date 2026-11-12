@@ -51,6 +51,12 @@ from tradingagents.forecast.artifact import (
     TIMEFRAME_HOURS,
     profile_for,
 )
+from tradingagents.forecast.ohlc import (
+    aggregate_ohlc_provenance,
+    normalize_ohlc_path,
+    ohlc_path_problem,
+    ohlc_quality,
+)
 
 # Rows per child request: 5 symbols x 16 paths measured 874 MiB peak against
 # 6.07 GiB for the un-chunked 960-row call, for 13% more wall time. 960 rows is
@@ -96,6 +102,8 @@ class SampledSymbol:
     status: str
     reason: str | None = None
     paths: tuple[dict[str, Any], ...] = ()
+    ohlc_quality: dict[str, Any] = field(default_factory=dict)
+    ohlc_provenance: dict[str, Any] = field(default_factory=dict)
     duration_ms: float | None = None
     params: dict[str, Any] = field(default_factory=dict)
 
@@ -125,6 +133,8 @@ def validate_settings(settings: SamplerSettings) -> str | None:
         return f"paths={settings.paths} exceeds the {MAX_PATHS}-path bound"
     if settings.max_batch_rows < 1:
         return "max_batch_rows must be at least 1"
+    if settings.max_batch_rows < settings.paths:
+        return "max_batch_rows must allow at least one symbol's paths"
     if settings.max_batch_rows > MAX_BATCH_ROWS:
         return (
             f"max_batch_rows={settings.max_batch_rows} exceeds the {MAX_BATCH_ROWS}-row "
@@ -147,8 +157,10 @@ def plan_batches(count: int, *, max_batch_rows: int, paths: int) -> list[tuple[i
     """
     if max_batch_rows < 1:
         raise SamplerError("max_batch_rows must be at least 1")
-    per_symbol = max(1, int(paths))
-    run = max(1, max_batch_rows // per_symbol)
+    if paths < 1 or max_batch_rows < paths:
+        raise SamplerError("max_batch_rows must allow at least one symbol's paths")
+    per_symbol = int(paths)
+    run = max_batch_rows // per_symbol
     return [(start, min(start + run, count)) for start in range(0, count, run)]
 
 
@@ -291,9 +303,10 @@ class KronosSampler:
     ) -> list[SampledSymbol]:
         """Forecast every ``(symbol, timeframe, horizon_hours, candles, seed)``.
 
-        Chunked so no single child request exceeds ``max_batch_rows``. A chunk
-        that overruns its deadline kills the child (the work is not interruptible
-        from outside) and yields ``timeout`` for that chunk's symbols; the next
+        Chunked so no single child request exceeds ``max_batch_rows`` or mixes
+        timeframes or horizons. A chunk that overruns its deadline kills the
+        child (the work is not interruptible from outside) and yields ``timeout``
+        for that chunk's symbols; the next
         chunk starts a fresh child. A chunk that fails for any other reason
         yields ``error`` with the child's stderr tail. No chunk is retried
         inside this call — the caller's cycle budget decides whether to retry.
@@ -310,7 +323,12 @@ class KronosSampler:
         results: list[SampledSymbol] = []
         with self._lock:
             for start, stop in batches:
-                results.extend(self._sample_chunk(requests[start:stop]))
+                while start < stop:
+                    end = start + 1
+                    while end < stop and requests[end][1:3] == requests[start][1:3]:
+                        end += 1
+                    results.extend(self._sample_chunk(requests[start:end]))
+                    start = end
         return results
 
     def _sample_chunk(
@@ -376,9 +394,9 @@ class KronosSampler:
                 f"horizon {horizon_hours}h is not a whole number of {timeframe} bars"
             )
         pred_len = horizon_hours // hours
-        if pred_len > MAX_HORIZON_BARS:
+        if pred_len < 1 or pred_len > MAX_HORIZON_BARS:
             raise SamplerError(
-                f"horizon of {pred_len} bars exceeds the {MAX_HORIZON_BARS}-bar bound"
+                f"horizon of {pred_len} bars is outside the [1, {MAX_HORIZON_BARS}]-bar bound"
             )
         return pred_len
 
@@ -527,26 +545,35 @@ class KronosSampler:
             )
             return [self._failed(symbol, "error", reason) for symbol, *_ in chunk]
         out: list[SampledSymbol] = []
-        for (symbol, _t, _h, _c, _base_seed), entry in zip(chunk, raw, strict=True):
+        for (symbol, _t, _h, _c, base_seed), entry in zip(chunk, raw, strict=True):
             problem = _entry_problem(entry, symbol, requested_paths=self.settings.paths,
-                                     pred_len=pred_len)
+                                     pred_len=pred_len, base_seed=base_seed)
             if problem is not None:
                 out.append(self._failed(symbol, "error", problem))
                 continue
             paths = []
             for path in entry["paths"]:
-                closes = [float(value) for value in path["closes"]]
-                highs = [float(value) for value in path["highs"]]
-                lows = [float(value) for value in path["lows"]]
-                paths.append({
-                    "closes": closes, "highs": highs, "lows": lows,
-                    "seed": int(path["seed"]) if path.get("seed") is not None else None,
-                })
-            out.append(SampledSymbol(
-                symbol=symbol, status="ok", paths=tuple(paths),
-                duration_ms=duration_ms if duration_ms is None else float(duration_ms),
-                params=params,
-            ))
+                normalized = normalize_ohlc_path(
+                    path, index=len(paths), horizon_bars=pred_len,
+                )
+                if normalized is None:
+                    # This should be unreachable after _entry_problem, but keeps
+                    # the decoder fail-closed if the normalizer contract changes.
+                    out.append(self._failed(symbol, "error", "the sampled OHLC path could not be normalized"))
+                    break
+                normalized["seed"] = int(path["seed"])
+                paths.append(normalized)
+            else:
+                quality = ohlc_quality(paths)
+                out.append(SampledSymbol(
+                    symbol=symbol, status="ok", paths=tuple(paths),
+                    ohlc_quality=quality,
+                    ohlc_provenance=aggregate_ohlc_provenance(paths),
+                    duration_ms=duration_ms if duration_ms is None else float(duration_ms),
+                    params=params,
+                ))
+                continue
+            continue
         return out
 
     @staticmethod
@@ -594,16 +621,13 @@ def _response_metadata_problem(result: dict[str, Any], expected: Any) -> str | N
 
 
 def _entry_problem(
-    entry: Any, symbol: str, *, requested_paths: int, pred_len: int,
+    entry: Any, symbol: str, *, requested_paths: int, pred_len: int, base_seed: int,
 ) -> str | None:
     """Why this per-symbol answer cannot be trusted, or None when it can.
 
-    A result is accepted only when it is exactly what was requested: the symbol
-    echoes back, the requested number of INDEPENDENT paths arrived (a 16-path
-    request satisfied by one path is a malformed answer, not a small sample),
-    every path carries the full horizon, every price is finite and positive
-    with high >= low, and the per-path seeds are distinct (they are what make
-    the paths independent draws). Anything else is an error, never a forecast.
+    The symbol, path count, horizon and seeds must match the request. Every
+    OHLC price must be finite and positive; inconsistent wick bounds are
+    corrected after validation while the raw path is retained for audit.
     """
     if not isinstance(entry, dict):
         return "a Kronos result is not an object"
@@ -618,29 +642,17 @@ def _entry_problem(
             "a request is satisfied only by the exact number of independent draws"
         )
     for index, path in enumerate(paths):
-        if not isinstance(path, dict):
-            return f"path {index} is not an object"
-        series = {"closes": path.get("closes"), "highs": path.get("highs"), "lows": path.get("lows")}
-        for name, values in series.items():
-            if not isinstance(values, list) or len(values) != pred_len:
-                return (
-                    f"path {index} {name} does not cover the {pred_len}-bar horizon "
-                    f"(got {len(values) if isinstance(values, list) else type(values).__name__})"
-                )
-            for value in values:
-                if not isinstance(value, (int, float)) or isinstance(value, bool):
-                    return f"path {index} {name} carries a non-numeric value"
-                if not math.isfinite(value) or value <= 0:
-                    return f"path {index} {name} carries a non-finite or non-positive price {value!r}"
-        highs, lows = series["highs"], series["lows"]
-        if any(high < low for high, low in zip(highs, lows, strict=True)):
-            return f"path {index} has a bar whose high is below its low"
+        problem = ohlc_path_problem(path, index=index, horizon_bars=pred_len)
+        if problem is not None:
+            return problem
         seed = path.get("seed")
         if not isinstance(seed, int) or isinstance(seed, bool):
             return f"path {index} carries no explicit seed; per-path seeding is what makes draws independent"
     seeds = [path["seed"] for path in paths]
     if len(set(seeds)) != len(seeds):
         return "the paths' seeds are not distinct; they would not be independent draws"
+    if seeds != [base_seed + index for index in range(requested_paths)]:
+        return "the paths' seeds do not match the requested base seed and draw order"
     return None
 
 
@@ -676,6 +688,7 @@ __all__ = [
     "SampledSymbol",
     "SamplerError",
     "SamplerSettings",
+    "ohlc_path_problem",
     "passes_floor",
     "percentile",
     "plan_batches",

@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["autoloop"])
 
 
 _CYCLE_SUMMARY_BUCKETS = (
-    "market_rejected", "confirmation_rejected", "proposal_rejected", "entered",
+    "market_rejected", "confirmation_rejected", "forecast_deferred", "proposal_rejected", "entered",
     "awaiting_approval", "risk_rejected", "not_executed", "execution_failed",
     "in_flight", "interrupted", "other",
 )

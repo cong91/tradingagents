@@ -67,32 +67,29 @@ export type AttentionItem = {
   link: string;
 };
 
-export type BriefShadowProvider = {
-  provider: string;
-  distribution_kind: "model_samples" | "deterministic_rule";
-  attempts: { rows: number; ok: number; unavailable: number; error: number; timeout: number };
-  verdicts: { up: number; down: number; flat: number };
-  evaluations: {
-    rows: number;
-    direction_scored: number;
-    direction_hits: number;
-    band_scored: number;
-    band_inside: number;
-    net_r_rows: number;
-    stop_first_rate_mean: number | null;
-  };
+/**
+ * The active Kronos forecast of the most recent recorded cycle. `state` names
+ * the recorded cycle outcome: no record yet, read failure, elapsed window,
+ * unavailable forecast, or a usable forecast.
+ */
+export type OhlcQualityStatus = "consistent" | "corrected" | "unknown";
+
+export type OhlcQuality = {
+  status: OhlcQualityStatus;
+  algorithm: "ohlc_wick_bounds_v1" | null;
+  version: 1 | null;
+  corrected_bar_count: number | null;
+  corrected_path_count: number | null;
+  changed_field_counts: { highs: number; lows: number } | null;
+  absolute_delta_by_field: {
+    highs: { total: number; max: number };
+    lows: { total: number; max: number };
+  } | null;
+  reason: string | null;
 };
 
-/**
- * The ACTIVE Kronos forecast of the most recent recorded cycle — its own block,
- * never a shadow row. `state` names which situation this is and they are not
- * interchangeable: `off` (switch off), `empty` (on, nothing recorded), `error`
- * (read failed), `stale` (the recorded window fully elapsed), `unavailable`
- * (the recorded block itself failed) and `ok`. A failed block carries NO
- * numbers, so the renderer must never print ratios from one.
- */
 export type BriefActiveForecast = {
-  state: "ok" | "off" | "empty" | "error" | "stale" | "unavailable";
+  state: "ok" | "empty" | "error" | "stale" | "unavailable";
   status: string;
   reason?: string | null;
   cycle_id?: string | null;
@@ -113,6 +110,8 @@ export type BriefActiveForecast = {
     direction_ratio?: Record<string, number> | null;
     band?: Record<string, number | null> | null;
     band_spread_ratio?: number | null;
+    signal_basis?: "close_only" | null;
+    ohlc_quality?: OhlcQuality | null;
     reference_close?: number | null;
     data_open_time?: number | null;
     as_of?: string | null;
@@ -126,45 +125,6 @@ export type BriefActiveForecast = {
     latency_ms?: number | null;
     created_at?: string | null;
   } | null;
-};
-
-/** The brief's shadow slot: what the observation layer recorded, or why nothing. */
-export type BriefShadow = {
-  /**
-   * Which kind of "nothing to show" this is. The three are NOT interchangeable:
-   * `disabled` means the operator switched the worker off, `empty` means it is
-   * on but has recorded nothing yet, `error` means the read failed. Rendering
-   * one sentence for all three (as the section first did) told an operator with
-   * the worker enabled that it was "not enabled".
-   */
-  state?: "ok" | "disabled" | "empty" | "error";
-  status: string;
-  reason?: string | null;
-  providers?: string[];
-  kronos?: { available: boolean; reason: string | null } | null;
-  totals?: {
-    rows: number;
-    ok: number;
-    unavailable: number;
-    errors: number;
-    timeouts: number;
-    retrospective: number;
-    first_data_open_time: string | null;
-    last_data_open_time: string | null;
-  } | null;
-  providers_detail?: BriefShadowProvider[];
-  observations?: {
-    symbol: string;
-    timeframe: string;
-    horizon_hours: number;
-    provider: string;
-    direction: string | null;
-    status: string;
-    generation_kind: string;
-    outcome_group: string;
-    note?: string | null;
-  }[];
-  note?: string;
 };
 
 export type BriefPayload = {
@@ -245,7 +205,6 @@ export type BriefPayload = {
       sample_cycle_id: string | null;
     }[];
     pipeline_error_cycles: number | null;
-    shadow: BriefShadow;
     note: string;
     reason?: string;
   };

@@ -61,9 +61,8 @@ function changedServerKeys(left: OperatorConfigPayload, right: OperatorConfigPay
   return keys;
 }
 
-/** A change on ANY gate row (Auto modes AND the Kronos context switch) is a
- * deliberate operator write on the server, so a stale authorization (confirm +
- * reason) is cleared — the operator must re-confirm against the fresh state. */
+/** A change on any managed Auto gate row invalidates the previous confirmation
+ * and reason, so the operator must re-confirm against the fresh state. */
 function hasChangedGate(left: OperatorConfigPayload, right: OperatorConfigPayload): boolean {
   const gateKeys = operatorGateKeys(right.settings);
   return [...changedServerKeys(left, right)].some((key) => gateKeys.has(key));
@@ -132,12 +131,10 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
       const previous = payloadRef.current;
       const currentDraft = draftRef.current;
       if (serverAheadRef.current && pendingRef.current) {
-        if (!sameServerConfig(pendingRef.current, next)) {
-          if (hasChangedGate(pendingRef.current, next)) {
-            clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
-          }
-          pendingRef.current = next;
+        if (!sameServerConfig(pendingRef.current, next) && hasChangedGate(pendingRef.current, next)) {
+          clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
         }
+        pendingRef.current = next;
         refreshFailedRef.current = false;
         setRefreshFailed(false);
         setServerAhead(true);
@@ -156,6 +153,8 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
         pendingRef.current = null;
         serverAheadRef.current = false;
         refreshFailedRef.current = false;
+        payloadRef.current = next;
+        setPayload(next);
         setServerAhead(false);
         setRefreshFailed(false);
       } else {

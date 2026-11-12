@@ -544,6 +544,42 @@ async function renderChecks(snapshot) {
   assert.equal(controller.payload.settings.find((row) => row.key === "auto_futures_enabled").value, true);
   assert.equal(controller.dirtyCount, 0);
 
+  // A tuning/status refresh must not discard an operator draft or confirmation.
+  const statusBefore = { ...nextWith({ auto_spot_enabled: true }), kronos: { profile_id: "small_base" } };
+  api.operatorConfigApi.get = async () => clone(statusBefore);
+  await controller.reload();
+  render();
+  controller.setValue("auto_futures_enabled", true);
+  render();
+  controller.setConfirmation(true);
+  controller.setGateReason("preserve draft");
+  render();
+  api.operatorConfigApi.get = async () => ({ ...clone(statusBefore), kronos: { profile_id: "mini_2k" } });
+  await controller.reload();
+  render();
+  assert.equal(controller.payload.kronos.profile_id, "mini_2k");
+  assert.equal(controller.draft.auto_futures_enabled, true);
+  assert.equal(controller.confirmGate, true);
+  assert.equal(controller.reason, "preserve draft");
+  assert.equal(controller.serverAhead, false);
+
+  // A newer status must also survive reviewing a conflicting server snapshot.
+  const statusConflict = nextWith({ auto_spot_enabled: true, risk_max_open_heat_pct: 7 });
+  api.operatorConfigApi.get = async () => ({ ...clone(statusConflict), kronos: { profile_id: "small_base" } });
+  await controller.reload();
+  render();
+  assert.equal(controller.serverAhead, true);
+  api.operatorConfigApi.get = async () => ({ ...clone(statusConflict), kronos: { profile_id: "mini_2k" } });
+  await controller.reload();
+  render();
+  controller.reviewLatest();
+  render();
+  assert.equal(controller.payload.kronos.profile_id, "mini_2k");
+  assert.equal(controller.draft.auto_futures_enabled, true);
+  assert.equal(controller.confirmGate, false);
+  controller.undo("modes");
+  render();
+
   // Render both panes with the same controller; each row occurs only once.
   controller.setValue("risk_max_open_heat_pct", "-1");
   render();

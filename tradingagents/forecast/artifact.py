@@ -147,7 +147,7 @@ def _sha256(path: Path) -> str:
 
 def isolated_python() -> Path:
     """The operator's isolated interpreter; outside the repo by default."""
-    configured = os.environ.get("TRADINGAGENTS_SHADOW_KRONOS_PYTHON")
+    configured = os.environ.get("TRADINGAGENTS_KRONOS_PYTHON")
     if configured:
         return Path(configured)
     name = "kronos-venv/Scripts/python.exe" if os.name == "nt" else "kronos-venv/bin/python"
@@ -155,12 +155,12 @@ def isolated_python() -> Path:
 
 
 def isolated_source_dir() -> Path:
-    configured = os.environ.get("TRADINGAGENTS_SHADOW_KRONOS_SOURCE")
+    configured = os.environ.get("TRADINGAGENTS_KRONOS_SOURCE")
     return Path(configured) if configured else _DEFAULT_RESEARCH_DIR / "kronos-src"
 
 
 def isolated_model_dir() -> Path:
-    configured = os.environ.get("TRADINGAGENTS_SHADOW_KRONOS_MODELS")
+    configured = os.environ.get("TRADINGAGENTS_KRONOS_MODELS")
     return Path(configured) if configured else _DEFAULT_RESEARCH_DIR / "models"
 
 

@@ -22,32 +22,19 @@ def _kronos_block_for(
     derivatives: Any, ticker: str, futures_context: dict, config: dict, *, cycle_id: str,
     deadline: float | None = None, cancelled: threading.Event | None = None,
 ):
-    """The active Kronos block for one candidate, or None when the feature is off.
-
-    Returns None WITHOUT touching the venue when ``kronos_active_enabled`` is
-    false, so a disabled feature costs nothing and changes nothing. When it is
-    on, the symbol the cycle already resolved is reused (no second resolution, no
-    second market read) and only the closed-candle history is fetched, through
-    the same reader and the same cutoff as the confirmation path. The service's
-    lifecycle is owned INSIDE the seam (scoped per call, closed on success,
-    error and timeout); the cycle's deadline and cancellation event bound the
-    inference.
-    """
-    settings = kronos_context.settings_for(config)
-    if not settings.enabled:
-        return None
-    exchange = derivatives._bridge.client()
+    """Build the Kronos block from the Futures cycle's resolved symbol and cutoff."""
     symbol = str(futures_context.get("unified_symbol") or futures_context.get("symbol") or ticker)
-    # The decision moment is the closed-candle boundary the cycle is running on,
-    # not "now": the 4h bar the context was built from must be the newest bar the
-    # forecast sees, or the forecast would describe a different market state than
-    # the one the agents were shown.
-    four_hour_open = futures_context.get("four_hour_open")
-    as_of = (
-        datetime.fromtimestamp(int(four_hour_open) / 1000, UTC) + timedelta(hours=4)
-        if four_hour_open is not None else datetime.now(UTC)
-    )
     try:
+        exchange = derivatives._bridge.client()
+        # The decision moment is the closed-candle boundary the cycle is running on,
+        # not "now": the 4h bar the context was built from must be the newest bar the
+        # forecast sees, or the forecast would describe a different market state than
+        # the one the agents were shown.
+        four_hour_open = futures_context.get("four_hour_open")
+        as_of = (
+            datetime.fromtimestamp(int(four_hour_open) / 1000, UTC) + timedelta(hours=4)
+            if four_hour_open is not None else datetime.now(UTC)
+        )
         return kronos_context.forecast_for_cycle(
             service=None, exchange=exchange, symbol=symbol, config=config,
             as_of=as_of, cycle_id=cycle_id, deadline=deadline, cancelled=cancelled,

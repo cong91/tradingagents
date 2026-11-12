@@ -187,7 +187,7 @@ def test_autoloop_cycles_summary_and_symbol_rollup(client):
     body = client.get("/api/autoloop/cycles").json()
 
     assert body["summary"] == {
-        "market_rejected": 1, "confirmation_rejected": 1, "proposal_rejected": 1,
+        "market_rejected": 1, "confirmation_rejected": 1, "forecast_deferred": 0, "proposal_rejected": 1,
         "entered": 1, "awaiting_approval": 0, "risk_rejected": 0,
         "not_executed": 0, "execution_failed": 0,
         "in_flight": 0, "interrupted": 0, "other": 0, "total": 4,
@@ -267,7 +267,7 @@ def test_autoloop_cycles_summary_maps_execution_outcomes_explicitly(client):
     body = client.get("/api/autoloop/cycles").json()
 
     assert body["summary"] == {
-        "market_rejected": 0, "confirmation_rejected": 0, "proposal_rejected": 0,
+        "market_rejected": 0, "confirmation_rejected": 0, "forecast_deferred": 0, "proposal_rejected": 0,
         "entered": 1, "awaiting_approval": 2, "risk_rejected": 1,
         "not_executed": 2, "execution_failed": 2,
         "in_flight": 0, "interrupted": 0, "other": 2, "total": 10,
