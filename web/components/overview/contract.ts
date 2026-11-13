@@ -25,7 +25,9 @@ export class FetchError extends Error {
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
+/** Shared by every panel on this screen (and by the brief) so one place owns
+ * the network/HTTP error shape. */
+export async function fetchJson<T>(url: string): Promise<T> {
   let res: Response;
   try {
     res = await fetch(url, { cache: "no-store" });

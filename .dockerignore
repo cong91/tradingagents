@@ -16,6 +16,18 @@ docker-compose.yml
 # Runtime/legacy state never belongs in an image: the control panel persists to
 # PostgreSQL and only operator_config.json is mounted at run time.
 server/data
+
+# Kronos is provisioned from immutable revisions in the dedicated build stages;
+# never copy host-side research environments, model caches, or model weights.
+tradingagents-research
+**/tradingagents-research
+kronos-venv
+kronos-src
+kronos-models
+**/.cache/huggingface
+*.safetensors
+**/*.safetensors
+
 # Archived legacy stores kept for reference outside the build context.
 archive
 # Frontend builds ship in their own image; keep their dependencies out of the API.

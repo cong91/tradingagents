@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from server import (
     daily as daily_mod,
+    futures_cycle_store,
     job_store,
     run_store,
     runs as runs_mod,
@@ -477,12 +478,12 @@ def test_terminal_futures_cycle_row_is_immutable(postgres_schema):
                  "execution_status": "not_started", "order_id": None},
     )
 
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id, status="completed", phase="entry",
         payload={"execution_status": "executed", "order_id": "LIVE-1"},
         terminal=True,
     )
-    row = job_store.load_futures_cycle(cycle_id)
+    row = futures_cycle_store.load_futures_cycle(cycle_id)
     assert row["status"] == "rejected" and row["phase"] == "proposal"
     assert row["payload"]["execution_status"] == "not_started"
     assert row["payload"]["order_id"] is None
@@ -506,14 +507,14 @@ def test_merge_keeps_recorded_values_against_late_nones(postgres_schema):
                  "confirmation_reason": "direction_mismatch",
                  "signal_reason": None, "execution_status": "not_started"},
     )
-    row = job_store.load_futures_cycle(cycle_id)
+    row = futures_cycle_store.load_futures_cycle(cycle_id)
     payload = row["payload"]
     assert payload["signal_reason"] == "tradeable_signal"  # a None never erases
     assert payload["signal"] == "Sell"
     assert payload["execution_status"] == "not_started"  # non-None overwrites
     assert payload["confirmation_reason"] == "direction_mismatch"
 
-    summary = job_store.futures_cycle_summary()
+    summary = futures_cycle_store.futures_cycle_summary()
     assert summary.get("confirmation_rejected", 0) == 0  # row is still in-flight
     assert summary.get("in_flight") == 1
 
@@ -521,7 +522,7 @@ def test_merge_keeps_recorded_values_against_late_nones(postgres_schema):
 def test_merge_is_none_safe_at_store_level(postgres_schema):
     """The merge rule itself: None on the incoming side cannot erase a recorded
     value, at any nesting level."""
-    merged = job_store._merge_payload(
+    merged = futures_cycle_store._merge_payload(
         {"a": "kept", "b": None, "c": {"d": "kept", "e": None}},
         {"a": None, "b": "new", "c": {"d": None, "e": "new", "f": None}},
     )
@@ -545,7 +546,7 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
         assert claim_cycle(
             cycle_id, symbol=symbol, four_hour_open="x", one_hour_open="y", payload={},
         )
-        job_store.update_futures_cycle(
+        futures_cycle_store.update_futures_cycle(
             cycle_id, status=status, phase=phase, payload=payload, terminal=True,
         )
 
@@ -593,7 +594,7 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
         payload={"execution_status": "executed", "executed": False},
     )
 
-    assert job_store.futures_cycle_summary() == {
+    assert futures_cycle_store.futures_cycle_summary() == {
         "entered": 1,
         "awaiting_approval": 2,
         "risk_rejected": 1,
@@ -602,7 +603,7 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
         "other": 1,
     }
 
-    rows = {row["symbol"]: row for row in job_store.futures_cycle_symbol_rollup()}
+    rows = {row["symbol"]: row for row in futures_cycle_store.futures_cycle_symbol_rollup()}
     assert rows["BTC/USDT:USDT"]["entered"] == 1
     assert rows["BTC/USDT:USDT"]["last_execution_status"] == "executed"
     assert rows["BTC/USDT:USDT"]["last_executed"] == "true"
@@ -636,9 +637,9 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
 
     # History is read-time-mapped, never rewritten: every seeded row still
     # carries exactly the terminal shape it was written with.
-    contradiction = job_store.load_futures_cycle("m-contradiction")
+    contradiction = futures_cycle_store.load_futures_cycle("m-contradiction")
     assert contradiction["status"] == "completed"
     assert contradiction["payload"]["execution_status"] == "executed"
     assert contradiction["payload"]["executed"] is False
-    assert job_store.load_futures_cycle("m-approval")["status"] == "rejected"
-    assert job_store.load_futures_cycle("m-failed")["phase"] == "execution"
+    assert futures_cycle_store.load_futures_cycle("m-approval")["status"] == "rejected"
+    assert futures_cycle_store.load_futures_cycle("m-failed")["phase"] == "execution"

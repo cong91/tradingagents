@@ -5,14 +5,26 @@ from types import SimpleNamespace
 
 import pytest
 
+from server import (
+    autoloop_analysis,
+    autoloop_cycle_records,
+    autoloop_futures_context,
+    autoloop_futures_execution,
+    futures_cycle_store,
+    futures_cycle_telemetry,
+    job_store,
+)
 from server.futures_decision_context import (
     build_futures_portfolio,
     effective_futures_leverage_cap,
     render_futures_decision_context,
 )
+from tradingagents.execution import futures_account
 from tradingagents.execution.futures_account import FuturesAccountSnapshot, FuturesPosition
 from tradingagents.execution.risk import RiskGuard, RiskLimits
 from tradingagents.execution.sizing import PlannedOrder
+from tradingagents.forecast.block import ForecastBlock
+from tradingagents.forecast.contract import GENERATION_FORWARD, STATUS_OK
 from tradingagents.portfolio import PortfolioContext
 
 pytestmark = pytest.mark.unit
@@ -394,21 +406,39 @@ def test_context_discloses_protective_level_substitution():
 def test_candidate_passes_open_positions_and_effective_guard_cap_without_database(
     monkeypatch, risk_cap, expected,
 ):
-    from server import autoloop
 
     account = _account(positions_scope_complete=True, positions=(FuturesPosition(
         symbol="BTC/USDT:USDT", quantity=-2.0, mark_price=100.0, notional=200.0,
     ),))
     seen = {}
     executor = SimpleNamespace(
-        _bridge=object(),
+        _bridge=SimpleNamespace(client=lambda: object()),
         risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=risk_cap)),
     )
-    monkeypatch.setattr(autoloop, "_closed_futures_context", lambda *_: _market_context())
-    monkeypatch.setattr(autoloop, "read_futures_account", lambda *_args, **_kwargs: account)
-    monkeypatch.setattr(autoloop, "_bracket_prices", lambda _, direction: BRACKETS[direction])
-    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
+    forecast = ForecastBlock(
+        symbol="BTC/USDT:USDT", status=STATUS_OK, direction="up",
+        direction_counts={"up": 12, "down": 3, "flat": 1},
+        direction_ratio={"up": 0.75, "down": 0.1875, "flat": 0.0625},
+        band={"low": 100.0, "p50": 106.0, "high": 110.0},
+        band_spread_ratio=10 / 105, reference_close=105.0,
+        data_open_time=1_792_987_200_000, as_of="2026-10-26T08:00:00+00:00",
+        horizon_hours=24, timeframe="4h", paths=16,
+        generation_kind=GENERATION_FORWARD, temperature=0.5, profile="small_base",
+        model_revision="NeoQuasar/Kronos-small@901c26c13326", artifact_hash="a" * 64,
+        created_at="2026-10-26T08:00:00+00:00", latency_ms=100.0,
+    )
+    monkeypatch.setattr(
+        autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_: forecast,
+    )
+    monkeypatch.setattr(
+        autoloop_futures_context, '_closed_futures_context',
+        lambda *_: _market_context(four_hour_open=1_792_987_200_000),
+    )
+    monkeypatch.setattr(futures_account, 'read_futures_account', lambda *_args, **_kwargs: account)
+    monkeypatch.setattr(job_store, "futures_position_stops", lambda: {})
+    monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _, direction: BRACKETS[direction])
+    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
 
     class Graph:
         def propagate(self, ticker, trade_date, *, asset_type, execution_context):
@@ -419,8 +449,8 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
         seen["portfolio"] = kwargs["portfolio"]
         result.reason = "planning captured offline"
 
-    monkeypatch.setattr(autoloop, "_process_futures_candidate", capture_plan)
-    result = autoloop._process_candidate(
+    monkeypatch.setattr(autoloop_futures_execution, '_process_futures_candidate', capture_plan)
+    result = autoloop_analysis._process_candidate(
         None, {"ticker": "BTC-USD", "asset_type": "crypto"},
         {"risk_max_derivatives_leverage": 3.0}, lambda *_: Graph(), executor,
     )
@@ -587,13 +617,13 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
 
     executor.plan_order = plan_order
     executor.audit_plan = lambda *args, **kwargs: None
-    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
-    # The terminal write goes straight through job_store (not the patched
+    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
+    # The terminal write goes straight through futures_cycle_store (not the patched
     # persist alias), so patch it at the module seam like the telemetry tests.
-    monkeypatch.setattr(autoloop.job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        autoloop, "_record_futures_cycle_rejection",
+        autoloop_cycle_records, '_record_futures_cycle_rejection',
         lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),
     )
     proposal = {
@@ -603,7 +633,7 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
     }
 
     result = autoloop.DailyResult(ticker="BTC-USD")
-    autoloop._process_futures_candidate(
+    autoloop_futures_execution._process_futures_candidate(
         executor, "BTC-USD", "Buy", {}, result,
         context=context, proposal=proposal, portfolio=book,
         brackets=BRACKETS, intent="enter",
@@ -666,11 +696,11 @@ def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monk
             ),
         )[1],
     )
-    monkeypatch.setattr(autoloop, "claim_futures_cycle", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(autoloop, "persist_futures_cycle_progress", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(autoloop.job_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(futures_cycle_store, "update_futures_cycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        autoloop, "_record_futures_cycle_rejection",
+        autoloop_cycle_records, '_record_futures_cycle_rejection',
         lambda *args, **kwargs: seen.setdefault("rejections", []).append(kwargs),
     )
     proposal = {
@@ -680,7 +710,7 @@ def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monk
     }
 
     result = autoloop.DailyResult(ticker="BTC-USD")
-    autoloop._process_futures_candidate(
+    autoloop_futures_execution._process_futures_candidate(
         executor, "BTC-USD", "Buy", {}, result,
         context=context, proposal=proposal,
         portfolio=PortfolioContext(cash=1_000.0, currency="USDT"),

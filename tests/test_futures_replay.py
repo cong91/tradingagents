@@ -15,7 +15,7 @@ that it should.
 
 import pytest
 
-from server import autoloop, futures_replay as replay
+from server import autoloop_futures_context, futures_replay as replay
 
 pytestmark = pytest.mark.unit
 
@@ -39,7 +39,7 @@ def test_baseline_rule_matches_production_confirmation_state():
     cycles = [cycle for cycle in replay.load_cycles() if cycle.had_snapshot]
     for cycle in cycles:
         signal = cycle.signal or "Hold"
-        assert replay.baseline_confirms(cycle.context, signal) == autoloop._confirmation_state(
+        assert replay.baseline_confirms(cycle.context, signal) == autoloop_futures_context._confirmation_state(
             cycle.context, signal,
         )
 

@@ -6,6 +6,11 @@ import type { NextConfig } from "next";
 const apiBase = process.env.API_INTERNAL_URL ?? "http://127.0.0.1:8000";
 
 const nextConfig: NextConfig = {
+  // Verification builds go to their own directory so a build never fights the
+  // dev server over .next (Next 16 dropped the CLI --dist-dir flag). The
+  // browser fixture test builds with NEXT_DIST_DIR=.next-verify and serves that
+  // output; the default stays .next for dev and normal production builds.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   async redirects() {
     // /pipeline đã gộp vào trang Hoạt động bot; /scanner cũng vậy. Bookmark cũ
     // của người dùng phải về đích mới thay vì 404 (temporary: có thể đổi lại).

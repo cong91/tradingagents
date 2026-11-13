@@ -4,9 +4,9 @@ type PageCopy = { title: string; description: string };
 
 export const vi = {
   overview: {
-    title: "Tổng quan lợi nhuận",
+    title: "Tổng quan vận hành",
     description:
-      "Alpha tích luỹ của các quyết định đã chốt, hiệu suất theo thời gian và lệnh thực thi gần đây.",
+      "Bản tin vận hành chỉ đọc: việc cần xử lý, kết quả đã đối soát, rủi ro đang mở và hoạt động của bot hôm nay.",
   },
   approvals: {
     title: "Duyệt lệnh",
@@ -32,9 +32,9 @@ export const vi = {
 
 export const en: typeof vi = {
   overview: {
-    title: "P&L overview",
+    title: "Operations overview",
     description:
-      "Cumulative alpha of resolved decisions, performance over time and recent executed orders.",
+      "Read-only operating brief: what needs handling, the reconciled result, open risk and what the bot is doing today.",
   },
   approvals: {
     title: "Order approvals",

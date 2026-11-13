@@ -229,6 +229,10 @@ reports/
 # Next.js control panel (web/)
 web/node_modules/
 web/.next/
+# Verification build output (NEXT_DIST_DIR); the dashboard gate writes here so a
+# running dev server keeps .next. Untracked generated output must never be
+# linted, committed, or counted as a change.
+web/.next-verify/
 
 # Control-panel server state (watchlist, approval queue, server audit trail)
 server/data/

@@ -58,9 +58,6 @@ if (requestedLocale) {
   i18nLocale.getLocale = () => requestedLocale;
 }
 
-const { PerformancePositions } = require(
-  path.join(webRoot, "components/overview/performance-positions.tsx")
-);
 const { PerformanceHistory } = require(
   path.join(webRoot, "components/overview/performance-history.tsx")
 );
@@ -85,13 +82,12 @@ const { ResolvedList } = require(
 const cases = JSON.parse(fs.readFileSync(0, "utf8"));
 const rendered = Object.fromEntries(Object.entries(cases).map(([name, item]) => {
   const component = item.component === "history" ? PerformanceHistory
-    : item.component === "portfolio" ? PortfolioCard
     : item.component === "performance" ? PerformanceCard
     : item.component === "chip" ? ExecStatusChipView
     : item.component === "audit_table" ? AuditLogTable
     : item.component === "funnel" ? FuturesCycleFunnel
     : item.component === "resolved" ? ResolvedList
-    : PerformancePositions;
+    : PortfolioCard;
   return [name, renderToStaticMarkup(React.createElement(component, item.props))];
 }));
 process.stdout.write(JSON.stringify(rendered));
@@ -106,6 +102,8 @@ class RenderedHtml(HTMLParser):
         self.rows = {}
         self._elements = []
         self._row = None
+        self._caption = None
+        self._caption_parts = None
         self.feed(markup)
 
     @property
@@ -121,7 +119,11 @@ class RenderedHtml(HTMLParser):
         self._elements.append((tag, label))
         if label:
             self.regions.add(label)
-        if tag == "tr":
+        if tag == "caption":
+            self._caption_parts = []
+        elif tag == "table":
+            self._caption = None
+        elif tag == "tr":
             self._row = {"region": self._active_region(), "text": [], "cells": [], "cell": None}
         elif tag in {"td", "th"} and self._row is not None:
             self._row["cell"] = []
@@ -132,17 +134,26 @@ class RenderedHtml(HTMLParser):
 
     def handle_data(self, data):
         self.text_parts.append(data)
+        if self._caption_parts is not None:
+            self._caption_parts.append(data)
         if self._row is not None:
             self._row["text"].append(data)
             if self._row["cell"] is not None:
                 self._row["cell"].append(data)
 
     def handle_endtag(self, tag):
+        if tag == "caption" and self._caption_parts is not None:
+            self._caption = " ".join("".join(self._caption_parts).split())
+            self._caption_parts = None
         if tag in {"td", "th"} and self._row is not None and self._row["cell"] is not None:
             self._row["cells"].append(" ".join("".join(self._row["cell"]).split()))
             self._row["cell"] = None
         if tag == "tr" and self._row is not None:
-            region = self._row["region"]
+            # Rows are keyed by their owning region when one exists, else by the
+            # table's sr-only caption — the Portfolio card (the positions owner
+            # since the performance/positions split) labels its tables via
+            # captions, not role="region".
+            region = self._row["region"] or self._caption
             if region:
                 text = " ".join("".join(self._row["text"]).split())
                 self.rows.setdefault(region, []).append({"text": text, "cells": self._row["cells"]})
@@ -175,6 +186,8 @@ def _futures(positions, *, read=None):
 def _portfolio_props(
     *, source="venue", spot_positions=None, futures=None, stale=False, futures_stale=False,
 ):
+    """Props of the component that owns the positions tables since the
+    performance/positions split: the Portfolio card."""
     data = {
         "generated_at": "2026-11-02T12:00:00Z",
         "positions_source": source,
@@ -183,7 +196,7 @@ def _portfolio_props(
         "futures": futures,
     }
     return {
-        "portfolioState": {"status": "ready", "data": data, "fetchedAt": 0},
+        "state": {"status": "ready", "data": data, "fetchedAt": 0},
         "stale": stale,
         "futuresStale": futures_stale,
         "onRetry": None,
@@ -345,14 +358,14 @@ def _cases():
     }
     cases = {
         "venue_snapshot": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(
                 spot_positions=[{"ticker": "BTC", "quantity": 0.25, "marked_price": 67000}],
                 futures=venue_futures,
             ),
         },
         "audit_spot": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(
                 source="audit",
                 spot_positions=[{"ticker": "UNI", "quantity": 10, "marked_price": 8.5}],
@@ -360,27 +373,27 @@ def _cases():
             ),
         },
         "missing_futures_positions": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(futures=_futures(None)),
         },
         "partial_futures_positions": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(
                 futures=_futures([_position("HYPE/USDT:USDT")], read=_read_status("partial")),
             ),
         },
         "empty_partial_futures": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(
                 futures=_futures([], read=_read_status("partial")),
             ),
         },
         "stale_empty_futures": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(futures=_futures([]), stale=True),
         },
         "missing_observed_at": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(
                 futures=_futures([], read=_read_status(observed_at=None)),
             ),
@@ -399,14 +412,14 @@ def _cases():
             },
         },
         "scope_only": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(futures=_futures([], read={
                 **_read_status("partial"),
                 "issues": [{"symbol": None, "reason": "scope_unverified"}],
             })),
         },
         "monitor_position_missing": {
-            "component": "positions",
+            "component": "portfolio",
             "props": _portfolio_props(futures=_futures(
                 [_position("ZEC/USDT:USDT")], read={
                     **_read_status("partial"),
@@ -576,9 +589,9 @@ def test_default_locale_renders_english_copy(rendered_default_locale):
 def test_venue_snapshot_renders_reported_spot_and_futures_with_full_precision(rendered):
     page = rendered["venue_snapshot"]
 
-    assert "Bảng vị thế Spot, có thể cuộn ngang" in page.regions
-    assert "BTC" in page.rows["Bảng vị thế Spot, có thể cuộn ngang"][1]["text"]
-    futures_rows = page.rows["Bảng vị thế Futures, có thể cuộn ngang"]
+    spot_rows = page.rows["Vị thế Spot đang mở theo từng mã"]
+    assert "BTC" in spot_rows[1]["text"]
+    futures_rows = page.rows["Các vị thế Futures do sàn báo cáo"]
     assert all(
         symbol in " ".join(row["text"] for row in futures_rows)
         for symbol in ("HYPE/USDT:USDT", "SOL/USDT:USDT", "XPL/USDT:USDT")
@@ -591,7 +604,7 @@ def test_audit_derived_spot_rows_are_not_rendered_as_current_positions(rendered)
 
     assert "Vị thế Spot hiện tại không khả dụng vì không có snapshot được xác minh từ sàn." in page.text
     assert not any("UNI" in row for rows in page.rows.values() for row in rows)
-    assert "Bảng vị thế Spot, có thể cuộn ngang" not in page.regions
+    assert "Vị thế Spot đang mở theo từng mã" not in page.rows
 
 
 def test_missing_futures_positions_are_reported_as_unavailable_not_empty(rendered):
@@ -604,7 +617,7 @@ def test_missing_futures_positions_are_reported_as_unavailable_not_empty(rendere
 def test_partial_futures_snapshot_warns_that_positions_may_be_missing(rendered):
     page = rendered["partial_futures_positions"]
 
-    assert "Chưa xác minh được danh sách Futures đầy đủ; có thể còn vị thế chưa hiển thị." in page.text
+    assert "Danh sách vị thế Futures có thể không đầy đủ; không thể xác nhận toàn bộ vị thế đang mở." in page.text
 
 
 def test_missing_monitored_position_names_the_symbol_and_reason(rendered):
@@ -614,7 +627,7 @@ def test_missing_monitored_position_names_the_symbol_and_reason(rendered):
         "ZEC/USDT:USDT: Vị thế đang được hệ thống quản lý nhưng không có trong danh sách sàn"
         in page.text
     )
-    assert "Chưa xác minh được danh sách Futures đầy đủ" in page.text
+    assert "Danh sách vị thế Futures có thể không đầy đủ" in page.text
 
 
 def test_empty_partial_futures_snapshot_is_not_claimed_to_be_flat(rendered):
@@ -627,21 +640,29 @@ def test_empty_partial_futures_snapshot_is_not_claimed_to_be_flat(rendered):
 def test_stale_empty_futures_snapshot_is_not_claimed_to_be_flat(rendered):
     page = rendered["stale_empty_futures"]
 
-    assert "Dữ liệu vị thế đã cũ, không phản ánh trạng thái hiện tại." in page.text
+    assert "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc" in page.text
     assert "Chưa thể xác nhận có vị thế Futures đang mở hay không." in page.text
 
 
 def test_missing_futures_observation_time_is_explicitly_unverified(rendered):
     page = rendered["missing_observed_at"]
 
-    assert "Thời điểm đọc vị thế: không xác định." in page.text
+    # No read time may be claimed when there is none: the "read at" line is
+    # absent and the unverified alert stands instead.
+    assert "Thời điểm đọc vị thế tại sàn:" not in page.text
     assert "Không xác định được thời điểm đọc vị thế Futures; không thể xác nhận dữ liệu hiện tại." in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
+def test_a_verified_read_states_its_exchange_time(rendered):
+    page = rendered["venue_snapshot"]
+
+    assert "Thời điểm đọc vị thế tại sàn: " in page.text
+    assert "2/11/26" in page.text
+
+
 @pytest.mark.parametrize("condition", ["unavailable", "error"])
-def test_futures_unavailable_does_not_mark_fresh_spot_stale(rendered, component, condition):
-    page = rendered[f"{component}_{condition}"]
+def test_futures_unavailable_does_not_mark_fresh_spot_stale(rendered, condition):
+    page = rendered[f"portfolio_{condition}"]
 
     assert "BTC" in page.text
     assert "Dữ liệu Spot đã cũ" not in page.text
@@ -655,10 +676,9 @@ def test_futures_unavailable_does_not_mark_fresh_spot_stale(rendered, component,
     assert "Sàn không báo vị thế Futures đang mở" not in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
 @pytest.mark.parametrize("condition", ["old", "missing_time", "invalid_time"])
-def test_unverified_futures_do_not_hide_fresh_spot(rendered, component, condition):
-    page = rendered[f"{component}_{condition}"]
+def test_unverified_futures_do_not_hide_fresh_spot(rendered, condition):
+    page = rendered[f"portfolio_{condition}"]
 
     assert "BTC" in page.text
     assert "Dữ liệu Spot đã cũ" not in page.text
@@ -670,70 +690,65 @@ def test_unverified_futures_do_not_hide_fresh_spot(rendered, component, conditio
         assert "Không xác định được thời điểm đọc vị thế Futures" in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_missing_futures_timestamp_never_claims_empty_even_without_stale_prop(rendered, component):
-    page = rendered[f"{component}_missing_time_unflagged"]
+def test_missing_futures_timestamp_never_claims_empty_even_without_stale_prop(rendered):
+    page = rendered["portfolio_missing_time_unflagged"]
 
     assert "Không xác định được thời điểm đọc vị thế Futures" in page.text
     assert "Chưa thể xác nhận có vị thế Futures đang mở hay không." in page.text
     assert "Sàn không báo vị thế Futures đang mở" not in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_fresh_futures_empty_snapshot_still_reports_no_open_positions(rendered, component):
-    page = rendered[f"{component}_fresh"]
+def test_fresh_futures_empty_snapshot_still_reports_no_open_positions(rendered):
+    page = rendered["portfolio_fresh"]
 
     assert "BTC" in page.text
     assert "Sàn không báo vị thế Futures đang mở" in page.text
     assert "Dữ liệu Futures đã cũ" not in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_last_poll_error_marks_spot_and_futures_stale(rendered, component):
-    page = rendered[f"{component}_poll_error"]
+def test_last_poll_error_marks_spot_and_futures_stale(rendered):
+    page = rendered["portfolio_poll_error"]
 
     assert "offline" in page.text
     assert "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc" in page.text
     assert "Sàn không báo vị thế Futures đang mở" not in page.text
-    if component == "performance":
-        assert "Dữ liệu Spot đã cũ" in page.text
-        assert "Bảng vị thế Spot, có thể cuộn ngang" not in page.regions
-    else:
-        assert "đang hiển thị dữ liệu cũ" in page.text
+    assert "đang hiển thị dữ liệu cũ" in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_fresh_empty_spot_is_not_suppressed_by_stale_futures(rendered, component):
-    page = rendered[f"{component}_empty_spot_old_futures"]
+def test_fresh_empty_spot_is_not_suppressed_by_stale_futures(rendered):
+    page = rendered["portfolio_empty_spot_old_futures"]
 
-    if component == "performance":
-        assert "Không có tài sản Spot được hệ thống nhận diện trong snapshot này" in page.text
-    else:
-        assert "Chưa có dữ liệu Spot" in page.text
+    assert "Chưa có dữ liệu Spot" in page.text
     assert "Snapshot Spot đã cũ" not in page.text
     assert "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc" in page.text
     assert "Sàn không báo vị thế Futures đang mở" not in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_stale_portfolio_marks_spot_and_futures_stale(rendered, component):
-    page = rendered[f"{component}_stale_snapshot"]
+def test_stale_portfolio_marks_spot_and_futures_stale(rendered):
+    page = rendered["portfolio_stale_snapshot"]
 
     assert "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc" in page.text
     assert "Sàn không báo vị thế Futures đang mở" not in page.text
-    if component == "performance":
-        assert "Dữ liệu Spot đã cũ" in page.text
-    else:
-        assert "Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận." in page.text
+    assert "Snapshot đã cũ; trạng thái Spot và Futures hiện tại chưa được xác nhận." in page.text
 
 
-@pytest.mark.parametrize("component", ["performance", "portfolio"])
-def test_stale_nonempty_futures_are_explicitly_labelled(rendered, component):
-    page = rendered[f"{component}_old_positions"]
+def test_stale_nonempty_futures_are_explicitly_labelled(rendered):
+    page = rendered["portfolio_old_positions"]
 
     assert "BTC" in page.text
     assert "HYPE/USDT:USDT" in page.text
     assert "Dữ liệu Futures đã cũ hoặc chưa xác minh được thời điểm đọc" in page.text
+
+
+def test_performance_card_does_not_duplicate_the_positions_owner(rendered):
+    """The positions dedup (one data, one home) is itself pinned: the trading
+    performance card keeps fills + events and never re-renders the position
+    tables the Portfolio card owns."""
+    page = rendered["performance_old_positions"]
+
+    assert "Các vị thế Futures do sàn báo cáo" not in page.rows
+    assert "Vị thế Spot đang mở theo từng mã" not in page.rows
+    assert "HYPE/USDT:USDT" not in page.text
 
 
 def test_scope_only_warning_does_not_claim_partial_read(rendered):

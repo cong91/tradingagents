@@ -13,6 +13,7 @@ import { formatDateTimeVi } from "./format-time";
 import { InterfacePreferencesCard } from "./interface-preferences-card";
 import { LLM_SETTING_KEYS, LlmConfigCard } from "./llm-config-card";
 import { OperatorModes, OperatorRisk } from "./operator-config-card";
+import { OperatorForecast } from "./operator-forecast-card";
 import { useOperatorConfig } from "./operator-config-controller";
 import { PathsCard } from "./paths-card";
 import { SaveBar } from "./save-bar";
@@ -28,6 +29,7 @@ export function SettingsScreen() {
   const c = t.settings.screen;
   const controller = useSettings();
   const operator = useOperatorConfig();
+  const { reload: reloadOperator } = operator;
   const [area, setArea] = useState<SettingsArea>("automation");
   const [llmDirty, setLlmDirty] = useState(false);
   const [cookiesDirty, setCookiesDirty] = useState(false);
@@ -60,6 +62,12 @@ export function SettingsScreen() {
     return () => clearTimeout(scrollId);
   }, [area, operator.phase, controller.phase]);
 
+  useEffect(() => {
+    if (controller.saveState.kind === "saved" && controller.saveState.scope === "kronos-profile") {
+      void reloadOperator();
+    }
+  }, [controller.saveState, reloadOperator]);
+
   const unsaved = controller.dirtyCount > 0 || operator.dirtyCount > 0 || llmDirty || cookiesDirty || scheduleDirty;
   useUnsavedNavigation(unsaved, c.leaveUnsaved);
 
@@ -88,10 +96,14 @@ export function SettingsScreen() {
 
   const selectArea = useCallback((next: SettingsArea) => setArea(next), []);
   const systemRows = rowsByArea.system;
+  const otherAiRows = rowsByArea.ai.filter((row) => !row.key.startsWith("kronos_active_"));
   const aiKeys = [
     ...LLM_SETTING_KEYS,
-    ...rowsByArea.ai.map((row) => row.key),
+    ...otherAiRows.map((row) => row.key),
   ];
+  const kronosUncertainConflict = controller.saveState.kind === "uncertain" &&
+    controller.saveState.scope === "kronos-profile" && controller.serverAhead;
+  const nonKronosUncertain = controller.saveState.kind === "uncertain" && controller.saveState.scope !== "kronos-profile";
   const systemKeys = systemRows.map((row) => row.key);
   const connectionKeys = rowsByArea.connections.map((row) => row.key);
   const riskKeys = rowsByArea.risk.map((row) => row.key);
@@ -128,7 +140,7 @@ export function SettingsScreen() {
           {controller.serverAhead ? (
             <div id="settings-conflict" role="status" className="mb-4 space-y-3 rounded-md border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
               <p>{c.serverAhead}</p>
-              {controller.saveState.kind === "uncertain" ? <p role="alert">{t.settings.save.uncertain}</p> : null}
+              {controller.saveState.kind === "uncertain" && (!kronosUncertainConflict || area !== "ai") && (!nonKronosUncertain || area !== "ai") ? <p role="alert">{t.settings.save.uncertain}</p> : null}
               {Object.keys(controller.conflictValues).length > 0 ? (
                 <div>
                   <h3 className="font-medium">{c.conflictTitle}</h3>
@@ -185,13 +197,14 @@ export function SettingsScreen() {
           </section>
           <section id="ai" hidden={area !== "ai"} className="space-y-4">
             {controller.payload ? <LlmConfigCard controller={controller} onDirtyChange={setLlmDirty} /> : null}
-            {rowsByArea.ai.length ? (
-              <details className="rounded-md border bg-card p-4" open={rowsByArea.ai.some((row) => Boolean(controller.fieldErrors[row.key])) || undefined}>
+            {otherAiRows.length ? (
+              <details className="rounded-md border bg-card p-4" open={otherAiRows.some((row) => Boolean(controller.fieldErrors[row.key])) || undefined}>
                 <summary className="cursor-pointer text-sm font-medium">{c.advanced}</summary>
-                <div className="mt-4"><SettingsSection title={t.settings.groups.llm.title} description={t.settings.groups.llm.description} rows={rowsByArea.ai} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
+                <div className="mt-4"><SettingsSection title={t.settings.groups.llm.title} description={t.settings.groups.llm.description} rows={otherAiRows} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
               </details>
             ) : null}
-            {controller.payload ? <SaveBar controller={controller} keys={aiKeys} scope="ai" /> : null}
+            {controller.payload ? <div id="ai-general-save"><SaveBar controller={controller} keys={aiKeys} scope="ai" scopeLabel={t.settings.groups.llm.title} suppressUncertainMessage={controller.saveState.kind === "uncertain" && controller.saveState.scope === "kronos-profile"} /></div> : null}
+            <OperatorForecast controller={controller} operator={operator} />
           </section>
           <section id="risk" hidden={area !== "risk"} className="space-y-4">
             {operatorAllowlist !== null || operator.phase !== "ready" ? <OperatorRisk controller={operator} /> : null}
@@ -203,13 +216,13 @@ export function SettingsScreen() {
                 <div className="mt-4"><SettingsSection title={t.settings.groups.risk.title} description={t.settings.groups.risk.description} rows={rowsByArea.risk} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} /></div>
               </details>
             ) : null}
-            {operatorAllowlist !== null && riskKeys.length ? <SaveBar controller={controller} keys={riskKeys} scope="risk" /> : null}
+            {operatorAllowlist !== null && riskKeys.length ? <SaveBar controller={controller} keys={riskKeys} scope="risk" suppressUncertainMessage={kronosUncertainConflict || (nonKronosUncertain && controller.serverAhead)} /> : null}
           </section>
           <section id="connections" hidden={area !== "connections"} className="space-y-4">
             {rowsByArea.connections.length ? (
               <SettingsSection title={t.settings.groups.exec.title} description={t.settings.groups.exec.description} rows={rowsByArea.connections} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} />
             ) : null}
-            {connectionKeys.length ? <SaveBar controller={controller} keys={connectionKeys} scope="connections" /> : null}
+            {connectionKeys.length ? <SaveBar controller={controller} keys={connectionKeys} scope="connections" suppressUncertainMessage={kronosUncertainConflict || (nonKronosUncertain && controller.serverAhead)} /> : null}
             <DataSourceCard onDirtyChange={setCookiesDirty} />
           </section>
           <section id="system" hidden={area !== "system"} className="space-y-4">
@@ -220,7 +233,7 @@ export function SettingsScreen() {
                 <div className="mt-4"><SettingsSection title={c.otherTitle} description={c.otherDescription} rows={systemRows} values={controller.formValues} errors={controller.fieldErrors} onChange={controller.setValue} showTechnicalDetails /></div>
               </details>
             ) : null}
-            {systemKeys.length ? <SaveBar controller={controller} keys={systemKeys} scope="system" /> : null}
+            {systemKeys.length ? <SaveBar controller={controller} keys={systemKeys} scope="system" suppressUncertainMessage={kronosUncertainConflict || (nonKronosUncertain && controller.serverAhead)} /> : null}
             {grouped ? <PathsCard rows={grouped.pathRows} /> : null}
           </section>
         </div>

@@ -187,6 +187,22 @@ async def put_settings(request: Request):
                 422, "coercion_error", str(exc), {"env_var": env_var, "message": str(exc)}
             ) from exc
 
+    # The selected model-tokenizer pair must be in the verified registry.
+    kronos_fields = [key for key in validated if key.startswith("kronos_active_")]
+    if kronos_fields:
+        from tradingagents.forecast.settings import tuning_problems
+
+        current_config = get_config()
+        problems = tuning_problems(validated, current_config)
+        if problems:
+            raise ApiError(
+                422, "validation_error",
+                "the Kronos model-tokenizer pair is invalid: " + "; ".join(
+                    f"{key}: {reason}" for key, reason in sorted(problems.items())
+                ),
+                {"fields": problems},
+            )
+
     set_config(validated)  # in-memory: effective for runs created after this call
     # Durable in PostgreSQL (0006_engine_settings.sql), re-applied at boot
     # between the env layer and the operator overrides — .env is never written

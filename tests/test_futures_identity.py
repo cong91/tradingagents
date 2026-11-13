@@ -471,7 +471,8 @@ def test_migration_is_additive_nullable_and_not_backfilled():
     assert "update bracket_recovery_tasks" not in sql
     from server import postgres
 
-    assert [migration.version for migration in postgres._load_migrations()] == [1, 2, 3, 4, 5, 6, 7]
+    # The shipped migrations are applied in order.
+    assert [migration.version for migration in postgres._load_migrations()] == list(range(1, 13))
 
 
 @pytest.mark.integration
@@ -522,6 +523,7 @@ def test_fresh_postgres_upgrade_preserves_unbound_rows(monkeypatch):
                 "1, '[]'::jsonb, 'now')"
             )
 
+        monkeypatch.setattr(postgres, "_load_migrations", lambda: migrations[:5])
         assert postgres.migrate() == ["0005_futures_account_identity.sql"]
         with psycopg.connect(scoped_dsn) as conn:
             position = conn.execute(

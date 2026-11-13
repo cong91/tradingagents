@@ -15,6 +15,8 @@ export function areaForHash(hash: string): SettingsArea | null {
 export function areaForSetting(key: string): SettingsArea {
   if (key === "benchmark_ticker" || key === "checkpoint_enabled") return "system";
   if (key === "quick_think_fallback_models" || key === "deep_think_fallback_models" || key === "max_tool_rounds") return "ai";
+  // The Kronos profile is displayed with its read-only readiness in the AI area.
+  if (key.startsWith("kronos_active_")) return "ai";
   const group = SETTING_GROUPS.find((candidate) => candidate.keys.includes(key));
   if (group?.id === "llm") return "ai";
   if (group?.id === "exec") return "connections";

@@ -13,13 +13,13 @@ import {
 } from "@/components/ui/card";
 import { useT, type Messages } from "@/lib/i18n";
 import { formatDateTimeVi } from "./format-time";
-import { useOperatorConfig, type OperatorConfigController } from "./operator-config-controller";
+import { type OperatorConfigController } from "./operator-config-controller";
 import {
   isOperatorGateKey,
+  operatorGateKeys,
   operatorRiskGroup,
   operatorSection,
   type OperatorRiskGroup,
-  type OperatorSection,
   type OperatorSettingRow,
   type OperatorValue,
 } from "./operator-config-types";
@@ -109,7 +109,7 @@ function OperatorRow({ row, controller }: { row: OperatorSettingRow; controller:
   const meta = t.settings.settingMeta[row.key];
   const rowLabel = row.gate ? t.settings.gateLabels[row.key] ?? row.label : meta?.label ?? row.label;
   const rowHint = row.gate ? t.settings.gateHints[row.key] ?? row.hint : meta?.hint ?? row.hint;
-  const switchControl = row.gate && isOperatorGateKey(row.key);
+  const switchControl = row.gate;
   const pending = controller.changed.includes(row.key);
   const invalid = controller.invalidKeys.includes(row.key);
   const id = `operator-${row.key}`;
@@ -132,7 +132,11 @@ function OperatorRow({ row, controller }: { row: OperatorSettingRow; controller:
           <Badge variant={row.override ? "secondary" : "outline"}>
             {row.override ? c.overridden : c.noOverride}
           </Badge>
-          {row.gate ? <Badge variant="destructive">{c.gate}</Badge> : null}
+          {row.gate ? (
+            <Badge variant="outline">
+              {isOperatorGateKey(row.key) ? c.gate : c.contextSwitch}
+            </Badge>
+          ) : null}
         </div>
         <p id={!row.gate && rowHint ? `${id}-hint` : undefined} className="mt-0.5 text-xs text-muted-foreground">{rowHint}</p>
         {switchControl ? (
@@ -227,12 +231,14 @@ function OperatorSectionView({
   section,
   controller,
 }: {
-  section: OperatorSection;
+  section: "modes" | "risk";
   controller: OperatorConfigController;
 }) {
   const t = useT();
   const c = t.settings.operator;
-  const title = c.groups[section === "modes" ? "gates" : "risk"];
+  // The section key ("modes") and the copy group key ("gates") differ on
+  // purpose: the modes card is titled "Chế độ tự động", not "modes".
+  const title = c.groups[section === "modes" ? "gates" : section];
   const { payload } = controller;
   if (controller.phase === "loading") {
     return (
@@ -262,7 +268,7 @@ function OperatorSectionView({
   }
 
   const rows = payload.settings.filter((row) => operatorSection(row) === section);
-  const changes = controller.sectionChanges[section];
+  const changes = controller.sectionChanges[section] ?? [];
   const groups = section === "modes"
     ? [{ id: "gates", title: "", rows }]
     : riskOrder.map((id) => ({
@@ -273,6 +279,9 @@ function OperatorSectionView({
   const labels = changes.map((key) => t.settings.gateLabels[key] ?? key).join(", ");
   const feedback = controller.feedback[section];
   const hasInvalid = changes.some((key) => controller.invalidKeys.includes(key));
+  const gateKeys = operatorGateKeys(payload.settings);
+  const sectionGateChange = changes.some((key) => gateKeys.has(key));
+  const reasonInputId = "operator-gate-reason";
   return (
     <Card id={section === "modes" ? "operator-config" : "operator-risk"}>
       <CardHeader>
@@ -308,10 +317,14 @@ function OperatorSectionView({
             controller={controller}
           />
         ))}
-        {section === "modes" && changes.length > 0 ? (
+        {sectionGateChange ? (
           <div className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
-            <p className="text-sm font-medium">{c.gateChanges(labels)}</p>
-            <p className="text-xs text-muted-foreground">{c.gateWarning}</p>
+            <p className="text-sm font-medium">
+              {c.gateChanges(labels)}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {c.gateWarning}
+            </p>
             <label className="flex min-touch items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -322,9 +335,11 @@ function OperatorSectionView({
               />
               {c.confirm}
             </label>
-            <label htmlFor="operator-gate-reason" className="text-sm font-medium">{c.reasonLabel}</label>
+            <label htmlFor={reasonInputId} className="text-sm font-medium">
+              {c.reasonLabel}
+            </label>
             <input
-              id="operator-gate-reason"
+              id={reasonInputId}
               type="text"
               value={controller.reason}
               disabled={controller.saving}
@@ -347,7 +362,7 @@ function OperatorSectionView({
             className="min-touch"
             disabled={
               controller.saving || controller.refreshing || controller.serverAhead || controller.refreshFailed || changes.length === 0 || hasInvalid ||
-              (section === "modes" && (!controller.confirmGate || !controller.reason.trim()))
+              (sectionGateChange && (!controller.confirmGate || !controller.reason.trim()))
             }
             onClick={() => void controller.save(section)}
           >
@@ -375,14 +390,4 @@ export function OperatorModes({ controller }: { controller: OperatorConfigContro
 
 export function OperatorRisk({ controller }: { controller: OperatorConfigController }) {
   return <OperatorSectionView section="risk" controller={controller} />;
-}
-
-export function OperatorConfigCard() {
-  const controller = useOperatorConfig();
-  return (
-    <div className="space-y-4">
-      <OperatorModes controller={controller} />
-      <OperatorRisk controller={controller} />
-    </div>
-  );
 }

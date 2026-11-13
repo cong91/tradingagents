@@ -278,6 +278,59 @@ def _row(key: str, stored: dict[str, dict]) -> dict:
     }
 
 
+def _kronos_section() -> dict:
+    """Readiness and derived inputs for the selected active Kronos pair."""
+    from tradingagents.forecast.artifact import (
+        isolated_model_dir,
+        isolated_python,
+        isolated_source_dir,
+        profile_for,
+        verify_artifacts,
+    )
+    from tradingagents.forecast.settings import settings_from_config
+
+    settings = settings_from_config(get_config())
+    python = isolated_python()
+    try:
+        profile = profile_for(settings.profile)
+    except ValueError as exc:
+        problem = str(exc)
+        profile = None
+    verified = False
+    if profile is not None and not python.exists():
+        problem = f"the isolated Kronos interpreter is absent ({python})"
+    elif profile is not None:
+        try:
+            problem, _verified = verify_artifacts(
+                isolated_source_dir(), isolated_model_dir(), settings.profile,
+            )
+        except OSError as exc:
+            problem = f"the pinned artifacts could not be inspected: {exc}"
+        else:
+            verified = problem is None
+    return {
+        "profile_id": settings.profile,
+        "timeframe": settings.timeframe,
+        "horizon_hours": settings.horizon_hours,
+        "lookback_bars": settings.lookback_bars,
+        "max_context": profile.max_context if profile is not None else None,
+        "paths": settings.paths,
+        "temperature": settings.temperature,
+        "readiness": {
+            "status": "ready" if problem is None else "unavailable",
+            "reason": problem,
+            "verified": verified,
+        },
+        "model": {
+            "source_revision": profile.source_revision if profile is not None else "",
+            "model_revision": profile.model_revision if profile is not None else "",
+            "repo": profile.model_repo if profile is not None else "",
+            "tokenizer_revision": profile.tokenizer_revision if profile is not None else "",
+            "tokenizer_repo": profile.tokenizer_repo if profile is not None else "",
+        },
+    }
+
+
 def _payload() -> dict:
     stored = {row["key"]: row for row in control_store.load_operator_setting_rows()}
     rows = [_row(key, stored) for key in _ALLOWED]
@@ -297,6 +350,7 @@ def _payload() -> dict:
             "any_auto_enabled": any(modes.values()),
         },
         "effective_exec_mode": effective_exec_mode(),
+        "kronos": _kronos_section(),
         "allowlist": sorted(_ALLOWED),
     }
 
