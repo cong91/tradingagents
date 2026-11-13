@@ -65,6 +65,22 @@ FAKE_API = r"""
   function brief() {
     if (state.brief === 500) return null;
     const hidden = state.coverageOnly === true;
+    const closureMode = state.closureEvidence || "complete";
+    const recordedClosed = ["partial-zero", "absent"].includes(closureMode) ? 0 : 1;
+    const closureEvidence = closureMode === "absent" ? null : {
+      status: closureMode === "complete" ? "complete" : "partial",
+      verified_closed: closureMode === "complete" ? 1 : 0,
+      unverified_positions: closureMode === "complete" ? 0 : 1,
+      unverified_closed_timestamps: closureMode === "complete" ? 0 : recordedClosed,
+      reason: closureMode === "complete" ? null : "Some recorded closures lack stored-fill proof.",
+    };
+    const positions = {
+      total: 1, closed: recordedClosed, recorded_closed: recordedClosed,
+      first_opened: "2026-11-09T23:55:00Z",
+      last_closed: recordedClosed ? "2026-11-10T01:00:00Z" : null,
+      ...(closureEvidence ? {closure_evidence: closureEvidence} : {}),
+    };
+
     return {
       generated_at: "2026-11-10T09:25:00Z", stale_after: 30, read_only: true,
       disclaimer: "Research framework — not financial advice.",
@@ -77,13 +93,13 @@ FAKE_API = r"""
       funnel: {status: "ok", buckets: {entered: 2}, total: 2},
       results: {
         ledger: hidden
-          ? {status: "partial", positions: {total: 1, closed: 1}, fills: 2,
+          ? {status: "partial", positions, fills: 2,
              totals: {realized_by_currency: {USDT: "5"}, fee_by_currency: {},
                funding_by_currency: {}, net_by_currency: []},
              funding_unknown_currencies: [], fee_unknown_currencies: [],
              funding_observations: {status: "partial", events: [], truncated: false},
              coverage: coverage("error")}
-          : {status: "partial", positions: {total: 1, closed: 1}, fills: 2,
+          : {status: "partial", positions, fills: 2,
              totals: {realized_by_currency: {USDT: "5"}, fee_by_currency: {USDT: "0.25"},
                funding_by_currency: {}, net_by_currency: [netRow()]},
              funding_unknown_currencies: ["USDT"], fee_unknown_currencies: [],

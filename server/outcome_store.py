@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import json as _json_module
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from server import db
+from server import db, outcome_poll_lock
+from server.outcome_closure import verified_closure
 
 # The worker's restart-catch-up cursor row key in outcome_ledger_state.
 LEDGER_CURSOR_KEY = "outcome_ledger"
@@ -36,8 +39,90 @@ def _json(value: Any) -> str:
     return _json_module.dumps(value, default=str)
 
 
+def _stable_json(value: Any) -> str:
+    return _json_module.dumps(value, sort_keys=True, default=str)
+
+
+def _closure_evidence_current(conn: Any, position: dict[str, Any]) -> bool:
+    """Lock and compare the journal evidence captured before the venue read."""
+    snapshot = position.get("closure_evidence_snapshot")
+    if not isinstance(snapshot, dict):
+        return True
+    journal = snapshot.get("journal")
+    journal_task_id = journal.get("task_id") if isinstance(journal, dict) else None
+    current_journal = conn.execute(
+        """SELECT task_id, symbol, entry_order_id, close_side, quantity, legs,
+                  placed_ids, status, venue_key, account_identity_exchange,
+                  account_identity_profile, account_identity_type, account_identity_hash
+           FROM bracket_recovery_tasks WHERE task_id = %s FOR UPDATE""",
+        (journal_task_id,),
+    ).fetchone()
+    if current_journal is None:
+        return False
+
+    expected_cycle = snapshot.get("cycle")
+    cycle = conn.execute(
+        "SELECT cycle_id, symbol, payload FROM futures_cycles WHERE cycle_id = %s FOR UPDATE",
+        (position.get("cycle_id"),),
+    ).fetchone()
+    if cycle is None:
+        return False
+    payload = cycle["payload"] if isinstance(cycle["payload"], dict) else {}
+    current_cycle = {
+        "cycle_id": cycle["cycle_id"],
+        "symbol": cycle["symbol"],
+        "order_id": payload.get("order_id"),
+        "entry_intent_id": payload.get("entry_intent_id"),
+        "entry_provenance": payload.get("entry_provenance"),
+    }
+    if _stable_json(current_cycle) != _stable_json(expected_cycle):
+        return False
+
+    def evidence_row(row: Any) -> dict[str, Any]:
+        return {
+            "task_id": row["task_id"], "symbol": row["symbol"],
+            "entry_order_id": row.get("entry_order_id"), "close_side": row["close_side"],
+            "quantity": str(row["quantity"]) if row.get("quantity") is not None else None,
+            "legs": row["legs"],
+            "placed_ids": sorted(str(item) for item in (row["placed_ids"] or [])),
+            "status": row["status"], "venue_key": row["venue_key"],
+            "account_identity_exchange": row["account_identity_exchange"],
+            "account_identity_profile": row["account_identity_profile"],
+            "account_identity_type": row["account_identity_type"],
+            "account_identity_hash": row["account_identity_hash"],
+        }
+
+    if _stable_json(evidence_row(current_journal)) != _stable_json(journal):
+        return False
+
+    bracket = snapshot.get("bracket")
+    bracket_task_id = bracket.get("task_id") if isinstance(bracket, dict) else None
+    current_bracket = conn.execute(
+        """SELECT task_id, symbol, entry_order_id, close_side, legs, placed_ids,
+                  status, venue_key, account_identity_exchange,
+                  account_identity_profile, account_identity_type, account_identity_hash
+           FROM bracket_recovery_tasks WHERE task_id = %s FOR UPDATE""",
+        (bracket_task_id,),
+    ).fetchone() if bracket_task_id is not None else None
+    if (bracket is None) != (current_bracket is None):
+        return False
+    return bracket is None or _stable_json(evidence_row(current_bracket)) == _stable_json(bracket)
+
+
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+@contextmanager
+def _connection(*, write: bool = False) -> Iterator[Any]:
+    """Use the poll owner's session, or an independent session outside a poll."""
+    guard = outcome_poll_lock.current_guard()
+    if guard is not None:
+        with guard.transaction() as conn:
+            yield conn
+    else:
+        with (db.session() if write else db.read()) as conn:
+            yield conn
 
 
 def record_outcome(
@@ -54,41 +139,57 @@ def record_outcome(
     honestly. A replayed ingest of the same window returns all-duplicates and
     leaves every total unchanged.
     """
-    with db.session() as conn:
-        position_row = conn.execute(
-            """INSERT INTO outcome_positions
-               (outcome_id, account_id, cycle_id, client_order_id, venue_order_id,
-                symbol, market_type, side, planned_quantity, filled_quantity,
-                opened_at, closed_at, attribution, strategy_version, provenance)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-               ON CONFLICT (account_id, client_order_id) DO NOTHING
-               RETURNING outcome_id""",
-            (
-                _uuid(), account_id, position.get("cycle_id"),
-                position["client_order_id"], position.get("venue_order_id"),
-                position["symbol"], position["market_type"], position["side"],
-                position.get("planned_quantity"), position["filled_quantity"],
-                position.get("opened_at"), position.get("closed_at"),
-                position["attribution"], position.get("strategy_version"),
-                _json(position.get("provenance") or {}),
-            ),
-        ).fetchone()
-        if position_row is None:
+    with _connection(write=True) as conn:
+        evidence_current = _closure_evidence_current(conn, position)
+        if position.get("reconcile") and not fills:
             outcome_row = conn.execute(
                 """SELECT outcome_id, symbol, side, market_type, planned_quantity,
                           venue_order_id, cycle_id FROM outcome_positions
                    WHERE account_id = %s AND client_order_id = %s FOR UPDATE""",
                 (account_id, position["client_order_id"]),
             ).fetchone()
-            identity_fields = (
-                "symbol", "side", "market_type", "planned_quantity", "venue_order_id", "cycle_id",
-            )
-            if any(outcome_row[key] != position.get(key) for key in identity_fields):
-                raise ValueError("conflicting position identity")
+            if outcome_row is None:
+                return {
+                    "positions_new": 0, "fills_new": 0, "fills_duplicate": 0,
+                    "exits_new": 0, "funding_new": 0,
+                }
             positions_new = 0
         else:
-            outcome_row = position_row
-            positions_new = 1
+            inserted = conn.execute(
+                """INSERT INTO outcome_positions
+                   (outcome_id, account_id, cycle_id, client_order_id, venue_order_id,
+                    symbol, market_type, side, planned_quantity, filled_quantity,
+                    opened_at, closed_at, attribution, strategy_version, provenance)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                   ON CONFLICT (account_id, client_order_id) DO NOTHING
+                   RETURNING outcome_id, symbol, side, market_type, planned_quantity,
+                             venue_order_id, cycle_id""",
+                (
+                    _uuid(), account_id, position.get("cycle_id"),
+                    position["client_order_id"], position.get("venue_order_id"),
+                    position["symbol"], position["market_type"], position["side"],
+                    position.get("planned_quantity"), position["filled_quantity"],
+                    position.get("opened_at"), position.get("closed_at"),
+                    position["attribution"], position.get("strategy_version"),
+                    _json(position.get("provenance") or {}),
+                ),
+            ).fetchone()
+            if inserted is None:
+                outcome_row = conn.execute(
+                    """SELECT outcome_id, symbol, side, market_type, planned_quantity,
+                              venue_order_id, cycle_id FROM outcome_positions
+                       WHERE account_id = %s AND client_order_id = %s FOR UPDATE""",
+                    (account_id, position["client_order_id"]),
+                ).fetchone()
+                positions_new = 0
+            else:
+                outcome_row = inserted
+                positions_new = 1
+        identity_fields = (
+            "symbol", "side", "market_type", "planned_quantity", "venue_order_id", "cycle_id",
+        )
+        if any(outcome_row[key] != position.get(key) for key in identity_fields):
+            raise ValueError("conflicting position identity")
         outcome_id = outcome_row["outcome_id"]
 
         fills_new = fills_duplicate = 0
@@ -193,14 +294,6 @@ def record_outcome(
                           MAX(occurred_at) FILTER (WHERE role = 'exit') AS closed_at
                    FROM outcome_fills WHERE outcome_id = %s""", (outcome_id,),
             ).fetchone()
-            planned = position.get("planned_quantity")
-            if planned is None:
-                planned = totals["entry_qty"]
-            already_closed = conn.execute(
-                "SELECT closed_at FROM outcome_positions WHERE outcome_id = %s FOR UPDATE",
-                (outcome_id,),
-            ).fetchone()["closed_at"]
-            closed_at = already_closed
             chronology = conn.execute(
                 """SELECT MIN(balance) AS minimum_balance FROM (
                        SELECT SUM(CASE WHEN role = 'entry' THEN quantity ELSE -quantity END)
@@ -209,25 +302,69 @@ def record_outcome(
                        FROM outcome_fills WHERE outcome_id = %s
                    ) timeline""", (outcome_id,),
             ).fetchone()
-            # Closure is position-scoped fill evidence (plan §4.4): entry total
-            # equals the journaled venue-rounded plan and exit total equals the
-            # entry total with a sane chronology. Venue-window completeness is
-            # a coverage concern — the CCXT reader reports "partial" on every
-            # successful read, so gating closure on it would freeze every
-            # production position open forever. A missed fill shows up as a
-            # totals mismatch, which keeps the position open.
-            if (planned is not None
-                    and planned > 0 and totals["entry_qty"] == planned
-                    and totals["exit_qty"] == totals["entry_qty"]
-                    and totals["opened_at"] is not None and totals["closed_at"] is not None
-                    and chronology["minimum_balance"] >= 0):
-                closed_at = totals["closed_at"]
+            stored_fill_rows = conn.execute(
+                """SELECT venue_trade_id AS trade_id, venue_order_id AS order_id,
+                          symbol, side, role, quantity, price, occurred_at
+                   FROM outcome_fills WHERE outcome_id = %s""",
+                (outcome_id,),
+            ).fetchall()
+            stored_fill_facts = [
+                {
+                    "trade_id": row["trade_id"],
+                    "order_id": row["order_id"],
+                    "symbol": row["symbol"],
+                    "side": row["side"],
+                    "role": row["role"],
+                    "quantity": str(row["quantity"]),
+                    "price": str(row["price"]),
+                    "occurred_at": row["occurred_at"].isoformat(),
+                }
+                for row in stored_fill_rows
+            ]
+            proof = verified_closure(
+                fill_history=position.get("fill_history"),
+                planned_quantity=position.get("planned_quantity"),
+                entry_quantity=totals["entry_qty"],
+                exit_quantity=totals["exit_qty"],
+                opened_at=totals["opened_at"],
+                closed_at=totals["closed_at"],
+                minimum_balance=chronology["minimum_balance"],
+                entry_order_final=position.get("entry_order_final"),
+                expected_identity=position.get("closure_identity") or {},
+                fill_facts=position.get("closure_fill_facts") or [],
+                stored_fill_facts=stored_fill_facts,
+            ) if evidence_current else None
+            existing_closure = conn.execute(
+                """SELECT closed_at, provenance FROM outcome_positions
+                   WHERE outcome_id = %s FOR UPDATE""", (outcome_id,),
+            ).fetchone()
+            provenance = dict(position.get("provenance") or {})
+            provenance["history_complete"] = position.get("history_complete") is True
+            provenance["closure_verdict"] = "verified" if proof is not None else "unverified"
+            provenance["closure_verdict_at"] = datetime.now(UTC).isoformat()
+            if proof is not None:
+                provenance.pop("recorded_closed_at", None)
+                provenance["closure_proof_version"] = proof["version"]
+                provenance["closure_proof"] = proof
+            else:
+                previous_provenance = dict(existing_closure["provenance"] or {})
+                recorded_closed_at = (
+                    existing_closure["closed_at"]
+                    or previous_provenance.get("recorded_closed_at")
+                )
+                provenance.pop("closure_proof_version", None)
+                provenance.pop("closure_proof", None)
+                if recorded_closed_at is not None:
+                    provenance["recorded_closed_at"] = (
+                        recorded_closed_at.isoformat()
+                        if hasattr(recorded_closed_at, "isoformat") else recorded_closed_at
+                    )
             conn.execute(
                 """UPDATE outcome_positions SET filled_quantity = %s, opened_at = %s,
                    closed_at = %s, provenance = %s::jsonb WHERE outcome_id = %s""",
-                (totals["entry_qty"], totals["opened_at"], closed_at,
-                 _json({**(position.get("provenance") or {}),
-                        "history_complete": position.get("history_complete")}), outcome_id),
+                (totals["entry_qty"], totals["opened_at"],
+                 proof["closed_at"] if proof is not None else None,
+                 _json(provenance), outcome_id),
             )
 
     return {
@@ -241,7 +378,7 @@ def record_outcome(
 
 def upsert_coverage(row: dict[str, Any]) -> None:
     """Insert or refresh one coverage row keyed by (account, window)."""
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         conn.execute(
             """INSERT INTO outcome_coverage
                (account_id, window_start, window_end, fills_found,
@@ -278,7 +415,7 @@ def upsert_coverage(row: dict[str, Any]) -> None:
 
 def get_cursor(key: str = LEDGER_CURSOR_KEY) -> str | None:
     """The worker's persisted cursor value, or None before the first run."""
-    with db.read() as conn:
+    with _connection() as conn:
         row = conn.execute(
             "SELECT cursor_value FROM outcome_ledger_state WHERE state_key = %s",
             (key,),
@@ -288,7 +425,7 @@ def get_cursor(key: str = LEDGER_CURSOR_KEY) -> str | None:
 
 def set_cursor(value: str, key: str = LEDGER_CURSOR_KEY) -> None:
     """Persist the cursor so a restart catches up from where it left off."""
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         conn.execute(
             """INSERT INTO outcome_ledger_state (state_key, cursor_value, updated_at)
                VALUES (%s, %s, %s)
@@ -311,7 +448,7 @@ def set_state(value: str, key: str) -> None:
 
 def clear_state(key: str) -> None:
     """Drop one worker bookkeeping value (e.g. after a successful retry)."""
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         conn.execute(
             "DELETE FROM outcome_ledger_state WHERE state_key = %s", (key,),
         )
@@ -319,7 +456,7 @@ def clear_state(key: str) -> None:
 
 def schedule_reconciliation(cycle_id: str) -> None:
     """Keep a durable round-robin queue even before a position has fills."""
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         conn.execute(
             """INSERT INTO outcome_ledger_state (state_key, cursor_value, updated_at)
                VALUES (%s, %s, %s) ON CONFLICT (state_key) DO NOTHING""",
@@ -328,16 +465,14 @@ def schedule_reconciliation(cycle_id: str) -> None:
 
 
 def reconciliation_batch(*, batch_size: int) -> list[dict[str, Any]]:
-    """Claim the least recently attempted cycles, including closed positions.
+    """Rotate the least recently attempted cycles, including closed positions.
 
-    Claiming locks the batch rows (FOR UPDATE SKIP LOCKED) and bumps their
-    updated_at in the same transaction: a concurrent poller skips the held
-    rows instead of double-reading the same venue window, and the bump
-    rotates the claimed batch to the back of the round-robin queue.
+    The poll's session advisory lock owns the work through venue reads;
+    this short transaction only rotates the bounded round-robin batch.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         rows = conn.execute(
             """WITH claimed AS (
                    SELECT s.state_key
@@ -364,7 +499,7 @@ def reconciliation_batch(*, batch_size: int) -> list[dict[str, Any]]:
 
 def schedule_existing_positions(*, batch_size: int) -> None:
     """Enqueue previously recorded positions without altering their history."""
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         conn.execute(
             """INSERT INTO outcome_ledger_state (state_key, cursor_value, updated_at)
                SELECT 'reconcile:' || p.cycle_id, p.cycle_id, now()
@@ -386,7 +521,7 @@ def record_funding_observations(account_id: str, venue_key: str, account_type: s
     if any(not isinstance(event, dict) or not isinstance(event.get("id"), str)
            or not event["id"].strip() or event["id"] != event["id"].strip() for event in events):
         raise ValueError("funding observation requires a venue income ID")
-    with db.session() as conn:
+    with _connection(write=True) as conn:
         for event in events:
             inserted = conn.execute(
                 """INSERT INTO outcome_funding_observations
@@ -414,8 +549,27 @@ def record_funding_observations(account_id: str, venue_key: str, account_type: s
                     raise ValueError("conflicting venue funding identity")
 
 
+def revoke_cycle_closure(cycle_id: str, reason: str) -> None:
+    """Revoke stale closure proof while retaining the recorded timestamp."""
+    with _connection(write=True) as conn:
+        conn.execute(
+            """UPDATE outcome_positions
+               SET provenance = (provenance - 'closure_proof_version' - 'closure_proof')
+                   || CASE WHEN closed_at IS NULL
+                           THEN '{}'::jsonb
+                           ELSE jsonb_build_object('recorded_closed_at', closed_at::text)
+                      END
+                   || jsonb_build_object('closure_verdict', 'unverified',
+                                         'closure_verdict_at', %s::text,
+                                         'closure_verdict_reason', %s::text),
+                   closed_at = NULL
+               WHERE cycle_id = %s""",
+            (datetime.now(UTC).isoformat(), reason, cycle_id),
+        )
+
+
 def stored_cycle_fills(account_id: str, cycle_id: str) -> list[dict]:
-    with db.read() as conn:
+    with _connection() as conn:
         rows = conn.execute(
             """SELECT f.venue_trade_id, f.symbol, f.realized_pnl, f.realized_pnl_currency
                FROM outcome_fills f JOIN outcome_positions p ON p.outcome_id = f.outcome_id
@@ -432,10 +586,9 @@ def terminal_cycles_after(
 ) -> list[dict[str, Any]]:
     """The next bounded batch of terminal cycles in stable (updated_at, id) order.
 
-    The cursor is the last processed (updated_at, cycle_id) pair, so a restart
-    resumes exactly where it stopped: nothing reprocessed, nothing skipped,
-    whatever batch size the caller bounds. This is the durable pagination the
-    plan requires — never a ``LIMIT``-from-top read that silently drops rows.
+    The cursor is the last processed (updated_at, cycle_id) pair. A restart
+    resumes after it, and previously attempted cycles can be retried when a
+    poll does not reach its cursor update.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -451,7 +604,7 @@ def terminal_cycles_after(
         params.extend([cursor_updated_at, cursor_cycle_id or ""])
     query += " ORDER BY updated_at ASC, cycle_id ASC LIMIT %s"
     params.append(batch_size)
-    with db.read() as conn:
+    with _connection() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(row) for row in rows]
 
@@ -478,14 +631,14 @@ def find_journal_tasks(symbol: str, venue_order_id: str | None = None, *,
     if intent_id is not None:
         query += " AND task_id = %s"
         params.append(intent_id)
-    with db.read() as conn:
+    with _connection() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(row) for row in rows]
 
 
 def find_bracket_tasks(symbol: str, entry_order_id: str) -> list[dict[str, Any]]:
     """Return all bracket evidence rows; callers must reject ambiguity."""
-    with db.read() as conn:
+    with _connection() as conn:
         rows = conn.execute(
             """SELECT task_id, symbol, entry_order_id, close_side, legs, placed_ids,
                       status, venue_key, account_identity_exchange,

@@ -146,7 +146,9 @@ def redact_proposal(proposal: Any) -> dict:
         return {}
     allowed = (
         "margin_mode", "leverage", "risk_fraction", "margin_fraction",
-        "entry_price", "stop_loss", "take_profit",
+        "entry_price", "stop_loss", "take_profit", "scale_out_enabled",
+        "scale_out_first_r", "scale_out_first_fraction", "scale_out_second_r",
+        "scale_out_second_fraction",
     )
     sanitized = {}
     for key in allowed:
@@ -154,6 +156,11 @@ def redact_proposal(proposal: Any) -> dict:
         if key == "margin_mode":
             if isinstance(value, str) and value in ("isolated", "cross"):
                 sanitized[key] = value
+        elif key == "scale_out_enabled":
+            if isinstance(value, bool):
+                sanitized[key] = value
+            elif key in proposal and value is None:
+                sanitized[key] = None
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             if math.isfinite(float(value)):
                 sanitized[key] = value

@@ -46,8 +46,14 @@ def _recorded_cycle(candle: Candle, signal: str = "Buy", *, confirmed: str | Non
     cycle_payload = dict(payload) if payload is not None else {"agent_proposal": {
         "entry_price": candle.close, "stop_loss": candle.close * 0.98,
         "take_profit": candle.close * 1.04, "leverage": 1.0,
-        "risk_fraction": 0.01,
+        "risk_fraction": 0.01, "margin_fraction": 0.25,
+        "margin_mode": "isolated", "scale_out_enabled": False,
     }}
+    cycle_payload.setdefault("pm_decision", {"futures_execution_intent": "enter"})
+    cycle_payload.setdefault("proposal_validation", {
+        "valid": confirmed not in ("direction_mismatch", "doji_candle"),
+        "reason": confirmed if confirmed in ("direction_mismatch", "doji_candle") else None,
+    })
     cycle_payload.setdefault("phase_timestamps", {
         "analysis_finished_at": datetime.fromtimestamp(
             (decision_ms - 60_000) / 1000, UTC,
@@ -98,9 +104,9 @@ def test_rule_baseline_imports_the_production_rule_not_a_fork():
     cycle = _recorded_cycle(candle)
     rule = futures_replay.baseline_confirms
     source = rule_source(rule, [cycle])
-    # The rule's verdict is available when the snapshot evidence closed, so the
-    # proposal rides the snapshot's own 4h bar; the engine fills one bar later.
-    proposal = source(candle)
+    # Recorded lifecycle timestamps postdate the snapshot evidence, so the
+    # proposal is available only on the following eligible 4h candle.
+    proposal = source(_activated_candle(candle))
     # The source carries the rule function identity itself — no fork object.
     assert source.rule_fn is rule  # type: ignore[attr-defined]
     # The recorded snapshot's directions make the rule confirm; the proposal
@@ -138,6 +144,36 @@ def test_recorded_baseline_passes_a_confirmed_entry_through():
     assert proposal is not None
     assert proposal.stop_loss == pytest.approx(101.0 * 0.98)
     assert proposal.take_profit == pytest.approx(101.0 * 1.04)
+
+
+def test_recorded_source_requires_explicit_entry_intent_validation_and_terms():
+    candle = _candle(_START, 101.0)
+    incomplete = _recorded_cycle(candle)
+    incomplete["payload"].pop("pm_decision")
+    source = recorded_source(
+        [incomplete], confirmation_rule=futures_replay.baseline_confirms,
+    )
+    assert source(_activated_candle(candle)) is None
+    assert source.skipped["missing_intent"] == 1
+    assert source.coverage_status == "insufficient_evidence"
+
+    incomplete = _recorded_cycle(candle)
+    incomplete["payload"]["agent_proposal"].pop("margin_mode")
+    source = recorded_source(
+        [incomplete], confirmation_rule=futures_replay.baseline_confirms,
+    )
+    assert source(_activated_candle(candle)) is None
+    assert source.skipped["missing_terms"] == 1
+
+
+def test_exported_fixture_remains_insufficient_proposal_evidence():
+    import json
+
+    rows = json.loads(futures_replay.FIXTURE_PATH.read_text(encoding="utf-8"))
+    source = rule_source(futures_replay.baseline_confirms, rows)
+    assert source.built == 0
+    assert source.coverage_status == "insufficient_evidence"
+    assert source.skipped["missing_intent"] > 0
 
 
 def test_unknown_ablation_knob_is_refused_not_ignored():
@@ -281,11 +317,14 @@ def _snapshot_cycle(
                 "volume": 10.0, "is_closed": four_hour_closed,
             },
         },
-        "payload": {"agent_proposal": {
-            "entry_price": 101.0, "stop_loss": stop_loss,
-            "take_profit": take_profit, "leverage": 1.0,
-            "risk_fraction": 0.01,
-        }},
+        "payload": {"pm_decision": {"futures_execution_intent": "enter"},
+                    "proposal_validation": {"valid": True},
+                    "agent_proposal": {
+                        "entry_price": 101.0, "stop_loss": stop_loss,
+                        "take_profit": take_profit, "leverage": 1.0,
+                        "risk_fraction": 0.01, "margin_fraction": 0.25,
+                        "margin_mode": "isolated", "scale_out_enabled": False,
+                    }},
     }
     if decision_at is not None:
         row["proposal_validated_at"] = decision_at
@@ -364,7 +403,26 @@ def test_recorded_source_scopes_events_by_symbol_and_timeframe():
     assert foreign_timeframe is None
 
 
-def test_recorded_source_skips_conflicting_duplicate_events_without_overwrite():
+def test_source_rejection_diagnostics_are_deterministic_across_row_order():
+    first = _snapshot_cycle("BTC/USDT:USDT", _START, _START)
+    duplicate = _snapshot_cycle(
+        "BTC/USDT:USDT", _START, _START,
+        decision_at=datetime.fromtimestamp(
+            (_START + 14_400_000 + 120_000) / 1000, UTC,
+        ).isoformat(),
+        stop_loss=97.0,
+    )
+    original = _recorded_cycle(_candle(_START, 101.0), confirmed="direction_mismatch")
+    rows = [first, duplicate, original]
+    diagnostics = []
+    for ordering in (rows, list(reversed(rows)), [rows[1], rows[0], rows[2]]):
+        source = recorded_source(
+            ordering, confirmation_rule=futures_replay.baseline_confirms,
+        )
+        diagnostics.append((source.skipped, source.built, source.coverage_status))
+    assert diagnostics[0] == diagnostics[1] == diagnostics[2]
+
+
     decision_at = datetime.fromtimestamp((_START + 14_400_000 + 120_000) / 1000, UTC).isoformat()
     first = _snapshot_cycle(
         "BTC/USDT:USDT", _START, _START, decision_at=decision_at,
@@ -378,5 +436,128 @@ def test_recorded_source_skips_conflicting_duplicate_events_without_overwrite():
         [first, duplicate], confirmation_rule=futures_replay.baseline_confirms,
     )
 
-    assert source(_candle(_START, 101.0)) is None
-    assert source.skipped["duplicate_event"] == 2
+    assert source(_candle(_START + 14_400_000, 101.0)) is None
+    assert source.skipped["duplicate_conflict"] == 2
+
+
+@pytest.mark.parametrize("intent", ["structured_terms_unavailable", "unexpected"])
+def test_unknown_intent_makes_source_evidence_incomplete(intent):
+    candle = _candle(_START, 101.0)
+    unknown = _recorded_cycle(_candle(_START + _DAY_MS, 102.0))
+    unknown["payload"]["pm_decision"]["futures_execution_intent"] = intent
+    source = rule_source(futures_replay.baseline_confirms, [_recorded_cycle(candle), unknown])
+    assert source.skipped["missing_intent"] == 1
+    assert source.skipped["non_entry_intent"] == 0
+    assert source.coverage_status == "insufficient_evidence"
+
+
+@pytest.mark.parametrize("intent", ["abstain", "manage_existing"])
+def test_known_non_entry_intent_does_not_make_other_evidence_incomplete(intent):
+    candle = _candle(_START, 101.0)
+    non_entry = _recorded_cycle(_candle(_START + _DAY_MS, 102.0))
+    non_entry["payload"]["pm_decision"]["futures_execution_intent"] = intent
+    source = rule_source(futures_replay.baseline_confirms, [_recorded_cycle(candle), non_entry])
+    assert source.skipped["non_entry_intent"] == 1
+    assert source.coverage_status == "sufficient_evidence"
+
+
+def test_recorded_confirmation_rejection_overrides_valid_proposal():
+    candle = _candle(_START, 101.0)
+    cycle = _recorded_cycle(candle, confirmed="direction_mismatch")
+    cycle["payload"]["proposal_validation"] = {"valid": True}
+    source = recorded_source([cycle], confirmation_rule=futures_replay.baseline_confirms)
+    assert source(_activated_candle(candle)) is None
+    assert source.skipped["recorded_rejection"] == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_replay_preserves_recorded_scale_out_policy(enabled):
+    candle = _candle(_START, 101.0)
+    cycle = _recorded_cycle(candle)
+    cycle["payload"]["agent_proposal"]["scale_out_enabled"] = enabled
+    source = rule_source(futures_replay.baseline_confirms, [cycle])
+    assert source(_activated_candle(candle)).scale_out_enabled is enabled
+
+
+@pytest.mark.parametrize("value", [None, "false", 0])
+def test_replay_refuses_missing_or_invalid_scale_out_policy(value):
+    candle = _candle(_START, 101.0)
+    cycle = _recorded_cycle(candle)
+    cycle["payload"]["agent_proposal"]["scale_out_enabled"] = value
+    source = rule_source(futures_replay.baseline_confirms, [cycle])
+    assert source(_activated_candle(candle)) is None
+    assert source.coverage_status == "insufficient_evidence"
+
+
+def test_replay_coverage_counts_only_holdout_activation_candles():
+    candle = _candle(_START, 101.0)
+    source = rule_source(futures_replay.baseline_confirms, [_recorded_cycle(candle)])
+    matching = _activated_candle(candle)
+    missing_time = _candle(matching.open_time + _DAY_MS, 101.0)
+    foreign_symbol = _symbol_candle("ETH/USDT:USDT", "4h", matching.open_time, 101.0)
+    foreign_timeframe = _symbol_candle(candle.symbol, "1h", matching.open_time, 101.0)
+    assert source.coverage_for([matching])["status"] == "sufficient_evidence"
+    for unmatched in (missing_time, foreign_symbol, foreign_timeframe):
+        coverage = source.coverage_for([unmatched])
+        assert coverage["built"] == 0
+        assert coverage["status"] == "insufficient_evidence"
+
+
+def test_replay_coverage_ignores_incomplete_evidence_outside_holdout():
+    candle = _candle(_START, 101.0)
+    outside = _recorded_cycle(_candle(_START + _DAY_MS, 102.0))
+    outside["payload"].pop("pm_decision")
+    source = rule_source(futures_replay.baseline_confirms, [_recorded_cycle(candle), outside])
+    assert source.coverage_status == "insufficient_evidence"
+    coverage = source.coverage_for([_activated_candle(candle)])
+    assert coverage["status"] == "sufficient_evidence"
+    assert coverage["skipped"]["missing_intent"] == 0
+
+
+def test_holdout_coverage_detects_conflicts_with_other_activation_times():
+    first = _candle(_START, 101.0)
+    conflicting = _recorded_cycle(first)
+    later_ms = first.close_time + 2 * _DAY_MS
+    conflicting["payload"]["phase_timestamps"]["proposal_validated_at"] = datetime.fromtimestamp(
+        later_ms / 1000, UTC,
+    ).isoformat()
+    independent = _candle(_START + _DAY_MS, 102.0)
+    source = rule_source(
+        futures_replay.baseline_confirms,
+        [_recorded_cycle(first), conflicting, _recorded_cycle(independent)],
+    )
+    coverage = source.coverage_for([_activated_candle(first), _activated_candle(independent)])
+    assert coverage["built"] == 1
+    assert coverage["skipped"]["duplicate_conflict"] == 2
+    assert coverage["status"] == "insufficient_evidence"
+
+
+def test_holdout_coverage_handles_repeated_reference_to_one_row():
+    candle = _candle(_START, 101.0)
+    cycle = _recorded_cycle(candle)
+    source = rule_source(futures_replay.baseline_confirms, [cycle, cycle])
+    coverage = source.coverage_for([_activated_candle(candle)])
+    assert coverage["input_count"] == 2
+    assert coverage["skipped"]["duplicate_event"] == 1
+    assert coverage["status"] == "sufficient_evidence"
+
+
+def test_conflicting_identities_are_checked_before_rule_filtering():
+    candle = _candle(_START, 101.0)
+    accepted = _recorded_cycle(candle)
+    rejected = _recorded_cycle(candle, signal="Sell")
+    for rows in ([accepted, rejected], [rejected, accepted]):
+        source = rule_source(futures_replay.baseline_confirms, rows)
+        assert source(_activated_candle(candle)) is None
+        assert source.skipped["duplicate_conflict"] == 2
+        assert source.coverage_status == "insufficient_evidence"
+
+
+def test_conflicting_recorded_confirmation_reasons_cannot_restore_entry():
+    candle = _candle(_START, 101.0)
+    entry = _recorded_cycle(candle)
+    rejection = _recorded_cycle(candle, confirmed="direction_mismatch")
+    for rows in ([entry, rejection], [rejection, entry]):
+        source = recorded_source(rows, confirmation_rule=futures_replay.baseline_confirms)
+        assert source(_activated_candle(candle)) is None
+        assert source.skipped["duplicate_conflict"] == 2

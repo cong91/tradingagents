@@ -347,6 +347,21 @@ def _process_futures_candidate(
         )
         return
     proposal_validation = {"valid": True, "reason": None}
+    scale_out_policy = {
+        "enabled": config.get("risk_derivatives_scale_out_enabled") is True,
+        "first_r": config.get("risk_derivatives_scale_out_first_r", 1.0),
+        "first_fraction": config.get("risk_derivatives_scale_out_first_fraction", 0.33),
+        "second_r": config.get("risk_derivatives_scale_out_second_r", 2.0),
+        "second_fraction": config.get("risk_derivatives_scale_out_second_fraction", 0.33),
+    }
+    replay_terms = {
+        **futures_cycle_telemetry.redact_proposal(proposal),
+        "scale_out_enabled": scale_out_policy["enabled"],
+        "scale_out_first_r": scale_out_policy["first_r"],
+        "scale_out_first_fraction": scale_out_policy["first_fraction"],
+        "scale_out_second_r": scale_out_policy["second_r"],
+        "scale_out_second_fraction": scale_out_policy["second_fraction"],
+    }
     stop, take = terms["stop_loss"], terms["take_profit"]
     if stop is None or take is None:
         with telemetry.span("protective_bracket", ticker):
@@ -360,7 +375,7 @@ def _process_futures_candidate(
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
             telemetry={
-                **decision_data, "agent_proposal": futures_cycle_telemetry.redact_proposal(proposal),
+                **decision_data, "agent_proposal": replay_terms,
                 "effective_caps": cycle_payload.get("effective_caps", {}),
                 "proposal_validation": proposal_validation, "execution_status": "not_started",
             },
@@ -375,7 +390,7 @@ def _process_futures_candidate(
             signal_reason=result.reason, phase="proposal", snapshot=context,
             cycle_id=cycle_id, agent_note=agent_note,
             telemetry={
-                **decision_data, "agent_proposal": futures_cycle_telemetry.redact_proposal(proposal),
+                **decision_data, "agent_proposal": replay_terms,
                 "effective_caps": cycle_payload.get("effective_caps", {}),
                 "proposal_validation": proposal_validation, "execution_status": "not_started",
             },
@@ -395,7 +410,7 @@ def _process_futures_candidate(
         "confirmation_result": confirmation_ok,
         "confirmation_reason": confirmation_reason,
         "snapshot": futures_cycle_telemetry.snapshot_payload(context),
-        "agent_proposal": futures_cycle_telemetry.redact_proposal(proposal),
+        "agent_proposal": replay_terms,
         "proposal_validation": proposal_validation,
         "mark_price": mark,
         # HEAD carried the PM's verbatim decision onto the terminal success row;

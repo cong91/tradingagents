@@ -24,6 +24,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from server import outcome_store
+from server.outcome_closure import fill_history_complete as verify_fill_history_complete
+from server.outcome_poll_lock import PollLockBusyError, PollLockError, poll_lock
 from server.outcome_venue_reads import read_venue_window
 from tradingagents.dataflows.config import get_config
 from tradingagents.execution.futures_entry_journal import (
@@ -116,6 +118,43 @@ def _ms(moment: datetime) -> int:
     return int(moment.timestamp() * 1000)
 
 
+def _closure_evidence_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize mutable cycle/journal evidence for the final write fence."""
+    quantity = row.get("quantity")
+    return {
+        "task_id": row.get("task_id"),
+        "symbol": row.get("symbol"),
+        "entry_order_id": row.get("entry_order_id"),
+        "close_side": row.get("close_side"),
+        "quantity": str(quantity) if quantity is not None else None,
+        "legs": row.get("legs"),
+        "placed_ids": sorted(str(item) for item in (row.get("placed_ids") or [])),
+        "status": row.get("status"),
+        "venue_key": row.get("venue_key"),
+        "account_identity_exchange": row.get("account_identity_exchange"),
+        "account_identity_profile": row.get("account_identity_profile"),
+        "account_identity_type": row.get("account_identity_type"),
+        "account_identity_hash": row.get("account_identity_hash"),
+    }
+
+
+def _closure_evidence_snapshot(
+    cycle: dict[str, Any], journal: dict[str, Any], bracket: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = cycle.get("payload") if isinstance(cycle.get("payload"), dict) else {}
+    return {
+        "cycle": {
+            "cycle_id": cycle.get("cycle_id"),
+            "symbol": cycle.get("symbol"),
+            "order_id": payload.get("order_id"),
+            "entry_intent_id": payload.get("entry_intent_id"),
+            "entry_provenance": payload.get("entry_provenance"),
+        },
+        "journal": _closure_evidence_row(journal),
+        "bracket": _closure_evidence_row(bracket) if bracket is not None else None,
+    }
+
+
 def _process_cycle(
     cycle: dict[str, Any],
     *,
@@ -132,6 +171,7 @@ def _process_cycle(
     order_id = payload.get("order_id")
     symbol = str(cycle.get("symbol") or "")
     if payload.get("execution_status") not in ("executed", "uncertain") or not symbol:
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "cycle_not_executed")
         return {"cycle_id": cycle.get("cycle_id"), "result": "skipped_not_executed"}
 
     payload_marker = payload.get("entry_provenance")
@@ -139,14 +179,17 @@ def _process_cycle(
         # Old cycles have no account/intent binding in their payload. An
         # order ID plus symbol can collide across accounts, even with one
         # matching journal row, so it is not attribution evidence.
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_marker_unavailable")
         return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
     if (not valid_managed_live_provenance(payload_marker)
             or payload.get("entry_intent_id") != payload_marker.get("intent_id")
             or payload_marker.get("symbol") != symbol):
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_marker_invalid")
         return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
     tasks = outcome_store.find_journal_tasks(symbol, intent_id=payload_marker["intent_id"])
     tasks = [task for task in tasks if record_entry_provenance(task) == payload_marker]
     if len(tasks) != 1:
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_journal_ambiguous")
         return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_ambiguous_journal"}
     journal = tasks[0]
     marker = record_entry_provenance(journal)
@@ -159,13 +202,16 @@ def _process_cycle(
             or journal.get("close_side") != ("sell" if marker.get("side") == "buy" else "buy")
             or any(identity.get(key) != journal.get(f"account_identity_{key}")
                    for key in ("exchange", "profile", "type", "hash"))):
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_identity_mismatch")
         return {"cycle_id": cycle.get("cycle_id"), "result": "unattributed_no_marker"}
     placed_ids = journal.get("placed_ids") if isinstance(journal.get("placed_ids"), list) else []
     if order_id is None:
         if len(placed_ids) != 1 or not isinstance(placed_ids[0], str):
+            outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_order_unavailable")
             return {"cycle_id": cycle.get("cycle_id"), "result": "pending_order_evidence"}
         order_id = placed_ids[0]
     elif str(order_id) not in placed_ids:
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "entry_order_mismatch")
         return {"cycle_id": cycle.get("cycle_id"), "result": "pending_order_evidence"}
     cycle_order = CycleOrder(
         cycle_id=str(cycle.get("cycle_id")), order_id=str(order_id), symbol=symbol,
@@ -186,6 +232,7 @@ def _process_cycle(
         and task.get("account_identity_hash") == identity.get("hash")
     )]
     if len(bracket_tasks) > 1:
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "exit_evidence_ambiguous")
         return {"cycle_id": cycle_order.cycle_id, "result": "unattributed_ambiguous_bracket"}
     bracket_task = bracket_tasks[0] if bracket_tasks else None
     exit_evidence = bracket_exit_order_ids(
@@ -197,15 +244,27 @@ def _process_cycle(
 
     opened_at = _parse_iso(cycle.get("created_at"))
     if opened_at is None:
+        outcome_store.revoke_cycle_closure(str(cycle.get("cycle_id")), "cycle_timestamp_unavailable")
         return {"cycle_id": cycle_order.cycle_id, "result": "unavailable_cycle_timestamp"}
     now = datetime.now(UTC)
-    if fill_source is read_venue_window:
-        window = read_venue_window(account_id, symbol, _ms(opened_at), _ms(now),
-                                   expected_venue=journal["venue_key"])
-    else:
-        window = fill_source(account_id, symbol, _ms(opened_at), _ms(now))
+    requested_start = datetime.fromtimestamp(_ms(opened_at) / 1000, tz=UTC)
+    requested_end = datetime.fromtimestamp(_ms(now) / 1000, tz=UTC)
+    read_error: Exception | None = None
+    try:
+        if fill_source is read_venue_window:
+            window = read_venue_window(account_id, symbol, _ms(opened_at), _ms(now),
+                                       expected_venue=journal["venue_key"])
+        else:
+            window = fill_source(account_id, symbol, _ms(opened_at), _ms(now))
+    except Exception as exc:  # noqa: BLE001 - persist non-proof state before retrying
+        read_error = exc
+        window = {
+            "status": "error", "fills": [], "funding": None,
+            "warnings": [f"fill_history_read_error:{type(exc).__name__}"],
+        }
     source_status = str(window.get("status") or "unavailable")
-    raw_fills = window.get("fills") if isinstance(window.get("fills"), list) else []
+    raw_fill_value = window.get("fills")
+    raw_fills = raw_fill_value if isinstance(raw_fill_value, list) else []
     source_warnings = [str(item) for item in window.get("warnings") or []]
     warnings = list(source_warnings)
     warnings.extend(str(item) for item in window.get("funding_warnings") or [])
@@ -213,25 +272,15 @@ def _process_cycle(
     actual_end = _parse_iso(window.get("end_at"))
     source_start = actual_start or opened_at
     source_end = actual_end or now
-    # The reader accepts millisecond bounds; compare at that same precision.
-    requested_start = datetime.fromtimestamp(_ms(opened_at) / 1000, tz=UTC)
-    requested_end = datetime.fromtimestamp(_ms(now) / 1000, tz=UTC)
-    history_complete = (source_status == "ok" and not warnings and actual_start is not None
-                        and actual_end is not None and source_start <= requested_start
-                        and source_end >= requested_end)
-    seen_fill_ids: set[str] = set()
-    if any(not isinstance(raw, dict) or raw.get("symbol") != symbol for raw in raw_fills):
-        warnings.append("fill_symbol_or_shape_invalid")
-        history_complete = False
     if (actual_start is None or actual_end is None or source_start > requested_start
             or source_end < requested_end):
-        history_complete = False
         warnings.append("history_window_bounds_unverified")
-    if source_start > requested_start:
-        warnings.append("history_start_omits_position_window")
+    malformed_fills = int(not isinstance(raw_fill_value, list))
+    duplicate_fills = unattributed = contradictory_fills = 0
+    if malformed_fills:
+        warnings.append("fill_list_shape_invalid")
     funding_events = _funding_rows(window.get("funding"), cycle_order.cycle_id, account_id, opened_at)
-    # Funding observations are account scoped; their presence never proves a
-    # position-level allocation.
+    # Funding uncertainty is visible in coverage but cannot alter fill completeness.
     warnings.append("funding_position_attribution_unknown")
     if window.get("funding") is None:
         warnings.append("funding_history_unavailable")
@@ -242,13 +291,26 @@ def _process_cycle(
             account_id, journal["venue_key"], identity["type"], symbol, funding_events,
         )
 
-    managed = recovered = unattributed = 0
+    managed = recovered = 0
     fill_rows: list[dict[str, Any]] = []
+    seen_fill_ids: set[str] = set()
     side = "long" if (journal.get("close_side") == "sell") else "short"
     recovery_map = recovered_client_order_ids([journal])
     for raw in raw_fills:
         if not isinstance(raw, dict) or raw.get("symbol") != symbol:
+            malformed_fills += 1
+            warnings.append("fill_symbol_or_shape_invalid")
             continue
+        trade_id = raw.get("trade_id")
+        if not isinstance(trade_id, str) or not trade_id:
+            malformed_fills += 1
+            warnings.append("fill_missing_trade_id")
+            continue
+        if trade_id in seen_fill_ids:
+            duplicate_fills += 1
+            warnings.append("duplicate_fill_in_history")
+            continue
+        seen_fill_ids.add(trade_id)
         verdict = attribute_fill(raw.get("order_id"), symbol, cycle_order)
         if verdict.attribution == "unattributed":
             verdict = attribute_exit_fill(
@@ -268,28 +330,27 @@ def _process_cycle(
             "sell" if marker["side"] == "buy" else "buy"
         )
         if raw.get("side") != expected_side:
-            unattributed += 1
+            contradictory_fills += 1
+            warnings.append("fill_side_contradicts_order_evidence")
             continue
         managed += verdict.attribution == "managed"
         recovered += verdict.attribution == "recovered"
-        trade_id = raw.get("trade_id")
-        if not isinstance(trade_id, str) or not trade_id:
-            warnings.append("attributed_fill_missing_trade_id")
-            history_complete = False
+        quantity = _decimal(raw.get("contracts"))
+        price = _decimal(raw.get("price"))
+        timestamp = raw.get("timestamp")
+        if (quantity is None or quantity <= 0 or price is None or price <= 0
+                or _parse_iso(timestamp) is None):
+            malformed_fills += 1
+            warnings.append("attributed_fill_malformed")
             continue
-        if trade_id in seen_fill_ids:
-            warnings.append("duplicate_fill_in_history")
-            history_complete = False
-            continue
-        seen_fill_ids.add(trade_id)
         fill_rows.append({
             "venue_trade_id": trade_id,
             "venue_order_id": raw.get("order_id"),
             "symbol": symbol,
             "side": raw.get("side"),
             "role": "entry",  # partitioned below against the position's side
-            "quantity": _decimal(raw.get("contracts")),
-            "price": _decimal(raw.get("price")),
+            "quantity": quantity,
+            "price": price,
             "fee": _decimal(raw.get("fee")),
             "fee_currency": raw.get("fee_currency"),
             "realized_pnl": _decimal(raw.get("realized_pnl")),
@@ -297,64 +358,113 @@ def _process_cycle(
             "realized_pnl_semantics": (
                 REALIZED_PNL_EXCLUDES_FEE if identity.get("exchange") == "binance" else None
             ),
-            "occurred_at": raw.get("timestamp"),
+            "occurred_at": timestamp,
         })
-    complete_fills = [row for row in fill_rows if None not in (
-        row["quantity"], row["price"], row["occurred_at"],
-    ) and row["side"] in ("buy", "sell") and _parse_iso(row["occurred_at"]) is not None]
-    if len(complete_fills) != len(fill_rows) or unattributed:
-        warnings.append("fill_attribution_incomplete")
-        history_complete = False
+
     planned_quantity = _decimal(journal.get("quantity"))
-    entries, exits_fills = partition_position_fills(side, complete_fills)
-    if not entries:
-        history_complete = False
+    entries, exits_fills = partition_position_fills(side, fill_rows)
     filled_quantity = sum((row["quantity"] for row in entries), Decimal(0))
     partial_entry = bool(
-        complete_fills and planned_quantity is not None
-        and filled_quantity < planned_quantity
+        entries and planned_quantity is not None and filled_quantity < planned_quantity
     )
-    # A source can only establish completeness for the requested window, not
-    # while it reports unmapped or malformed fills.
-    history_complete = (history_complete and len(complete_fills) == len(fill_rows)
-                        and not unattributed)
-    if ingest and complete_fills:
-        for row in complete_fills:
+    fill_history = {
+        "source_status": source_status,
+        "source_certified_complete": window.get("fills_complete") is True,
+        "requested_start": requested_start.isoformat(),
+        "requested_end": requested_end.isoformat(),
+        "observed_start": actual_start.isoformat() if actual_start is not None else None,
+        "observed_end": actual_end.isoformat() if actual_end is not None else None,
+        "source_warnings": source_warnings,
+        "funding_warnings": [
+            *[str(item) for item in window.get("funding_warnings") or []],
+            "funding_position_attribution_unknown",
+        ],
+        "malformed_fill_count": malformed_fills,
+        "duplicate_fill_count": duplicate_fills,
+        "unattributed_fill_count": unattributed,
+        "contradictory_fill_count": contradictory_fills,
+    }
+    history_complete = verify_fill_history_complete(
+        source_status=source_status,
+        source_certified_complete=fill_history["source_certified_complete"],
+        requested_start=requested_start,
+        requested_end=requested_end,
+        observed_start=actual_start,
+        observed_end=actual_end,
+        source_warnings=source_warnings,
+        malformed_fill_count=malformed_fills,
+        duplicate_fill_count=duplicate_fills,
+        unattributed_fill_count=unattributed,
+        contradictory_fill_count=contradictory_fills,
+    )
+    if fill_rows:
+        for row in fill_rows:
             row["role"] = "entry" if row in entries else "exit"
-        opened_at = _first_ocurred(entries) or opened_at
-        position = {
-            "cycle_id": cycle_order.cycle_id,
+    entry_legs = [
+        leg for leg in journal.get("legs", [])
+        if isinstance(leg, dict) and leg.get("name") == "entry-intent"
+    ] if isinstance(journal.get("legs"), list) else []
+    entry_order_final = (
+        entry_legs[0].get("entry_order_final") if len(entry_legs) == 1 else None
+    )
+    position = {
+        "cycle_id": cycle_order.cycle_id,
+        "client_order_id": journal.get("entry_order_id"),
+        "venue_order_id": str(order_id),
+        "symbol": symbol,
+        "market_type": "perpetual",
+        "side": side,
+        "planned_quantity": planned_quantity,
+        "filled_quantity": filled_quantity,
+        "opened_at": (_first_ocurred(entries) or opened_at).isoformat(),
+        "closed_at": None,
+        "reconcile": True,
+        "history_complete": history_complete,
+        "fill_history": fill_history,
+        "entry_order_final": entry_order_final,
+        "closure_identity": {
+            "order_id": str(order_id),
             "client_order_id": journal.get("entry_order_id"),
-            "venue_order_id": str(order_id),
             "symbol": symbol,
-            "market_type": "perpetual",
-            "side": side,
-            "planned_quantity": planned_quantity,
-            "filled_quantity": filled_quantity,
-            "opened_at": opened_at.isoformat(),
-            "closed_at": None,
-            "reconcile": True,
-            "history_complete": history_complete,
-            "attribution": "recovered" if recovered and not managed else "managed",
-            "strategy_version": cycle.get("strategy_version"),
-            "provenance": {
-                "source": "outcome_ledger_worker",
-                "fill_source_status": source_status,
-                "journal_task_id": journal.get("task_id"),
-                "bracket_task_id": (bracket_task or {}).get("task_id"),
-                "venue_key": journal.get("venue_key"),
-            },
-        }
+            "venue_key": journal.get("venue_key"),
+            "account_id": account_id,
+            "account_identity": identity,
+        },
+        "closure_evidence_snapshot": _closure_evidence_snapshot(cycle, journal, bracket_task),
+        "closure_fill_facts": [
+            {
+                "trade_id": row["venue_trade_id"],
+                "order_id": row.get("venue_order_id"),
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "role": "entry" if row in entries else "exit",
+                "quantity": str(row["quantity"]),
+                "price": str(row["price"]),
+                "occurred_at": row["occurred_at"],
+            }
+            for row in fill_rows
+        ],
+        "attribution": "recovered" if recovered and not managed else "managed",
+        "strategy_version": cycle.get("strategy_version"),
+        "provenance": {
+            "source": "outcome_ledger_worker",
+            "fill_source_status": source_status,
+            "journal_task_id": journal.get("task_id"),
+            "bracket_task_id": (bracket_task or {}).get("task_id"),
+            "venue_key": journal.get("venue_key"),
+        },
+    }
+    exit_rows: list[dict[str, Any]] = []
+    if fill_rows:
+        for row in fill_rows:
+            row["role"] = "entry" if row in entries else "exit"
         exit_rows = _build_exit_rows(
             account_id, cycle_order.cycle_id, position, exits_fills, payload,
         )
-        counts = outcome_store.record_outcome(
-            account_id=account_id, position=position,
-            fills=complete_fills, exits=exit_rows, funding=[],
-        )
-    else:
-        counts = {"positions_new": 0, "fills_new": 0, "fills_duplicate": 0,
-                  "exits_new": 0, "funding_new": 0}
+    counts = outcome_store.record_outcome(
+        account_id=account_id, position=position,
+        fills=fill_rows, exits=exit_rows, funding=[],
+    )
 
     # Coverage: the venue's whole realized total in the window against what
     # the ledger actually attributed, with unattributed fills published.
@@ -363,7 +473,7 @@ def _process_cycle(
         for raw in raw_fills if isinstance(raw, dict)
     ]
     stored = outcome_store.stored_cycle_fills(account_id, cycle_order.cycle_id) if ingest else []
-    current_ids = {row["venue_trade_id"] for row in complete_fills}
+    current_ids = {row["venue_trade_id"] for row in fill_rows}
     ledger_realized = [
         CurrencyAmount(row["realized_pnl_currency"], row["realized_pnl"])
         for row in stored if row["venue_trade_id"] in current_ids and row["symbol"] == symbol
@@ -373,7 +483,7 @@ def _process_cycle(
         window_start=source_start.isoformat(),
         window_end=source_end.isoformat(),
         fills_found=len(raw_fills),
-        attributed_fill_count=len(complete_fills),
+        attributed_fill_count=len(fill_rows),
         venue_realized=venue_realized,
         ledger_realized=ledger_realized,
         unattributed_manual_detected=unattributed,
@@ -385,10 +495,14 @@ def _process_cycle(
     )
     if ingest:
         outcome_store.upsert_coverage(coverage)
+    if read_error is not None:
+        # Keep the failed observation visible and closure revoked, but let the
+        # bounded poll retry policy own the failure lifecycle.
+        raise RuntimeError(f"venue history read failed: {type(read_error).__name__}") from read_error
     return {
         "cycle_id": cycle_order.cycle_id,
-        "result": "recorded" if complete_fills else "no_fills_in_window",
-        "fills_attributed": len(complete_fills),
+        "result": "recorded" if fill_rows else "no_fills_in_window",
+        "fills_attributed": len(fill_rows),
         "unattributed": unattributed,
         "counts": counts,
     }
@@ -513,6 +627,15 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
         return {"status": "disabled"}
     if fill_source is None:
         fill_source = read_venue_window
+    try:
+        with poll_lock():
+            return _poll_owned(fill_source, batch_size=batch_size)
+    except PollLockBusyError:
+        return {"status": "busy"}
+
+
+def _poll_owned(fill_source: FillSource, *, batch_size: int) -> dict[str, Any]:
+    """Run discovery and reconciliation under the active poll owner."""
     cursor = outcome_store.get_cursor()
     if cursor is None:
         outcome_store.set_cursor(datetime.now(UTC).isoformat())
@@ -539,8 +662,16 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
             outcomes.append(_process_cycle(cycle, fill_source=fill_source, ingest=True))
             outcome_store.clear_state(f"failed:{cycle_id}")
             continue
+        except PollLockError:
+            raise
         except Exception as exc:  # noqa: BLE001 - one bad cycle must not stop the poll
             logger.warning("outcome ledger failed to process %s: %s", cycle_id, exc)
+            try:
+                outcome_store.revoke_cycle_closure(cycle_id, "cycle_processing_error")
+            except PollLockError:
+                raise
+            except Exception:
+                logger.exception("outcome ledger could not revoke stale closure %s", cycle_id)
             failure = repr(exc)
             outcomes.append({"cycle_id": cycle_id,
                              "result": f"error:{type(exc).__name__}"})
@@ -565,11 +696,25 @@ def poll_once(fill_source: FillSource | None = None, *, batch_size: int = DEFAUL
             continue
         try:
             reconciled.append(_process_cycle(cycle, fill_source=fill_source, ingest=True))
+            outcome_store.clear_state(f"failed:{cycle_id}")
+        except PollLockError:
+            raise
         except Exception as exc:  # noqa: BLE001 - a failed revisit must not starve others
             logger.warning("outcome ledger failed to reconcile %s: %s", cycle_id, exc)
+            try:
+                outcome_store.revoke_cycle_closure(cycle_id, "reconciliation_error")
+            except PollLockError:
+                raise
+            except Exception:
+                logger.exception("outcome ledger could not revoke stale closure %s", cycle_id)
             reconciled.append({"cycle_id": cycle_id, "result": f"error:{type(exc).__name__}"})
-        finally:
-            outcome_store.set_state(cycle_id, key=f"reconcile:{cycle_id}")
+            attempts = _bump_attempts(cycle_id)
+            if attempts >= MAX_CYCLE_ATTEMPTS:
+                _record_cycle_error(cycle, repr(exc))
+                outcome_store.set_state("permanent", key=f"reconcile:{cycle_id}")
+                outcome_store.set_state("permanent", key=f"failed:{cycle_id}")
+                continue
+        outcome_store.set_state(cycle_id, key=f"reconcile:{cycle_id}")
     return {"status": "polled", "processed": len(batch), "outcomes": outcomes,
             "reconciled": reconciled}
 

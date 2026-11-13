@@ -62,11 +62,10 @@ def as_of_closed(candles: Iterable[Candle], as_of: datetime) -> list[Candle]:
 
 
 def sequential_candles(candles: Iterable[Candle], timeframe: str) -> list[Candle]:
-    """One contiguous, ordered, closed series; gaps and mixes are refused.
+    """Return ordered closed candles; gaps are allowed, overlaps are refused.
 
-    The engine needs a strictly increasing closed sequence in a single
-    timeframe; anything else (overlaps, unordered rows, the forming bar,
-    foreign timeframes) would silently distort the price path, so it raises.
+    The engine needs a single timeframe with non-overlapping intervals. Missing
+    intervals are not filled, so downstream consumers can account for gaps.
     """
     duration = timeframe_ms(timeframe)
     ordered = sorted(candles, key=lambda candle: candle.open_time)
@@ -78,7 +77,7 @@ def sequential_candles(candles: Iterable[Candle], timeframe: str) -> list[Candle
             raise ValueError(f"mixed timeframes in series: {candle.timeframe!r}")
         if candle.close_time - candle.open_time != duration:
             raise ValueError("candle duration does not match the timeframe")
-        if checked and candle.open_time <= checked[-1].open_time:
+        if checked and candle.open_time < checked[-1].close_time:
             raise ValueError("duplicate or overlapping candle")
         checked.append(candle)
     return checked

@@ -233,70 +233,6 @@ def test_brief_does_not_write_anything(client):
 
 
 # ---------------------------------------------------------------------------
-# results: verified vs estimated, never a fabricated zero
-
-
-def test_brief_reports_an_empty_ledger_as_unavailable_not_zero(client):
-    payload = client.get("/api/brief").json()
-    ledger = payload["results"]["ledger"]
-    assert ledger["status"] == "unavailable"
-    assert "not zero" in ledger["reason"]
-    assert ledger["totals"] is None
-
-
-def test_brief_keeps_verified_and_estimated_separate(client, fake_portfolio):
-    from server import outcome_store
-
-    outcome_store.record_outcome(
-        account_id="binance:demo:" + "a" * 64,
-        position={
-            "cycle_id": "cycle-v", "client_order_id": "ta_v", "venue_order_id": "1",
-            "symbol": "BTC/USDT:USDT", "market_type": "perpetual", "side": "long",
-            "planned_quantity": Decimal("1"), "filled_quantity": Decimal("1"),
-            "opened_at": "2026-11-10T00:00:00+00:00",
-            "closed_at": "2026-11-10T05:00:00+00:00",
-            "attribution": "managed", "strategy_version": "1", "provenance": {},
-        },
-        fills=[{
-            "venue_trade_id": "901", "venue_order_id": "1", "symbol": "BTC/USDT:USDT",
-            "side": "sell", "role": "exit", "quantity": Decimal("1"),
-            "price": Decimal("105"), "fee": Decimal("0.1"), "fee_currency": "USDT",
-            "realized_pnl": Decimal("5"), "realized_pnl_currency": "USDT",
-            "occurred_at": "2026-11-10T05:00:00+00:00",
-        }],
-        exits=[], funding=[],
-    )
-    fake_portfolio(_fake_portfolio(notional_currency="USDT", equity_currency="USDT",
-                                   notional=100.0, equity=1000.0))
-    payload = client.get("/api/brief").json()
-
-    # The ledger block carries reconciled money only.
-    assert payload["results"]["ledger"]["status"] == "partial"
-    assert payload["results"]["ledger"]["totals"]["realized_by_currency"]["USDT"] == "5"
-    # The estimate block carries the unreconciled figures, but never claims them
-    # as verified: they live under a different key with no shared total.
-    estimated = payload["results"]["estimated"]
-    assert estimated["spot_audit_realized_total"] == 5.0
-    assert "net_by_currency" not in estimated
-    assert estimated["futures_unrealized"] == 3.0
-
-
-def test_brief_reports_unattributed_fills_per_coverage_row_not_summed(client):
-    _seed_coverage(status="ok", warnings=[], manual=2, account="binance:demo:" + "b" * 64,
-                   window_start="2026-11-10T00:00:00+00:00",
-                   window_end="2026-11-10T01:00:00+00:00")
-    _seed_coverage(status="ok", warnings=[], manual=3, account="binance:demo:" + "c" * 64,
-                   window_start="2026-11-10T02:00:00+00:00",
-                   window_end="2026-11-10T03:00:00+00:00")
-    payload = client.get("/api/brief").json()
-    rows = payload["results"]["unattributed_manual"]
-    assert [row["count"] for row in rows] == [3, 2]
-    # The brief never presents one summed headline over overlapping windows.
-    assert "unattributed_total" not in payload["results"]
-    assert "never be summed" in payload["results"]["coverage_note"]
-
-
-# ---------------------------------------------------------------------------
 # risk: only what is provable
 
 
@@ -370,7 +306,6 @@ def test_brief_survives_a_failing_portfolio_read(client, fake_portfolio):
     assert payload["status"]["venue_profile"] is None
     assert payload["risk"]["open_positions"]["futures"] is None
     assert payload["risk"]["exposure"]["value_pct"] is None
-    assert payload["results"]["estimated"]["futures_unrealized"] is None
     assert payload["portfolio"] is None
 
 

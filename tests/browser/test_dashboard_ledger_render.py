@@ -23,7 +23,7 @@ const React = require("react");
 const {renderToStaticMarkup} = require("react-dom/server");
 function compile(module, filename) {
   let source = fs.readFileSync(filename, "utf8");
-  if (filename.endsWith(path.join("brief", "brief-card.tsx"))) {
+  if (filename.endsWith(path.join("brief", "results-section.tsx"))) {
     source = source.replace("function VerifiedBlock(", "export function VerifiedBlock(")
       .replace("function FundingObservations(", "export function FundingObservations(");
   }
@@ -43,11 +43,11 @@ Module._resolveFilename = function(request, parent, isMain, options) {
 const locale = require(path.join(web, "lib/i18n/locale.ts"));
 locale.getServerLocale = () => "en";
 locale.getLocale = () => "en";
-const {VerifiedBlock, FundingObservations} = require(path.join(web, "components/overview/brief/brief-card.tsx"));
+const {VerifiedBlock, ClosureEvidenceBlock, FundingObservations} = require(path.join(web, "components/overview/brief/results-section.tsx"));
 const ledger = JSON.parse(fs.readFileSync(0, "utf8"));
 const data = {results: {ledger}};
 process.stdout.write(renderToStaticMarkup(React.createElement(React.Fragment, null,
-  React.createElement(VerifiedBlock, {data}), React.createElement(FundingObservations, {data}))));
+  React.createElement(VerifiedBlock, {data}), React.createElement(ClosureEvidenceBlock, {ledger}), React.createElement(FundingObservations, {data}))));
 """
 
 
@@ -79,6 +79,83 @@ class _Rows(HTMLParser):
         elif tag == "tr" and self.cells is not None:
             self.rows[self.current] = self.cells
             self.current = self.cells = None
+
+
+
+@pytest.mark.parametrize(
+    ("status", "recorded_closed", "verified_closed", "expected_status", "verified_timestamp"),
+    [
+        pytest.param("complete", 1, 1, "complete", True, id="complete-status"),
+        pytest.param("partial", 0, 0, "partial", False, id="partial-zero"),
+        pytest.param(None, 1, None, "unavailable", False, id="unavailable-proof"),
+        pytest.param("partial", 1, 1, "partial", True, id="coherent-verified-count"),
+        pytest.param("partial", 1, 2, "partial", False, id="incoherent-verified-count"),
+    ],
+)
+def test_closure_evidence_renders_recorded_and_proven_counts_without_postgres(
+    status, recorded_closed, verified_closed, expected_status, verified_timestamp,
+):
+    ledger = {
+        "status": "partial",
+        "positions": {
+            "total": 2,
+            "closed": recorded_closed,
+            "recorded_closed": recorded_closed,
+            "first_opened": "2026-11-09T23:55:00+00:00",
+            "last_closed": "2026-11-10T01:00:00+00:00" if recorded_closed else None,
+            "last_recorded_closed": "2026-11-10T01:00:00+00:00" if recorded_closed else None,
+            "closure_evidence": None if status is None else {
+                "status": status,
+                "verified_closed": verified_closed,
+                "unverified_positions": 1 if status != "complete" else 0,
+                "unverified_closed_timestamps": max(
+                    0, recorded_closed - (verified_closed or 0)
+                ) if status != "complete" else 0,
+                "reason": None if status == "complete" else "Partial stored-fill proof.",
+            },
+        },
+        "fills": 2,
+        "totals": {
+            "realized_by_currency": {"USDT": "12345678901234567890.123456789"},
+            "fee_by_currency": {}, "funding_by_currency": {},
+            "net_by_currency": [{"currency": "USDT", "amount": None,
+                                  "funding_known": False, "fee_known": False}],
+        },
+        "funding_unknown_currencies": ["USDT"],
+        "fee_unknown_currencies": [],
+        "funding_observations": {"status": "partial", "events": [], "truncated": False},
+        "coverage": [],
+    }
+    web = require_web_renderer()
+    result = subprocess.run(
+        ["node", "-e", _RENDER], cwd=web, input=json.dumps(ledger),
+        capture_output=True, text=True, encoding="utf-8", check=False, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "12345678901234567890.123456789" in result.stdout
+    assert f'data-closure-evidence-status="{expected_status}"' in result.stdout
+    assert "Recorded positions" in result.stdout
+    if status == "complete":
+        assert "Closures verified against stored fills" in result.stdout
+        assert "Recorded positions with closure timestamps" in result.stdout
+    elif status == "partial":
+        assert "Recorded positions with closure timestamps (unverified)" in result.stdout
+        assert "does not prove that no closures occurred" in result.stdout
+        assert "Closures verified against stored fills" in result.stdout
+    else:
+        assert "Recorded positions with closure timestamps (unverified)" in result.stdout
+        assert "does not prove that no closures occurred" in result.stdout
+        assert "Closures verified against stored fills" not in result.stdout
+
+    if verified_timestamp:
+        assert "Last closure timestamp verified against stored fills" in result.stdout
+        assert "Latest recorded closure timestamp (may be unverified)" not in result.stdout
+    elif recorded_closed:
+        assert "Last closure timestamp verified against stored fills" not in result.stdout
+        assert "Latest recorded closure timestamp (may be unverified)" in result.stdout
+    else:
+        assert "Last closure timestamp verified against stored fills" not in result.stdout
+        assert "Latest recorded closure timestamp (may be unverified)" not in result.stdout
 
 
 @pytest.mark.parametrize("route", ["/api/outcomes", "/api/brief"])

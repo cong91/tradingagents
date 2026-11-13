@@ -2,14 +2,13 @@
 
 One rule this module exists to enforce: slippage changes the fill price only.
 Every fee is computed on the slipped price, and no component of the PnL
-pipeline may subtract slippage again — the engine never receives a slippage
-value to deduct, only prices already carrying it. Funding is applied between
-candles that span a settlement boundary, with the venue's sign convention
-recorded per series (positive amount = the position receives funding).
+pipeline may subtract slippage again. Funding is settled from explicit per-event
+rates and mark prices, never inferred from candle prices or entry prices.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -65,61 +64,91 @@ class CostModel:
 
 @dataclass(frozen=True)
 class FundingSeries:
-    """A funding rate series with its venue sign semantics recorded.
+    """Per-settlement funding evidence for a linear contract.
 
-    ``amounts`` maps settlement timestamps to signed quote-currency amounts for
-    the position's original opened size: a positive value pays the position
-    (short receiving funding on Binance), a negative charges it. After a
-    scale-out, the engine prorates each amount to the remaining quantity.
-    ``notional_scale`` converts feeds expressed in smaller quote units. The
-    semantics string travels with the series so a report can state which
-    convention produced the numbers.
-
-    ``known_from_ms``/``known_to_ms`` optionally mark the span the venue
-    history actually covers. A window with NO settlement inside that span is
-    a KNOWN zero (the series is the authoritative history), while a window
-    outside the span is UNKNOWN — the two must never be conflated: missing
-    funding is unknown, never zero.
+    Rates are fractions of the settlement mark notional. A positive rate is
+    paid by longs and received by shorts. Missing rate or mark evidence at a
+    listed settlement is unknown, not zero. The explicit bounds state the
+    half-open interval for which the source is complete; inside that interval,
+    a covered window with no settlement is a known zero.
     """
 
-    amounts: dict[int, float]
-    venue_semantics: str
-    notional_scale: float = 1.0
+    symbol: str | None = None
+    rates: dict[int, float | None] = field(default_factory=dict)
+    mark_prices: dict[int, float | None] = field(default_factory=dict)
     known_from_ms: int | None = None
     known_to_ms: int | None = None
+    quote_currency: str | None = None
+    contract_type: str | None = None
+    quantity_unit: str | None = None
+    venue_semantics: str = "positive rate paid by longs, received by shorts"
 
-    def received_between(self, start_ms: int, end_ms: int) -> float | None:
-        """Signed funding the position earns for settlements in [start, end).
-
-        Returns None only when the window lies outside the recorded known
-        span; a window inside the span with no settlement is a known zero.
-        """
-        if self.known_from_ms is not None and start_ms < self.known_from_ms:
-            return None
-        if self.known_to_ms is not None and end_ms > self.known_to_ms:
-            return None
-        events = [ts for ts in self.amounts if start_ms <= ts < end_ms]
-        return sum(self.amounts[ts] for ts in events) * self.notional_scale
-
-    def received_in_known_span(self, start_ms: int, end_ms: int) -> float:
-        """Sum settlement rates covered by this series, clipping unknown edges."""
-        known_start = max(
-            start_ms, self.known_from_ms if self.known_from_ms is not None else start_ms,
+    def settlement_times(self, start_ms: int, end_ms: int) -> list[int]:
+        """Covered evidence timestamps in the half-open window [start, end)."""
+        if not self._valid_bounds():
+            return []
+        return sorted(
+            timestamp for timestamp in self.rates.keys() | self.mark_prices.keys()
+            if isinstance(timestamp, int) and not isinstance(timestamp, bool)
+            and start_ms <= timestamp < end_ms
+            and self.known_from_ms <= timestamp < self.known_to_ms
         )
-        known_end = min(
-            end_ms, self.known_to_ms if self.known_to_ms is not None else end_ms,
+
+    def settlement_received(
+        self, timestamp_ms: int, *, quantity: float, side: str,
+    ) -> float | None:
+        """Signed quote-currency funding at one settlement, or None if invalid."""
+        rate = self.rates.get(timestamp_ms)
+        mark = self.mark_prices.get(timestamp_ms)
+        if not _finite_number(rate) or not _finite_number(mark) or mark <= 0:
+            return None
+        if not _finite_number(quantity) or quantity < 0 or side not in ("long", "short"):
+            return None
+        amount = (-1.0 if side == "long" else 1.0) * quantity * mark * rate
+        return amount if math.isfinite(amount) else None
+
+    def matches_contract(self, *, symbol: str, quote_currency: str) -> bool:
+        """Whether metadata identifies this exact linear base-quantity market."""
+        return (
+            bool(symbol)
+            and bool(quote_currency)
+            and self.symbol == symbol
+            and self.quote_currency == quote_currency
+            and self.contract_type == "linear"
+            and self.quantity_unit == "base"
         )
-        if known_start >= known_end:
-            return 0.0
-        events = [ts for ts in self.amounts if known_start <= ts < known_end]
-        return sum(self.amounts[ts] for ts in events) * self.notional_scale
+
+    def _valid_bounds(self) -> bool:
+        return (
+            isinstance(self.known_from_ms, int)
+            and not isinstance(self.known_from_ms, bool)
+            and isinstance(self.known_to_ms, int)
+            and not isinstance(self.known_to_ms, bool)
+            and self.known_from_ms < self.known_to_ms
+        )
+
+    def _valid_timestamps(self) -> bool:
+        return all(
+            isinstance(timestamp, int) and not isinstance(timestamp, bool)
+            for timestamp in self.rates.keys() | self.mark_prices.keys()
+        )
 
     def covers(self, start_ms: int, end_ms: int) -> bool:
-        """Whether the full half-open window lies within the known span."""
-        return not (
-            self.known_from_ms is not None and start_ms < self.known_from_ms
-            or self.known_to_ms is not None and end_ms > self.known_to_ms
+        """Whether valid explicit bounds cover the entire [start, end) window."""
+        if start_ms >= end_ms:
+            return True
+        return (
+            self._valid_bounds()
+            and self._valid_timestamps()
+            and start_ms >= self.known_from_ms
+            and end_ms <= self.known_to_ms
         )
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 @dataclass
@@ -147,15 +176,6 @@ class CostLedger:
     def mark_funding_available(self, series: FundingSeries) -> None:
         self.funding_available = True
         self._pending_semantics.add(series.venue_semantics)
-
-    def apply_funding(self, series: FundingSeries, start_ms: int, end_ms: int) -> None:
-        """Fold a known unit-notional funding rate into the ledger."""
-        self.mark_funding_available(series)
-        amount = series.received_between(start_ms, end_ms)
-        if amount is None:
-            self.mark_funding_uncertain(series)
-            return
-        self.record_funding(amount)
 
     def mark_funding_uncertain(self, series: FundingSeries) -> None:
         self.mark_funding_available(series)

@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -155,16 +155,20 @@ def financial_replay(
     variants = _variants(rule_name, recorded)
     run_id = f"financial_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{seed}"
     first_open = datetime.fromtimestamp(min(holdout_opens) / 1000, UTC)
-    last_open = datetime.fromtimestamp(max(holdout_opens) / 1000, UTC)
+    last_close_ms = max(c.close_time for c in holdout_candles)
+    last_close = datetime.fromtimestamp(last_close_ms / 1000, UTC)
+    window_end = last_close.date()
+    if last_close.time() != datetime.min.time():
+        window_end += timedelta(days=1)
     manifest = build_manifest(
         run_id=run_id,
         hypothesis=(
             f"does the {rule_name} confirmation rule's simulated net after costs differ "
             "from holding cash, on imported closed candles"
         ),
-        # A real ISO range: the registry parses this with the walkforward date
-        # helper, so a synthetic string like "<date>:+1d" is not acceptable.
-        window=f"{first_open.date().isoformat()}:{last_open.date().isoformat()}",
+        # Registry endpoints are UTC dates; the exclusive end encloses the
+        # final close, while the replay metadata records its exact timestamp.
+        window=f"{first_open.date().isoformat()}:{window_end.isoformat()}",
         holdout_start=holdout_start,
         horizon_days=horizon_days,
         embargo_days=embargo_days,
@@ -197,6 +201,7 @@ def financial_replay(
             "last_close_ms": imported.candles[-1].close_time,
         },
         "holdout_candles": len(holdout_candles),
+        "holdout_last_close_ms": last_close_ms,
         "purged_rows": len(split.purged_rows),
         "risk_limits": {
             "source": "runtime config (mirrors DerivativesBridge._build_risk_guard)",
@@ -221,6 +226,7 @@ def financial_replay(
         "purged": len(split.purged_rows),
         "first_holdout_open_ms": min(holdout_opens),
         "last_holdout_open_ms": max(holdout_opens),
+        "last_holdout_close_ms": last_close_ms,
     }
     # run_experiment already persisted the summary; carry the coverage into the
     # stored copy so the artifact and the CLI print agree. The digest comes from

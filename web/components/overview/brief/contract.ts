@@ -41,10 +41,26 @@ export type LedgerTotals = {
   net_by_currency?: NetRow[];
 } | null;
 
+export type ClosureEvidence = {
+  status: "complete" | "partial" | "unavailable";
+  verified_closed: number | null;
+  unverified_positions: number | null;
+  unverified_closed_timestamps: number | null;
+  reason: string | null;
+};
+
 export type BriefLedger = {
   status: "partial" | "unavailable" | "error";
   reason?: string;
-  positions?: { total: number; closed: number } | null;
+  positions?: {
+    total: number;
+    closed: number;
+    recorded_closed?: number | null;
+    first_opened: string | null;
+    last_closed: string | null;
+    last_recorded_closed?: string | null;
+    closure_evidence?: ClosureEvidence | null;
+  } | null;
   fills?: number | null;
   totals?: LedgerTotals;
   funding_unknown_currencies?: (string | null)[];

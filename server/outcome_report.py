@@ -37,8 +37,25 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
     with db.read() as conn:
         position_row = conn.execute(
             """SELECT COUNT(*) AS positions,
-                      COUNT(*) FILTER (WHERE closed_at IS NOT NULL) AS closed,
-                      MIN(opened_at) AS first_opened, MAX(closed_at) AS last_closed
+                      COUNT(*) FILTER (
+                          WHERE closed_at IS NOT NULL
+                            AND provenance->>'closure_proof_version' = '2'
+                      ) AS verified_closed,
+                      COUNT(*) FILTER (
+                          WHERE COALESCE(closed_at, NULLIF(provenance->>'recorded_closed_at', '')::timestamptz)
+                                IS NOT NULL
+                      ) AS recorded_closed,
+                      MIN(opened_at) AS first_opened,
+                      MAX(COALESCE(
+                          closed_at,
+                          NULLIF(provenance->>'recorded_closed_at', '')::timestamptz
+                      )) AS last_recorded_closed,
+                      MAX(COALESCE(
+                          closed_at,
+                          NULLIF(provenance->>'recorded_closed_at', '')::timestamptz
+                      )) FILTER (
+                          WHERE provenance->>'closure_proof_version' = '2'
+                      ) AS last_verified_closed
                FROM outcome_positions"""
         ).fetchone()
         fill_row = conn.execute("SELECT COUNT(*) AS fills FROM outcome_fills").fetchone()
@@ -165,9 +182,39 @@ def summary(window_start: str | None = None, window_end: str | None = None) -> d
         "status": "partial",
         "positions": {
             "total": positions,
-            "closed": int(position_row["closed"] or 0),
+            # `closed` is retained as a recorded timestamp count for API
+            # compatibility. Verified closure is exposed separately below.
+            "closed": int(position_row["recorded_closed"] or 0),
+            "verified_closed": int(position_row["verified_closed"] or 0),
+            "recorded_closed": int(position_row["recorded_closed"] or 0),
             "first_opened": position_row["first_opened"],
-            "last_closed": position_row["last_closed"],
+            "last_closed": position_row["last_verified_closed"],
+            "last_recorded_closed": position_row["last_recorded_closed"],
+            "closure_evidence": {
+                "status": (
+                    "complete"
+                    if int(position_row["positions"] or 0)
+                    == int(position_row["verified_closed"] or 0)
+                    else "partial"
+                ),
+                "verified_closed": int(position_row["verified_closed"] or 0),
+                "unverified_positions": max(
+                    0,
+                    int(position_row["positions"] or 0)
+                    - int(position_row["verified_closed"] or 0),
+                ),
+                "unverified_closed_timestamps": max(
+                    0,
+                    int(position_row["recorded_closed"] or 0)
+                    - int(position_row["verified_closed"] or 0),
+                ),
+                "reason": (
+                    "Closure is verified only against complete, identity-bound stored fill history."
+                    if int(position_row["positions"] or 0)
+                    != int(position_row["verified_closed"] or 0)
+                    else None
+                ),
+            },
         },
         "fills": fills,
         "totals": {

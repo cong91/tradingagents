@@ -99,6 +99,12 @@ def _trading_variants() -> list[VariantSpec]:
                 risk_fraction=0.004, margin_fraction=0.25,
             )
 
+        source.mode = "test_recorded_proposals"
+        source.input_count = 1
+        source.evaluated = 1
+        source.built = 1
+        source.coverage_status = "sufficient_evidence"
+        source.skipped = {}
         return source
 
     return [
@@ -113,11 +119,15 @@ def _funding_for(candles: list[Candle], *, partial: bool) -> FundingSeries:
     # the last open so that final window stays unknown. The settlement sits in
     # candles[3] because candles[2] fires the first scale-out tranche — a
     # settlement sharing that candle is honestly unattributable intrabar.
+    settlement_ms = candles[3].open_time + 1
     return FundingSeries(
-        amounts={candles[3].open_time + 1: 2.0},
+        symbol="BTC/USDT:USDT",
+        rates={settlement_ms: 0.0001},
+        mark_prices={settlement_ms: 20_000.0},
         venue_semantics="test: positive = received",
         known_from_ms=candles[2 if partial else 1].open_time,
         known_to_ms=candles[-1].open_time if partial else candles[-1].close_time,
+        quote_currency="USDT", contract_type="linear", quantity_unit="base",
     )
 
 
@@ -161,12 +171,14 @@ def test_all_repeats_are_stored_and_seed_reproduces_them(tmp_path):
 
 
 
-def test_traded_run_with_missing_funding_is_unpairable_but_cash_control_is_numeric(tmp_path):
+def test_traded_run_with_missing_funding_is_unpairable_and_control_is_unscorable(tmp_path):
     summary = _run_trading_experiment(tmp_path, funding=None)
     assert summary["per_variant"]["no_trade"]["metric_values"] == [10000.0] * 3
     assert summary["per_variant"]["rule"]["metric_values"] == [None] * 3
+    assert summary["per_variant"]["rule"]["max_drawdowns"] == [None] * 3
     comparison = summary["comparisons"][0]
     assert comparison["verdict"] == "insufficient_evidence_coverage"
+    assert summary["per_variant"]["rule"]["max_drawdowns"] == [None] * 3
 
 
 def test_traded_run_with_partial_funding_is_unpairable(tmp_path):
@@ -178,6 +190,7 @@ def test_traded_run_with_partial_funding_is_unpairable(tmp_path):
     assert summary["per_variant"]["no_trade"]["metric_values"] == [10000.0] * 3
     assert summary["per_variant"]["rule"]["metric_values"] == [None] * 3
     assert summary["comparisons"][0]["verdict"] == "insufficient_evidence_coverage"
+    assert summary["per_variant"]["rule"]["max_drawdowns"] == [None] * 3
 
 
 def test_traded_run_with_full_funding_keeps_numeric_comparison(tmp_path):
@@ -288,21 +301,91 @@ def test_degenerate_interval_is_disclosed_not_pretended(tmp_path):
     assert "no sampling" not in varied["reason"]
 
 
-def test_none_metric_values_are_reported_not_zeroed(tmp_path):
+def test_funding_dependent_metrics_are_none_when_funding_is_unknown_or_partial():
+    from tradingagents.experiments.runner import _metric_value
+
+    report = {
+        "fills": [{"kind": "entry"}],
+        "max_drawdown": 0.12,
+        "max_drawdown_status": "estimate",
+        "funding_known": False,
+        "net_after_costs": {
+            "final_equity": 9_500.0,
+            "final_equity_estimate": 9_500.0,
+            "final_equity_status": "estimate",
+            "funding_received": None,
+            "funding_known": False,
+            "funding_partial": True,
+            "fee_paid": 2.5,
+        },
+    }
+    assert _metric_value(report, "net_after_costs.final_equity") is None
+    assert _metric_value(report, "net_after_costs.final_equity_estimate") is None
+    assert _metric_value(report, "max_drawdown") is None
+    assert _metric_value(report, "net_after_costs.fee_paid") == 2.5
+
+
+def test_source_diagnostics_are_stored_in_rows_and_summary(tmp_path):
     start_ms = holdout_start_ms_from_iso("2026-04-01")
-    split = _split(start_ms)
-    manifest = _manifest(tmp_path, seed=11, repeat=3)
-    run_experiment(
-        results_dir=tmp_path, manifest=manifest, split=split,
+    manifest = _manifest(tmp_path, seed=9, repeat=1)
+    summary = run_experiment(
+        results_dir=tmp_path, manifest=manifest, split=_split(start_ms),
         variants=_variants(), candles_holdout=_holdout_candles(4, start_ms),
     )
-    directory = artifacts.run_dir(tmp_path, manifest["run_id"])
-    rows = artifacts.load_results(directory)
-    # no_trade produces no fills: the engine's net is the cash constant, so
-    # the metric exists; assert the column is a float, never None-by-drop.
-    assert all(isinstance(row["metric_value"], float) for row in rows)
-    summary = artifacts.load_summary(directory)
-    assert summary["comparisons"], "a paired comparison row must exist"
+    rows = artifacts.load_results(artifacts.run_dir(tmp_path, manifest["run_id"]))
+    assert all("source_coverage" in row for row in rows)
+    assert all("source_coverage" in row["report"] for row in rows)
+    assert all(len(item["source_coverage"]) == item["repeats"]
+               for item in summary["per_variant"].values())
+
+
+def test_ordinary_proposal_sources_remain_comparable(tmp_path):
+    start_ms = holdout_start_ms_from_iso("2026-04-01")
+    manifest = _manifest(tmp_path, seed=11, repeat=3)
+    summary = run_experiment(
+        results_dir=tmp_path, manifest=manifest, split=_split(start_ms),
+        variants=_variants(), candles_holdout=_holdout_candles(4, start_ms),
+    )
+    assert summary["per_variant"]["no_trade"]["metric_values"] == [10000.0] * 3
+    assert summary["per_variant"]["rule"]["metric_values"] == [10000.0] * 3
+    assert summary["comparisons"][0]["verdict"] != "insufficient_evidence_coverage"
+
+
+def test_no_trade_control_is_suppressed_per_repeat_for_incomplete_replay(tmp_path):
+    start_ms = holdout_start_ms_from_iso("2026-04-01")
+    statuses = iter(["insufficient_evidence", "sufficient_evidence"])
+
+    def factory():
+        def source(candle):
+            return None
+        source.mode = "counterfactual_rule"
+        source.coverage_status = next(statuses)
+        source.built = 1
+        return source
+
+    variants = [
+        VariantSpec(name="no_trade", kind="no_trade", factory=lambda: lambda candle: None),
+        VariantSpec(name="rule", kind="rule", factory=factory),
+    ]
+    manifest = _manifest(tmp_path, seed=11, repeat=2)
+    summary = run_experiment(
+        results_dir=tmp_path, manifest=manifest, split=_split(start_ms),
+        variants=variants, candles_holdout=_holdout_candles(4, start_ms),
+    )
+    assert summary["per_variant"]["no_trade"]["metric_values"] == [None, 10000.0]
+    assert summary["per_variant"]["rule"]["metric_values"] == [None, 10000.0]
+    assert summary["per_variant"]["rule"]["max_drawdowns"] == [None, 0.0]
+
+
+def test_insufficient_replay_control_is_not_hidden_without_no_trade(tmp_path):
+    start_ms = holdout_start_ms_from_iso("2026-04-01")
+    variants = [VariantSpec(name="rule", kind="rule", factory=lambda: lambda candle: None)]
+    manifest = _manifest(tmp_path, repeat=1, variants=("rule",))
+    summary = run_experiment(
+        results_dir=tmp_path, manifest=manifest, split=_split(start_ms),
+        variants=variants, candles_holdout=_holdout_candles(4, start_ms),
+    )
+    assert summary["per_variant"]["rule"]["metric_values"] == [10000.0]
 
 
 def test_no_promotion_imports_anywhere_in_the_experiments_layer():

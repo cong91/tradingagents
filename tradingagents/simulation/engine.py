@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
-from tradingagents.dataflows.market_data import Candle
+from tradingagents.dataflows.market_data import Candle, timeframe_ms
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
@@ -48,6 +48,8 @@ from tradingagents.simulation.costs import CostLedger, CostModel, FundingSeries
 from tradingagents.simulation.fills import (
     AMBIGUITY_POLICIES,
     MarketRules,
+    gaps_stop,
+    gaps_target,
     market_entry_fill,
     match_exit,
     match_scale_out,
@@ -256,7 +258,7 @@ class _RunState:
     pending_exit_kind: str | None = None
 
 
-def _book_position(position: _Position, *, mark: float) -> Position:
+def _book_position(position: _Position, *, mark: float, currency: str) -> Position:
     """The PortfolioContext view of one open simulated position."""
     return Position(
         ticker=position.plan.ticker,
@@ -264,7 +266,7 @@ def _book_position(position: _Position, *, mark: float) -> Position:
         market="derivatives",
         market_symbol=position.plan.ccxt_symbol,
         notional=position.remaining * mark,
-        notional_currency="USDT",
+        notional_currency=currency,
         stop_loss=position.current_stop,
     )
 
@@ -330,26 +332,49 @@ def _apply_position_funding(
     end_ms: int,
     *,
     exposure_changed_intrabar: bool = False,
+    exposure_before_change: float | None = None,
 ) -> None:
-    """Apply covered notional funding, refusing ambiguous intrabar exposure."""
-    if funding is None:
+    """Apply covered settlement evidence to the position's live quantity.
+
+    The caller isolates candle-open settlements before matching exits. If an
+    exit changes exposure intrabar, every settlement in the remaining window
+    is unknown because OHLC has no ordering information.
+    """
+    if funding is None or start_ms >= end_ms:
         return
     start_ms = max(start_ms, position.opened_at_ms, position.funding_accounted_until_ms)
     if start_ms >= end_ms:
         return
     position.funding_accounted_until_ms = end_ms
     state.ledger.mark_funding_available(funding)
-    settlements = [ts for ts in funding.amounts if start_ms <= ts < end_ms]
-    if exposure_changed_intrabar and settlements:
+    if not funding.matches_contract(
+        symbol=position.plan.ccxt_symbol, quote_currency=state.ledger.currency,
+    ):
+        position.funding_complete = False
         state.ledger.mark_funding_uncertain(funding)
         return
-    rate = funding.received_in_known_span(start_ms, end_ms)
-    exposure_fraction = position.remaining / position.quantity if position.quantity else 0.0
-    amount = rate * exposure_fraction
-    if amount:
+
+    settlements = funding.settlement_times(start_ms, end_ms)
+    quantity_before_change = (
+        exposure_before_change if exposure_before_change is not None else position.remaining
+    )
+    unknown = False
+    for timestamp_ms in settlements:
+        if exposure_changed_intrabar:
+            unknown = True
+            continue
+        amount = funding.settlement_received(
+            timestamp_ms, quantity=quantity_before_change, side=position.side,
+        )
+        if amount is None:
+            unknown = True
+            continue
         state.ledger.record_funding(amount)
         position.funding_received += amount
     if not funding.covers(start_ms, end_ms):
+        unknown = True
+    if unknown:
+        position.funding_complete = False
         state.ledger.mark_funding_uncertain(funding)
 
 
@@ -415,8 +440,10 @@ def _maybe_open(
 ) -> None:
     """Plan, risk-check and fill one entry, exactly as the runtime would."""
     book = PortfolioContext(
-        cash=equity, currency="USDT",
-        positions=[_book_position(state.position, mark=decision_candle.close)]
+        cash=equity, currency=state.ledger.currency,
+        positions=[_book_position(
+            state.position, mark=decision_candle.close, currency=state.ledger.currency,
+        )]
         if state.position is not None else [],
     )
     plan = futures_plan(
@@ -547,21 +574,32 @@ def _manage_position(
     if position is None:
         return
     remaining_before_matching = position.remaining
-    # 1. Match exits against the levels resting during this candle.
     # Runtime parity: with scale-out enabled the take-profit order is
     # REPLACED by the tranche legs plus a trailed runner (scale_out_apply),
-    # so the target level must never close the whole remaining position —
-    # only the stop (and the trailed stop) exits it.
+    # so the target level must never close the whole remaining position.
     exit_target = None if position.scale_out is not None else position.current_target
     level = match_exit(
         candle, position.side, stop=position.current_stop, target=exit_target,
         quantity=position.remaining, rules=rules,
         ambiguity_policy=ambiguity_policy,
     )
+    exit_at_open = False
+    intrabar_change = False
+    remaining_after_open = remaining_before_matching
+    if level.fill is not None:
+        exit_fill = level.fill
+        exit_at_open = (
+            (exit_fill.kind == "stop" and gaps_stop(candle, position.side, position.current_stop))
+            or (
+                exit_fill.kind == "target" and position.current_target is not None
+                and gaps_target(candle, position.side, position.current_target)
+            )
+        )
     if level.ambiguous:
         state.result.ambiguity_count += 1
     if level.fill is not None:
         exit_fill = level.fill
+        intrabar_change = not exit_at_open
         # Resting levels (targets) fill at their price; a stop is a market
         # fill and slips against the trader through the cost model.
         exit_price = (
@@ -583,6 +621,10 @@ def _manage_position(
             )
             if scale_fill is None:
                 break
+            if gaps_target(candle, position.side, tranche.price):
+                remaining_after_open -= scale_fill.quantity
+            else:
+                intrabar_change = True
             _record_exit(
                 state, position, kind="scale_out", price=tranche.price,
                 quantity=scale_fill.quantity, open_time_ms=candle.open_time,
@@ -591,26 +633,41 @@ def _manage_position(
             position.fired_tranches += 1
             if state.position is None:
                 break
-    # Funding settles at a known candle boundary before the protection verdict.
-    # A settlement inside a candle that changed exposure is not attributable to
-    # either the pre- or post-exit size from OHLC alone, so it stays unknown.
-    if funding is not None:
-        candle_start = max(candle.open_time, position.opened_at_ms)
+
+    # An exit at the open excludes closed quantity from that settlement.
+    # Intrabar exits happen later, so the open settlement uses the pre-exit
+    # quantity, adjusted only for tranches filled exactly at the open.
+    if funding is not None and not exit_at_open and remaining_after_open > 1e-12:
         _apply_position_funding(
-            state, position, funding, candle_start, candle.close_time,
-            exposure_changed_intrabar=(
-                state.position is None or position.remaining != remaining_before_matching
-            ),
+            state, position, funding, candle.open_time, candle.open_time + 1,
+            exposure_before_change=remaining_after_open,
         )
+
+    # Funding after the candle open belongs to the exposure held through the
+    # window only when no intrabar size change occurred. An exit at the open
+    # leaves no post-exit window, while a later exit makes that window unknown.
     if state.position is None:
-        return  # fully exited during this candle; nothing left to protect
+        if not exit_at_open and intrabar_change and funding is not None:
+            _apply_position_funding(
+                state, position, funding, candle.open_time + 1, candle.close_time,
+                exposure_changed_intrabar=True,
+                exposure_before_change=remaining_after_open,
+            )
+        return
+    if funding is not None:
+        _apply_position_funding(
+            state, position, funding, candle.open_time + 1, candle.close_time,
+            exposure_changed_intrabar=intrabar_change,
+            exposure_before_change=remaining_after_open,
+        )
     held_hours = (candle.close_time - position.opened_at_ms) / 3_600_000
     # The runtime's funding conversion divides by the size the bracket
     # OPENED with (futures_protection._time_stop_funding_inputs), never the
     # shrunken remainder — the funding accrued on the original size.
     risk_amount = position.risk_per_unit * position.quantity
     cumulative_funding_r = (
-        position.funding_received / risk_amount if risk_amount > 0 else None
+        position.funding_received / risk_amount
+        if funding is not None and position.funding_complete and risk_amount > 0 else 0.0
     )
     protection = evaluate_profit_protection(
         side=position.side,
@@ -680,9 +737,13 @@ def run_simulation(
     ordered = sorted(candles, key=lambda candle: candle.open_time)
     if not ordered:
         raise ValueError("simulation needs at least one closed candle")
-    for candle in ordered:
+    for index, candle in enumerate(ordered):
         if not candle.is_closed:
             raise ValueError("simulation only consumes closed candles")
+        if index and candle.open_time < ordered[index - 1].close_time:
+            raise ValueError("duplicate or overlapping candle")
+        if candle.close_time - candle.open_time != timeframe_ms(candle.timeframe):
+            raise ValueError("candle duration must match its timeframe")
     model = costs if costs is not None else CostModel()
     rules = market_rules if market_rules is not None else MarketRules()
     limits = risk_limits if risk_limits is not None else RiskLimits()
@@ -724,7 +785,14 @@ def run_simulation(
             else:
                 proposal = proposal_source(candle)
                 if proposal is not None:
-                    equity = initial_cash + state.realized_total - ledger.fee_paid
+                    equity = (
+                        initial_cash + state.realized_total - ledger.fee_paid
+                        + (
+                            ledger.funding_received
+                            if ledger.funding_available and not ledger.funding_uncertain
+                            else 0.0
+                        )
+                    )
                     _maybe_open(
                         state, candle,
                         ordered[index + 1] if index + 1 < len(ordered) else None,

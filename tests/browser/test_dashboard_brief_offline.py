@@ -230,6 +230,31 @@ function reapProcessTree(child) {
           'unattributed funding observation missing or mislabeled: ' + observed);
       }
 
+      // Closure counts and timestamps have separate recorded vs verified meaning.
+      const closure = await text('[data-brief-block="closure-evidence"]');
+      const closureStatus = await get(
+        'document.querySelector("[data-brief-block=\\"closure-evidence\\"]")?.getAttribute("data-closure-evidence-status")');
+      if (state.closureEvidence === 'partial-zero') {
+        check(closureStatus === 'partial' && /recorded positions \(unverified\)/i.test(closure) &&
+          /recorded positions with closure timestamps \(unverified\)/i.test(closure) &&
+          /does not prove that no closures occurred/i.test(closure) &&
+          /Closures verified against stored fills\s*0/.test(closure),
+          'partial closed: 0 was presented as no closures or proof count was hidden: ' + closure);
+      } else if (state.closureEvidence === 'partial') {
+        check(closureStatus === 'partial' && /verified/i.test(closure) &&
+          /stored-fill evidence is partial/i.test(closure),
+          'partial closure evidence was not labeled: ' + closure);
+      } else if (state.closureEvidence === 'absent') {
+        check(closureStatus === 'unavailable' && /no stored-fill evidence is available/i.test(closure) &&
+          /does not prove that no closures occurred/i.test(closure),
+          'absent closure evidence was not presented as unavailable: ' + closure);
+      } else {
+        check(closureStatus === 'complete' && /Closures verified against stored fills/i.test(closure) &&
+          /only closures whose quantities are proven by stored fills/i.test(closure),
+          'complete stored-fill proof was not rendered: ' + closure);
+      }
+      results.closureEvidence = closureStatus;
+
       // B2: exactly one % on the exposure row and in the limits disclosure.
       const exposure = await text('[data-brief-row="exposure"]');
       check(!/%%/.test(exposure), 'B2: doubled percent in exposure row: ' + exposure);
@@ -539,6 +564,9 @@ def _port():
 # name -> fixture state driven into the page
 SCENARIOS = {
     "ready": {"name": "ready"},
+    "closure_partial": {"name": "closure_partial", "closureEvidence": "partial"},
+    "closure_partial_zero": {"name": "closure_partial_zero", "closureEvidence": "partial-zero"},
+    "closure_absent": {"name": "closure_absent", "closureEvidence": "absent"},
     "manual_open": None,
     "coverage_only": {"name": "coverage_only", "coverageOnly": True},
     "brief_error": {"name": "brief_error", "brief": 500, "halted": True, "approvals": 2},

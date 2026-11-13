@@ -13,6 +13,7 @@ from server import (
     futures_trade_history,
     job_store,
     outcome_ledger,
+    outcome_report,
     outcome_store,
 )
 from server.outcome_venue_reads import read_venue_window
@@ -64,6 +65,20 @@ def _setup_cycle(postgres_schema, cycle_id="cycle-lifecycle"):
     return start
 
 
+def _complete_fill_source(fills, *, status="ok", funding=None):
+    def source(account_id, symbol, since_ms, until_ms):
+        return {
+            "status": status,
+            "fills": fills,
+            "fills_complete": True,
+            "warnings": ["funding_history_unverified"],
+            "funding": funding,
+            "start_at": datetime.fromtimestamp(since_ms / 1000, UTC).isoformat(),
+            "end_at": datetime.fromtimestamp((until_ms + 1) / 1000, UTC).isoformat(),
+        }
+    return source
+
+
 def _position(postgres_schema):
     with psycopg.connect(postgres_schema) as conn:
         return conn.execute(
@@ -86,26 +101,94 @@ def test_partial_exit_is_revisited_after_cursor_and_late_fills_are_idempotent(
 
     # A new call represents a fresh worker after its discovery cursor advanced.
     for _ in range(2):
-        outcome_ledger.poll_once(_fill_source([entry, first_exit, final_exit]))
+        outcome_ledger.poll_once(_complete_fill_source([entry, first_exit, final_exit]))
     assert _position(postgres_schema)[2] == start + timedelta(minutes=4)
     with psycopg.connect(postgres_schema) as conn:
         assert conn.execute("SELECT count(*) FROM outcome_fills").fetchone()[0] == 3
         assert conn.execute("SELECT count(*) FROM outcome_exits").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT provenance->>'closure_proof_version' FROM outcome_positions"
+        ).fetchone()[0] == "2"
+
+
+@pytest.mark.parametrize("read_kind", ["empty", "error", "partial"])
+def test_revisit_revokes_and_reverifies_closure_without_losing_recorded_time(
+    postgres_schema, ingest_enabled, read_kind,
+):
+    start = _setup_cycle(postgres_schema, f"cycle-revoke-{read_kind}")
+    entry = _fill("revoke-entry", ORDER_ID, "1", start + timedelta(minutes=1))
+    exit_fill = _fill("revoke-exit", "9500", "1", start + timedelta(minutes=2), side="sell")
+    closed_at = start + timedelta(minutes=2)
+    outcome_ledger.poll_once(_complete_fill_source([entry, exit_fill]))
+    with psycopg.connect(postgres_schema) as conn:
+        assert conn.execute(
+            "SELECT closed_at, provenance->>'closure_proof_version' FROM outcome_positions"
+        ).fetchone() == (closed_at, "2")
+
+    if read_kind == "empty":
+        source = _fill_source([], status="unavailable")
+    elif read_kind == "partial":
+        source = _fill_source([entry, exit_fill], status="partial")
+    else:
+        def source(*args):
+            raise RuntimeError("venue unavailable")
+
+    for _ in range(2):
+        outcome_ledger.poll_once(source)
+        with psycopg.connect(postgres_schema) as conn:
+            row = conn.execute(
+                """SELECT closed_at, provenance->>'recorded_closed_at',
+                          provenance->>'closure_proof_version',
+                          provenance->>'closure_verdict',
+                          (SELECT count(*) FROM outcome_fills),
+                          (SELECT count(*) FROM outcome_exits)
+                   FROM outcome_positions""",
+            ).fetchone()
+        assert row[0] is None
+        assert datetime.fromisoformat(row[1]) == closed_at
+        assert row[2:] == (None, "unverified", 2, 1)
+        positions = outcome_report.summary()["positions"]
+        assert positions["closed"] == positions["recorded_closed"] == 1
+        assert positions["verified_closed"] == 0
+        assert positions["last_closed"] is None
+        assert positions["last_recorded_closed"] == closed_at
+        assert positions["closure_evidence"]["unverified_closed_timestamps"] == 1
+
+    outcome_ledger.poll_once(_complete_fill_source([entry, exit_fill]))
+    with psycopg.connect(postgres_schema) as conn:
+        row = conn.execute(
+            """SELECT closed_at, provenance->>'recorded_closed_at',
+                      provenance->>'closure_proof_version', provenance->>'closure_verdict',
+                      (SELECT count(*) FROM outcome_fills),
+                      (SELECT count(*) FROM outcome_exits)
+               FROM outcome_positions"""
+        ).fetchone()
+    assert row == (closed_at, None, "2", "verified", 2, 1)
+    positions = outcome_report.summary()["positions"]
+    assert positions["closed"] == positions["recorded_closed"] == 1
+    assert positions["verified_closed"] == 1
+    assert positions["last_closed"] == positions["last_recorded_closed"] == closed_at
+    assert positions["closure_evidence"]["unverified_closed_timestamps"] == 0
 
 
 @pytest.mark.parametrize("source_status", ["partial", "error", "unavailable"])
-def test_position_scoped_fill_evidence_closes_regardless_of_source_status(
+def test_unverified_fill_history_does_not_close_position(
     postgres_schema, ingest_enabled, source_status,
 ):
-    """Closure is position-scoped (plan §4.4): entry total equals the journal's
-    venue-rounded plan and exit total equals entry with a sane chronology. The
-    CCXT reader labels every successful normalized read "partial", so source
-    status must not freeze real positions open forever; the coverage row still
-    publishes the read's status and warnings."""
     start = _setup_cycle(postgres_schema)
     entry = _fill("10", ORDER_ID, "1", start + timedelta(minutes=1))
     exit_fill = _fill("11", "9500", "1", start + timedelta(minutes=2), side="sell")
     outcome_ledger.poll_once(_fill_source([entry, exit_fill], status=source_status))
+    assert _position(postgres_schema)[2] is None
+
+
+def test_funding_warning_does_not_change_certified_fill_completeness(
+    postgres_schema, ingest_enabled,
+):
+    start = _setup_cycle(postgres_schema)
+    entry = _fill("10a", ORDER_ID, "1", start + timedelta(minutes=1))
+    exit_fill = _fill("11a", "9500", "1", start + timedelta(minutes=2), side="sell")
+    outcome_ledger.poll_once(_complete_fill_source([entry, exit_fill]))
     assert _position(postgres_schema)[2] == start + timedelta(minutes=2)
 
 
@@ -120,12 +203,10 @@ def test_incomplete_fill_evidence_never_closes_a_position(postgres_schema, inges
 
 
 @pytest.mark.parametrize("extra_fill", ["duplicate", "wrong_symbol", "malformed"])
-def test_foreign_or_malformed_history_rows_do_not_block_closure(
+def test_foreign_or_malformed_history_rows_prevent_closure(
     postgres_schema, ingest_enabled, extra_fill,
 ):
-    """Rows that are not the position's own complete fills (paging duplicates,
-    other symbols, malformed records) stay out of the totals — they surface as
-    coverage warnings instead of freezing the position open."""
+    """Malformed, duplicate and unattributed rows invalidate history proof."""
     start = _setup_cycle(postgres_schema)
     entry = _fill("16", ORDER_ID, "1", start + timedelta(minutes=1))
     exit_fill = _fill("17", "9500", "1", start + timedelta(minutes=2), side="sell")
@@ -134,8 +215,8 @@ def test_foreign_or_malformed_history_rows_do_not_block_closure(
         "wrong_symbol": {**entry, "symbol": "ETH/USDT:USDT"},
         "malformed": "not-a-fill",
     }[extra_fill]
-    outcome_ledger.poll_once(_fill_source([entry, exit_fill, extra]))
-    assert _position(postgres_schema)[2] == start + timedelta(minutes=2)
+    outcome_ledger.poll_once(_complete_fill_source([entry, exit_fill, extra]))
+    assert _position(postgres_schema)[2] is None
 
 
 def test_late_partial_entry_and_missing_evidence_never_close_early(
@@ -146,12 +227,12 @@ def test_late_partial_entry_and_missing_evidence_never_close_early(
     first_exit = _fill("21", "9500", "0.5", start + timedelta(minutes=2), side="sell")
     late_entry = _fill("22", ORDER_ID, "0.5", start + timedelta(minutes=3))
     final_exit = _fill("23", "9500", "0.5", start + timedelta(minutes=4), side="sell")
-    outcome_ledger.poll_once(_fill_source([first_entry, first_exit]))
+    outcome_ledger.poll_once(_complete_fill_source([first_entry, first_exit]))
     assert _position(postgres_schema)[2] is None
-    outcome_ledger.poll_once(_fill_source([first_entry, first_exit, late_entry]))
+    outcome_ledger.poll_once(_complete_fill_source([first_entry, first_exit, late_entry]))
     assert _position(postgres_schema)[0] == Decimal("1")
     assert _position(postgres_schema)[2] is None
-    outcome_ledger.poll_once(_fill_source([first_entry, first_exit, late_entry, final_exit]))
+    outcome_ledger.poll_once(_complete_fill_source([first_entry, first_exit, late_entry, final_exit]))
     assert _position(postgres_schema)[2] == start + timedelta(minutes=4)
 
 
@@ -300,7 +381,7 @@ def test_existing_position_identity_conflicts_fail_atomically(postgres_schema, f
         )
 
 
-def test_missing_history_bounds_are_reported_but_do_not_freeze_closure(
+def test_missing_history_bounds_are_reported_but_do_not_close(
     postgres_schema, ingest_enabled,
 ):
     start = _setup_cycle(postgres_schema)
@@ -311,7 +392,7 @@ def test_missing_history_bounds_are_reported_but_do_not_freeze_closure(
         return {"status": "ok", "fills": [entry, exit_fill], "warnings": [], "funding": []}
 
     outcome_ledger.poll_once(source)
-    assert _position(postgres_schema)[2] == start + timedelta(minutes=2)
+    assert _position(postgres_schema)[2] is None
     with psycopg.connect(postgres_schema) as conn:
         row = conn.execute("SELECT status, warnings FROM outcome_coverage").fetchone()
         assert row[0] == "partial"
@@ -334,11 +415,16 @@ def test_production_usds_futures_identity_is_attributed_end_to_end(
             "UPDATE futures_cycles SET created_at = %s WHERE cycle_id = %s",
             (start, "cycle-usds"),
         )
-    entry = _fill("70", ORDER_ID, "1", start + timedelta(minutes=1))
-    exit_fill = _fill("71", "9500", "1", start + timedelta(minutes=2), side="sell")
-    result = outcome_ledger.poll_once(_fill_source([entry, exit_fill]))
+    result = outcome_ledger.poll_once(_complete_fill_source([
+        _fill("70", ORDER_ID, "1", start + timedelta(minutes=1)),
+        _fill("71", "9500", "1", start + timedelta(minutes=2), side="sell"),
+    ]))
     assert result["outcomes"][0]["result"] == "recorded"
     assert _position(postgres_schema)[2] == start + timedelta(minutes=2)
+    with psycopg.connect(postgres_schema) as conn:
+        assert conn.execute(
+            "SELECT provenance->>'closure_proof_version' FROM outcome_positions"
+        ).fetchone()[0] == "2"
 
 
 def test_entry_journal_update_writes_the_venue_rounded_quantity():
@@ -419,7 +505,6 @@ def test_ccxt_income_payload_preserves_timestamp_currency_and_raw_precision(monk
 
 
 def test_venue_identity_mismatch_refuses_history_read(monkeypatch):
-
     from tradingagents.execution import derivatives, futures_identity
 
     identity = SimpleNamespace(exchange="binance", profile="demo", account_type="futures",
@@ -479,6 +564,8 @@ def test_uncertain_entry_waits_for_exact_recovered_journal_order(postgres_schema
     )
     second = outcome_ledger.poll_once(_fill_source([fill]))
     assert second["reconciled"][0]["result"] == "recorded"
+    with psycopg.connect(postgres_schema) as conn:
+        assert conn.execute("SELECT count(*) FROM outcome_positions").fetchone()[0] == 1
     assert _position(postgres_schema)[2] is None
 
 
@@ -559,4 +646,3 @@ def test_reconciliation_round_robin_remains_fair_when_new_cycles_arrive(postgres
         seen.update(row["cycle_id"] for row in result["reconciled"])
     assert seen == {f"fair-{index}" for index in range(4)}
     assert len(calls) <= 16
-

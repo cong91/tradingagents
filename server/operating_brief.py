@@ -42,10 +42,10 @@ from server import (
     db,
     experiment_store,
     futures_cycle_store,
-    outcome_report,
     portfolio as portfolio_module,
     portfolio_snapshot,
 )
+from server.brief_results import _results_section
 from server.contract import utc_now_iso
 from server.settings import effective_exec_mode
 from tradingagents.dataflows.config import get_config
@@ -147,79 +147,6 @@ def _status_section(portfolio_body: dict[str, Any] | None) -> dict[str, Any]:
         "server_status": server_status,
         "audit_log_readable": audit_readable,
         "quote_currency": config.get("exec_quote_currency"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# results
-
-
-def _estimated_results(portfolio_body: dict[str, Any] | None) -> dict[str, Any]:
-    """Figures that are NOT reconciled against the venue — labelled as such.
-
-    The Spot realized number is the audit-log FIFO replay the portfolio card
-    already shows; the futures unrealized number is what the venue last
-    reported for open positions. Both are estimates by contract
-    (docs/ui-api-contract.md §6), so they never sit in the verified block.
-    """
-    body = portfolio_body or {}
-    realized = body.get("realized_pnl")
-    realized = realized if isinstance(realized, dict) else None
-    futures = body.get("futures")
-    futures = futures if isinstance(futures, dict) else None
-    futures_ok = futures is not None and futures.get("status") == "ok"
-    return {
-        "spot_audit_realized_total": (realized or {}).get("total"),
-        "spot_audit_realized_today": (realized or {}).get("today"),
-        "spot_currency": body.get("currency"),
-        "spot_closed_trades": (realized or {}).get("closed_trades"),
-        "spot_unknown_basis_closes": (realized or {}).get("unknown_basis_closes"),
-        "futures_unrealized": (futures or {}).get("unrealized_pnl") if futures_ok else None,
-        "futures_unrealized_currency": (
-            (futures or {}).get("unrealized_pnl_currency") if futures_ok else None
-        ),
-    }
-
-
-def _unattributed_from_coverage(coverage: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Manual/unlinked fills, kept per coverage row with its own window.
-
-    Coverage rows reconcile one cycle's fill window each and overlap by
-    construction, so their counts are reported per row and never summed into a
-    single headline number (see ``coverage_note``).
-    """
-    rows: list[dict[str, Any]] = []
-    for row in coverage:
-        manual = row.get("unattributed_manual_detected")
-        if manual:
-            rows.append({
-                "window_start": row.get("window_start"),
-                "window_end": row.get("window_end"),
-                "count": manual,
-                "account_id": row.get("account_id"),
-            })
-    return rows
-
-
-def _results_section(portfolio_body: dict[str, Any] | None) -> dict[str, Any]:
-    try:
-        ledger = outcome_report.summary()
-    except Exception as exc:
-        logger.warning("brief: outcome ledger unreadable: %r", exc)
-        ledger = _unavailable(f"the outcome ledger could not be read: {type(exc).__name__}")
-    coverage = ledger.get("coverage") if isinstance(ledger.get("coverage"), list) else []
-    return {
-        "ledger": ledger,
-        "estimated": _estimated_results(portfolio_body),
-        "unattributed_manual": _unattributed_from_coverage(coverage),
-        "coverage_note": (
-            "Each coverage row reconciles one cycle's own fill window; rows overlap "
-            "and must never be summed into one total."
-        ),
-        "ledger_note": (
-            "Totals are per currency and never FX-converted. A currency whose funding "
-            "rows are missing has no net claimed for it."
-        ),
     }
 
 

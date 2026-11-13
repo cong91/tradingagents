@@ -37,7 +37,7 @@ DEFAULT_METRIC = "net_after_costs.final_equity"
 # any metric resolving to one of them on a traded run with unproven funding is
 # unproducible, whatever the criteria named.
 _FUNDING_DEPENDENT_KEYS = frozenset({
-    "final_equity", "final_equity_estimate", "funding_received",
+    "final_equity", "final_equity_estimate", "funding_received", "max_drawdown",
 })
 
 # Modules the runner must never import or call (plan: no code promotion).
@@ -74,28 +74,28 @@ def _config_hash(config: dict) -> str:
 
 
 def _metric_value(result: dict[str, Any], metric: str) -> float | None:
-    """Read a dotted metric path; unknown traded funding never becomes numeric.
-
-    The guard is not limited to the default metric: any path resolving through
-    ``net_after_costs`` to a funding-dependent key is unproducible on a traded
-    run whose funding the engine could not prove. Funding-independent keys
-    (fees, ambiguity counts) stay numeric.
-    """
+    """Read a dotted metric path; unknown traded funding never becomes numeric."""
     net = result.get("net_after_costs")
     traded = bool(result.get("fills"))
-    funding_unproven = traded and isinstance(net, dict) and (
-        net.get("final_equity_status") == "estimate" or net.get("funding_known") is False
+    funding_unproven = traded and (
+        result.get("funding_known") is False
+        or result.get("max_drawdown_status") == "estimate"
+        or (
+            isinstance(net, dict)
+            and (
+                net.get("final_equity_status") == "estimate"
+                or net.get("funding_known") is False
+                or net.get("funding_partial") is True
+            )
+        )
     )
     value: Any = result
     final_key = metric.rsplit(".", 1)[-1]
-    through_net = False
     for part in metric.split("."):
         if not isinstance(value, dict) or part not in value:
             return None
         value = value[part]
-        if part == "net_after_costs" and isinstance(value, dict):
-            through_net = True
-    if funding_unproven and through_net and final_key in _FUNDING_DEPENDENT_KEYS:
+    if funding_unproven and final_key in _FUNDING_DEPENDENT_KEYS:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -266,6 +266,12 @@ def _run_repeats(
                 include_sensitivity=False,
             )
             report = result.report()
+            source_coverage = _source_coverage(source, candles_holdout)
+            source_coverage["variant_kind"] = spec.kind
+            report["source_coverage"] = source_coverage
+            metric_value = _metric_value(report, metric)
+            if source_coverage["replay_evidence"] and not source_coverage["evidence_backed"]:
+                metric_value = None
             llm = _llm_usage(source)
             per_variant.setdefault(spec.name, []).append({
                 "variant": spec.name, "repeat": index, "seed": rng_seed,
@@ -279,10 +285,27 @@ def _run_repeats(
                 "llm_tokens": llm.get("tokens", 0),
                 "llm_calls": llm.get("calls", 0),
                 "llm_latency_ms": llm.get("latency_ms", 0.0),
-                "metric_value": _metric_value(report, metric),
+                "metric_value": metric_value,
+                "source_coverage": source_coverage,
                 "report": report,
             })
         _ = rng  # the seed is folded into per-repeat seeds above
+
+    baseline_name = next(
+        (name for name in ("no_trade", "rule", "recorded")
+         if name in per_variant),
+        next(iter(per_variant)),
+    )
+    for index, control_row in enumerate(per_variant[baseline_name]):
+        if control_row["source_coverage"]["variant_kind"] != "no_trade":
+            continue
+        has_evidence_backed_challenger = any(
+            rows[index]["source_coverage"]["evidence_backed"]
+            for name, rows in per_variant.items() if name != baseline_name
+        )
+        if not has_evidence_backed_challenger:
+            control_row["metric_value"] = None
+            control_row["source_coverage"]["comparison_status"] = "insufficient_evidence"
 
     # Persistence: every repeat row (no cherry-picking), one file per run.
     rows = [row for name in per_variant for row in per_variant[name]]
@@ -308,6 +331,31 @@ def _read_variant_rows(
     if missing:
         raise ValueError(f"variant(s) produced no repeats: {missing}")
     return stored
+
+
+def _source_coverage(source: Any, candles_holdout: list) -> dict[str, Any]:
+    """Distinguish recorded replay evidence from ordinary proposal sources."""
+    mode = getattr(source, "mode", "unreported")
+    replay_evidence = mode in ("counterfactual_rule", "recorded_decisions", "recorded_ablation")
+    coverage_for = getattr(source, "coverage_for", None)
+    scoped = coverage_for(candles_holdout) if replay_evidence and callable(coverage_for) else {}
+    skipped = scoped.get("skipped", getattr(source, "skipped", {}))
+    status = scoped.get("status", getattr(source, "coverage_status", "unreported"))
+    built = scoped.get("built", getattr(source, "built", None))
+    evidence_backed = (
+        status == "sufficient_evidence" and isinstance(built, int) and built > 0
+        if replay_evidence else mode != "no_trade"
+    )
+    return {
+        "mode": mode,
+        "replay_evidence": replay_evidence,
+        "input_count": scoped.get("input_count", getattr(source, "input_count", None)),
+        "evaluated": scoped.get("evaluated", getattr(source, "evaluated", None)),
+        "built": built,
+        "status": status,
+        "evidence_backed": evidence_backed,
+        "skipped": dict(sorted(skipped.items())) if isinstance(skipped, dict) else {},
+    }
 
 
 def _llm_usage(source: Any) -> dict[str, Any]:
@@ -347,6 +395,21 @@ def _summarize(
             continue
         challenger_values = [row["metric_value"] for row in per_variant[name]]
         control_values = [row["metric_value"] for row in per_variant[baseline_name]]
+        challenger_coverage = [
+            row.get("source_coverage", {}) for row in per_variant[name]
+        ]
+        insufficient_source = any(
+            coverage.get("replay_evidence") is True
+            and coverage.get("evidence_backed") is not True
+            for coverage in challenger_coverage
+        )
+        if insufficient_source:
+            comparisons.append({
+                "challenger": name, "control": baseline_name, "metric": metric,
+                "verdict": "insufficient_evidence_coverage",
+                "reason": "challenger source has insufficient recorded proposal evidence",
+            })
+            continue
         if any(value is None for value in challenger_values + control_values):
             comparisons.append({
                 "challenger": name, "control": baseline_name, "metric": metric,
@@ -387,7 +450,15 @@ def _summarize(
             "llm_tokens": sum(row["llm_tokens"] for row in rows),
             "llm_calls": sum(row["llm_calls"] for row in rows),
             "metric_values": [row["metric_value"] for row in rows],
-            "max_drawdowns": [row["report"]["max_drawdown"] for row in rows],
+            "max_drawdowns": [
+                None if (
+                    row["report"].get("max_drawdown_status") == "estimate"
+                    or (row["source_coverage"].get("replay_evidence")
+                        and not row["source_coverage"].get("evidence_backed"))
+                ) else row["report"].get("max_drawdown")
+                for row in rows
+            ],
+            "source_coverage": [row.get("source_coverage", {}) for row in rows],
             "ambiguity_counts": [row["report"]["ambiguity_count"] for row in rows],
         }
     return {

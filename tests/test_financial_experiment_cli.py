@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -68,40 +69,45 @@ def _base_args(candles: Path, holdout: str = "2026-10-26") -> list[str]:
             "--holdout-start", holdout, "--seed", "7", "--repeat", "1"]
 
 
-def test_full_candle_import_produces_fills_equity_and_net(tmp_path):
-    """The financial part is real: fills, an equity curve and a net figure."""
+def test_evidence_poor_fixture_reports_insufficient_proposal_coverage(tmp_path):
+    """The exported source has no terms or intent, so cash is not a numeric result."""
     proc = _run(*_base_args(_CANDLES), "--derivatives-exposure-pct", "50",
                 results_dir=tmp_path)
     summary = _summary_of(proc)
 
     baseline = summary["per_variant"]["baseline"]
-    # Funding was not supplied, so a traded result is an estimate and cannot
-    # support a net comparison. Cash without trades remains a known control.
-    assert baseline["metric_values"][0] is None, summary
-    assert summary["per_variant"]["no_trade"]["metric_values"][0] == 10_000.0
+    assert baseline["metric_values"] == [None]
+    assert summary["per_variant"]["no_trade"]["metric_values"] == [None]
     assert summary["comparisons"][0]["verdict"] == "insufficient_evidence_coverage"
-    assert baseline["max_drawdowns"][0] > 0.0, "a traded run must show a drawdown"
+    assert baseline["max_drawdowns"] == [None]
+    diagnostics = baseline["source_coverage"][0]
+    assert diagnostics["status"] == "insufficient_evidence"
+    assert diagnostics["built"] == 0
+    assert diagnostics["skipped"]["missing_intent"] > 0
     assert summary["candle_coverage"]["holdout"] > 0
 
-    # The artifact on disk carries the same numbers, plus the provenance the
-    # plan requires: which candles, which symbol, and that no model was re-run.
     run_dir = tmp_path / "experiments" / summary["run_id"]
     stored = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert stored["per_variant"]["baseline"]["metric_values"] == baseline["metric_values"]
+    assert stored["per_variant"]["baseline"]["source_coverage"] == baseline["source_coverage"]
     assert summary["manifest_digest"] == stored["manifest_digest"]
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["kind"] == "replay_of_recording"
     assert manifest["replay"]["model_rerun"] is False
     assert manifest["replay"]["candles"]["count"] > 0
     assert manifest["replay"]["candles"]["symbol"] == "ENA/USDT:USDT"
-    # Repeat rows are on disk too: the financial numbers are re-readable, not
-    # only printed.
+    start_text, end_text = manifest["window"].split(":")
+    window_start = datetime.fromisoformat(start_text).replace(tzinfo=UTC)
+    window_end = datetime.fromisoformat(end_text).replace(tzinfo=UTC)
+    first_open = datetime.fromtimestamp(summary["candle_coverage"]["first_holdout_open_ms"] / 1000, UTC)
+    last_close = datetime.fromtimestamp(summary["candle_coverage"]["last_holdout_close_ms"] / 1000, UTC)
+    assert window_start <= first_open < last_close <= window_end
+    assert manifest["replay"]["holdout_last_close_ms"] == int(last_close.timestamp() * 1000)
     rows = [json.loads(line) for line in
             (run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines() if line]
-    assert rows and all("report" in row for row in rows)
-    traded = next(row["report"] for row in rows if row["report"]["fills"])
-    assert traded["net_after_costs"]["final_equity_status"] == "estimate"
-    assert traded["net_after_costs"]["final_equity_estimate"] != 10_000.0
+    rule_row = next(row for row in rows if row["variant"] == "baseline")
+    assert rule_row["source_coverage"] == diagnostics
+    assert rule_row["report"]["source_coverage"] == diagnostics
+    assert not rule_row["report"]["fills"]
 
 
 def test_cli_registration_populates_the_registry(postgres_schema, tmp_path, monkeypatch):
@@ -233,8 +239,12 @@ def test_no_trade_keeps_cash_in_the_same_sample_and_cost_model(tmp_path):
                 results_dir=tmp_path)
     summary = _summary_of(proc)
     no_trade = summary["per_variant"]["no_trade"]
-    assert no_trade["metric_values"] == [10_000.0]
+    assert no_trade["metric_values"] == [None]
     assert no_trade["max_drawdowns"] == [0.0]
+    assert no_trade["source_coverage"][0]["mode"] == "no_trade"
+    assert summary["per_variant"]["baseline"]["source_coverage"][0]["status"] == (
+        "insufficient_evidence"
+    )
     # Both variants replayed the identical holdout window.
     assert summary["candle_coverage"]["holdout"] > 0
     assert summary["comparisons"], "the paired comparison must be reported"
@@ -249,7 +259,10 @@ def test_zero_derivatives_cap_blocks_entries_and_says_so(tmp_path, monkeypatch):
     summary = _summary_of(proc)
     # The runtime default blocks every derivatives entry, so the rule cannot
     # trade; that must be reported, not presented as a flat result.
-    assert summary["per_variant"]["baseline"]["metric_values"] == [10_000.0]
+    assert summary["per_variant"]["baseline"]["metric_values"] == [None]
+    assert summary["per_variant"]["baseline"]["source_coverage"][0]["status"] == (
+        "insufficient_evidence"
+    )
     run_dir = tmp_path / "experiments" / summary["run_id"]
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert "risk_max_derivatives_exposure_pct is 0" in manifest["replay"]["note_blocking"]

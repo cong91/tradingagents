@@ -109,6 +109,19 @@ def _flat_proposal_source(price: float = 100.0) -> "Callable[[Candle], Proposal]
     return source
 
 
+def _funding_series(
+    candles: list[Candle], *, rates: dict[int, float], marks: dict[int, float],
+    known_from_ms: int | None = None, known_to_ms: int | None = None,
+    venue_semantics: str = "test: positive rate paid by longs, received by shorts",
+) -> FundingSeries:
+    return FundingSeries(
+        symbol="BTC/USDT:USDT", rates=rates, mark_prices=marks,
+        known_from_ms=known_from_ms, known_to_ms=known_to_ms,
+        quote_currency="USDT", contract_type="linear", quantity_unit="base",
+        venue_semantics=venue_semantics,
+    )
+
+
 def test_engine_plan_matches_runtime_size_chain():
     """Parity pin: the engine's futures plan equals DerivativesExecutor._size."""
     from tradingagents.execution.derivatives import DerivativesExecutor
@@ -193,7 +206,7 @@ def test_entry_parity_log_records_real_function_outputs():
 def test_ambiguity_counted_and_worst_first_fills_the_stop():
     # One candle spans both the stop (98) and the target (104); scale-out is
     # off so the take-profit is the matched target.
-    ambiguous_candle = _candle(1_700_000_100_000, 100.0, 104.5, 97.5, 101.0)
+    ambiguous_candle = _candle(1_700_003_600_000, 100.0, 104.5, 97.5, 101.0)
     candles = [_candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2), ambiguous_candle]
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
@@ -231,8 +244,8 @@ def test_gap_through_stop_fills_at_open_not_survived():
     """Blocker 3: a candle that OPENED below the long stop fills the stop at
     the open — the venue trigger fires there; the position can never quietly
     survive a candle that traded entirely past its stop."""
-    fill_candle = _candle(1_700_000_050_000, 100.0, 100.6, 99.4, 100.3)
-    gap_candle = _candle(1_700_000_100_000, 90.0, 97.0, 89.0, 95.0)  # open 90 < stop 98
+    fill_candle = _candle(1_700_003_600_000, 100.0, 100.6, 99.4, 100.3)
+    gap_candle = _candle(1_700_007_200_000, 90.0, 97.0, 89.0, 95.0)  # open 90 < stop 98
     candles = [
         _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
         fill_candle,
@@ -259,7 +272,7 @@ def test_entry_gap_below_stop_abandons_the_plan_instead_of_crashing():
     """A candle gapping through the bracket between decision and fill
     invalidates the plan: the entry is abandoned (validate_bracket
     semantics), never opened with a stop that does not protect it."""
-    gap_fill_candle = _candle(1_700_000_050_000, 90.0, 97.0, 89.0, 95.0)
+    gap_fill_candle = _candle(1_700_003_600_000, 90.0, 97.0, 89.0, 95.0)
     candles = [
         _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
         gap_fill_candle,
@@ -278,8 +291,8 @@ def test_gap_through_target_fills_at_open_favorable():
     """A candle that OPENED beyond the resting target fills the exit at the
     open — never skipped (the fill candle's range stays below the target so
     the resting limit survives until the gap)."""
-    fill_candle = _candle(1_700_000_050_000, 100.0, 103.4, 99.4, 103.0)
-    gap_candle = _candle(1_700_000_100_000, 120.0, 121.0, 119.5, 120.5)  # open 120 > 104
+    fill_candle = _candle(1_700_003_600_000, 100.0, 103.4, 99.4, 103.0)
+    gap_candle = _candle(1_700_007_200_000, 120.0, 121.0, 119.5, 120.5)  # open 120 > 104
     candles = [
         _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.2),
         fill_candle,
@@ -340,63 +353,65 @@ def test_scale_out_enabled_never_closes_full_at_the_take_profit():
 
 
 def test_funding_no_settlement_inside_known_span_is_a_known_zero():
-    """Finding 1: a window inside the series' known span with no settlement
-    is a known zero, NOT unknown; only windows outside the span are unknown."""
+    """A covered interval with no reported settlement is a known zero."""
     candles = _rising_candles(5)
-    funding = FundingSeries(
-        amounts={candles[3].open_time + 1: 2.0},
-        venue_semantics="test: positive = received",
+    funding = _funding_series(
+        candles, rates={}, marks={},
         known_from_ms=candles[0].open_time,
         known_to_ms=candles[-1].close_time,
     )
     result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
-    assert result.funding_known is True  # every window covered by the span
+    assert result.funding_known is True
     assert result.net_after_costs["funding_partial"] is False
-    assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
+    assert result.net_after_costs["funding_received"] == pytest.approx(0.0)
 
 
 def test_funding_window_outside_known_span_is_unknown_not_zero():
     candles = _rising_candles(5)
-    funding = FundingSeries(
-        amounts={candles[3].open_time + 1: 2.0},
-        venue_semantics="test: positive = received",
+    settlement = candles[3].open_time + 1
+    funding = _funding_series(
+        candles, rates={settlement: 0.0002}, marks={settlement: 100.0},
         known_from_ms=candles[3].open_time,
+        known_to_ms=candles[-1].close_time,
     )
     result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
+    entry_quantity = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
     assert result.funding_known is False
     assert result.net_after_costs["funding_partial"] is True
     assert result.net_after_costs["funding_unknown_windows"] > 0
-    assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
+    assert result.net_after_costs["funding_received"] == pytest.approx(
+        -entry_quantity * 100.0 * 0.0002
+    )
     assert result.net_after_costs["final_equity_status"] == "estimate"
 
 
 def test_funding_series_requires_full_window_coverage_at_boundaries_and_splits():
     series = FundingSeries(
-        amounts={200: 2.0},
-        venue_semantics="test: positive = received",
-        known_from_ms=100,
-        known_to_ms=300,
+        rates={200: 0.01}, mark_prices={200: 100.0},
+        venue_semantics="test: positive rate paid by longs, received by shorts",
+        symbol="BTC/USDT:USDT", quote_currency="USDT",
+        contract_type="linear", quantity_unit="base",
+        known_from_ms=100, known_to_ms=300,
     )
-    # Exact boundaries and adjacent windows are covered by the half-open span.
-    assert series.received_between(100, 200) == pytest.approx(0.0)
-    assert series.received_between(200, 300) == pytest.approx(2.0)
-    assert series.received_between(100, 300) == pytest.approx(2.0)
-    # Any overlap before or after the span is unknown, including a one-ms overlap.
-    assert series.received_between(99, 200) is None
-    assert series.received_between(100, 301) is None
-    assert series.received_between(50, 100) is None
-    assert series.received_between(300, 350) is None
+    assert series.covers(100, 200)
+    assert series.covers(200, 300)
+    assert series.covers(100, 300)
+    assert series.settlement_times(100, 300) == [200]
+    assert not series.covers(99, 200)
+    assert not series.covers(100, 301)
+    assert not series.covers(50, 100)
+    assert not series.covers(300, 350)
 
 
 def test_funding_window_partially_overlapping_known_span_is_unknown():
     series = FundingSeries(
-        amounts={200: 2.0},
-        venue_semantics="test: positive = received",
-        known_from_ms=100,
-        known_to_ms=300,
+        rates={200: 0.01}, mark_prices={200: 100.0},
+        symbol="BTC/USDT:USDT", quote_currency="USDT",
+        contract_type="linear", quantity_unit="base",
+        known_from_ms=100, known_to_ms=300,
     )
-    assert series.received_between(99, 150) is None
-    assert series.received_between(250, 301) is None
+    assert not series.covers(99, 150)
+    assert not series.covers(250, 301)
 
 
 def test_unknown_funding_on_traded_simulation_preserves_labeled_estimate():
@@ -423,9 +438,9 @@ def test_final_candle_exposure_settles_before_forced_close():
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
         risk_fraction=0.004, margin_fraction=0.25,
     )
-    funding = FundingSeries(
-        amounts={candles[-1].open_time + 1: 5.0},
-        venue_semantics="test: positive = received",
+    funding = _funding_series(
+        candles, rates={candles[-1].open_time + 1: -0.0005},
+        marks={candles[-1].open_time + 1: 100.0},
         known_from_ms=candles[-1].open_time,
         known_to_ms=candles[-1].close_time,
     )
@@ -435,7 +450,10 @@ def test_final_candle_exposure_settles_before_forced_close():
         funding=funding,
     )
     assert result.exit_reason_distribution.get("final_close") == 1
-    assert result.net_after_costs["funding_received"] == pytest.approx(5.0)
+    entry_quantity = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
+    assert result.net_after_costs["funding_received"] == pytest.approx(
+        entry_quantity * 100.0 * 0.0005
+    )
     assert result.funding_known is True
     assert result.net_after_costs["final_equity_status"] == "known"
 
@@ -450,9 +468,9 @@ def test_intrabar_exit_with_settlement_in_same_candle_marks_funding_unknown():
         stop_loss=98.0, take_profit=101.0, scale_out_enabled=False,
         risk_fraction=0.004, margin_fraction=0.25,
     )
-    funding = FundingSeries(
-        amounts={candles[1].open_time + 1_800_000: 5.0},
-        venue_semantics="test: positive = received",
+    settlement = candles[1].open_time + 1_800_000
+    funding = _funding_series(
+        candles, rates={settlement: -0.01}, marks={settlement: 100.0},
         known_from_ms=candles[1].open_time,
         known_to_ms=candles[1].close_time,
     )
@@ -478,9 +496,9 @@ def test_time_stop_uses_current_candle_funding_before_verdict():
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
         risk_fraction=0.004, margin_fraction=0.25,
     )
-    funding = FundingSeries(
-        amounts={candles[1].open_time + 1_800_000: 100.0},
-        venue_semantics="test: positive = received",
+    settlement = candles[1].open_time + 1_800_000
+    funding = _funding_series(
+        candles, rates={settlement: -0.05}, marks={settlement: 100.0},
         known_from_ms=candles[1].open_time,
         known_to_ms=candles[1].close_time,
     )
@@ -515,9 +533,9 @@ def test_gap_settlement_before_a_pending_exit_is_still_accounted():
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
         risk_fraction=0.004, margin_fraction=0.25,
     )
-    funding = FundingSeries(
-        amounts={candles[1].close_time + 60_000: 5.0},  # inside the c1→c2 gap
-        venue_semantics="test: positive = received",
+    funding = _funding_series(
+        candles, rates={candles[1].close_time + 60_000: -0.0005},
+        marks={candles[1].close_time + 60_000: 100.0},
         known_from_ms=candles[1].open_time,
         known_to_ms=candles[-1].close_time,
     )
@@ -528,7 +546,10 @@ def test_gap_settlement_before_a_pending_exit_is_still_accounted():
         max_hold_hours=0.1,
     )
     assert result.exit_reason_distribution.get("time_stop") == 1
-    assert result.net_after_costs["funding_received"] == pytest.approx(5.0)
+    entry_quantity = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
+    assert result.net_after_costs["funding_received"] == pytest.approx(
+        entry_quantity * 100.0 * 0.0005
+    )
     assert result.funding_known is True
 
 
@@ -547,9 +568,9 @@ def test_funding_after_scale_out_is_prorated_to_remaining_exposure():
         stop_loss=98.0, take_profit=140.0,
         risk_fraction=0.004, margin_fraction=0.25,
     )
-    funding = FundingSeries(
-        amounts={candles[2].open_time + 1_800_000: 3.0},
-        venue_semantics="test: positive = received",
+    settlement = candles[2].open_time + 1_800_000
+    funding = _funding_series(
+        candles, rates={settlement: 0.0005}, marks={settlement: 100.0},
         known_from_ms=candles[1].open_time,
         known_to_ms=candles[-1].close_time,
     )
@@ -561,7 +582,9 @@ def test_funding_after_scale_out_is_prorated_to_remaining_exposure():
     scale_out = next(fill for fill in result.fills if fill["kind"] == "scale_out")
     assert scale_out["candle_open_time"] == candles[1].open_time
     entry_qty = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
-    expected = 3.0 * (entry_qty - scale_out["quantity"]) / entry_qty
+    expected = -(
+        entry_qty - scale_out["quantity"]
+    ) * 100.0 * 0.0005
     assert result.net_after_costs["funding_received"] == pytest.approx(expected)
     assert result.funding_known is True
 
@@ -590,16 +613,24 @@ def test_funding_missing_reports_unknown_never_zero():
     assert result.net_after_costs["funding_unknown_windows"] == 0
 
 
-def test_funding_series_applies_signed_amounts():
+def test_funding_series_applies_signed_rate_and_mark():
     candles = _rising_candles(5)
-    funding = FundingSeries(
-        amounts={candles[3].open_time + 1: 2.0},  # one settlement inside window
-        venue_semantics="test: positive = received",
+    settlement = candles[3].open_time + 1
+    funding = _funding_series(
+        candles, rates={settlement: -0.0002}, marks={settlement: 100.0},
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[-1].close_time,
+        venue_semantics="test: positive rate paid by longs, received by shorts",
     )
     result = _run(candles, funding=funding, proposal_source=_flat_proposal_source())
+    entry_quantity = next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
     assert result.funding_known is True
-    assert result.net_after_costs["funding_received"] == pytest.approx(2.0)
-    assert result.net_after_costs["funding_semantics"] == "test: positive = received"
+    assert result.net_after_costs["funding_received"] == pytest.approx(
+        entry_quantity * 100.0 * 0.0002
+    )
+    assert result.net_after_costs["funding_semantics"] == (
+        "test: positive rate paid by longs, received by shorts"
+    )
 
 
 def test_report_carries_simulation_label_disclaimer_and_required_sections():
@@ -807,11 +838,11 @@ def test_funding_r_denominator_is_the_opened_size_not_the_remainder():
     # never rescue the position). The report separately marks funding unknown.
     assert protection_calls[0]["input"]["cumulative_funding_r"] == 0.0
 
-    from tradingagents.simulation.costs import FundingSeries
-
-    funding = FundingSeries(
-        amounts={candles[3].open_time + 1: 2.0},
-        venue_semantics="test: positive = received",
+    funding = _funding_series(
+        candles, rates={candles[3].open_time + 1: -0.0002},
+        marks={candles[3].open_time + 1: 100.0},
+        known_from_ms=candles[1].open_time,
+        known_to_ms=candles[-1].close_time,
     )
     funded = _run(candles, funding=funding, proposal_source=source)
     funded_calls = [

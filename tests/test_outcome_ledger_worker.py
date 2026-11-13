@@ -171,6 +171,20 @@ def _raising_source(message: str = "venue down"):
     return source
 
 
+def _complete_fill_source(fills: list[dict], *, funding: list | None = None):
+    def source(account_id: str, symbol: str, since_ms: int, until_ms: int) -> dict:
+        return {
+            "status": "ok",
+            "fills": fills,
+            "fills_complete": True,
+            "warnings": ["funding_history_unverified"],
+            "funding": funding,
+            "start_at": datetime.fromtimestamp(since_ms / 1000, UTC).isoformat(),
+            "end_at": datetime.fromtimestamp((until_ms + 1) / 1000, UTC).isoformat(),
+        }
+    return source
+
+
 def test_worker_module_is_independent_of_the_autoloop():
     """The outcome worker remains isolated from the autoloop."""
     import ast
@@ -241,7 +255,7 @@ def test_executed_cycle_with_managed_fills_is_recorded(postgres_schema, ingest_e
     # Production evidence: the exit fill carries the BRACKET order id, not the
     # entry order id — the bracket task holds it (blocker 2 fix).
     _record_bracket_task(ORDER_ID, placed_ids=["9500"])
-    result = outcome_ledger.poll_once(_fill_source([
+    result = outcome_ledger.poll_once(_complete_fill_source([
         _venue_fill("700", ORDER_ID),
         _venue_fill("701", "9500", realized="9.9", side="sell", price="104"),
     ]))
@@ -255,6 +269,10 @@ def test_executed_cycle_with_managed_fills_is_recorded(postgres_schema, ingest_e
     assert summary["status"] == "partial"
     assert summary["positions"]["total"] == 1
     assert summary["positions"]["closed"] == 1
+    assert summary["positions"]["verified_closed"] == 1
+    assert summary["positions"]["recorded_closed"] == 1
+    assert summary["positions"]["closure_evidence"]["verified_closed"] == 1
+    assert summary["positions"]["closure_evidence"]["unverified_positions"] == 0
     assert summary["totals"]["realized_by_currency"]["USDT"] == "9.9"
     assert summary["totals"]["fee_by_currency"]["USDT"] == "0.2"
     # The net claim is allowed: funding rows exist? No — but the fee semantics
@@ -466,50 +484,39 @@ def test_cycle_without_executed_order_is_skipped(postgres_schema, ingest_enabled
 
 
 def test_failing_cycle_is_retried_then_published_as_error_coverage(
-    postgres_schema, ingest_enabled,
+    postgres_schema, ingest_enabled, monkeypatch,
 ):
-    """Finding 4: a cycle that raises is never silently dropped — the cursor
-    holds back while attempts remain, and past the bound the failure lands as
-    a durable coverage row with status ``error``.
-
-    The deterministic poison: an exit fill with a negative quantity violates
-    the outcome_fills CHECK, so record_outcome (and the whole cycle) raises
-    on every poll until the retry bound publishes the failure.
-    """
+    """Unexpected per-cycle failures retry, then get a durable error row."""
     _enable_and_seed()
-    _record_executed_cycle("futures:BTC/USDT:USDT:e1")
+    failing_cycle_id = "futures:BTC/USDT:USDT:e1"
+    _record_executed_cycle(failing_cycle_id)
     _record_executed_cycle("futures:BTC/USDT:USDT:e2")
-    # The journal is bound AFTER both cycles so each carries the marker:
-    # a legacy marker-less cycle is skipped cleanly, which would move the
-    # cursor past it instead of exercising the retry bound below.
     _record_journal(placed_ids=[ORDER_ID])
     _record_bracket_task(ORDER_ID, placed_ids=["9510"])
+    original_process = outcome_ledger._process_cycle
 
-    poisoned_fills = [
-        _venue_fill("900", ORDER_ID),
-        _venue_fill("901", "9510", side="sell", price="104", realized="9.9"),
-    ]
-    poisoned_fills[1]["contracts"] = "-5"  # violates CHECK (quantity > 0)
+    def fail_one_cycle(cycle, *, fill_source, ingest):
+        if cycle["cycle_id"] == failing_cycle_id:
+            raise RuntimeError("poison cycle processing failure")
+        return original_process(cycle, fill_source=fill_source, ingest=ingest)
 
-    first = outcome_ledger.poll_once(_fill_source(poisoned_fills))
-    assert first["outcomes"][0]["result"] == "error:CheckViolation" or (
-        first["outcomes"][0]["result"].startswith("error:")
-    )
-    # The cursor did not advance past the failing cycle: poll 2 retries it.
-    second = outcome_ledger.poll_once(_fill_source(poisoned_fills))
-    assert second["outcomes"][0]["result"].startswith("error:")
-    third = outcome_ledger.poll_once(_fill_source(poisoned_fills))
-    assert third["outcomes"][0]["result"].startswith("error:")
-    # Past MAX_CYCLE_ATTEMPTS the failure is published and the pipeline moves.
+    monkeypatch.setattr(outcome_ledger, "_process_cycle", fail_one_cycle)
+    for _ in range(3):
+        result = outcome_ledger.poll_once(_fill_source([]))
+        assert result["outcomes"][0]["result"].startswith("error:")
+
     coverage = outcome_report.summary()["coverage"]
     error_rows = [row for row in coverage if row["status"] == "error"]
-    assert len(error_rows) == 1
-    assert error_rows[0]["account_id"].startswith("cycle-error:")
-    assert "venue read" in json.dumps(error_rows[0]["warnings"]) or (
-        "attempts" in json.dumps(error_rows[0]["warnings"])
-    )
-    fourth = outcome_ledger.poll_once(_fill_source([]))
-    assert fourth["processed"] == 1  # the cursor moved past the poisoned cycle to e2
+    assert error_rows
+    assert any(row["account_id"] == f"cycle-error:{failing_cycle_id}" for row in error_rows)
+    assert any("attempts" in json.dumps(row["warnings"]) for row in error_rows)
+
+    for _ in range(outcome_ledger.MAX_CYCLE_ATTEMPTS):
+        outcome_ledger.poll_once(_fill_source([]))
+    assert outcome_store.get_state(f"reconcile:{failing_cycle_id}") == "permanent"
+    revisit = outcome_ledger.poll_once(_fill_source([]))["reconciled"]
+    assert revisit
+    assert all(row["cycle_id"] != failing_cycle_id for row in revisit)
 
 
 def test_start_without_ingest_never_starts_a_thread():

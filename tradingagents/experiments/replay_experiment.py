@@ -21,7 +21,7 @@ import json
 import random
 import re
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +85,7 @@ def run_replay_experiment(
         raise ValueError("repeat must be at least 1")
     start, end = _parse_window(window)
     start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
+    end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
 
     _ISO_TS = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z)?"
 
@@ -101,7 +101,7 @@ def run_replay_experiment(
             return None
 
     cycles = [cycle for cycle in load_cycles(fixture_path)
-              if (open_ms := cycle_open_ms(cycle)) is not None and start_ms <= open_ms <= end_ms]
+              if (open_ms := cycle_open_ms(cycle)) is not None and start_ms <= open_ms < end_ms]
 
     run_id = f"replay_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{seed}"
     manifest = {
@@ -144,13 +144,26 @@ def run_replay_experiment(
         for name in rules:
             outcomes = replay_rule(cycles, RULES[name])
             confirmed = sum(1 for o in outcomes if o["rule_result"])
-            agreement = confirmed / len(outcomes) if outcomes else None
+            recorded_decisions = {
+                "aligned_direction": True,
+                "not_required_for_non_tradeable_signal": True,
+                "direction_mismatch": False,
+                "doji_candle": False,
+            }
+            known = [o for o in outcomes if o["recorded_confirmation_reason"] in recorded_decisions]
+            agreements = sum(
+                o["rule_result"] == recorded_decisions[o["recorded_confirmation_reason"]]
+                for o in known
+            )
+            agreement = agreements / len(outcomes) if outcomes and len(known) == len(outcomes) else None
             row = {
                 "variant": name, "repeat": repeat_index, "seed": seed + repeat_index,
                 "manifest_digest": digest,
                 "metric_value": agreement,
                 "cycles_replayed": len(outcomes),
                 "confirmed_by_rule": confirmed,
+                "decision_agreements": agreements,
+                "unknown_recorded_decisions": len(outcomes) - len(known),
                 "rng_sample": rng.random(),
             }
             per_rule.setdefault(name, []).append(row)
@@ -195,6 +208,8 @@ def run_replay_experiment(
                 "rates": [row["metric_value"] for row in values],
                 "cycles_replayed": values[0]["cycles_replayed"],
                 "confirmed_by_rule": values[0]["confirmed_by_rule"],
+                "decision_agreements": values[0]["decision_agreements"],
+                "unknown_recorded_decisions": values[0]["unknown_recorded_decisions"],
             }
             for name, values in per_rule.items()
         },
