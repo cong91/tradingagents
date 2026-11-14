@@ -6,6 +6,7 @@ plan §7). The brief must never fabricate a zero, never merge "no signal" with
 write anything.
 """
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -24,22 +25,33 @@ pytestmark = pytest.mark.unit
 
 
 def _seed_cycle(cycle_id: str, *, status: str, phase: str, payload: dict,
-                hour: int = 0) -> None:
-    """Seed one terminal cycle. ``hour`` varies the candle pair: futures_cycles
-    is UNIQUE on (symbol, 4h_open, 1h_open, strategy_version), so two cycles in
-    one test must sit on different candles — exactly as the runtime claims them."""
+                hour: int = 0) -> str:
+    """Seed one terminal cycle on its own candle pair. The stored id is the
+    canonical 7-segment identity built from the same opens (the label is only
+    a name); ``hour`` varies the candle pair exactly as the runtime claims
+    distinct candles."""
     from server import futures_cycle_store
+    from server.futures_cycle_telemetry import canonical_cycle_id
 
     candle = f"2026-11-10T{hour:02d}:00:00+00:00"
+    stored_id = canonical_cycle_id(
+        symbol="BTC/USDT:USDT", four_hour_open=candle, one_hour_open=candle,
+        timeframe="4h", open_time=int(
+            datetime(2026, 11, 10, hour, tzinfo=UTC).timestamp() * 1000
+        ),
+    )
     assert futures_cycle_store.claim_futures_cycle(
-        cycle_id,
+        stored_id,
         symbol="BTC/USDT:USDT",
         four_hour_open=candle,
         one_hour_open=candle,
         strategy_version="1",
+        timeframe="4h",
+        selected_open=int(datetime(2026, 11, 10, hour, tzinfo=UTC).timestamp() * 1000),
     )
-    futures_cycle_store.update_futures_cycle(cycle_id, status=status, phase=phase,
-                                            payload=payload, terminal=True)
+    futures_cycle_store.update_futures_cycle(stored_id, status=status, phase=phase,
+                                             payload=payload, terminal=True)
+    return stored_id
 
 
 def _seed_coverage(*, status: str, warnings: list[str], manual: int,
@@ -367,11 +379,19 @@ def test_brief_no_entry_reasons_carry_a_sample_cycle_and_top_three(client):
 
 def test_brief_excludes_in_flight_cycles_from_no_entry(client):
     from server import futures_cycle_store
+    from server.futures_cycle_telemetry import canonical_cycle_id
 
     # claim only: status 'claimed' — the decision has not been made yet.
     futures_cycle_store.claim_futures_cycle(
-        "cycle-running", symbol="BTC/USDT:USDT", four_hour_open="2026-11-10T00:00:00+00:00",
+        canonical_cycle_id(
+            symbol="BTC/USDT:USDT",
+            four_hour_open="2026-11-10T00:00:00+00:00",
+            one_hour_open="2026-11-10T00:00:00+00:00",
+            timeframe="4h", open_time=0,
+        ),
+        symbol="BTC/USDT:USDT", four_hour_open="2026-11-10T00:00:00+00:00",
         one_hour_open="2026-11-10T00:00:00+00:00", strategy_version="1",
+        timeframe="4h", selected_open=0,
     )
     payload = client.get("/api/brief").json()
     assert payload["activity"]["no_entry_top_reasons"] == []
@@ -526,22 +546,22 @@ def _forecast_block(*, as_of=None, status="ok") -> dict:
     }
 
 
-def _seed_forecast_cycle(cycle_id: str, block: dict, *, policy: str = "use") -> None:
-    _seed_cycle(cycle_id, hour=5, status="completed", phase="entry", payload={
+def _seed_forecast_cycle(cycle_id: str, block: dict, *, policy: str = "use") -> str:
+    return _seed_cycle(cycle_id, hour=5, status="completed", phase="entry", payload={
         "execution_status": "executed", "executed": True,
         "kronos_forecast": block, "kronos_policy": policy,
     })
 
 
 def test_brief_active_forecast_reports_the_latest_recorded_cycle(client):
-    _seed_forecast_cycle("cycle-fc-1", _forecast_block(), policy="use")
+    cycle_id = _seed_forecast_cycle("cycle-fc-1", _forecast_block(), policy="use")
     section = client.get("/api/brief").json()["active_forecast"]
     assert section["state"] == "ok"
     assert section["status"] == "ok"
     assert section["symbol"] == "BTC/USDT:USDT"
     assert section["quote_currency"] == "USDT"
     assert section["policy"] == "use"
-    assert section["cycle_id"] == "cycle-fc-1"
+    assert section["cycle_id"] == cycle_id
     forecast = section["forecast"]
     assert forecast["paths"] == 16
     assert forecast["direction_counts"]["up"] == 9

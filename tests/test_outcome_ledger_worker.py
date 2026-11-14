@@ -18,6 +18,7 @@ import psycopg
 import pytest
 
 from server import futures_cycle_store, job_store, outcome_ledger, outcome_report, outcome_store
+from server.futures_cycle_telemetry import canonical_cycle_id
 from tradingagents.execution.futures_entry_journal import managed_live_provenance
 from tradingagents.execution.sizing import PlannedOrder
 
@@ -52,13 +53,18 @@ _CYCLE_SEQ = count()
 
 def _record_executed_cycle(cycle_id: str, *, order_id: str | None = ORDER_ID,
                            executed: bool = True) -> None:
-    # Candle-open pairs must be distinct per cycle: futures_cycles carries a
-    # UNIQUE (symbol, four_hour_open, one_hour_open, strategy_version), so a
-    # repeated pair is a real-world duplicate, not a retry.
+    # Each cycle sits on its own candle pair, exactly as the runtime claims
+    # them; the stored id is the canonical identity built from those opens
+    # (the ``cycle_id`` argument is only a label now).
     seq = next(_CYCLE_SEQ)
     now = datetime.now(UTC)
     four_hour_open = (now - timedelta(hours=4 + seq)).isoformat()
     one_hour_open = (now - timedelta(hours=1 + seq)).isoformat()
+    four_open_ms = int(datetime.fromisoformat(four_hour_open).timestamp() * 1000)
+    stored_id = canonical_cycle_id(
+        symbol=SYMBOL, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+        timeframe="4h", open_time=four_open_ms,
+    )
     payload = {
         "execution_status": "executed" if executed else "risk_rejected",
         "executed": executed,
@@ -70,15 +76,17 @@ def _record_executed_cycle(cycle_id: str, *, order_id: str | None = ORDER_ID,
         "signal": "Buy",
     }
     assert futures_cycle_store.claim_futures_cycle(
-        cycle_id, symbol=SYMBOL, four_hour_open=four_hour_open,
+        stored_id, symbol=SYMBOL, four_hour_open=four_hour_open,
         one_hour_open=one_hour_open, strategy_version="1",
+        timeframe="4h", selected_open=four_open_ms,
         payload=payload,
     )
     futures_cycle_store.update_futures_cycle(
-        cycle_id, status="completed" if executed else "rejected",
+        stored_id, status="completed" if executed else "rejected",
         phase="entry" if executed else "execution",
         payload=payload, terminal=True,
     )
+    return stored_id
 
 
 def _record_journal(*, placed_ids: list[str], task_id: str | None = None,
@@ -337,7 +345,7 @@ def test_restart_catch_up_covers_cycles_completed_while_worker_was_down(
     assert result["processed"] == 1
     # The worker was "down": a second cycle landed afterwards.
     second_order = "9100"
-    _record_executed_cycle("futures:BTC/USDT:USDT:t4b", order_id=second_order)
+    second_cycle_id = _record_executed_cycle("futures:BTC/USDT:USDT:t4b", order_id=second_order)
     _record_journal(placed_ids=[second_order], client_order_id="ta_worker_b")
     _record_bracket_task(second_order, placed_ids=["9500"], task_id=f"bracket:{SYMBOL}:{second_order}")
     caught_up = outcome_ledger.poll_once(_fill_source([
@@ -345,7 +353,7 @@ def test_restart_catch_up_covers_cycles_completed_while_worker_was_down(
         _venue_fill("853", "9500", side="sell", price="106", realized="5.0"),
     ]))
     assert caught_up["processed"] == 1
-    assert caught_up["outcomes"][0]["cycle_id"] == "futures:BTC/USDT:USDT:t4b"
+    assert caught_up["outcomes"][0]["cycle_id"] == second_cycle_id
     summary = outcome_report.summary()
     assert summary["positions"]["total"] == 2
     assert summary["totals"]["realized_by_currency"]["USDT"] == "8.0"
@@ -368,8 +376,18 @@ def test_batch_is_bounded_and_ordered(postgres_schema, ingest_enabled):
     ]
     result = outcome_ledger.poll_once(_fill_source(fills), batch_size=2)
     assert result["processed"] == 2
-    first_ids = [outcome["cycle_id"] for outcome in result["outcomes"]]
-    assert first_ids == sorted(first_ids)
+    # The batch follows the scan order the cursor itself uses:
+    # (updated_at, cycle_id) — the canonical ids are opaque keys, so the head
+    # of the batch is whatever that ordering returns, read back from the DB.
+    with psycopg.connect(os.environ["TRADINGAGENTS_DATABASE_URL"]) as conn:
+        expected_head = [
+            row[0] for row in conn.execute(
+                "SELECT cycle_id FROM futures_cycles "
+                "WHERE status IN ('completed', 'rejected') "
+                "ORDER BY updated_at, cycle_id LIMIT 2"
+            ).fetchall()
+        ]
+    assert [outcome["cycle_id"] for outcome in result["outcomes"]] == expected_head
     # Next poll continues exactly where the cursor stopped.
     second = outcome_ledger.poll_once(_fill_source([]), batch_size=2)
     assert second["processed"] == 2
@@ -488,8 +506,7 @@ def test_failing_cycle_is_retried_then_published_as_error_coverage(
 ):
     """Unexpected per-cycle failures retry, then get a durable error row."""
     _enable_and_seed()
-    failing_cycle_id = "futures:BTC/USDT:USDT:e1"
-    _record_executed_cycle(failing_cycle_id)
+    failing_cycle_id = _record_executed_cycle("futures:BTC/USDT:USDT:e1")
     _record_executed_cycle("futures:BTC/USDT:USDT:e2")
     _record_journal(placed_ids=[ORDER_ID])
     _record_bracket_task(ORDER_ID, placed_ids=["9510"])

@@ -461,18 +461,70 @@ def test_job_results_are_replaced_not_duplicated(client, tmp_path):
 # --- futures_cycles: the store contract the telemetry layer leans on ----------
 
 
+@pytest.mark.integration
+def test_futures_cycle_claims_distinct_selected_candles_with_same_confirmations(postgres_schema):
+    """Selected timeframe/open time extends identity beyond fixed confirmations."""
+    from server.futures_cycle_telemetry import canonical_cycle_id, claim_cycle
+
+    symbol = "BTC/USDT:USDT"
+    confirmations = {"four_hour_open": "4h-open", "one_hour_open": "1h-open"}
+    first_id = canonical_cycle_id(
+        symbol=symbol, timeframe="1m", open_time=1_000, **confirmations,
+    )
+    second_id = canonical_cycle_id(
+        symbol=symbol, timeframe="15m", open_time=2_000, **confirmations,
+    )
+
+    assert claim_cycle(
+        first_id, symbol=symbol, timeframe="1m", selected_open=1_000,
+        **confirmations, payload={"timeframe": "1m"},
+    )
+    assert claim_cycle(
+        second_id, symbol=symbol, timeframe="15m", selected_open=2_000,
+        **confirmations, payload={"timeframe": "15m"},
+    )
+    assert not claim_cycle(
+        first_id, symbol=symbol, timeframe="1m", selected_open=1_000,
+        **confirmations, payload={"timeframe": "1m"},
+    )
+
+    assert futures_cycle_store.load_futures_cycle(first_id)["payload"]["timeframe"] == "1m"
+    assert futures_cycle_store.load_futures_cycle(second_id)["payload"]["timeframe"] == "15m"
+
+
+@pytest.mark.integration
+def test_claim_rejects_an_id_that_is_not_the_canonical_identity(postgres_schema):
+    """The database CHECK locks the id format: a producer that drifts from the
+    canonical builder cannot persist a row at all."""
+    import psycopg
+
+    from server.futures_cycle_telemetry import claim_cycle
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        claim_cycle(
+            "futures:BTC/USDT:USDT:4h-open:1h-open:1",
+            symbol="BTC/USDT:USDT", four_hour_open="4h-open", one_hour_open="1h-open",
+            timeframe="1h", selected_open=7, payload={},
+        )
+
+
 def test_terminal_futures_cycle_row_is_immutable(postgres_schema):
     """Once a row lands terminal the store refuses every later write: the audit
     record a rejection produced can never be overwritten into an entry."""
-    from server.futures_cycle_telemetry import claim_cycle, persist_rejection
+    from server.futures_cycle_telemetry import canonical_cycle_id, claim_cycle, persist_rejection
 
-    cycle_id = "futures:BTC/USDT:USDT:x:y:1"
+    cycle_id = canonical_cycle_id(
+        symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", open_time=7,
+    )
     assert claim_cycle(
         cycle_id, symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", selected_open=7,
         payload={"requested_ticker": "BTC-USD", "unified_symbol": "BTC/USDT:USDT"},
     )
     persist_rejection(
         cycle_id, symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", selected_open=7,
         phase="proposal",
         payload={"signal": "Buy", "signal_reason": "agent_abstained",
                  "execution_status": "not_started", "order_id": None},
@@ -493,11 +545,15 @@ def test_merge_keeps_recorded_values_against_late_nones(postgres_schema):
     """A rejection write that omits a field must not null out what an earlier
     phase recorded (analysis wrote signal_reason before the confirmation gate
     refused), while real corrections still overwrite."""
-    from server.futures_cycle_telemetry import claim_cycle, persist_progress
+    from server.futures_cycle_telemetry import canonical_cycle_id, claim_cycle, persist_progress
 
-    cycle_id = "futures:ETH/USDT:USDT:x:y:1"
+    cycle_id = canonical_cycle_id(
+        symbol="ETH/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", open_time=7,
+    )
     assert claim_cycle(
         cycle_id, symbol="ETH/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", selected_open=7,
         payload={"signal_reason": "tradeable_signal", "signal": "Sell",
                  "execution_status": "in_progress"},
     )
@@ -540,21 +596,33 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
     no order and execute failure each keep their own bucket; legacy rows whose
     terminal write predates the phase split are mapped at read time from the
     outcome their payload recorded — the stored rows are never rewritten."""
-    def _seed(cycle_id, symbol, *, status, phase, payload):
-        from server.futures_cycle_telemetry import claim_cycle
+    def _seed(label, symbol, *, status, phase, payload):
+        from server.futures_cycle_telemetry import canonical_cycle_id, claim_cycle
 
+        cycle_id = canonical_cycle_id(
+            symbol=symbol,
+            four_hour_open="2026-10-27T08:00:00+00:00",
+            one_hour_open="2026-10-27T11:00:00+00:00",
+            timeframe="4h", open_time=len(label),
+        )
         assert claim_cycle(
-            cycle_id, symbol=symbol, four_hour_open="x", one_hour_open="y", payload={},
+            cycle_id, symbol=symbol,
+            four_hour_open="2026-10-27T08:00:00+00:00",
+            one_hour_open="2026-10-27T11:00:00+00:00",
+            timeframe="4h", selected_open=len(label), payload={},
         )
         futures_cycle_store.update_futures_cycle(
             cycle_id, status=status, phase=phase, payload=payload, terminal=True,
         )
+        return cycle_id
 
-    _seed(
-        "m-executed", "BTC/USDT:USDT", status="completed", phase="entry",
-        payload={"execution_status": "executed", "executed": True},
-    )
-    _seed(
+    ids = {
+        "m-executed": _seed(
+            "m-executed", "BTC/USDT:USDT", status="completed", phase="entry",
+            payload={"execution_status": "executed", "executed": True},
+        ),
+    }
+    ids["m-approval"] = _seed(
         "m-approval", "ETH/USDT:USDT", status="rejected", phase="execution",
         payload={"execution_status": "awaiting_approval", "executed": False,
                  "execution_reason": "awaiting approval (auto-confirm env gate closed)"},
@@ -569,7 +637,7 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
         payload={"execution_status": "not_executed", "executed": False,
                  "plan_reason": "sizing refused: risk budget below minimum"},
     )
-    _seed(
+    ids["m-failed"] = _seed(
         "m-failed", "ADA/USDT:USDT", status="failed", phase="execution",
         payload={"execution_status": "failed", "executed": False,
                  "failure_reason": "RuntimeError: venue down"},
@@ -589,7 +657,7 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
         "m-legacy-approval", "BNB/USDT:USDT", status="completed", phase="entry",
         payload={"execution_status": "awaiting_approval"},
     )
-    _seed(
+    ids["m-contradiction"] = _seed(
         "m-contradiction", "DOT/USDT:USDT", status="completed", phase="entry",
         payload={"execution_status": "executed", "executed": False},
     )
@@ -637,9 +705,9 @@ def test_futures_cycle_summary_and_rollup_map_outcomes_without_rewriting_history
 
     # History is read-time-mapped, never rewritten: every seeded row still
     # carries exactly the terminal shape it was written with.
-    contradiction = futures_cycle_store.load_futures_cycle("m-contradiction")
+    contradiction = futures_cycle_store.load_futures_cycle(ids["m-contradiction"])
     assert contradiction["status"] == "completed"
     assert contradiction["payload"]["execution_status"] == "executed"
     assert contradiction["payload"]["executed"] is False
-    assert futures_cycle_store.load_futures_cycle("m-approval")["status"] == "rejected"
-    assert futures_cycle_store.load_futures_cycle("m-failed")["phase"] == "execution"
+    assert futures_cycle_store.load_futures_cycle(ids["m-approval"])["status"] == "rejected"
+    assert futures_cycle_store.load_futures_cycle(ids["m-failed"])["phase"] == "execution"

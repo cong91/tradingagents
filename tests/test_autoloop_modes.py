@@ -34,7 +34,7 @@ pytestmark = pytest.mark.unit
 @pytest.fixture
 def mode_state(monkeypatch):
     config = {"auto_spot_enabled": False, "auto_futures_enabled": False}
-    persisted = {"enabled": False, "interval_minutes": 30, "updated_at": "old"}
+    persisted = {"enabled": False, "updated_at": "old"}
     writes = []
     starts = []
     wakeup = threading.Event()
@@ -72,7 +72,10 @@ def test_load_state_and_payload_derive_enabled_from_modes(mode_state, spot, futu
     assert payload["modes"] == {
         "auto_spot": spot, "auto_futures": futures, "any_auto_enabled": expected,
     }
-    assert payload["interval_minutes"] == 30
+    # The cadence is derived per mode from the selected candle timeframe; the
+    # manual interval is gone from the payload.
+    assert payload["schedules"]["auto_spot"]["enabled"] is spot
+    assert payload["schedules"]["auto_futures"]["enabled"] is futures
 
 
 def test_sync_mode_state_persists_changes_starts_and_wakes(mode_state, monkeypatch):
@@ -82,7 +85,7 @@ def test_sync_mode_state_persists_changes_starts_and_wakes(mode_state, monkeypat
 
     config["auto_spot_enabled"] = True
     assert autoloop.sync_mode_state() == {
-        "enabled": True, "interval_minutes": 30, "updated_at": "enabled-at",
+        "enabled": True, "updated_at": "enabled-at",
     }
     assert starts == [True]
     assert wakeup.is_set()
@@ -97,7 +100,7 @@ def test_sync_mode_state_persists_changes_starts_and_wakes(mode_state, monkeypat
 
     config["auto_futures_enabled"] = False
     assert autoloop.sync_mode_state() == {
-        "enabled": False, "interval_minutes": 30, "updated_at": "disabled-at",
+        "enabled": False, "updated_at": "disabled-at",
     }
     assert persisted["enabled"] is False
     assert len(writes) == 2
@@ -119,7 +122,7 @@ def test_unreadable_scheduler_store_remains_fail_closed(mode_state, monkeypatch)
         autoloop.sync_mode_state()
 
 
-def test_interval_update_cannot_disable_an_enabled_mode(mode_state, monkeypatch):
+def test_interval_update_is_rejected_loudly_and_never_disables_a_mode(mode_state, monkeypatch):
     config, persisted, _writes, starts, _wakeup = mode_state
     config["auto_spot_enabled"] = True
     monkeypatch.setattr(autoloop.audit_log, "record", lambda *_args, **_kwargs: None)
@@ -128,12 +131,15 @@ def test_interval_update_cannot_disable_an_enabled_mode(mode_state, monkeypatch)
         return {"enabled": False, "interval_minutes": 45}
 
     monkeypatch.setattr(autoloop_api, 'json_body', body)
-    response = anyio.run(autoloop_api.set_autoloop, None)
+    with pytest.raises(ApiError) as rejected:
+        anyio.run(autoloop_api.set_autoloop, None)
 
-    assert response["enabled"] is True
-    assert persisted["enabled"] is True
-    assert persisted["interval_minutes"] == 45
-    assert starts == [True]
+    # The removed interval key fails loudly; the mode and its enablement are
+    # untouched (an interval write can no longer smuggle a state change).
+    assert rejected.value.status_code == 400
+    assert rejected.value.code == "validation_error"
+    assert persisted["enabled"] is False
+    assert starts == []
 
 
 def test_run_now_requires_enabled_mode(mode_state, monkeypatch):
@@ -294,9 +300,19 @@ def test_mode_disabled_during_graph_build_never_propagates(monkeypatch):
         config["auto_spot_enabled"] = False
         return SimpleNamespace(propagate=lambda *_args, **_kwargs: propagated.append(True))
 
+    from datetime import UTC, datetime
+
+    from tradingagents.auto_timeframes import last_closed_candle
+    from tradingagents.dataflows.market_data import Candle
+
+    opened, closed = last_closed_candle(datetime.now(UTC), "4h")
+    candle = Candle("BTC/USDT", "4h", int(opened.timestamp() * 1000),
+                    int(closed.timestamp() * 1000), 100, 101, 99, 100, 1, True)
+    monkeypatch.setattr(autoloop_analysis.autoloop_candles, "selected_candle", lambda *_a, **_k: candle)
+    bridge = SimpleNamespace(client=lambda: object(), symbol_for=lambda _: "BTC/USDT")
     with pytest.raises(autoloop_execution.AutoModeDisabled, match="before analysis"):
         autoloop_analysis._process_candidate(
-            object(), {"ticker": "BTC-USD", "asset_type": "crypto"}, config, build,
+            bridge, {"ticker": "BTC-USD", "asset_type": "crypto"}, config, build,
             mode=AutoMode.SPOT,
         )
     assert propagated == []
@@ -308,12 +324,20 @@ def test_futures_disable_after_portfolio_sync_stops_planning(monkeypatch):
     monkeypatch.setattr(autoloop_execution, "get_config", lambda: dict(config))
     monkeypatch.setattr(futures_cycle_telemetry, 'persist_progress', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(autoloop_futures_context, '_unified_mark_price', lambda *_args: 100.0)
-    monkeypatch.setattr(futures_signals.FuturesSignalEnvelope, "create", lambda **_kwargs: None)
+    monkeypatch.setattr(futures_signals.FuturesSignalEnvelope, "create", lambda **_kwargs: SimpleNamespace(to_json=lambda: "{}"))
+    from datetime import UTC, datetime
+
+    from tradingagents.auto_timeframes import last_closed_candle
+
     now_ms = int(time.time() * 1000)
     one = SimpleNamespace(open_time=now_ms - 3_600_000, close_time=now_ms - 1)
     four = SimpleNamespace(open_time=now_ms - 14_400_000, close_time=now_ms - 1)
+    opened, closed = last_closed_candle(datetime.now(UTC), "4h")
+    selected = SimpleNamespace(timeframe="4h", open_time=int(opened.timestamp() * 1000),
+                               close_time=int(closed.timestamp() * 1000))
     context = {
         "unified_symbol": "BTC/USDT:USDT", "one_hour": one, "four_hour": four,
+        "selected_candle": selected,
         "one_hour_direction": "bullish", "four_hour_direction": "bullish",
     }
     planned = []
@@ -402,9 +426,19 @@ def test_graph_callback_uses_captured_generation(monkeypatch):
             steps.append("second")
             return {}, "Hold"
 
+    from datetime import UTC, datetime
+
+    from tradingagents.auto_timeframes import last_closed_candle
+    from tradingagents.dataflows.market_data import Candle
+
+    opened, closed = last_closed_candle(datetime.now(UTC), "4h")
+    candle = Candle("BTC/USDT", "4h", int(opened.timestamp() * 1000),
+                    int(closed.timestamp() * 1000), 100, 101, 99, 100, 1, True)
+    monkeypatch.setattr(autoloop_analysis.autoloop_candles, "selected_candle", lambda *_a, **_k: candle)
+    bridge = SimpleNamespace(client=lambda: object(), symbol_for=lambda _: "BTC/USDT")
     with pytest.raises(autoloop_execution.AutoModeDisabled):
         autoloop_analysis._process_candidate(
-            object(), {"ticker": "BTC-USD", "asset_type": "crypto"}, config,
+            bridge, {"ticker": "BTC-USD", "asset_type": "crypto"}, config,
             lambda *_args: Graph(), mode=AutoMode.SPOT, authorization=authorization,
         )
     assert steps == ["first"]

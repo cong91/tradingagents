@@ -86,6 +86,7 @@ class DailyResult(BaseModel):
     executed: bool = False
     order_id: str | None = None
     reason: str | None = None
+    candle_identity: dict[str, Any] | None = None
 
 
 def _today_iso() -> str:
@@ -211,6 +212,7 @@ def _handle_plan(
         kwargs = {"confirm": True, "portfolio": portfolio}
         if on_entry_evidence is not None:
             kwargs["on_entry_evidence"] = on_entry_evidence
+        if check_entry_allowed is not None:
             kwargs["check_entry_allowed"] = check_entry_allowed
         order_id = bridge.execute_order(plan, **kwargs)
         result.order_id = order_id

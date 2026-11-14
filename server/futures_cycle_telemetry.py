@@ -99,12 +99,43 @@ def _candle_open(context: dict, timeframe: str) -> datetime:
     return opened.astimezone(UTC)
 
 
+def canonical_cycle_id(
+    *, symbol: str, four_hour_open: str, one_hour_open: str,
+    timeframe: str, open_time: int,
+) -> str:
+    """The one durable Futures cycle identity format.
+
+    ``futures:{symbol}:{4h open ISO}:{1h open ISO}:{strategy}:{timeframe}:{selected open ms}``.
+    The ISO stamps embed ``:`` themselves, so the id is never parsed by
+    splitting — consumers treat it as an opaque key or rebuild it here.
+    """
+    return f"futures:{symbol}:{four_hour_open}:{one_hour_open}:1:{timeframe}:{int(open_time)}"
+
+
 def cycle_identity(context: dict) -> tuple[str, str, str]:
-    """Return durable cycle id and normalized candle-open timestamps."""
+    """Return durable cycle id and normalized candle-open timestamps.
+
+    The operator-selected candle identity is mandatory: a context without it
+    has no per-timeframe claim, so refusing here is the fail-closed contract
+    (the pre-selection rejection path derives the identity from the wall
+    clock + configured timeframe instead — see ``autoloop_cycle_records``).
+    """
     symbol = str(context["unified_symbol"])
     one_hour_open = _candle_open(context, "one_hour").isoformat()
     four_hour_open = _candle_open(context, "four_hour").isoformat()
-    cycle_id = f"futures:{symbol}:{four_hour_open}:{one_hour_open}:1"
+    identity = context.get("candle_identity")
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(identity.get("timeframe"), str)
+        or not identity["timeframe"]
+        or isinstance(identity.get("open_time"), bool)
+        or not isinstance(identity.get("open_time"), int)
+    ):
+        raise ValueError("futures cycle identity requires the selected candle identity")
+    cycle_id = canonical_cycle_id(
+        symbol=symbol, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+        timeframe=identity["timeframe"], open_time=identity["open_time"],
+    )
     return cycle_id, four_hour_open, one_hour_open
 
 
@@ -241,6 +272,8 @@ def claim_cycle(
     symbol: str,
     four_hour_open: str,
     one_hour_open: str,
+    timeframe: str,
+    selected_open: int,
     payload: dict,
     strategy_version: str = "1",
 ) -> bool:
@@ -250,6 +283,8 @@ def claim_cycle(
         four_hour_open=four_hour_open,
         one_hour_open=one_hour_open,
         strategy_version=strategy_version,
+        timeframe=timeframe,
+        selected_open=int(selected_open),
         payload=redact_payload(payload),
     )
 
@@ -283,6 +318,8 @@ def persist_rejection(
     symbol: str,
     four_hour_open: str,
     one_hour_open: str,
+    timeframe: str,
+    selected_open: int,
     phase: str,
     payload: dict,
     status: str = "rejected",
@@ -292,6 +329,8 @@ def persist_rejection(
         symbol=symbol,
         four_hour_open=four_hour_open,
         one_hour_open=one_hour_open,
+        timeframe=timeframe,
+        selected_open=selected_open,
         payload=payload,
     )
     timestamp = utc_now_iso()
@@ -309,6 +348,7 @@ def persist_rejection(
 
 
 __all__ = [
+    "canonical_cycle_id",
     "claim_cycle",
     "cycle_identity",
     "decision_telemetry",

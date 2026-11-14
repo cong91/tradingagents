@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { getMessages } from "@/lib/i18n/messages";
-import type { AutoloopLastCycle, AutoloopModes } from "@/components/settings/autoloop-types";
+import type { AutoloopLastCycle, AutoloopModes, AutoloopSchedules } from "@/components/settings/autoloop-types";
 import { scannerApi } from "./scanner-api";
 import type { FuturesCycle, FuturesCycleSummary, FuturesCycleSymbolRollup } from "./scanner-types";
 
@@ -14,7 +14,7 @@ export interface FuturesCycleState {
   symbols: FuturesCycleSymbolRollup[];
   runningCycle: boolean;
   enabled: boolean;
-  intervalMinutes: number | null;
+  futuresTimeframe: string | null;
   loading: boolean;
   error: string | null;
   refresh: () => void;
@@ -26,7 +26,7 @@ export function useFuturesCycles(): FuturesCycleState {
   const [symbols, setSymbols] = useState<FuturesCycleSymbolRollup[]>([]);
   const [runningCycle, setRunningCycle] = useState(false);
   const [enabled, setEnabled] = useState(false);
-  const [intervalMinutes, setIntervalMinutes] = useState<number | null>(null);
+  const [futuresTimeframe, setFuturesTimeframe] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,6 +34,7 @@ export function useFuturesCycles(): FuturesCycleState {
     scannerApi.futuresCycles().then(
       (body: Awaited<ReturnType<typeof scannerApi.futuresCycles>> & {
         modes?: Partial<AutoloopModes> | null;
+        schedules?: Partial<AutoloopSchedules> | null;
         last_cycle?: (Partial<AutoloopLastCycle> & Record<string, unknown>) | null;
       }) => {
         const lastCycle = body.last_cycle;
@@ -54,7 +55,7 @@ export function useFuturesCycles(): FuturesCycleState {
         setSymbols(body.symbols ?? []);
         setRunningCycle(Boolean(body.running_cycle && futuresRunning));
         setEnabled((body.enabled ?? false) && (body.modes?.auto_futures ?? true));
-        setIntervalMinutes(body.interval_minutes ?? null);
+        setFuturesTimeframe(body.schedules?.auto_futures?.timeframe ?? null);
         setError(null);
       },
       (err: unknown) => {
@@ -70,7 +71,7 @@ export function useFuturesCycles(): FuturesCycleState {
   }, [load]);
 
   return {
-    cycles, summary, symbols, runningCycle, enabled, intervalMinutes,
+    cycles, summary, symbols, runningCycle, enabled, futuresTimeframe,
     loading, error, refresh: load,
   };
 }

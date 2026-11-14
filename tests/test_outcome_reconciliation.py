@@ -16,6 +16,7 @@ from server import (
     outcome_report,
     outcome_store,
 )
+from server.futures_cycle_telemetry import canonical_cycle_id
 from server.outcome_venue_reads import read_venue_window
 from tests.test_outcome_ledger_worker import (
     ACCOUNT_HASH,
@@ -53,14 +54,14 @@ def _fill(trade_id, order_id, quantity, timestamp, *, side="buy"):
 
 def _setup_cycle(postgres_schema, cycle_id="cycle-lifecycle"):
     _enable_and_seed()
-    _record_executed_cycle(cycle_id)
+    stored_id = _record_executed_cycle(cycle_id)
     _record_journal(placed_ids=[ORDER_ID])
     _record_bracket_task(ORDER_ID, placed_ids=["9500"])
     start = datetime.now(UTC) - timedelta(minutes=30)
     with psycopg.connect(postgres_schema) as conn:
         conn.execute(
             "UPDATE futures_cycles SET created_at = %s WHERE cycle_id = %s",
-            (start, cycle_id),
+            (start, stored_id),
         )
     return start
 
@@ -543,14 +544,22 @@ def test_uncertain_entry_waits_for_exact_recovered_journal_order(postgres_schema
     payload = {"execution_status": "uncertain", "entry_provenance": marker,
                "entry_intent_id": marker["intent_id"], "protection_state": "unverified"}
     now = datetime.now(UTC)
+    four_hour_open = (now - timedelta(hours=4)).isoformat()
+    one_hour_open = (now - timedelta(hours=1)).isoformat()
+    four_open_ms = int(datetime.fromisoformat(four_hour_open).timestamp() * 1000)
+    uncertain_id = canonical_cycle_id(
+        symbol=SYMBOL, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+        timeframe="4h", open_time=four_open_ms,
+    )
     assert futures_cycle_store.claim_futures_cycle(
-        "uncertain-cycle", symbol=SYMBOL,
-        four_hour_open=(now - timedelta(hours=4)).isoformat(),
-        one_hour_open=(now - timedelta(hours=1)).isoformat(),
-        strategy_version="1", payload=payload,
+        uncertain_id, symbol=SYMBOL,
+        four_hour_open=four_hour_open,
+        one_hour_open=one_hour_open,
+        strategy_version="1", timeframe="4h", selected_open=four_open_ms,
+        payload=payload,
     )
     futures_cycle_store.update_futures_cycle(
-        "uncertain-cycle", status="interrupted", phase="entry", payload=payload, terminal=True,
+        uncertain_id, status="interrupted", phase="entry", payload=payload, terminal=True,
     )
     _record_journal(placed_ids=[], task_id=marker["intent_id"])
     fill = _venue_fill("55", ORDER_ID)
@@ -581,12 +590,20 @@ def test_uncertain_entry_rejects_mismatched_task_identity(
     payload = {"execution_status": "uncertain", "entry_provenance": marker,
                "entry_intent_id": marker["intent_id"], "protection_state": "unverified"}
     now = datetime.now(UTC)
+    four_hour_open = (now - timedelta(hours=4)).isoformat()
+    one_hour_open = (now - timedelta(hours=1)).isoformat()
+    four_open_ms = int(datetime.fromisoformat(four_hour_open).timestamp() * 1000)
+    mismatch_id = canonical_cycle_id(
+        symbol=SYMBOL, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+        timeframe="4h", open_time=four_open_ms,
+    )
     futures_cycle_store.claim_futures_cycle(
-        "mismatch-cycle", symbol=SYMBOL, four_hour_open=(now - timedelta(hours=4)).isoformat(),
-        one_hour_open=(now - timedelta(hours=1)).isoformat(), strategy_version="1", payload=payload,
+        mismatch_id, symbol=SYMBOL, four_hour_open=four_hour_open,
+        one_hour_open=one_hour_open, strategy_version="1",
+        timeframe="4h", selected_open=four_open_ms, payload=payload,
     )
     futures_cycle_store.update_futures_cycle(
-        "mismatch-cycle", status="interrupted", phase="entry", payload=payload, terminal=True,
+        mismatch_id, status="interrupted", phase="entry", payload=payload, terminal=True,
     )
     _record_journal(placed_ids=[ORDER_ID], task_id=marker["intent_id"])
     with psycopg.connect(postgres_schema) as conn:
@@ -628,9 +645,10 @@ def test_existing_0008_ledger_rows_survive_event_identity_migration(postgres_sch
 
 def test_reconciliation_round_robin_remains_fair_when_new_cycles_arrive(postgres_schema, ingest_enabled):
     _enable_and_seed()
+    fair_ids: set[str] = set()
     for index in range(4):
         order_id = str(9100 + index)
-        _record_executed_cycle(f"fair-{index}", order_id=order_id)
+        fair_ids.add(_record_executed_cycle(f"fair-{index}", order_id=order_id))
         _record_journal(placed_ids=[order_id], client_order_id=f"ta_fair_{index}")
     calls = []
 
@@ -644,5 +662,5 @@ def test_reconciliation_round_robin_remains_fair_when_new_cycles_arrive(postgres
         assert len(result["outcomes"]) <= 1
         assert len(result["reconciled"]) <= 1
         seen.update(row["cycle_id"] for row in result["reconciled"])
-    assert seen == {f"fair-{index}" for index in range(4)}
+    assert seen == fair_ids
     assert len(calls) <= 16

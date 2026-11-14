@@ -37,6 +37,20 @@ from tradingagents.forecast.settings import ForecastSettings
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.fixture(autouse=True)
+def _selected_market_candle(monkeypatch):
+    from tradingagents.auto_timeframes import last_closed_candle
+    from tradingagents.dataflows.market_data import Candle
+
+    def selected(_exchange, symbol, timeframe, *, as_of):
+        opened, closed = last_closed_candle(as_of, timeframe)
+        return Candle(symbol, timeframe, int(opened.timestamp() * 1000),
+                      int(closed.timestamp() * 1000), 100, 110, 90, 105, 1, True)
+
+    monkeypatch.setattr(autoloop_analysis.autoloop_candles, "selected_candle", selected)
+
+
 _FOUR_HOUR_MS = 14_400_000
 
 
@@ -251,6 +265,7 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
     monkeypatch.setattr(autoloop_execution, "raise_if_execution_closed", check_deadline)
 
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
+        "decision_as_of": datetime.now(UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -384,6 +399,7 @@ def test_defer_stops_the_candidate_before_the_graph_and_the_llm(monkeypatch, for
 
     monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", persist)
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
+        "decision_as_of": datetime.now(UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -457,6 +473,7 @@ def test_a_forecast_client_failure_is_recorded_as_defer(monkeypatch):
         ),
     )
     monkeypatch.setattr(autoloop_futures_context, "_closed_futures_context", lambda *_: {
+        "decision_as_of": datetime.now(UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -477,7 +494,12 @@ def test_a_forecast_client_failure_is_recorded_as_defer(monkeypatch):
     monkeypatch.setattr(futures_cycle_telemetry, "claim_cycle", lambda *_a, **_k: True)
     monkeypatch.setattr(autoloop_analysis.job_store, "futures_position_stops", lambda: {})
 
+    calls = []
+
     def fail_client():
+        calls.append(1)
+        if len(calls) == 1:
+            return object()
         raise RuntimeError("forecast venue unavailable")
 
     def fail_graph(*_args):
@@ -534,6 +556,7 @@ def test_closing_the_mode_mid_inference_stops_the_candidate(monkeypatch):
             return {"futures_execution_intent": "abstain"}, "Hold"
 
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
+        "decision_as_of": datetime.now(UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -589,6 +612,7 @@ def test_the_forecast_block_is_recorded_on_the_cycle_payload(monkeypatch):
         lambda _cid, payload=None, **_k: persisted.append(dict(payload or {})),
     )
     monkeypatch.setattr(autoloop_futures_context, '_closed_futures_context', lambda *_: {
+        "decision_as_of": datetime.now(UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": 1_799_990_400_000,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),
@@ -607,7 +631,12 @@ def test_the_forecast_block_is_recorded_on_the_cycle_payload(monkeypatch):
     ))
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda _t, direction: (90.0, 110.0))
     monkeypatch.setattr(futures_cycle_telemetry, 'claim_cycle', lambda *_a, **_k: True)
-    monkeypatch.setattr(autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_k: _block())
+    from tradingagents.auto_timeframes import last_closed_candle
+
+    monkeypatch.setattr(
+        autoloop_futures_context.kronos_context, "forecast_for_cycle",
+        lambda **kwargs: _block(data_open_time=int(last_closed_candle(kwargs["as_of"], "4h")[0].timestamp() * 1000)),
+    )
     monkeypatch.setattr(
         autoloop_futures_execution, '_process_futures_candidate',
         lambda _e, _t, _s, _c, result, **kwargs: setattr(result, "reason", "captured"),

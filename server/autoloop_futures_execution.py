@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from server import (
+    autoloop_candles,
     autoloop_cycle_records,
     autoloop_execution,
     autoloop_futures_context,
@@ -220,6 +222,7 @@ def _process_futures_candidate(
         checkpoint(persist_attempt="entry_provenance" in evidence and "order_id" not in evidence)
     if not cycle_payload:
         cycle_id, four_hour_open, one_hour_open = futures_cycle_telemetry.cycle_identity(context)
+        claim_identity = context["candle_identity"]
         cycle_payload = {
             "requested_ticker": ticker,
             "unified_symbol": context["unified_symbol"],
@@ -234,12 +237,15 @@ def _process_futures_candidate(
             symbol=context["unified_symbol"],
             four_hour_open=four_hour_open,
             one_hour_open=one_hour_open,
+            timeframe=str(claim_identity["timeframe"]),
+            selected_open=int(claim_identity["open_time"]),
             payload=cycle_payload,
         ):
             result.reason = "duplicate futures signal skipped"
             return
-    candle_1h = context["one_hour"]
     candle_4h = context["four_hour"]
+    selected_candle = context.get("selected_candle")
+    timeframe_revision = context.get("timeframe_revision")
     if intent is None:
         intent = "structured_terms_unavailable"
     if intent != "enter":
@@ -397,10 +403,24 @@ def _process_futures_candidate(
             phase_timestamps=phase_timestamps,
         )
         return
-    expires_at = now + (
-        datetime.fromtimestamp(candle_4h.close_time / 1000, UTC)
-        - datetime.fromtimestamp(candle_4h.open_time / 1000, UTC)
+    if selected_candle is None:
+        result.reason = "selected candle identity unavailable"
+        record_rejection(ticker, unified_symbol=symbol, signal=signal, signal_reason=result.reason,
+                         phase="proposal", snapshot=context, cycle_id=cycle_id)
+        return
+    expires_at = min(
+        now + (datetime.fromtimestamp(candle_4h.close_time / 1000, UTC)
+               - datetime.fromtimestamp(candle_4h.open_time / 1000, UTC)),
+        datetime.fromtimestamp(
+            (selected_candle.close_time + selected_candle.close_time - selected_candle.open_time) / 1000,
+            UTC,
+        ),
     )
+    if expires_at <= now:
+        result.reason = "selected candle expired before proposal"
+        record_rejection(ticker, unified_symbol=symbol, signal=signal, signal_reason=result.reason,
+                         phase="proposal", snapshot=context, cycle_id=cycle_id)
+        return
     cycle_payload.update({
         **decision_data,
         "requested_ticker": ticker,
@@ -433,15 +453,16 @@ def _process_futures_candidate(
         cycle_id, phase="proposal", payload={**cycle_payload, "phase_timestamps": phase_timestamps},
         timestamp=phase_timestamps["proposal_validated_at"],
     )
-    FuturesSignalEnvelope.create(
-        symbol=symbol,
-        candle_open=datetime.fromtimestamp(candle_1h.open_time / 1000, UTC),
-        candle_close=datetime.fromtimestamp(candle_1h.close_time / 1000, UTC),
+    envelope = FuturesSignalEnvelope.create(
+        symbol=symbol, timeframe=selected_candle.timeframe,
+        candle_open=datetime.fromtimestamp(selected_candle.open_time / 1000, UTC),
+        candle_close=datetime.fromtimestamp(selected_candle.close_time / 1000, UTC),
         direction=direction, entry=mark, stop=stop, targets=(take,),
         created_at=now, expires_at=expires_at,
         confirmation_candle_open=datetime.fromtimestamp(candle_4h.open_time / 1000, UTC),
         strategy="autoloop", strategy_version="1",
     )
+    cycle_payload["signal_envelope"] = json.loads(envelope.to_json())
     try:
         autoloop_execution.raise_if_mode_disabled(mode, "futures planning", authorization)
         if deadline is not None:
@@ -505,6 +526,10 @@ def _process_futures_candidate(
         with telemetry.span("execution_policy", ticker):
             def execute_guard(execute):
                 def execute_and_checkpoint():
+                    autoloop_candles.require_current(
+                        selected_candle, config_key="auto_futures_timeframe", config_revision=timeframe_revision,
+                    )
+                    envelope.validate_at(datetime.now(UTC))
                     entry_evidence({"execution_status": "uncertain"})
                     try:
                         value = execute()
@@ -522,6 +547,13 @@ def _process_futures_candidate(
                     execute_and_checkpoint, deadline, cancelled, execution_lock, mode, authorization,
                 )
 
+            def check_entry_allowed():
+                autoloop_execution.raise_if_execution_closed(deadline, cancelled, "futures entry submission")
+                autoloop_candles.require_current(
+                    selected_candle, config_key="auto_futures_timeframe", config_revision=timeframe_revision,
+                )
+                envelope.validate_at(datetime.now(UTC))
+
             execution_daily._handle_plan(
                 derivatives,
                 plan,
@@ -529,9 +561,7 @@ def _process_futures_candidate(
                 result,
                 execute_guard=execute_guard,
                 on_entry_evidence=entry_evidence,
-                check_entry_allowed=lambda: autoloop_execution.raise_if_execution_closed(
-                    deadline, cancelled, "futures entry submission",
-                ),
+                check_entry_allowed=check_entry_allowed,
             )
         # Terminal outcome vocabulary (audit truth): only a venue-confirmed
         # order is "executed"; a refused/pending/no-order plan keeps its own

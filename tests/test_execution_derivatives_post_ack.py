@@ -2,6 +2,7 @@
 
 import threading
 import time
+from datetime import datetime
 
 import ccxt
 import psycopg
@@ -513,6 +514,7 @@ def test_timed_out_real_entry_keeps_cycle_and_journal_correlated(
     from server import autoloop, autoloop_analysis, futures_cycle_store
     from server.auto_modes import AutoMode
     from server.autoloop_telemetry import CycleTelemetry
+    from server.futures_cycle_telemetry import canonical_cycle_id
     from tradingagents.execution import daily
     from tradingagents.execution.auto_authorization import capture_authorization
 
@@ -527,11 +529,17 @@ def test_timed_out_real_entry_keeps_cycle_and_journal_correlated(
     finished = threading.Event()
     started = threading.Event()
     original_create = exchange.create_order
-    cycle_id = "futures:test-timeout"
+    four_open = "2026-01-01T00:00:00+00:00"
+    four_open_ms = int(datetime.fromisoformat(four_open).timestamp() * 1000)
     symbol = order.ccxt_symbol
+    cycle_id = canonical_cycle_id(
+        symbol=symbol, four_hour_open=four_open, one_hour_open=four_open,
+        timeframe="4h", open_time=four_open_ms,
+    )
     assert futures_cycle_store.claim_futures_cycle(
-        cycle_id, symbol=symbol, four_hour_open="2026-01-01T00:00:00+00:00",
-        one_hour_open="2026-01-01T00:00:00+00:00", strategy_version="1",
+        cycle_id, symbol=symbol, four_hour_open=four_open,
+        one_hour_open=four_open, strategy_version="1",
+        timeframe="4h", selected_open=four_open_ms,
         payload={"forecast_started": True, "kronos_forecast": {"status": "ok"}},
     )
 

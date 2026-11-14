@@ -810,18 +810,20 @@ def test_replay_cycle_identity_drift_is_documented_not_scored():
     rows by their snapshot, never by cycle_id time; but grouping by cycle_id
     timestamps would misattribute rows. Only 1 of the 3 counterfactual flips
     carries a drifted identity (and for that one the identity's 4h block is 4h
-    newer too: the cycle_id names a different candle pair entirely)."""
+    newer too: the cycle_id names a different candle pair entirely). The ids
+    are the canonical 7-segment form the 0014 migration produced for the same
+    rows; the suffix (:4h:{4h-open ms}) is opaque to this check."""
     cycles = [c for c in futures_replay.load_cycles() if c.had_snapshot]
     flipped_ids = {
-        "futures:QNT-USD:2026-10-26T16:00:00+00:00:2026-10-26T21:00:00+00:00:1",
-        "futures:QNT-USD:2026-10-27T00:00:00+00:00:2026-10-27T06:00:00+00:00:1",
-        "futures:QNT-USD:2026-10-27T04:00:00+00:00:2026-10-27T07:00:00+00:00:1",
+        "futures:QNT-USD:2026-10-26T16:00:00+00:00:2026-10-26T21:00:00+00:00:1:4h:1793030400000",
+        "futures:QNT-USD:2026-10-27T00:00:00+00:00:2026-10-27T06:00:00+00:00:1:4h:1793059200000",
+        "futures:QNT-USD:2026-10-27T04:00:00+00:00:2026-10-27T07:00:00+00:00:1:4h:1793073600000",
     }
     drifted, drifted_flips = 0, 0
     for cycle in cycles:
         match = re.search(
             r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00):"
-            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00):1$", cycle.cycle_id)
+            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00):1:", cycle.cycle_id)
         assert match, cycle.cycle_id
         identity_one = datetime.fromisoformat(match.group(2)).astimezone(UTC)
         snapshot_one = datetime.fromtimestamp(

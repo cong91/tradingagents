@@ -42,6 +42,12 @@ def _market_context(**metrics):
         "four_hour_open": "2026-10-26T04:00:00Z",
         "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
+        # The canonical identity contract: every claimable context carries the
+        # operator-selected candle identity (defaults here; tests override).
+        "candle_identity": {
+            "symbol": "BTC/USDT:USDT", "timeframe": "4h",
+            "open_time": 1_792_987_200_000, "close_time": 1_793_000_160_000,
+        },
         **metrics,
     }
 
@@ -427,12 +433,23 @@ def test_candidate_passes_open_positions_and_effective_guard_cap_without_databas
         model_revision="NeoQuasar/Kronos-small@901c26c13326", artifact_hash="a" * 64,
         created_at="2026-10-26T08:00:00+00:00", latency_ms=100.0,
     )
+    from dataclasses import replace
+
+    from tradingagents.auto_timeframes import last_closed_candle
+    from tradingagents.dataflows.market_data import Candle
+
+    decision = datetime.now(UTC)
+    opened, closed = last_closed_candle(decision, "4h")
+    selected = Candle("BTC/USDT:USDT", "4h", int(opened.timestamp() * 1000),
+                      int(closed.timestamp() * 1000), 100, 110, 90, 105, 1, True)
+    forecast = replace(forecast, data_open_time=selected.open_time)
+    monkeypatch.setattr(autoloop_analysis.autoloop_candles, "selected_candle", lambda *_a, **_k: selected)
     monkeypatch.setattr(
         autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_: forecast,
     )
     monkeypatch.setattr(
         autoloop_futures_context, '_closed_futures_context',
-        lambda *_: _market_context(four_hour_open=1_792_987_200_000),
+        lambda *_: _market_context(four_hour_open=1_792_987_200_000, decision_as_of=decision.isoformat()),
     )
     monkeypatch.setattr(futures_account, 'read_futures_account', lambda *_args, **_kwargs: account)
     monkeypatch.setattr(job_store, "futures_position_stops", lambda: {})
@@ -586,6 +603,7 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
         "unified_symbol": "BTC/USDT:USDT",
         "one_hour": candle_1h,
         "four_hour": candle_4h,
+        "selected_candle": SimpleNamespace(timeframe="4h", open_time=four_open, close_time=four_open + four_hour_ms),
         "one_hour_open": datetime.fromtimestamp(one_open / 1000, UTC).isoformat(),
         "one_hour_close": candle_1h.close,
         "four_hour_open": datetime.fromtimestamp(four_open / 1000, UTC).isoformat(),
@@ -593,6 +611,10 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
         "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
         "funding_rate": -0.0001,
+        "candle_identity": {
+            "symbol": "BTC/USDT:USDT", "timeframe": "4h",
+            "open_time": four_open, "close_time": four_open + four_hour_ms,
+        },
     }
     book = PortfolioContext(cash=1_000.0, currency="USDT")
     seen: dict = {}
@@ -670,12 +692,17 @@ def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monk
         "unified_symbol": "BTC/USDT:USDT",
         "one_hour": candle_1h,
         "four_hour": candle_4h,
+        "selected_candle": SimpleNamespace(timeframe="4h", open_time=four_open, close_time=four_open + four_hour_ms),
         "one_hour_open": datetime.fromtimestamp(one_open / 1000, UTC).isoformat(),
         "one_hour_close": candle_1h.close,
         "four_hour_open": datetime.fromtimestamp(four_open / 1000, UTC).isoformat(),
         "four_hour_close": candle_4h.close,
         "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
+        "candle_identity": {
+            "symbol": "BTC/USDT:USDT", "timeframe": "4h",
+            "open_time": four_open, "close_time": four_open + four_hour_ms,
+        },
     }
     seen: dict = {}
     executor = SimpleNamespace(

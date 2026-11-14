@@ -2,6 +2,7 @@
 
 import threading
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -30,11 +31,17 @@ pytestmark = pytest.mark.unit
 
 
 def _install(monkeypatch, cancelled, *, cancel_at):
-    candle = SimpleNamespace(
-        open=100, high=110, low=90, close=105,
-        open_time=1_700_000_000_000, close_time=1_700_014_400_000,
+    from tradingagents.auto_timeframes import last_closed_candle
+    from tradingagents.dataflows.market_data import Candle
+
+    now = datetime.now(UTC)
+    opened, closed = last_closed_candle(now, "4h")
+    candle = Candle(
+        "BTC/USDT:USDT", "4h", int(opened.timestamp() * 1000), int(closed.timestamp() * 1000),
+        100, 110, 90, 105, 1, True,
     )
     context = {
+        "decision_as_of": now.isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "one_hour": candle, "four_hour": candle,
         "one_hour_open": 1_799_996_400_000, "four_hour_open": 1_799_985_600_000,
         "one_hour_direction": "bullish", "four_hour_direction": "bullish",
@@ -57,6 +64,7 @@ def _install(monkeypatch, cancelled, *, cancel_at):
         )
 
     monkeypatch.setattr(autoloop_futures_context, "_closed_futures_context", market)
+    monkeypatch.setattr(autoloop_analysis.autoloop_candles, "selected_candle", lambda *_a, **_k: candle)
     monkeypatch.setattr(futures_account, "read_futures_account", account)
     monkeypatch.setattr(futures_cycle_telemetry, "claim_cycle", lambda *a, **k: claims.append(k) or True)
     monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", lambda *a, **k: writes.append(k))
@@ -64,7 +72,7 @@ def _install(monkeypatch, cancelled, *, cancel_at):
     monkeypatch.setattr(job_store, "futures_position_stops", lambda: {})
     monkeypatch.setattr(autoloop_futures_context, "_bracket_prices", lambda *_a, **_k: (90, 110))
     executor = SimpleNamespace(
-        _bridge=object(), risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=3)),
+        _bridge=SimpleNamespace(client=lambda: object()), risk_guard=RiskGuard(limits=RiskLimits(max_derivatives_leverage=3)),
     )
     return executor, claims, writes
 
@@ -108,6 +116,10 @@ def test_late_graph_result_or_error_never_adds_a_cycle_write(monkeypatch, graph_
         model_revision="NeoQuasar/Kronos-small@901c26c13326", artifact_hash="a" * 64,
         created_at="2027-01-15T08:00:00+00:00", latency_ms=100.0,
     )
+    from dataclasses import replace
+
+    selected = autoloop_analysis.autoloop_candles.selected_candle(None, None, None)
+    forecast = replace(forecast, data_open_time=selected.open_time)
     monkeypatch.setattr(
         autoloop_futures_context.kronos_context, "forecast_for_cycle", lambda **_: forecast,
     )

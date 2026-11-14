@@ -84,6 +84,20 @@ function RowField({
       </label>
     );
   }
+  if (row.type === "timeframe") {
+    return (
+      <select
+        id={id}
+        value={typeof value === "string" ? value : ""}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        aria-describedby={describedBy}
+        className="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm"
+      >
+        {(row.options ?? []).map((option) => <option key={option} value={option}>{option}</option>)}
+      </select>
+    );
+  }
   return (
     <div className="flex min-w-0 items-center gap-2">
       <input

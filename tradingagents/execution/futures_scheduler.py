@@ -1,33 +1,18 @@
 """UTC boundary helpers for closed futures candles."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 
-_TIMEFRAME = {"1h": timedelta(hours=1), "4h": timedelta(hours=4)}
-
-
-def floor_boundary(value: datetime, timeframe: str) -> datetime:
-    """Return the UTC opening time of the containing candle."""
-    if value.tzinfo is None:
-        raise ValueError("boundary time must be timezone-aware")
-    try:
-        duration = _TIMEFRAME[timeframe]
-    except KeyError as exc:
-        raise ValueError(f"unsupported futures timeframe: {timeframe}") from exc
-    utc = value.astimezone(UTC)
-    seconds = int(duration.total_seconds())
-    epoch = int(utc.timestamp())
-    return datetime.fromtimestamp(epoch - epoch % seconds, UTC)
+from tradingagents.auto_timeframes import last_closed_candle
 
 
-def last_closed_boundary(value: datetime, timeframe: str) -> tuple[datetime, datetime]:
-    """Return (open, close) for the latest candle closed at value."""
-    boundary = floor_boundary(value, timeframe)
-    duration = _TIMEFRAME[timeframe]
-    return boundary - duration, boundary
-
-
+# The Futures confirmation rule is deliberately fixed to this pair. The
+# operator-selected Auto candle timeframe is a separate identity contract,
+# and the scheduler cadence derives from it (server/autoloop_schedule.py).
 def closed_candle_pair(as_of: datetime) -> tuple[tuple[datetime, datetime], tuple[datetime, datetime]]:
     """Return the latest closed 1h and 4h candles at ``as_of``."""
-    if as_of.tzinfo is None:
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("scheduler time must be timezone-aware")
-    return last_closed_boundary(as_of, "1h"), last_closed_boundary(as_of, "4h")
+    return last_closed_candle(as_of, "1h"), last_closed_candle(as_of, "4h")
+
+
+__all__ = ["closed_candle_pair"]

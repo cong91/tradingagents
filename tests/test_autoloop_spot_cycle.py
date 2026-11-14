@@ -219,7 +219,10 @@ def test_cycle_runs_crypto_candidates_before_advisory_stocks(tmp_path, monkeypat
             {"ticker": "ETH-USD", "asset_type": "crypto"},
         ],
     )
-    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config, **_kwargs: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
 
     seen: list[str] = []
 
@@ -298,7 +301,10 @@ def test_cycle_candidate_timeout_is_terminal_and_does_not_execute(tmp_path, monk
             ["BTC-USD"], [], [{"ticker": "BTC-USD", "asset_type": "crypto"}],
         ),
     )
-    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config, **_kwargs: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
     release_graph = threading.Event()
     graph_returned = threading.Event()
 
@@ -340,7 +346,10 @@ def test_cycle_publishes_active_graph_stage_while_candidate_is_running(tmp_path,
         "screen_universe",
         lambda *_args: [{"ticker": "BTC-USD", "asset_type": "crypto"}],
     )
-    monkeypatch.setattr(autoloop_mod, "_build_bridge", lambda *_args: _StubVenue())
+    monkeypatch.setattr(
+        autoloop_mod, "_build_bridge",
+        lambda config, **_kwargs: ExchangeBridge(config=config, exchange_factory=_StubVenue),
+    )
 
     release_graph = threading.Event()
     graph_entered = threading.Event()
@@ -404,6 +413,14 @@ def test_timed_out_worker_cannot_execute_after_slow_sync(tmp_path, monkeypatch):
 
     class SlowBridge:
         config = {"auto_spot_enabled": True, "exec_live": True}
+
+        # The spot path reads the selected Auto candle off the same venue
+        # client the bridge plans and executes through.
+        def client(self):
+            return _StubVenue()
+
+        def symbol_for(self, ticker):
+            return "BTC/USDT"
 
         def sync_portfolio(self):
             sync_entered.set()

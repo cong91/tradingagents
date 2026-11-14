@@ -19,9 +19,11 @@ import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle
 
 FIXTURE_PATH = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "futures_cycles_replay.json"
@@ -92,6 +94,31 @@ def _rebuild_context(snapshot: dict | None, symbol: str) -> dict[str, Any] | Non
     context = dict(snapshot)
     context["one_hour"] = candle_1h
     context["four_hour"] = candle_4h
+    if "selected_candle" in snapshot:
+        identity = snapshot.get("candle_identity")
+        if not isinstance(identity, dict):
+            return None
+        raw_selected = snapshot["selected_candle"]
+        if not isinstance(raw_selected, dict) or raw_selected.get("is_closed") is not True:
+            return None
+        selected = _candle_from_payload(raw_selected, str(identity.get("timeframe")), symbol)
+        try:
+            step = timeframe_ms(selected.timeframe) if selected is not None else 0
+            cutoff = datetime.fromisoformat(str(snapshot["decision_as_of"]).replace("Z", "+00:00"))
+            if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+                return None
+            cutoff_ms = int(cutoff.timestamp() * 1000)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return None
+        if (selected is None or selected.symbol != identity.get("symbol") or selected.symbol != symbol
+                or selected.timeframe != identity.get("timeframe")
+                or selected.open_time != identity.get("open_time")
+                or selected.close_time != identity.get("close_time")
+                or selected.open_time < 0 or selected.open_time % step
+                or selected.close_time - selected.open_time != step
+                or selected.close_time != cutoff_ms - cutoff_ms % step):
+            return None
+        context["selected_candle"] = selected
     context["one_hour_direction"] = _candle_direction(candle_1h)
     context["four_hour_direction"] = _candle_direction(candle_4h)
     context["one_hour_open"] = candle_1h.open_time

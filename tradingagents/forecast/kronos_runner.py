@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import platform
 import sys
 import time
@@ -73,12 +74,49 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _timestamp_sequences(rows, step_ms, pred_len, max_context):
+    """Validate the input grid and construct future opens for the predictor."""
+    if (isinstance(step_ms, bool) or not isinstance(step_ms, int)
+            or step_ms not in (60_000, 900_000, 3_600_000, 14_400_000)):
+        raise ValueError("unsupported candle step")
+    if isinstance(pred_len, bool) or not isinstance(pred_len, int) or not 1 <= pred_len <= 72:
+        raise ValueError("invalid prediction length")
+    if (isinstance(max_context, bool) or not isinstance(max_context, int)
+            or not isinstance(rows, list) or not 32 <= len(rows) <= max_context):
+        raise ValueError("candle history is outside the profile context")
+    opens = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 6:
+            raise ValueError("malformed candle row")
+        numbers = row[:5]
+        try:
+            valid_numbers = all(
+                not isinstance(value, bool) and math.isfinite(float(value)) for value in numbers
+            )
+            prices = [float(value) for value in numbers[:4]]
+            volume = float(numbers[4])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid candle prices or volume") from exc
+        if (not valid_numbers or min(prices) <= 0 or volume < 0
+                or prices[1] < max(prices[0], prices[3])
+                or prices[2] > min(prices[0], prices[3])):
+            raise ValueError("invalid candle prices or volume")
+        timestamp = row[5]
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0 or timestamp % step_ms:
+            raise ValueError("invalid or off-grid candle timestamp")
+        if opens and timestamp != opens[-1] + step_ms:
+            raise ValueError("candle timestamps are not sequential")
+        opens.append(timestamp)
+    future = [opens[-1] + step_ms * index for index in range(1, pred_len + 1)]
+    return opens, future
+
+
 def _answer(payload, predictor, device, torch, model_dir, load_ms, metadata):
     import numpy as np
     import pandas as pd
 
-    step_ms = int(payload["step_ms"])
-    pred_len = int(payload["pred_len"])
+    step_ms = payload["step_ms"]
+    pred_len = payload["pred_len"]
     path_count = int(payload["paths"])
     temperature = float(payload["temperature"])
     top_p = float(payload["top_p"])
@@ -93,11 +131,9 @@ def _answer(payload, predictor, device, torch, model_dir, load_ms, metadata):
         })
         # Timestamps are UTC-naive epoch ms: the calendar features Kronos consumes
         # (hour/weekday/month) are the venue's own clock, not the host's locale.
-        x_ts = pd.Series(pd.to_datetime([row[5] for row in rows], unit="ms"))
-        last_open = int(rows[-1][5])
-        y_ts = pd.Series(pd.to_datetime(
-            [last_open + step_ms * (index + 1) for index in range(pred_len)], unit="ms"
-        ))
+        opens, future = _timestamp_sequences(rows, step_ms, pred_len, metadata["max_context"])
+        x_ts = pd.Series(pd.to_datetime(opens, unit="ms", errors="raise"))
+        y_ts = pd.Series(pd.to_datetime(future, unit="ms", errors="raise"))
         return frame, x_ts, y_ts
 
     # One shape: a batch of series (``requests`` + one ``seeds`` entry per

@@ -146,7 +146,9 @@ class _StubVenue:
         return []
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, **kwargs):
-        duration = 3_600_000 if timeframe == "1h" else 14_400_000
+        from tradingagents.auto_timeframes import timeframe_ms
+
+        duration = timeframe_ms(timeframe)
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         open_ms = now_ms - (now_ms % duration) - duration
         return [[open_ms, _STUB_PRICE, _STUB_PRICE + 100,
@@ -224,7 +226,9 @@ class _StubDerivVenue(_StubVenue):
         return f"{float(amount):.6f}"
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, **kwargs):
-        duration = 3_600_000 if timeframe == "1h" else 14_400_000
+        from tradingagents.auto_timeframes import timeframe_ms
+
+        duration = timeframe_ms(timeframe)
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         open_ms = now_ms - (now_ms % duration) - duration
         # open, high, low, close per requested direction; a doji closes flat.
@@ -307,12 +311,17 @@ def _derivatives_cycle_env(tmp_path, monkeypatch, *, config_extra=None, candle_d
     monkeypatch.setattr(_StubDerivVenue, "candle_direction", candle_direction)
     # These cycle tests exercise execution and telemetry; model inference has
     # separate coverage, so supply a recorded forward forecast at that seam.
-    monkeypatch.setattr(
-        autoloop_futures_context.kronos_context,
-        "forecast_for_cycle",
-        lambda **kwargs: ForecastBlock(
+    # The block carries the identity of the candle the cycle selected: the
+    # runtime guard refuses a forecast drawn off a different candle.
+    def forecast(**kwargs):
+        expected = kwargs["expected_candle"]
+        return ForecastBlock(
             symbol=kwargs["symbol"], status="ok", generation_kind="forward",
-        ),
+            timeframe=expected.timeframe, data_open_time=expected.open_time,
+        )
+
+    monkeypatch.setattr(
+        autoloop_futures_context.kronos_context, "forecast_for_cycle", forecast,
     )
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices',
                         lambda ticker, direction="long": (
@@ -372,11 +381,29 @@ class _NoopVenue:
 
 
 def _market_context(ticker: str = "BTC-USD"):
+    from server.autoloop_candles import candle_identity
+    from tradingagents.auto_timeframes import last_closed_candle
     from tradingagents.dataflows.market_data import Candle
 
-    now = int(datetime(2026, 10, 7, 8, tzinfo=UTC).timestamp() * 1000)
-    one_hour = Candle("BTC/USDT:USDT", "1h", now - 3_600_000, now - 1, 100, 110, 90, 105, 1.0, True)
-    four_hour = Candle("BTC/USDT:USDT", "4h", now - 14_400_000, now - 1, 100, 110, 90, 105, 1.0, True)
+    def to_ms(value):
+        return int(value.timestamp() * 1000)
+
+    # Live boundaries: the entry path refuses a selected candle that has
+    # already expired, so the fixture must describe the candles closed NOW.
+    one_hour_open, one_hour_close = last_closed_candle(datetime.now(UTC), "1h")
+    four_hour_open, four_hour_close = last_closed_candle(datetime.now(UTC), "4h")
+    one_hour = Candle(
+        "BTC/USDT:USDT", "1h", to_ms(one_hour_open), to_ms(one_hour_close),
+        100, 110, 90, 105, 1.0, True,
+    )
+    four_hour = Candle(
+        "BTC/USDT:USDT", "4h", to_ms(four_hour_open), to_ms(four_hour_close),
+        100, 110, 90, 105, 1.0, True,
+    )
+    selected = Candle(
+        "BTC/USDT:USDT", "4h", four_hour.open_time, four_hour.close_time,
+        100, 110, 90, 105, 1.0, True,
+    )
     return {
         "requested_ticker": ticker,
         "symbol": "BTC/USDT:USDT",
@@ -389,4 +416,6 @@ def _market_context(ticker: str = "BTC-USD"):
         "four_hour_close": four_hour.close,
         "one_hour_direction": "bullish",
         "four_hour_direction": "bullish",
+        "selected_candle": selected,
+        "candle_identity": candle_identity(selected),
     }

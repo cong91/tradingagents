@@ -284,7 +284,13 @@ export interface FuturesCyclesResponse {
   symbols?: FuturesCycleSymbolRollup[];
   running_cycle?: boolean;
   enabled?: boolean;
-  interval_minutes?: number;
+  /** Lịch derived theo khung nến đã chọn; chi tiết ở settings/autoloop-types. */
+  schedules?: Record<string, {
+    enabled: boolean;
+    timeframe: string | null;
+    next_due_at: string | null;
+    last_dispatched_open: number | null;
+  }>;
   last_cycle?: Record<string, unknown> | null;
 }
 

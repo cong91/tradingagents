@@ -29,10 +29,15 @@ def ingest_enabled():
     set_config({"outcome_ledger_ingest_enabled": False})
 
 
+# The canonical id the prepared cycle actually landed under (the label passed
+# to _record_executed_cycle is only a name now).
+STORED_CYCLE_IDS: dict[str, str] = {}
+
+
 @pytest.fixture
 def prepared_cycle(postgres_schema, ingest_enabled):
     _enable_and_seed()
-    _record_executed_cycle("poll-owner-cycle")
+    STORED_CYCLE_IDS["poll-owner-cycle"] = _record_executed_cycle("poll-owner-cycle")
     _record_journal(placed_ids=[ORDER_ID])
     return postgres_schema
 
@@ -146,7 +151,8 @@ def test_contending_poll_is_busy_and_owner_is_idle_during_venue_read(prepared_cy
 
     state, counts = _state_snapshot(prepared_cycle)
     assert counts == (1, 1, 0, 0, 1, 1)
-    assert any(key == "outcome_ledger" and "poll-owner-cycle" in value for key, value, _ in state)
+    stored_id = STORED_CYCLE_IDS["poll-owner-cycle"]
+    assert any(key == "outcome_ledger" and stored_id in value for key, value, _ in state)
     with psycopg.connect(prepared_cycle) as conn:
         writes = conn.execute("SELECT table_name, backend_pid FROM poll_write_backends").fetchall()
     assert {table for table, _ in writes} == {
@@ -230,7 +236,8 @@ def test_unlock_during_poll_aborts_before_next_write(prepared_cycle):
     state, counts = _state_snapshot(prepared_cycle)
     assert counts == (0, 0, 0, 0, 0, 0)
     assert not any(key.startswith("failed:") for key, _, _ in state)
-    assert not any(key == "outcome_ledger" and "poll-owner-cycle" in value for key, value, _ in state)
+    stored_id = STORED_CYCLE_IDS["poll-owner-cycle"]
+    assert not any(key == "outcome_ledger" and stored_id in value for key, value, _ in state)
 
 
 def test_same_table_with_different_search_path_contends(postgres_schema, monkeypatch):
@@ -342,7 +349,7 @@ def test_poll_initialization_obeys_owner_lock(postgres_schema, ingest_enabled):
 
 
 def test_revisit_failures_are_bounded_and_leave_a_permanent_marker(prepared_cycle):
-    cycle_id = "poll-owner-cycle"
+    cycle_id = STORED_CYCLE_IDS["poll-owner-cycle"]
     assert outcome_ledger.poll_once(_fill_source([_venue_fill("first", ORDER_ID)]))["status"] == "polled"
 
     def fail_source(*args):
@@ -363,7 +370,7 @@ def test_revisit_failures_are_bounded_and_leave_a_permanent_marker(prepared_cycl
 
 
 def test_busy_poll_does_not_change_reconciliation_rotation(prepared_cycle):
-    cycle = "poll-owner-cycle"
+    cycle = STORED_CYCLE_IDS["poll-owner-cycle"]
     outcome_store.schedule_reconciliation(cycle)
     earlier = datetime.now(UTC) - timedelta(days=1)
     with psycopg.connect(prepared_cycle) as conn:

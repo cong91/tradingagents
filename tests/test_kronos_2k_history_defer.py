@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,8 @@ def test_missing_or_gap_history_defers_candidate_before_graph_and_llm(
         def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None, **_kwargs):
             assert symbol == "BTC/USDT:USDT"
             assert timeframe == "4h"
+            if limit == 1:
+                return [rows[-1]]
             assert limit == self.max_ohlcv_limit
             self.pages.append((since, limit))
             return [row for row in rows if row[0] >= since][:limit]
@@ -81,6 +84,7 @@ def test_missing_or_gap_history_defers_candidate_before_graph_and_llm(
         kronos_context.KronosForecastService, "from_config", classmethod(_service_from_config),
     )
     monkeypatch.setattr(autoloop_futures_context, "_closed_futures_context", lambda *_: {
+        "decision_as_of": datetime.fromtimestamp((four_hour_open + step) / 1000, UTC).isoformat(),
         "unified_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
         "four_hour_open": four_hour_open,
         "one_hour": SimpleNamespace(open=1, high=1, low=1, close=1),

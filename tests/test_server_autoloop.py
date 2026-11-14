@@ -24,8 +24,13 @@ def test_get_autoloop_defaults(client):
     body = client.get("/api/autoloop").json()
     assert body["generated_at"].endswith("Z")
     assert body["enabled"] is False
-    assert body["interval_minutes"] == 1440
     assert body["running_cycle"] is False
+    # The cadence is derived per mode from the selected candle timeframe; the
+    # manual interval is gone from the contract.
+    assert set(body["schedules"]) == {"auto_spot", "auto_futures"}
+    for schedule in body["schedules"].values():
+        assert schedule["enabled"] is False
+        assert schedule["timeframe"] is None and schedule["next_due_at"] is None
     assert body["gates"] == {
         "auto_spot": False, "auto_futures": False, "any_auto_enabled": False,
     }
@@ -51,6 +56,16 @@ def test_enable_modes_closed_is_409_and_arms_nothing(client, tmp_path, monkeypat
     assert started == []  # the scheduler was never armed by a refused enable
 
 
+def test_legacy_interval_key_is_rejected_loudly(client):
+    """A stale client still sending interval_minutes fails loudly instead of
+    being silently ignored: the derived cadence is the only authority."""
+    set_config({"auto_spot_enabled": True, "exec_live": False})
+    response = client.post("/api/autoloop", json={"enabled": True, "interval_minutes": 30})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "validation_error"
+    assert "interval_minutes" in response.json()["error"]["message"]
+
+
 @pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
 def test_enable_with_mode_open_persists_state_and_arms_scheduler(
     client, tmp_path, monkeypatch, spot, futures,
@@ -61,28 +76,33 @@ def test_enable_with_mode_open_persists_state_and_arms_scheduler(
 
     # Execution authorization is separate from scheduler enablement.
     set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures, "exec_live": False})
-    response = client.post("/api/autoloop", json={"enabled": True, "interval_minutes": 30})
+    response = client.post("/api/autoloop", json={"enabled": True})
     assert response.status_code == 200
     body = response.json()
     assert body["enabled"] is True
-    assert body["interval_minutes"] == 30
     expected = {"auto_spot": spot, "auto_futures": futures, "any_auto_enabled": True}
     assert body["gates"] == body["modes"] == expected
+    schedules = body["schedules"]
+    assert schedules["auto_spot"]["enabled"] is spot
+    assert schedules["auto_futures"]["enabled"] is futures
+    for schedule in schedules.values():
+        if schedule["enabled"]:
+            assert schedule["timeframe"] == "4h"
+            assert schedule["next_due_at"]
 
     state = control_store.load_autoloop_state()
-    assert state == {"enabled": True, "interval_minutes": 30, "updated_at": state["updated_at"]}
+    assert state["enabled"] is True
     assert state["updated_at"]
     assert client.get("/api/autoloop").json()["enabled"] is True
     assert started == [True]
 
 
-def test_disable_is_never_gated_and_omitted_interval_defaults(client, tmp_path):
+def test_disable_is_never_gated(client, tmp_path):
     # Both modes closed: turning the loop OFF must still work.
     response = client.post("/api/autoloop", json={"enabled": False})
     assert response.status_code == 200
     state = control_store.load_autoloop_state()
     assert state["enabled"] is False
-    assert state["interval_minutes"] == 1440  # default when omitted
 
 
 @pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
@@ -91,7 +111,7 @@ def test_scheduler_request_cannot_disable_an_enabled_mode(client, monkeypatch, s
     monkeypatch.setattr(autoloop_mod, "ensure_started", lambda: started.append(True))
     set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
 
-    response = client.post("/api/autoloop", json={"enabled": False, "interval_minutes": 30})
+    response = client.post("/api/autoloop", json={"enabled": False})
 
     assert response.status_code == 200
     assert response.json()["enabled"] is True
@@ -104,13 +124,14 @@ def test_scheduler_request_cannot_disable_an_enabled_mode(client, monkeypatch, s
 
 @pytest.mark.parametrize("spot,futures", [(True, False), (False, True), (True, True)])
 def test_scheduler_read_derives_enabled_from_modes_even_with_stale_state(client, spot, futures):
-    autoloop_mod._save_state({"enabled": False, "interval_minutes": 30, "updated_at": "stale"})
+    autoloop_mod._save_state({"enabled": False, "updated_at": "stale"})
     set_config({"auto_spot_enabled": spot, "auto_futures_enabled": futures})
 
     body = client.get("/api/autoloop").json()
 
     assert body["enabled"] is True
-    assert body["interval_minutes"] == 30
+    assert body["schedules"]["auto_spot"]["enabled"] is spot
+    assert body["schedules"]["auto_futures"]["enabled"] is futures
     assert control_store.load_autoloop_state()["enabled"] is False
 
 
@@ -139,10 +160,9 @@ def test_autoloop_validates_body(client, tmp_path):
     for bad_body in (
         {"enabled": "yes"},
         {"enabled": 1},
-        {"enabled": True, "interval_minutes": 10},      # below the floor
-        {"enabled": True, "interval_minutes": 1441},    # above the ceiling
-        {"enabled": True, "interval_minutes": True},    # bool is not an int here
-        {"enabled": True, "interval_minutes": "30"},
+        # The manual interval was removed; any leftover key fails loudly.
+        {"enabled": True, "interval_minutes": 10},
+        {"enabled": True, "interval_minutes": True},
     ):
         response = client.post("/api/autoloop", json=bad_body)
         assert response.status_code == 400, bad_body
@@ -151,16 +171,27 @@ def test_autoloop_validates_body(client, tmp_path):
 
 
 def _seed_cycle(cycle_id: str, symbol: str, *, status: str, phase: str,
-                payload: dict | None = None) -> None:
+                payload: dict | None = None) -> str:
+    """Seed one terminal cycle; the stored id is the canonical identity built
+    from the same opens (the label names the seed, it is not the key)."""
     from server import futures_cycle_store
+    from server.futures_cycle_telemetry import canonical_cycle_id
 
+    stored_id = canonical_cycle_id(
+        symbol=symbol,
+        four_hour_open="2026-10-25T04:00:00+00:00",
+        one_hour_open="2026-10-25T07:00:00+00:00",
+        timeframe="4h", open_time=len(cycle_id),
+    )
     assert futures_cycle_store.claim_futures_cycle(
-        cycle_id, symbol=symbol, four_hour_open="2026-10-25T04:00:00+00:00",
+        stored_id, symbol=symbol, four_hour_open="2026-10-25T04:00:00+00:00",
         one_hour_open="2026-10-25T07:00:00+00:00", strategy_version="1",
+        timeframe="4h", selected_open=len(cycle_id),
     )
     futures_cycle_store.update_futures_cycle(
-        cycle_id, status=status, phase=phase, payload=payload or {}, terminal=True,
+        stored_id, status=status, phase=phase, payload=payload or {}, terminal=True,
     )
+    return stored_id
 
 
 def test_autoloop_cycles_summary_and_symbol_rollup(client):

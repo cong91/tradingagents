@@ -6,24 +6,23 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from tradingagents.auto_timeframes import DEFAULT_AUTO_TIMEFRAME, timeframe_ms
 from tradingagents.forecast.artifact import (
     DEFAULT_LOOKBACK_BARS,
     DEFAULT_PROFILE,
     MAX_HORIZON_BARS,
     MIN_LOOKBACK_BARS,
-    TIMEFRAME_HOURS,
     max_context_for,
     profile_for,
 )
+from tradingagents.forecast.horizon import prediction_bars
 from tradingagents.forecast.sampler import (
     MAX_BATCH_ROWS,
     SamplerSettings,
     validate_settings,
 )
 
-DEFAULT_TIMEFRAME = "4h"
-
-
+DEFAULT_TIMEFRAME = DEFAULT_AUTO_TIMEFRAME
 DEFAULT_HORIZON_HOURS = 24
 
 
@@ -33,13 +32,17 @@ class ForecastSettings:
 
     profile: str = DEFAULT_PROFILE
     timeframe: str = DEFAULT_TIMEFRAME
-    horizon_hours: int = DEFAULT_HORIZON_HOURS
+    horizon_hours: float | None = DEFAULT_HORIZON_HOURS
     paths: int = 16
     temperature: float = 0.5
     top_p: float = 0.9
     lookback_bars: int = DEFAULT_LOOKBACK_BARS
     max_batch_rows: int = 80
     max_band_spread_ratio: float = 0.15
+
+    @property
+    def horizon_bars(self) -> int:
+        return prediction_bars(self.timeframe, self.horizon_hours)
 
     def sampler_settings(self) -> SamplerSettings:
         return SamplerSettings(
@@ -49,13 +52,18 @@ class ForecastSettings:
         )
 
     def as_params(self) -> dict[str, Any]:
-        # Everything here changes what the numbers MEAN and is therefore part of
-        # the cache identity: the band-spread bound can flip a direction to
-        # ``unclear``, so it travels with the rest.
+        # Mirrors settings_problem(): an unsupported timeframe degrades the
+        # horizon instead of raising from a getter a caller forgot to guard.
+        try:
+            horizon_bars: int | None = self.horizon_bars
+            horizon_hours = self.horizon_hours
+        except ValueError:
+            horizon_bars, horizon_hours = None, None
         return {
             "timeframe": self.timeframe,
             "profile": self.profile,
-            "horizon_hours": self.horizon_hours,
+            "horizon_hours": horizon_hours,
+            "horizon_bars": horizon_bars,
             "paths": self.paths,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -64,69 +72,59 @@ class ForecastSettings:
         }
 
     def unavailable_reason(self) -> str | None:
-        """Why these settings cannot run a forecast, or None when they can.
-
-        Bounds are honored here, at the settings layer: the timeframe must be a
-        supported one, the horizon a whole number of its bars inside the model
-        bound, the lookback inside the model's context, and the fixed sampling
-        knobs inside their measured bounds.
-        """
         return self.settings_problem()
 
     def settings_problem(self) -> str | None:
-        hours = TIMEFRAME_HOURS.get(self.timeframe)
-        if hours is None:
-            return (
-                f"timeframe {self.timeframe!r} is not a supported Kronos timeframe "
-                f"(one of {sorted(TIMEFRAME_HOURS)})"
-            )
-        if self.horizon_hours is None or self.horizon_hours % hours:
-            return (
-                f"horizon_hours={self.horizon_hours} is not a whole number of "
-                f"{self.timeframe} bars"
-            )
-        bars = self.horizon_hours // hours
-        if bars < 1 or bars > MAX_HORIZON_BARS:
+        try:
+            bars = self.horizon_bars
+        except ValueError as exc:
+            return str(exc)
+        if not 1 <= bars <= MAX_HORIZON_BARS:
             return f"horizon of {bars} bars exceeds the {MAX_HORIZON_BARS}-bar bound"
         try:
             max_context = max_context_for(self.profile)
         except ValueError as exc:
             return str(exc)
-        if self.lookback_bars < MIN_LOOKBACK_BARS or self.lookback_bars > max_context:
+        if (isinstance(self.lookback_bars, bool) or not isinstance(self.lookback_bars, int)
+                or self.lookback_bars < MIN_LOOKBACK_BARS or self.lookback_bars > max_context):
             return (
                 f"lookback_bars={self.lookback_bars} is outside the "
                 f"[{MIN_LOOKBACK_BARS}, {max_context}] window for profile "
                 f"{self.profile!r}"
             )
         if self.max_batch_rows < 1 or self.max_batch_rows > MAX_BATCH_ROWS:
-            return (
-                f"max_batch_rows={self.max_batch_rows} is outside [1, {MAX_BATCH_ROWS}]"
-            )
+            return f"max_batch_rows={self.max_batch_rows} is outside [1, {MAX_BATCH_ROWS}]"
         if not math.isfinite(self.max_band_spread_ratio) or self.max_band_spread_ratio <= 0:
-            return (
-                f"max_band_spread_ratio={self.max_band_spread_ratio} must be a finite "
-                "positive number"
-            )
+            return "max_band_spread_ratio must be a finite positive number"
         return validate_settings(self.sampler_settings())
 
 
 def settings_from_config(config: dict[str, Any]) -> ForecastSettings:
-    """Derive active forecast inputs from the selected pair and hold limit."""
+    """Derive lookback and prediction bars from the selected Auto candle series."""
     profile = str(config.get("kronos_active_profile") or DEFAULT_PROFILE)
-    raw_hold = config.get("risk_derivatives_max_hold_hours", 72.0)
+    timeframe = config.get("auto_futures_timeframe", DEFAULT_TIMEFRAME)
     try:
-        hold = float(raw_hold)
-    except (TypeError, ValueError):
-        hold = DEFAULT_HORIZON_HOURS
-    if not math.isfinite(hold) or hold <= 0:
-        hold = DEFAULT_HORIZON_HOURS
-    step = TIMEFRAME_HOURS[DEFAULT_TIMEFRAME]
-    horizon = min(MAX_HORIZON_BARS, max(1, int(hold // step))) * step
+        step_minutes = timeframe_ms(timeframe) // 60_000
+    except ValueError:
+        horizon = None
+    else:
+        raw_hold = config.get("risk_derivatives_max_hold_hours", 72.0)
+        try:
+            hold = float(raw_hold)
+        except (TypeError, ValueError):
+            hold = float(DEFAULT_HORIZON_HOURS)
+        if not math.isfinite(hold) or hold <= 0:
+            hold = float(DEFAULT_HORIZON_HOURS)
+        bars = max(1, int(min(hold * 60 / step_minutes, MAX_HORIZON_BARS)))
+        horizon = bars * step_minutes / 60
     try:
         lookback = max_context_for(profile)
     except ValueError:
         lookback = DEFAULT_LOOKBACK_BARS
-    return ForecastSettings(profile=profile, horizon_hours=horizon, lookback_bars=lookback)
+    return ForecastSettings(
+        profile=profile, timeframe=timeframe,
+        horizon_hours=horizon, lookback_bars=lookback,
+    )
 
 
 _TUNING_KEYS = ("kronos_active_profile",)
@@ -151,3 +149,13 @@ def tuning_problems(payload: dict[str, Any], config: dict[str, Any]) -> dict[str
     except ValueError as exc:
         return {"kronos_active_profile": str(exc)}
     return {}
+
+
+__all__ = [
+    "DEFAULT_HORIZON_HOURS",
+    "DEFAULT_TIMEFRAME",
+    "ForecastSettings",
+    "prospective_tuning_config",
+    "settings_from_config",
+    "tuning_problems",
+]

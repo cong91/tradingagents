@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
+from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle
 from tradingagents.simulation.data import candle_from_payload
 
@@ -66,6 +68,35 @@ def replay_recorded_decisions(
             "four_hour_open": four_hour.open_time,
             "four_hour_close": four_hour.close,
         }
+        selected_identity = snapshot.get("candle_identity") if isinstance(snapshot, dict) else None
+        if selected_identity is not None:
+            if not isinstance(selected_identity, dict):
+                missing_snapshot += 1
+                continue
+            selected = candle_from_payload(
+                snapshot.get("selected_candle"), str(selected_identity.get("timeframe")), symbol,
+            )
+            try:
+                step = timeframe_ms(selected.timeframe) if selected is not None else 0
+                cutoff = datetime.fromisoformat(str(snapshot["decision_as_of"]).replace("Z", "+00:00"))
+                if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+                    raise ValueError("decision time must be timezone-aware")
+                cutoff_ms = int(cutoff.timestamp() * 1000)
+            except (KeyError, ValueError, TypeError, OverflowError):
+                missing_snapshot += 1
+                continue
+            if (selected is None or selected.symbol != symbol
+                    or selected.symbol != selected_identity.get("symbol")
+                    or selected.timeframe != selected_identity.get("timeframe")
+                    or selected.open_time != selected_identity.get("open_time")
+                    or selected.close_time != selected_identity.get("close_time")
+                    or selected.open_time < 0 or selected.open_time % step
+                    or selected.close_time - selected.open_time != step
+                    or selected.close_time != cutoff_ms - cutoff_ms % step):
+                missing_snapshot += 1
+                continue
+            context["selected_candle"] = selected
+            context["candle_identity"] = dict(selected_identity)
         confirmed, reason = confirmation_rule(context, signal)
         recorded_confirmed = row.get("confirmation_reason") not in _RECORDED_REJECTION_REASONS
         outcomes.append({

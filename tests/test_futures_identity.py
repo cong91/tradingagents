@@ -472,7 +472,7 @@ def test_migration_is_additive_nullable_and_not_backfilled():
     from server import postgres
 
     # The shipped migrations are applied in order.
-    assert [migration.version for migration in postgres._load_migrations()] == list(range(1, 13))
+    assert [migration.version for migration in postgres._load_migrations()] == list(range(1, 15))
 
 
 @pytest.mark.integration

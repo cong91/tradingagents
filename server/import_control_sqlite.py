@@ -11,8 +11,10 @@ an idempotent upsert, so an interrupted import can be resumed by re-running.
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from server import db
@@ -21,6 +23,21 @@ from server import db
 _TABLES = ("jobs", "job_results", "runs", "run_events", "futures_cycles",
            "futures_signal_claims", "bracket_recovery_tasks", "position_states",
            "position_monitor_leases")
+
+# A canonical 7-segment cycle id ends ":1:{timeframe}:{epoch-ms}"; legacy
+# SQLite rows carry only the 5-segment confirmation-pair id and are mapped to
+# the 4h default the pre-timeframe runtime actually analyzed.
+_CANONICAL_ID = re.compile(r":1:(1m|15m|1h|4h):\d+$")
+
+
+def _canonical_cycle_id(row: sqlite3.Row) -> str:
+    cycle_id = str(row["cycle_id"])
+    if _CANONICAL_ID.search(cycle_id):
+        return cycle_id
+    four_hour_open = datetime.fromisoformat(
+        str(row["four_hour_open"]).replace("Z", "+00:00")
+    ).astimezone(UTC)
+    return f"{cycle_id}:4h:{int(four_hour_open.timestamp() * 1000)}"
 
 
 def _connect_source(path: Path) -> sqlite3.Connection:
@@ -132,18 +149,24 @@ def _import_futures_cycles(source: sqlite3.Connection) -> int:
     rows = source.execute("SELECT * FROM futures_cycles").fetchall()
     with db.session() as conn:
         for row in rows:
+            four_open_ms = int(datetime.fromisoformat(
+                str(row["four_hour_open"]).replace("Z", "+00:00")
+            ).astimezone(UTC).timestamp() * 1000)
+            # Migration 0014 made both columns NOT NULL: every imported row
+            # must carry the same 4h default the id mapping above assumes.
             conn.execute(
                 """
                 INSERT INTO futures_cycles (cycle_id, symbol, four_hour_open, one_hour_open,
-                                            strategy_version, status, phase, payload,
+                                            strategy_version, timeframe, selected_open,
+                                            status, phase, payload,
                                             created_at, updated_at, finished_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, '4h', %s, %s, %s, %s::jsonb, %s, %s, %s)
                 ON CONFLICT (cycle_id) DO NOTHING
                 """,
                 (
-                    row["cycle_id"], row["symbol"], row["four_hour_open"],
-                    row["one_hour_open"], row["strategy_version"], row["status"],
-                    row["phase"], row["payload"], row["created_at"],
+                    _canonical_cycle_id(row), row["symbol"], row["four_hour_open"],
+                    row["one_hour_open"], row["strategy_version"], four_open_ms,
+                    row["status"], row["phase"], row["payload"], row["created_at"],
                     row["updated_at"], row["finished_at"],
                 ),
             )

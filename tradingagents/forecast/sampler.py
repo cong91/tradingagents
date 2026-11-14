@@ -39,18 +39,23 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
+from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle
 from tradingagents.forecast.artifact import (
     DEFAULT_PROFILE,
     MAX_HORIZON_BARS,
     MAX_PATHS,
+    MIN_LOOKBACK_BARS,
     MIN_PATHS,
     RUNNER_PATH,
-    TIMEFRAME_HOURS,
     profile_for,
 )
+from tradingagents.forecast.block import CandleSeries
+from tradingagents.forecast.horizon import prediction_bars
+from tradingagents.forecast.inputs import series_problem
 from tradingagents.forecast.ohlc import (
     aggregate_ohlc_provenance,
     normalize_ohlc_path,
@@ -109,10 +114,10 @@ class SampledSymbol:
 
 
 def _step_ms(timeframe: str) -> int:
-    hours = TIMEFRAME_HOURS.get(timeframe)
-    if hours is None:
-        raise SamplerError(f"Kronos supports 1h/4h series, got {timeframe!r}")
-    return hours * 3_600_000
+    try:
+        return timeframe_ms(timeframe)
+    except ValueError as exc:
+        raise SamplerError(str(exc)) from exc
 
 
 def validate_settings(settings: SamplerSettings) -> str | None:
@@ -385,15 +390,11 @@ class KronosSampler:
         return self._results_from(chunk, answer, pred_len=pred_len)
 
     @staticmethod
-    def _pred_len(timeframe: str, horizon_hours: int) -> int:
-        hours = TIMEFRAME_HOURS.get(timeframe)
-        if hours is None:
-            raise SamplerError(f"Kronos supports 1h/4h series, got {timeframe!r}")
-        if horizon_hours % hours:
-            raise SamplerError(
-                f"horizon {horizon_hours}h is not a whole number of {timeframe} bars"
-            )
-        pred_len = horizon_hours // hours
+    def _pred_len(timeframe: str, horizon_hours: float) -> int:
+        try:
+            pred_len = prediction_bars(timeframe, horizon_hours)
+        except ValueError as exc:
+            raise SamplerError(str(exc)) from exc
         if pred_len < 1 or pred_len > MAX_HORIZON_BARS:
             raise SamplerError(
                 f"horizon of {pred_len} bars is outside the [1, {MAX_HORIZON_BARS}]-bar bound"
@@ -413,7 +414,21 @@ class KronosSampler:
         # candles are converted to plain rows HERE: the payload is JSON on a
         # pipe, and a dataclass in it would fail only inside the child.
         requests = []
-        for symbol, _timeframe, _horizon, candles, _seed in chunk:
+        profile = profile_for(self.settings.profile)
+        for symbol, request_timeframe, _horizon, candles, _seed in chunk:
+            if not MIN_LOOKBACK_BARS <= len(candles) <= profile.max_context:
+                raise SamplerError("candle history is outside the profile context")
+            if request_timeframe != timeframe:
+                raise SamplerError("mixed timeframes in sampler chunk")
+            try:
+                cutoff = datetime.fromtimestamp(candles[-1].close_time / 1000, UTC)
+                problem = series_problem(
+                    CandleSeries(symbol, candles, cutoff), timeframe, lookback_bars=len(candles),
+                )
+            except (TypeError, ValueError, OverflowError, OSError) as exc:
+                raise SamplerError(f"invalid candle timestamp: {exc}") from exc
+            if problem is not None:
+                raise SamplerError(problem)
             requests.append({
                 "symbol": symbol,
                 "candles": [
@@ -423,7 +438,6 @@ class KronosSampler:
                 ],
             })
         self._request_counter += 1
-        profile = profile_for(self.settings.profile)
         return {
             # The id lets the parent prove the line it read answers the request
             # it just sent — banners and stale lines are skipped, not trusted.

@@ -48,7 +48,7 @@ def test_mini_2k_runner_passes_2048_candles_and_six_step_context(tmp_path, monke
             99.0 + index,
             100.5 + index,
             10.0 + index,
-            1_800_000_000_000 + index * _FOUR_HOUR_MS,
+            1_800_000_000_000 - (1_800_000_000_000 % _FOUR_HOUR_MS) + index * _FOUR_HOUR_MS,
         ]
         for index in range(_BAR_COUNT)
     ]

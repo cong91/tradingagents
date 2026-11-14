@@ -26,7 +26,7 @@ def test_demo_flow_closed_candles_signal_sizing_and_position_manager(monkeypatch
     one_hour, four_hour = closed_candle_pair(now)
     assert one_hour[1] <= now and four_hour[1] <= now
     envelope = FuturesSignalEnvelope.create(
-        symbol="BTC/USDT:USDT", candle_open=one_hour[0], candle_close=one_hour[1],
+        symbol="BTC/USDT:USDT", timeframe="1h", candle_open=one_hour[0], candle_close=one_hour[1],
         direction="short", entry=100, stop=105, targets=(95, 90),
         created_at=now, expires_at=now + timedelta(minutes=30),
         confirmation_candle_open=four_hour[0], strategy="demo", strategy_version="1",

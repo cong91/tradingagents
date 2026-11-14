@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from tradingagents.dataflows.market_data import Candle, fetch_closed_candles
@@ -104,6 +104,7 @@ def forecast_for_cycle(
     config: dict[str, Any],
     as_of: datetime,
     cycle_id: str,
+    expected_candle: Candle | None = None,
     deadline: float | None = None,
     cancelled: threading.Event | None = None,
 ) -> ForecastBlock | None:
@@ -139,9 +140,14 @@ def forecast_for_cycle(
                 status="unavailable",
                 reason=f"closed {settings.timeframe} history could not be read: {exc}",
             )
+        if expected_candle is not None and (not candles or candles[-1] != expected_candle):
+            return ForecastBlock(
+                symbol=symbol, status=STATUS_UNAVAILABLE,
+                reason="forecast history differs from the selected cycle candle",
+            )
         series = CandleSeries(
             symbol=symbol, candles=candles,
-            as_of=as_of if as_of.tzinfo else as_of.replace(tzinfo=UTC),
+            as_of=as_of,
         )
         if cancelled is not None and cancelled.is_set():
             return ForecastBlock(

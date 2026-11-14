@@ -1171,9 +1171,9 @@ Audit log tồn tại nhưng không đọc được trả HTTP `503 audit_log_un
 
 ---
 
-## 13. Autoloop + halt — vòng lặp tự chạy & kill switch (rev 5)
+## 13. Autoloop + halt — vòng lặp tự chạy & kill switch (rev 6)
 
-Nguồn: `server/autoloop.py`, `server/autoloop_cycles.py`. Scheduler lưu state và `interval_minutes` trong PostgreSQL `control_settings`; khi đọc state thành công, `enabled` hiệu lực được suy ra từ các mode. Mỗi cycle chạy tuần tự các thị trường được bật: Spot trước (crypto qua bridge, stock chỉ advisory), rồi Futures (crypto qua `DerivativesExecutor`), cùng một deadline. Các mode được kiểm tra lại trước khi chạy và trước các bước phân tích, lập kế hoạch, thực thi; call đang bay không bị huỷ tức thời. `POST /api/runs` là phân tích riêng, không phụ thuộc hai công tắc. Cycle khi run/job active → skip + audit `autoloop_cycle_skipped`.
+Nguồn: `server/autoloop.py`, `server/autoloop_schedule.py`, `server/autoloop_cycles.py`. Scheduler lưu state và marker due theo mode trong PostgreSQL `control_settings`; khi đọc state thành công, `enabled` hiệu lực được suy ra từ các mode. **Chu kỳ quét tự suy từ khung nến đã chọn**: mỗi mode có marker `{timeframe: last_dispatched_open}` (per `(mode, timeframe)`), mode được "due" khi nến đóng mới nhất của khung nó mới hơn marker. Mỗi tick scheduler chỉ chạy MỘT mode — nến chờ lâu nhất trước, tie-break xen kẽ; mode còn lại báo `not_due`. Boundary bị lỡ gộp về nến mới nhất (không dồn hàng đợi); boundary tiêu hao khi sàn chưa publish nến là at-most-once (run-now là retry tường minh). Marker chỉ được ghi khi worker giữ cycle lock và mode thực sự bắt đầu; kết thúc cycle đánh thức scheduler. Futures vẫn giữ confirmation cố định 1h+4h, tách bạch khỏi khung đã chọn (`futures_scheduler.py`). Cycle khi run/job active → skip + audit `autoloop_cycle_skipped`; marker chưa ghi nên mode vẫn due. `POST /api/runs` là phân tích riêng, không phụ thuộc hai công tắc.
 
 - **Enable fail-closed**: `any_auto_enabled` là `auto_spot OR auto_futures`; cần ít nhất một chế độ bật để scheduler hoạt động hoặc chạy ngay. Managed entry dùng authorization của mode và đường live tới venue đã cấu hình, độc lập `exec_live`; không suy ra dry-run từ cờ cũ. Tắt một mode chặn công việc và entry mới của thị trường đó; mode kia không bị tắt theo. Khi mode bị tắt rồi bật lại, authorization đã chụp trước đó vẫn cũ và không được gửi lệnh.
 - **Kill switch không gate** (`autoloop.py:405-432`): `POST /api/halt` ghi `{"event": "halt", "timestamp", "reason"}` vào engine audit log — RiskGuard của MỌI process replay line này và từ chối phần còn lại của hôm nay cho tới reset hoặc UTC day roll (sticky, day-scoped — `risk.py:163-173`; timestamp là thứ làm halt day-scoped — `risk.py:111-119`). `halt_reset` hôm nay gỡ sticky cho tới breach/halt mới. Đổi so với §11.9 (risk cũ "không có endpoint reset halt trong v1"): rev 5 đưa reset thành endpoint tường minh `/api/halt/reset`.
@@ -1186,7 +1186,20 @@ Response 200:
 {
   "generated_at": "2026-10-02T08:00:00Z",
   "enabled": false,
-  "interval_minutes": 1440,
+  "schedules": {
+    "auto_spot": {
+      "enabled": false,
+      "timeframe": null,
+      "next_due_at": null,
+      "last_dispatched_open": null
+    },
+    "auto_futures": {
+      "enabled": false,
+      "timeframe": null,
+      "next_due_at": null,
+      "last_dispatched_open": null
+    }
+  },
   "running_cycle": false,
   "modes": {
     "auto_spot": false,
@@ -1203,11 +1216,11 @@ Response 200:
 }
 ```
 
-- `interval_minutes` hợp lệ trong `[15, 1440]`, mặc định 1440; state không đọc được thì loop coi như tắt.
+- `schedules` — lịch derived theo khung nến của từng mode (`server/autoloop_schedule.py`): `timeframe` là khung cấu hình (null khi mode tắt), `next_due_at` là thời điểm đóng nến kế tiếp, `last_dispatched_open` là open (epoch ms) của nến gần nhất mode đó đã chạy cho khung hiện tại. Không có trường interval thủ công; đổi khung ở operator config là đổi cadence, và write/reset khung đánh thức scheduler.
 - `modes` và `gates` cùng chứa trạng thái `auto_spot`, `auto_futures` và OR `any_auto_enabled`; UI autoloop đọc `modes`. Khi đọc được scheduler state, `enabled` được suy ra từ `any_auto_enabled`; state không đọc được thì `enabled` false. Muốn dừng scheduler phải tắt cả hai mode, không thể dùng `enabled: false` để ghi đè một mode đang bật.
 - `cycles` là tối đa 20 futures cycle gần nhất do job store trả về.
 - `running_cycle` — một cycle đang giữ lock (in-memory, `autoloop.py:346`).
-- `last_cycle` — tóm tắt cycle hiện tại hoặc gần nhất, chỉ in-memory (mất khi restart): `{started_at, finished_at, status: "running"|"completed"|"timeout"|"failed"|"skipped_busy", candidates[], results[], modes?, error, telemetry?, universe?: {crypto, stock}, reason?}`. `modes` có các key `auto_spot` và `auto_futures`, mỗi mode có status, candidates, results, timestamps và telemetry riêng. Summary cập nhật theo stage; `finished_at` là null khi chạy. `results[]` mỗi phần tử `{ticker, signal, executed, order_id, reason, stop_loss, take_profit}`.
+- `last_cycle` — tóm tắt cycle hiện tại hoặc gần nhất, chỉ in-memory (mất khi restart): `{started_at, finished_at, status: "running"|"completed"|"timeout"|"failed"|"skipped_busy", candidates[], results[], modes?, error, telemetry?, universe?: {crypto, stock}, reason?}`. `modes` có các key `auto_spot` và `auto_futures`, mỗi mode có status (`pending`/`not_due`/`disabled`/`running`/`completed`/`timeout`/`failed`), candidates, results, timestamps và telemetry riêng; mode enabled nhưng chưa đến boundary của khung nó là `not_due`. Summary cập nhật theo stage; `finished_at` là null khi chạy. `results[]` mỗi phần tử `{ticker, signal, executed, order_id, reason, candle_identity, stop_loss, take_profit}`.
 - `last_cycle.telemetry` — `{active_stage, active_ticker, active_elapsed_ms, active_node, active_path[], active_spans[], last_stage, current_ticker, events[], dropped_events}`. Các giá trị active có thể null; `active_path` giữ chuỗi stage cha để phân biệt LLM/tool/vendor trong node nào. `active_elapsed_ms` được tính lại mỗi GET khi chạy; sau timeout snapshot giữ nguyên, worker muộn không được ghi đè. `active_spans[]` gồm `{stage, ticker, node, started_at, elapsed_ms}`; timestamps UTC ISO-8601, thời gian dùng monotonic clock và đơn vị milliseconds.
 - `telemetry.events[]` giữ tối đa 100 sự kiện gần nhất: `{event: "started"|"finished"|"failed", stage, ticker, node, started_at, duration_ms?, error_type?}`. Event hoàn thành/thất bại có duration; lỗi chỉ giữ tên loại exception. `dropped_events` đếm số event cũ bị loại. Không lưu prompt, tool arguments/output, API key, URL hoặc nội dung exception trong telemetry.
 - Stage bao gồm screening/universe, venue setup, futures market context, graph build/state preparation, từng LangGraph node, LLM, tool, từng vendor attempt, planning/portfolio sync/bracket/execution policy và finalization. Timeout nêu ticker cùng stage/node đang hoạt động; engine deadline/cancellation guard vẫn chặn lệnh mới từ worker đã hết hạn. Chu kỳ timeout cũng ghi snapshot timing vào server audit. UI dùng nhãn `Đang chạy` và `Hết thời gian`, không hiển thị hai trạng thái này là `Hoàn tất`.
@@ -1219,13 +1232,13 @@ Trạng thái: loading · empty (n/a) · error 500 · stale 30s, poll 5s khi `ru
 Request bắt buộc `Content-Type: application/json` (§0):
 
 ```json
-{ "enabled": true, "interval_minutes": 60 }
+{ "enabled": true }
 ```
 
-- `enabled` bắt buộc boolean; `interval_minutes` tuỳ chọn int `[15, 1440]` (bool không tính là int) — sai → `400 validation_error` (`autoloop.py:357-372`).
+- `enabled` bắt buộc boolean. Gửi `interval_minutes` (key đã xoá) → `400 validation_error` — client cũ phải sửa, không bị bỏ qua im lặng.
 - Yêu cầu `enabled: true` khi `any_auto_enabled` false → `409 mode_closed` kèm `details.gates`; không persist gì.
-- Với request hợp lệ còn lại, server thay `enabled` bằng `any_auto_enabled`, kể cả khi client gửi `false`. Do đó không thể dừng scheduler qua cờ request khi một mode vẫn bật; tắt cả hai mode để dừng.
-- Thành công: persist `{enabled, interval_minutes, updated_at}` vào PostgreSQL, audit `autoloop_updated`, arm scheduler nếu mode bật và wake loop. Response 200: payload GET sau khi ghi.
+- Server thay `enabled` bằng `any_auto_enabled`, kể cả khi client gửi `false`; tắt cả hai mode để dừng.
+- Thành công: merge `{enabled, updated_at}` vào state PostgreSQL hiện có (giữ nguyên `mode_schedule`), audit `autoloop_updated`, arm scheduler nếu mode bật và wake loop. Response 200: payload GET sau khi ghi.
 
 Trạng thái: loading · error 400/409/415 · stale (n/a — action).
 

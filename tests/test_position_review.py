@@ -157,6 +157,24 @@ def test_prompt_contains_the_evidence_and_the_output_contract():
     assert NO_EXTERNAL_TOOLS in prompt
 
 
+def test_market_section_degrades_when_a_candle_gap_is_refused(monkeypatch):
+    """Strict closed-candle parsing refuses a gapped series, so the review
+    prompt must degrade that line instead of failing the whole review."""
+    from tradingagents.dataflows.market_data import ClosedCandlePaginationError
+
+    def refuse(*_args, **_kwargs):
+        raise ClosedCandlePaginationError("closed candle sequence contains a gap")
+
+    monkeypatch.setattr(position_review, "fetch_closed_candles", refuse)
+
+    section = position_review._market_section(
+        object(), "TIA/USDT:USDT", datetime(2026, 10, 7, 8, tzinfo=UTC),
+    )
+
+    assert "- 1h closed candles (last 24): unavailable" in section
+    assert "- 4h closed candles (last 12): unavailable" in section
+
+
 def test_prompt_marks_a_paying_short():
     class _RateClient:
         def fetch_funding_rate(self, symbol, params=None):

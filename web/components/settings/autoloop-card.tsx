@@ -29,10 +29,7 @@ import {
 } from "@/components/ui/dialog";
 import { autoloopApi, toAutoloopError } from "./autoloop-api";
 import {
-  AUTOLOOP_DEFAULT_INTERVAL,
   AUTOLOOP_MODE_ROWS,
-  AUTOLOOP_MAX_INTERVAL,
-  AUTOLOOP_MIN_INTERVAL,
   type AutoloopLastCycle,
   type AutoloopModeCycle,
   type AutoloopModeKey,
@@ -50,16 +47,7 @@ type HaltState = "loading" | "unknown" | "active" | "inactive";
 
 type AutoloopCardProps = {
   hideHalt?: boolean;
-  onDirtyChange?: (dirty: boolean) => void;
 };
-
-/** Khoảng cách phút hợp lệ: số nguyên trong [15, 1440] — cùng ràng buộc server. */
-function parseInterval(raw: string): number | null {
-  if (!/^\d+$/.test(raw.trim())) return null;
-  const value = Number(raw.trim());
-  if (!Number.isInteger(value)) return null;
-  return AUTOLOOP_MIN_INTERVAL <= value && value <= AUTOLOOP_MAX_INTERVAL ? value : null;
-}
 
 /** Tóm tắt một dòng của chu kỳ gần nhất (thời gian + trạng thái + ứng viên). */
 function lastCycleSummary(t: Messages, cycle: AutoloopLastCycle): string {
@@ -253,26 +241,17 @@ export function AutoloopHaltControl() {
   );
 }
 
-export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardProps) {
+export function AutoloopCard({ hideHalt = false }: AutoloopCardProps) {
   const t = useT();
   const c = t.settings.autoloop;
   const [phase, setPhase] = useState<"loading" | "error" | "ready" | "stale">("loading");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [payload, setPayload] = useState<AutoloopPayload | null>(null);
-  // Bản nháp khoảng cách phút: poll không ghi đè khi user đang sửa (§0.2 stale rule).
-  const [intervalDraft, setIntervalDraft] = useState(String(AUTOLOOP_DEFAULT_INTERVAL));
-  const [intervalError, setIntervalError] = useState<string | null>(null);
-  const [gateWarning, setGateWarning] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [savePending, setSavePending] = useState(false);
   const [runPending, setRunPending] = useState(false);
 
   const hasDataRef = useRef(false);
-  const draftDirtyRef = useRef(false);
-  const intervalDraftRef = useRef(String(AUTOLOOP_DEFAULT_INTERVAL));
-  const savedIntervalRef = useRef<string | null>(null);
   const loadSequenceRef = useRef(0);
-  const savePendingRef = useRef(false);
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -282,30 +261,15 @@ export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardPr
     };
   }, []);
 
-  const setDirty = useCallback((dirty: boolean) => {
-    if (draftDirtyRef.current === dirty) return;
-    draftDirtyRef.current = dirty;
-    onDirtyChange?.(dirty);
-  }, [onDirtyChange]);
-
   const applyPayload = useCallback((data: AutoloopPayload) => {
-    savedIntervalRef.current = String(data.interval_minutes);
     setPayload(data);
-    if (!draftDirtyRef.current) {
-      intervalDraftRef.current = savedIntervalRef.current;
-      setIntervalDraft(savedIntervalRef.current);
-    }
   }, []);
 
   const load = useCallback(async () => {
-    if (savePendingRef.current) return;
     const sequence = ++loadSequenceRef.current;
     try {
       const data = await autoloopApi.get();
       if (!aliveRef.current || sequence !== loadSequenceRef.current) return;
-      if (draftDirtyRef.current && intervalDraftRef.current === String(data.interval_minutes)) {
-        setDirty(false);
-      }
       applyPayload(data);
       hasDataRef.current = true;
       setPhase("ready");
@@ -315,7 +279,7 @@ export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardPr
       setFeedback(null);
       setPhase(hasDataRef.current ? "stale" : "error");
     }
-  }, [applyPayload, setDirty]);
+  }, [applyPayload]);
 
   // Nạp lần đầu trong callback (không setState đồng bộ trong effect body),
   // rồi poll theo trạng thái running_cycle.
@@ -330,39 +294,6 @@ export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardPr
     const pollId = setInterval(() => void load(), phase === "ready" && runningCycle ? POLL_RUNNING_MS : POLL_IDLE_MS);
     return () => clearInterval(pollId);
   }, [load, phase, runningCycle]);
-
-  const save = useCallback(
-    async (enabled: boolean) => {
-      const interval = parseInterval(intervalDraft);
-      if (interval === null) {
-        setIntervalError(c.intervalError(AUTOLOOP_MIN_INTERVAL, AUTOLOOP_MAX_INTERVAL));
-        return;
-      }
-      if (savePendingRef.current || phase !== "ready" || (enabled !== true && payload?.modes.any_auto_enabled)) return;
-      savePendingRef.current = true;
-      loadSequenceRef.current += 1;
-      setIntervalError(null);
-      setGateWarning(null);
-      setSavePending(true);
-      try {
-        const data = await autoloopApi.set(enabled, interval);
-        setDirty(false);
-        applyPayload(data);
-        setFeedback({ role: "status", text: c.intervalSaved });
-      } catch (err) {
-        const error = toAutoloopError(err);
-        if (error.code === "mode_closed") {
-          setGateWarning(c.modeClosedWarning);
-        } else {
-          setFeedback({ role: "alert", text: error.message });
-        }
-      } finally {
-        savePendingRef.current = false;
-        if (aliveRef.current) setSavePending(false);
-      }
-    },
-    [applyPayload, intervalDraft, c, payload, phase, setDirty],
-  );
 
   const runNow = useCallback(async () => {
     if (phase !== "ready" || !payload?.modes.any_auto_enabled || payload.running_cycle || runPending) return;
@@ -467,6 +398,30 @@ export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardPr
           </p>
         </section> : null}
 
+        {phase === "ready" && payload ? <section aria-label={c.scheduleAria}>
+          <ul className="space-y-2">
+            {AUTOLOOP_MODE_ROWS.map((key: AutoloopModeKey) => {
+              const schedule = payload.schedules?.[key];
+              return (
+                <li
+                  key={key}
+                  className="flex flex-wrap items-center justify-between gap-2 border-t py-2 first:border-t-0 first:pt-0"
+                >
+                  <span className="min-w-0 text-sm">
+                    {c.modeRows[key]}
+                    <span className="block text-xs text-muted-foreground">
+                      {schedule?.enabled
+                        ? c.scheduleDue(schedule.timeframe, schedule.next_due_at, schedule.last_dispatched_open)
+                        : c.scheduleOff}
+                    </span>
+                  </span>
+                  <ModeBadge open={modes[key]} />
+                </li>
+              );
+            })}
+          </ul>
+        </section> : null}
+
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border p-3">
           {phase === "ready" ? (
             <span className="min-w-0 flex-1 text-sm text-muted-foreground">
@@ -478,52 +433,7 @@ export function AutoloopCard({ hideHalt = false, onDirtyChange }: AutoloopCardPr
               {t.common.retry}
             </Button>
           ) : null}
-          <span className="flex flex-wrap items-center gap-2">
-            <label htmlFor="autoloop-interval" className="text-sm text-muted-foreground">
-              {c.intervalLabel}
-            </label>
-            <input
-              id="autoloop-interval"
-              type="text"
-              inputMode="numeric"
-              value={intervalDraft}
-              onChange={(event) => {
-                const nextDraft = event.target.value;
-                intervalDraftRef.current = nextDraft;
-                setDirty(phase !== "ready" || nextDraft !== savedIntervalRef.current);
-                setIntervalDraft(nextDraft);
-                setIntervalError(null);
-              }}
-              disabled={savePending}
-              aria-invalid={intervalError ? true : undefined}
-              aria-describedby={intervalError ? "autoloop-interval-error" : undefined}
-              className="h-9 w-24 rounded-lg border border-input bg-background px-3 text-sm tabular-nums outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 aria-[invalid=true]:border-destructive"
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              className="min-touch"
-              onClick={() => void save(enabled)}
-              disabled={savePending || phase !== "ready" || schedulerUnknown}
-            >
-              {c.apply}
-            </Button>
-          </span>
         </div>
-        {intervalError ? (
-          <p id="autoloop-interval-error" role="alert" className="text-xs text-destructive">
-            {intervalError}
-          </p>
-        ) : null}
-        {gateWarning ? (
-          <div
-            role="alert"
-            className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
-          >
-            <TriangleAlertIcon className="size-4 shrink-0" aria-hidden="true" />
-            {gateWarning}
-          </div>
-        ) : null}
 
         <div className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
           <Button className="min-touch" onClick={() => void runNow()} disabled={phase !== "ready" || cycleBusy || !anyModeEnabled}>

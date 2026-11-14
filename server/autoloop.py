@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import UTC, datetime
 from typing import Any
 
 from server import (
@@ -18,6 +19,7 @@ from server import (
     autoloop_candidates,
     autoloop_execution,
     autoloop_futures_context,
+    autoloop_schedule,
     control_store,
     daily as daily_mod,
     futures_cycle_telemetry,
@@ -36,13 +38,10 @@ from tradingagents.execution.daily import DailyResult
 from tradingagents.forecast.block import ForecastBlock
 from tradingagents.forecast.contract import STATUS_TIMEOUT
 
-MIN_INTERVAL_MINUTES = 15
-
-
-MAX_INTERVAL_MINUTES = 1440
-
-
-DEFAULT_INTERVAL_MINUTES = 1440
+# Scheduled cadence follows each mode's selected candle timeframe
+# (server/autoloop_schedule.py); there is no manual scan interval. The wait
+# below only bounds the idle poll while no mode is enabled.
+IDLE_POLL_SECONDS = 60.0
 
 
 logger = logging.getLogger(__name__)
@@ -105,19 +104,66 @@ def _load_state() -> dict:
 
     Auto Spot/Auto Futures are the source of truth for whether the scheduler
     may run. The persisted bit is normalized on read so stale state cannot arm
-    the loop after both modes are closed.
+    the loop after both modes are closed. ``mode_schedule`` (the per-mode,
+    per-timeframe dispatch markers) is preserved verbatim for the scheduler.
     """
     data = _load_persisted_state()
     if data is None:
-        return {"enabled": False, "interval_minutes": DEFAULT_INTERVAL_MINUTES}
+        return {"enabled": False, autoloop_schedule.MODE_SCHEDULE_KEY: {}}
     normalized = dict(data)
     normalized["enabled"] = bool(auto_modes.enabled_modes(get_config()))
-    normalized.setdefault("interval_minutes", DEFAULT_INTERVAL_MINUTES)
+    schedule = normalized.get(autoloop_schedule.MODE_SCHEDULE_KEY)
+    normalized[autoloop_schedule.MODE_SCHEDULE_KEY] = (
+        schedule if isinstance(schedule, dict) else {}
+    )
     return normalized
 
 
 def _save_state(state: dict) -> None:
     control_store.save_autoloop_state(state)
+
+
+def _load_mode_schedule() -> dict:
+    state = _load_persisted_state()
+    schedule = state.get(autoloop_schedule.MODE_SCHEDULE_KEY) if isinstance(state, dict) else None
+    return schedule if isinstance(schedule, dict) else {}
+
+
+def _record_mode_dispatch(config: dict, mode: AutoMode) -> None:
+    """Mark the mode's current selected candle as served, under the state lock.
+
+    Written when the cycle worker actually starts the mode (it holds the cycle
+    lock by then), so a busy-skip or deadline-expired batch never consumes a
+    boundary. Per-timeframe markers keep a 4h→1m→4h round trip from replaying
+    an already-served candle. A boundary consumed while the venue has not yet
+    published the closed bar is not retried automatically — at-most-once by
+    design; run-now is the explicit retry.
+
+    Best effort like ``_load_persisted_state``: an unreadable or unwritable
+    store must never fail a running cycle. A lost marker only makes the same
+    candle due again on the next tick, and the cycle-id claim still dedupes.
+    """
+    try:
+        timeframe = autoloop_schedule.selected_timeframe(config, mode)
+        opened, _closed = autoloop_schedule.last_closed_candle(datetime.now(UTC), timeframe)
+        open_ms = int(opened.timestamp() * 1000)
+        with _state_lock:
+            persisted = control_store.load_autoloop_state()
+            persisted = persisted if isinstance(persisted, dict) else {}
+            schedule = dict(persisted.get(autoloop_schedule.MODE_SCHEDULE_KEY) or {})
+            served = dict(schedule.get(autoloop_schedule.mode_key(mode)) or {})
+            served[timeframe] = open_ms
+            schedule[autoloop_schedule.mode_key(mode)] = served
+            _save_state({
+                **persisted,
+                autoloop_schedule.MODE_SCHEDULE_KEY: schedule,
+                "updated_at": utc_now_iso(),
+            })
+    except Exception:  # noqa: BLE001 - the marker is best effort, the cycle is not
+        logger.exception(
+            "failed to record the %s dispatch marker; the same candle may run again",
+            autoloop_schedule.mode_key(mode),
+        )
 
 
 def sync_mode_state() -> dict:
@@ -126,7 +172,7 @@ def sync_mode_state() -> dict:
     Operator mode writes call this after applying their config. A mode change
     always wakes the scheduler so a closed mode is observed promptly; the
     durable ``enabled``/``updated_at`` pair changes only when the derived
-    scheduler state changes.
+    scheduler state changes. Timeframe markers are preserved.
     """
     with _state_lock:
         persisted = control_store.load_autoloop_state()
@@ -136,7 +182,6 @@ def sync_mode_state() -> dict:
             persisted = {
                 **persisted,
                 "enabled": derived_enabled,
-                "interval_minutes": _interval_from(persisted),
                 "updated_at": utc_now_iso(),
             }
             _save_state(persisted)
@@ -146,15 +191,9 @@ def sync_mode_state() -> dict:
     return {**persisted, "enabled": derived_enabled}
 
 
-def _interval_from(state: dict) -> int:
-    raw = state.get("interval_minutes")
-    if (
-        isinstance(raw, bool)
-        or not isinstance(raw, int)
-        or not MIN_INTERVAL_MINUTES <= raw <= MAX_INTERVAL_MINUTES
-    ):
-        return DEFAULT_INTERVAL_MINUTES
-    return raw
+def wake_scheduler() -> None:
+    """Recompute due work at once (config, mode or timeframe change)."""
+    _wakeup.set()
 
 
 def _set_last_cycle(summary: dict, telemetry: CycleTelemetry | None = None) -> None:
@@ -202,41 +241,76 @@ def stop() -> None:
 
 
 def _scheduler_loop() -> None:
-    """Run an enabled loop immediately, then wait between later cycles.
+    """Run due work immediately, then wake at the selected-candle boundaries.
 
-    First cycle runs at startup if enabled; subsequent cycles wait the full
-    interval before running. The wakeup event allows immediate re-reads when
-    settings change but does not bypass the interval between actual cycles.
-    A stop request never launches a new cycle, even one already waited on.
+    Each tick computes the due modes from every enabled mode's own timeframe
+    (``server/autoloop_schedule.py``); a cycle serves ONE mode — the longest
+    waiting unserved candle — so a slow mode can never starve behind a fast
+    one. The wakeup event allows immediate re-reads when settings change. A
+    stop request never launches a new cycle, even one already waited on.
     """
-    processed_update = object()
+    processed_update: Any = object()
+    last_scheduled: str | None = None
     while not _scheduler_stop.is_set():
         state = _load_state()
         updated_at = state.get("updated_at")
         if updated_at != processed_update:
             processed_update = updated_at
             if state.get("enabled") and not _scheduler_stop.is_set():
-                _spawn_cycle()
-        timed_out = not _wakeup.wait(timeout=_interval_from(state) * 60.0)
+                last_scheduled = _spawn_due_cycle(last_scheduled)
+        config = get_config()
+        if state.get("enabled"):
+            wait = autoloop_schedule.wake_wait_seconds(config, datetime.now(UTC))
+        else:
+            wait = IDLE_POLL_SECONDS
+        _wakeup.wait(timeout=wait)
         _wakeup.clear()
-        if timed_out and not _scheduler_stop.is_set():
-            latest = _load_state()
-            latest_update = latest.get("updated_at")
-            if latest_update != processed_update:
-                processed_update = latest_update
-                if latest.get("enabled"):
-                    _spawn_cycle()
-            elif latest.get("enabled"):
-                _spawn_cycle()
+        if not _scheduler_stop.is_set():
+            # Both paths recompute at once: a boundary timeout AND an explicit
+            # wakeup (config/mode/timeframe change, or a finished cycle
+            # re-arming a busy-skipped mode). _spawn_due_cycle is a no-op when
+            # nothing is due, so an event wake cannot double-spawn.
+            latest_state = _load_state()
+            # A stop arriving during the state read still wins: shutdown never
+            # arms new work.
+            if not _scheduler_stop.is_set():
+                latest_update = latest_state.get("updated_at")
+                if latest_update != processed_update:
+                    processed_update = latest_update
+                if latest_state.get("enabled"):
+                    last_scheduled = _spawn_due_cycle(last_scheduled)
 
 
-def _spawn_cycle(graph_builder: Callable | None = None) -> str:
-    """Run one cycle on a worker thread unless one is already running."""
+def _spawn_due_cycle(last_scheduled: str | None) -> str | None:
+    """Spawn one cycle for the single most overdue mode, if any is due.
+
+    Returns the mode key of a successfully started cycle (the new alternating
+    tie-break anchor) or the previous anchor unchanged.
+    """
+    config = get_config()
+    due = autoloop_schedule.due_modes(config, _load_mode_schedule(), datetime.now(UTC))
+    mode = autoloop_schedule.pick_scheduled_mode(due, last_scheduled)
+    if mode is None:
+        return last_scheduled
+    # Exactly one mode per cycle — the pick, never the whole due dict.
+    status = _spawn_cycle({mode: due[mode]})
+    return autoloop_schedule.mode_key(mode) if status == "started" else last_scheduled
+
+
+def _spawn_cycle(
+    due: dict[AutoMode, dict] | None = None, graph_builder: Callable | None = None,
+) -> str:
+    """Run one cycle on a worker thread unless one is already running.
+
+    ``due=None`` (run-now) forces every enabled mode; a scheduled spawn passes
+    exactly one due mode. Markers are written by the worker when a mode
+    actually starts, so a busy-skip or deadline-expired batch stays due.
+    """
     global _cycle_thread
     if _cycle_lock.locked():
         return "already_running"
     thread = threading.Thread(
-        target=_run_cycle_locked, args=(graph_builder,), name="server-autoloop-cycle",
+        target=_run_cycle_locked, args=(graph_builder, due), name="server-autoloop-cycle",
         daemon=True,
     )
     _cycle_thread = thread
@@ -244,13 +318,26 @@ def _spawn_cycle(graph_builder: Callable | None = None) -> str:
     return "started"
 
 
-def _run_cycle_locked(graph_builder: Callable | None = None) -> None:
+def _run_cycle_locked(
+    graph_builder: Callable | None = None, due: dict[AutoMode, dict] | None = None,
+) -> None:
     if not _cycle_lock.acquire(blocking=False):
         return  # a concurrent spawn won: it runs, this one is a no-op
     try:
-        _run_cycle(graph_builder)
+        _run_cycle(graph_builder, due)
     finally:
         _cycle_lock.release()
+        # The next due tick must be recomputed at once: a busy-skipped mode
+        # stays pending, and a finished batch may already owe another boundary.
+        # EXCEPT when this cycle was skipped busy: it consumed no boundary and
+        # another worker still holds the pipeline, so re-arming now would hot
+        # loop (spawn → skip → audit row) until that work ends. The next
+        # boundary timeout or a state write wakes the loop instead.
+        last = _last_cycle
+        if not (isinstance(last, dict) and last.get("status") == "skipped_busy"):
+            wakeup_set = getattr(_wakeup, "set", None)
+            if wakeup_set is not None:
+                wakeup_set()
 
 
 def _terminalize_timed_out_cycle(
@@ -453,8 +540,15 @@ def _run_candidate_with_timeout(
     return outcome
 
 
-def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
-    """Dispatch the enabled markets sequentially under one cycle deadline."""
+def _run_cycle(
+    graph_builder: Callable | None = None, due: dict[AutoMode, dict] | None = None,
+) -> list[DailyResult]:
+    """Dispatch the scheduled market(s) sequentially under one cycle deadline.
+
+    ``due=None`` (run-now) forces every enabled mode; a scheduled spawn passes
+    exactly one due mode. An enabled mode left out of the dispatch is reported
+    ``not_due`` — its own candle boundary has not advanced yet.
+    """
     started_at = utc_now_iso()
     deadline = time.monotonic() + autoloop_execution.CYCLE_TIMEOUT_SECONDS
     build_graph = graph_builder if graph_builder is not None else _default_graph_builder
@@ -474,14 +568,21 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
     audit_log.record("autoloop_cycle_started")
     config, authorization = capture_process_config()
     enabled = auto_modes.enabled_modes(config)
+    requested = enabled if due is None else frozenset(due)
     summary: dict = {
         "started_at": started_at, "finished_at": None, "status": "running",
         "candidates": [], "results": [], "modes": {}, "error": None,
     }
     for mode in AutoMode:
+        if mode in requested:
+            status = "pending"
+        elif mode in enabled:
+            status = "not_due"
+        else:
+            status = "disabled"
         summary["modes"][_mode_key(mode)] = {
             "mode": mode.value,
-            "status": "pending" if mode in enabled else "disabled",
+            "status": status,
             "candidates": [], "results": [],
             "started_at": None, "finished_at": None,
             "telemetry": None,
@@ -499,7 +600,7 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
 
     try:
         dispatch_modes(
-            enabled,
+            requested,
             deadline=deadline,
             is_enabled=lambda mode: autoloop_execution.mode_is_enabled(mode, authorization),
             run_mode=run_mode,
@@ -518,6 +619,8 @@ def _run_cycle(graph_builder: Callable | None = None) -> list[DailyResult]:
                 summary["error"] = summary["error"] or mode_summary["error"]
             else:
                 mode_summary["status"] = "disabled"
+            mode_summary["finished_at"] = utc_now_iso()
+        if mode_summary["status"] == "not_due":
             mode_summary["finished_at"] = utc_now_iso()
     mode_statuses = {item["status"] for item in summary["modes"].values()}
     if summary["status"] == "running":
@@ -558,6 +661,10 @@ def _run_mode_cycle(
     mode_summary = summary["modes"][mode_name]
     mode_summary["status"] = "running"
     mode_summary["started_at"] = utc_now_iso()
+    # The worker owns the cycle lock here: consume this mode's boundary now, so
+    # a busy-skip, a deadline expiry before this mode, or a disabled transition
+    # after the spawn never marks a candle that never ran.
+    _record_mode_dispatch(config, mode)
 
     def publish_telemetry(snapshot: dict) -> None:
         mode_summary["telemetry"] = snapshot
@@ -751,6 +858,7 @@ def _result_summary(result: DailyResult) -> dict:
         "executed": result.executed,
         "order_id": result.order_id,
         "reason": result.reason,
+        "candle_identity": result.candle_identity,
         "stop_loss": getattr(plan, "stop_loss", None) if plan is not None else None,
         "take_profit": getattr(plan, "take_profit", None) if plan is not None else None,
     }

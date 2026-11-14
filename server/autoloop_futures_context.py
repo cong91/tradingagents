@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from server import (
@@ -26,19 +26,24 @@ def _kronos_block_for(
     symbol = str(futures_context.get("unified_symbol") or futures_context.get("symbol") or ticker)
     try:
         exchange = derivatives._bridge.client()
-        # The decision moment is the closed-candle boundary the cycle is running on,
-        # not "now": the 4h bar the context was built from must be the newest bar the
-        # forecast sees, or the forecast would describe a different market state than
-        # the one the agents were shown.
-        four_hour_open = futures_context.get("four_hour_open")
-        as_of = (
-            datetime.fromtimestamp(int(four_hour_open) / 1000, UTC) + timedelta(hours=4)
-            if four_hour_open is not None else datetime.now(UTC)
-        )
-        return kronos_context.forecast_for_cycle(
+        identity = futures_context["candle_identity"]
+        if identity["timeframe"] != config.get("auto_futures_timeframe", "4h"):
+            raise ValueError("forecast timeframe differs from the selected candle")
+        as_of = datetime.fromtimestamp(identity["close_time"] / 1000, UTC)
+        block = kronos_context.forecast_for_cycle(
             service=None, exchange=exchange, symbol=symbol, config=config,
-            as_of=as_of, cycle_id=cycle_id, deadline=deadline, cancelled=cancelled,
+            as_of=as_of, cycle_id=cycle_id, expected_candle=futures_context["selected_candle"],
+            deadline=deadline, cancelled=cancelled,
         )
+        if block is not None and block.ok and (
+            block.symbol != symbol or block.timeframe != identity["timeframe"]
+            or block.data_open_time != identity["open_time"]
+        ):
+            return ForecastBlock(
+                symbol=symbol, status="unavailable",
+                reason="forecast candle identity differs from the selected cycle candle",
+            )
+        return block
     except Exception as exc:  # a forecast failure must never fail the candidate
         logger.warning("kronos active: forecast failed for %s (%r)", ticker, exc)
         return ForecastBlock(
@@ -62,6 +67,7 @@ def _closed_futures_context(derivatives: Any, ticker: str) -> dict | None:
         return None
     return {
         "requested_ticker": ticker,
+        "decision_as_of": now.isoformat(),
         "symbol": symbol,
         "unified_symbol": symbol,
         "one_hour": candle_1h,

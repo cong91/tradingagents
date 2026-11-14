@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from tradingagents.auto_timeframes import timeframe_ms as _timeframe_ms
+
 
 @dataclass(frozen=True)
 class Candle:
@@ -28,11 +30,7 @@ class ClosedCandlePaginationError(ValueError):
 
 
 def timeframe_ms(timeframe: str) -> int:
-    units = {"1h": 3_600_000, "4h": 14_400_000}
-    try:
-        return units[timeframe]
-    except KeyError as exc:
-        raise ValueError(f"unsupported crypto timeframe: {timeframe}") from exc
+    return _timeframe_ms(timeframe)
 
 
 def _coerce_limit(value: Any, timeframe: str) -> int | None:
@@ -140,9 +138,13 @@ def _parse_closed_row(
     duration: int,
     cutoff: int,
 ) -> tuple[int, Candle] | None:
-    if len(row) < 6:
-        return None
-    open_time = int(row[0])
+    if not isinstance(row, (list, tuple)) or len(row) < 6:
+        raise ClosedCandlePaginationError("malformed candle row")
+    open_time = row[0]
+    if isinstance(open_time, bool) or not isinstance(open_time, int) or open_time < 0:
+        raise ClosedCandlePaginationError("candle open_time must be non-negative integer milliseconds")
+    if open_time % duration:
+        raise ClosedCandlePaginationError(f"candle open_time {open_time} is off the {timeframe} grid")
     close_time = open_time + duration
     if close_time > cutoff:
         return None
@@ -175,6 +177,8 @@ def _single_closed_candles(
             row, symbol=symbol, timeframe=timeframe, duration=duration, cutoff=cutoff,
         )
         if parsed is not None:
+            if candles and parsed[0] != candles[-1].open_time + duration:
+                raise ClosedCandlePaginationError("closed candle sequence contains a gap, duplicate or disorder")
             candles.append(parsed[1])
     return candles
 
@@ -208,9 +212,10 @@ def _paginated_closed_candles(
         new_timestamps = 0
         duplicate_outside_boundary = False
         for row in rows:
-            if len(row) < 6:
-                continue
-            open_time = int(row[0])
+            parsed = _parse_closed_row(
+                row, symbol=symbol, timeframe=timeframe, duration=duration, cutoff=cutoff,
+            )
+            open_time = row[0]
             if open_time in page_open_times:
                 raise ClosedCandlePaginationError(
                     f"duplicate candle open_time {open_time} within page"
@@ -228,9 +233,6 @@ def _paginated_closed_candles(
                 if previous_page_max != open_time:
                     duplicate_outside_boundary = True
                 continue
-            parsed = _parse_closed_row(
-                row, symbol=symbol, timeframe=timeframe, duration=duration, cutoff=cutoff,
-            )
             if parsed is None:
                 continue
             by_open_time[open_time] = (content, parsed[1])
@@ -275,7 +277,7 @@ def _paginated_closed_candles(
 def fetch_closed_candles(exchange: Any, symbol: str, timeframe: str,
                          *, as_of: datetime, limit: int = 100) -> list[Candle]:
     """Fetch only candles fully closed at ``as_of``; never use the forming bar."""
-    if as_of.tzinfo is None:
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("as_of must be timezone-aware")
     if limit < 1:
         raise ValueError("limit must be positive")

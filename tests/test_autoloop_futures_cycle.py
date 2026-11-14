@@ -9,6 +9,7 @@ import pytest
 import tradingagents.dataflows.screening as screening_mod
 from server import (
     autoloop as autoloop_mod,
+    autoloop_candles,
     autoloop_futures_context,
     autoloop_futures_execution,
 )
@@ -25,7 +26,7 @@ from tests.autoloop_runtime_fixtures import (
     _StubVenue,
     client as client,
 )
-from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.dataflows.config import config_key_revision, get_config, set_config
 from tradingagents.execution import daily as execution_daily
 from tradingagents.execution.auto_authorization import capture_authorization
 
@@ -870,7 +871,7 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
     monkeypatch.setattr(autoloop_futures_context, "datetime", FixedDateTime)
     monkeypatch.setattr(autoloop_futures_execution, "datetime", FixedDateTime)
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices', lambda ticker, direction="long": (90.0, 110.0))
-    candle_rows = {"1h": [[(now.timestamp() - 3600) * 1000, 100, 110, 90, 105, 1]], "4h": [[(now.timestamp() - 4 * 3600) * 1000, 100, 110, 90, 105, 1]]}
+    candle_rows = {"1h": [[int((now.timestamp() - 3600) * 1000), 100, 110, 90, 105, 1]], "4h": [[int((now.timestamp() - 4 * 3600) * 1000), 100, 110, 90, 105, 1]]}
 
     class Exchange:
         def fetch_ohlcv(self, symbol, timeframe, **kwargs):
@@ -896,14 +897,26 @@ def test_futures_worker_wiring_claims_and_skips_duplicate(tmp_path, monkeypatch)
             return PlannedOrder(ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", market="derivatives", side="buy", quantity=1, cost=100, estimated_price=100, stop_loss=90, take_profit=110)
 
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
+    derivatives = Derivatives()
+    # The execution path owns the selected-candle identity: build it from the
+    # same venue reads the cycle makes instead of hand-building a context.
+    context = autoloop_futures_context._closed_futures_context(derivatives, "BTC-USD")
+    assert context is not None
+    context["selected_candle"] = autoloop_candles.selected_candle(
+        Exchange(), context["unified_symbol"], "4h",
+        as_of=datetime.fromisoformat(context["decision_as_of"]),
+    )
+    context["candle_identity"] = autoloop_candles.candle_identity(context["selected_candle"])
+    context["timeframe_revision"] = config_key_revision("auto_futures_timeframe")
+
     autoloop_futures_execution._process_futures_candidate(
-        Derivatives(), "BTC-USD", "Buy", {}, result, proposal=_agent_proposal(),
-        intent="enter",
+        derivatives, "BTC-USD", "Buy", {}, result, context=context,
+        proposal=_agent_proposal(), intent="enter",
     )
     assert result.reason == "awaiting approval"
     duplicate = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_futures_execution._process_futures_candidate(
-        Derivatives(), "BTC-USD", "Buy", {}, duplicate, proposal=_agent_proposal(),
-        intent="enter",
+        derivatives, "BTC-USD", "Buy", {}, duplicate, context=context,
+        proposal=_agent_proposal(), intent="enter",
     )
     assert duplicate.reason == "duplicate futures signal skipped"

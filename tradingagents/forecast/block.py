@@ -31,7 +31,8 @@ class ForecastBlock:
     reference_close: float | None = None
     data_open_time: int | None = None
     as_of: str | None = None
-    horizon_hours: int | None = None
+    horizon_hours: float | None = None
+    horizon_bars: int | None = None
     timeframe: str | None = None
     paths: int | None = None
     per_path_samples: int = 1
@@ -84,6 +85,7 @@ class ForecastBlock:
             "data_open_time": self.data_open_time,
             "as_of": self.as_of,
             "horizon_hours": self.horizon_hours,
+            "horizon_bars": self.horizon_bars,
             "timeframe": self.timeframe,
             "paths": self.paths,
             "per_path_samples": self.per_path_samples,

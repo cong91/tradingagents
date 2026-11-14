@@ -320,11 +320,15 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
     const sectionGateChange = keys.some((key) => gateKeys.has(key));
     if (sectionGateChange && (!confirmGateRef.current || !reasonRef.current.trim())) return;
 
-    const settings: Record<string, number | boolean> = {};
+    const settings: Record<string, number | boolean | string> = {};
     for (const row of payload.settings) {
       if (!keys.includes(row.key)) continue;
       if (row.type === "bool") {
         settings[row.key] = draft[row.key] === true;
+      } else if (row.type === "timeframe") {
+        const value = draft[row.key];
+        if (typeof value !== "string" || !row.options?.includes(value)) return;
+        settings[row.key] = value;
       } else {
         const value = parseOperatorNumber(draft[row.key]);
         if (value === null) return;

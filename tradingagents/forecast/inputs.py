@@ -28,7 +28,7 @@ def series_problem(series: CandleSeries, timeframe: str, *, lookback_bars: int) 
       each bar's order is sane (high >= max(open, close) >= min >= low);
     - the window is gap-free on the closed-bar grid.
     """
-    if series.as_of.tzinfo is None:
+    if series.as_of.tzinfo is None or series.as_of.utcoffset() is None:
         return "the decision moment (as_of) must be timezone-aware"
     candles = series.candles
     required_bars = max(MIN_LOOKBACK_BARS, lookback_bars)
@@ -43,10 +43,14 @@ def series_problem(series: CandleSeries, timeframe: str, *, lookback_bars: int) 
     timeframes = {candle.timeframe for candle in candles}
     if timeframes != {timeframe}:
         return f"candles are not all {timeframe}: {sorted(timeframes)}"
-    if not all(candle.is_closed for candle in candles):
+    if not all(candle.is_closed is True for candle in candles):
         return "a forming candle was supplied; only closed candles may be used"
     step = _timeframe_ms(timeframe)
     for index, candle in enumerate(candles):
+        if (isinstance(candle.open_time, bool) or not isinstance(candle.open_time, int)
+                or candle.open_time < 0 or candle.open_time % step
+                or isinstance(candle.close_time, bool) or not isinstance(candle.close_time, int)):
+            return f"candle {index} has an invalid or off-grid timestamp"
         if candle.close_time - candle.open_time != step:
             return (
                 f"candle {index} has a duration inconsistent with the {timeframe} "

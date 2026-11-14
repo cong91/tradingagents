@@ -31,6 +31,8 @@ const settingMetaVi = {
   risk_max_total_exposure_pct: { label: "Tổng mức phơi nhiễm tối đa", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Giới hạn lệnh lỗ liên tiếp" },
   risk_max_derivatives_leverage: { label: "Đòn bẩy phái sinh tối đa", unit: "x", hint: "Trần bộ bảo vệ rủi ro. Agent đề xuất đòn bẩy thực tế; vượt trần này lệnh bị từ chối." },
+  auto_spot_timeframe: { label: "Khung nến Auto Spot", hint: "Nến 1m/15m có thể hết hạn trước khi phân tích hoàn tất; khi đó lệnh bị từ chối an toàn." },
+  auto_futures_timeframe: { label: "Khung nến Auto Futures", hint: "Xác nhận Futures vẫn dùng 1h và 4h. Nến 1m/15m có thể hết hạn trước khi phân tích hoàn tất; khi đó lệnh bị từ chối an toàn." },
   risk_max_derivatives_exposure_pct: { label: "Phơi nhiễm phái sinh tối đa", unit: "%", hint: "0 = chặn hoàn toàn giao dịch phái sinh." },
   risk_max_derivatives_exposure_hard_pct: { label: "Phơi nhiễm phái sinh tối đa khi vượt trần", unit: "%", hint: "Trần cứng của cơ chế vượt trần: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này. 0 = tắt." },
   risk_derivatives_override_min_r: { label: "R tối thiểu để vượt trần", hint: "Lời mục tiêu / rủi ro stop tối thiểu của đề xuất để đủ điều kiện vượt trần." },
@@ -95,6 +97,8 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   risk_max_total_exposure_pct: { label: "Max total exposure", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Consecutive losing orders limit" },
   risk_max_derivatives_leverage: { label: "Max derivatives leverage", unit: "x", hint: "Risk-guard cap. The agent proposes the actual leverage; orders above this cap are rejected." },
+  auto_spot_timeframe: { label: "Auto Spot candle timeframe", hint: "A 1m/15m candle may expire before analysis completes; the order is safely rejected if that happens." },
+  auto_futures_timeframe: { label: "Auto Futures candle timeframe", hint: "Futures confirmation still uses 1h and 4h. A 1m/15m candle may expire before analysis completes; the order is safely rejected if that happens." },
   risk_max_derivatives_exposure_pct: { label: "Max derivatives exposure", unit: "%", hint: "0 = block derivatives trading entirely." },
   risk_max_derivatives_exposure_hard_pct: { label: "Max derivatives exposure when overriding", unit: "%", hint: "Hard cap of the override mechanism: only orders that qualify for the override may push total exposure up to this level. 0 = off." },
   risk_derivatives_override_min_r: { label: "Min R to override", hint: "Minimum target profit / stop risk of the proposal to qualify for the override." },
@@ -350,10 +354,19 @@ export const vi = {
     empty: "Máy chủ không trả về đường dẫn nào.",
   },
   autoloop: {
-    schedulerDescription: "Cấu hình khoảng cách cho các chế độ Auto Spot và Auto Futures đã bật trong cấu hình vận hành.",
+    schedulerDescription:
+      "Chu kỳ quét tự chạy theo boundary nến của khung mỗi mode đã chọn trong cấu hình vận hành (1m/15m/1h/4h); không cần đặt khoảng cách thủ công.",
     schedulerEnabled: "Lịch tự động đã bật",
     schedulerInactive: "Scheduler chưa hoạt động hoặc chưa xác định được trạng thái.",
     statusStale: "Không cập nhật được trạng thái; dữ liệu trước đó có thể đã cũ.",
+    scheduleAria: "Lịch quét theo khung nến",
+    scheduleDue: (timeframe: string | null, nextDue: string | null, lastOpen: number | null) => {
+      const tf = timeframe ?? "?";
+      const next = nextDue ?? "?";
+      const last = lastOpen != null ? ` · nến trước: ${new Date(lastOpen).toISOString()}` : "";
+      return `Khung ${tf} · lần tới: ${next}${last}`;
+    },
+    scheduleOff: "Chưa bật — lịch quét theo khung nến khi mode được arm.",
     clearHaltConfirmTitle: "Xác nhận gỡ HALT",
     clearHaltConfirmDescription: "Gỡ HALT có thể cho phép lệnh mới theo cấu hình hiện tại và các kiểm tra rủi ro. Trạng thái dừng sẽ được kiểm tra lại trước khi gỡ.",
     clearHaltConfirmAction: "Xác nhận gỡ HALT",
@@ -361,7 +374,6 @@ export const vi = {
     runNow: "Chạy ngay",
     runNowHint: "Chạy ngay một chu kỳ. Chu kỳ có thể đặt lệnh thật theo cấu hình hiện tại và các kiểm tra rủi ro.",
     runStarted: "Đã tiếp nhận yêu cầu chạy ngay. Cập nhật trạng thái để kiểm tra chu kỳ.",
-    intervalSaved: "Đã lưu khoảng cách.",
     title: "Chế độ tự động",
     loading: "Đang tải trạng thái vòng tự động…",
     loadFailed: "Không tải được trạng thái vòng tự động.",
@@ -378,12 +390,6 @@ export const vi = {
     } as Record<string, string>,
     modeAvailable: "Có ít nhất một chế độ tự động đang bật",
     noModesEnabled: "Bật Auto Spot hoặc Auto Futures trong cấu hình vận hành để chạy chu kỳ",
-    intervalLabel: "Khoảng cách (phút)",
-    apply: "Áp dụng",
-    intervalError: (min: number, max: number) =>
-      `Khoảng cách phải là số nguyên từ ${min} đến ${max} phút.`,
-    enabledFeedback: (minutes: number) => `Đã bật vòng tự động — chu kỳ chạy mỗi ${minutes} phút.`,
-    disabledFeedback: "Vòng tự động đang tắt.",
     modeClosedWarning: "Bật Auto Spot hoặc Auto Futures trước khi chạy chu kỳ.",
     runStatus: {
       started: "Đã gửi yêu cầu — chu kỳ đang bắt đầu.",
@@ -717,10 +723,19 @@ export const en: typeof vi = {
     empty: "The server returned no paths.",
   },
   autoloop: {
-    schedulerDescription: "Configure the interval for the Auto Spot and Auto Futures modes enabled in operator configuration.",
+    schedulerDescription:
+      "The scan cadence follows each enabled mode's selected candle boundary (1m/15m/1h/4h) from operator configuration; there is no manual interval.",
     schedulerEnabled: "Scheduled automation enabled",
     schedulerInactive: "Scheduler is inactive or its status is unknown.",
     statusStale: "Could not refresh status. Previous data may be stale.",
+    scheduleAria: "Scan schedule by candle timeframe",
+    scheduleDue: (timeframe: string | null, nextDue: string | null, lastOpen: number | null) => {
+      const tf = timeframe ?? "?";
+      const next = nextDue ?? "?";
+      const last = lastOpen != null ? ` · last candle: ${new Date(lastOpen).toISOString()}` : "";
+      return `${tf} timeframe · next due: ${next}${last}`;
+    },
+    scheduleOff: "Not armed — the scan follows the candle boundary once the mode is enabled.",
     clearHaltConfirmTitle: "Confirm clearing HALT",
     clearHaltConfirmDescription: "Clearing HALT may allow new orders under the current configuration and risk checks. The halt will be checked again before clearing.",
     clearHaltConfirmAction: "Confirm clear HALT",
@@ -728,7 +743,6 @@ export const en: typeof vi = {
     runNow: "Run now",
     runNowHint: "Run a cycle now. It may place real orders under the current configuration and risk checks.",
     runStarted: "Run-now request accepted. Refresh status to check the cycle.",
-    intervalSaved: "Interval saved.",
     title: "Autoloop",
     loading: "Loading autoloop status from GET /api/autoloop…",
     loadFailed: "Could not load autoloop status.",
@@ -745,11 +759,6 @@ export const en: typeof vi = {
     },
     modeAvailable: "At least one automation mode is enabled",
     noModesEnabled: "Enable Auto Spot or Auto Futures in operator configuration to run a cycle",
-    intervalLabel: "Interval (minutes)",
-    apply: "Apply",
-    intervalError: (min, max) => `Interval must be an integer between ${min} and ${max} minutes.`,
-    enabledFeedback: (minutes) => `Autoloop enabled — a cycle runs every ${minutes} minutes.`,
-    disabledFeedback: "Autoloop is disabled.",
     modeClosedWarning: "Enable Auto Spot or Auto Futures before running a cycle.",
     runStatus: {
       started: "Request sent — the cycle is starting.",

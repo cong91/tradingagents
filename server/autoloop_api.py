@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Request
 
 from server import (
     audit as audit_log,
     autoloop,
+    autoloop_schedule,
     daily as daily_mod,
     futures_cycle_store,
     runs as runs_mod,
 )
+from server.auto_modes import MODE_KEYS, AutoMode
 from server.contract import ApiError, json_body, utc_now_iso
+from tradingagents.auto_timeframes import last_closed_candle, timeframe_ms
 from tradingagents.dataflows.config import get_config
 from tradingagents.execution.audit import append_event
 
@@ -27,13 +30,44 @@ _CYCLE_SUMMARY_BUCKETS = (
 )
 
 
+def _schedules() -> dict:
+    """Per-mode derived schedule: cadence follows the selected candle timeframe."""
+    config = autoloop.get_config()
+    markers = autoloop._load_mode_schedule()
+    now = datetime.now(UTC)
+    schedules: dict[str, dict] = {}
+    for mode in AutoMode:
+        key = autoloop_schedule.mode_key(mode)
+        enabled = config.get(MODE_KEYS[mode]) is True
+        served = markers.get(key)
+        served = served if isinstance(served, dict) else {}
+        if enabled:
+            timeframe = autoloop_schedule.selected_timeframe(config, mode)
+            _opened, closed = last_closed_candle(now, timeframe)
+            # The boundary the scheduler wakes for: the NEXT candle close, not
+            # the one that just passed (contract §13 rev 6 "thời điểm đóng
+            # nến kế tiếp").
+            next_due = closed + timedelta(milliseconds=timeframe_ms(timeframe))
+            next_due_at = next_due.isoformat()
+        else:
+            timeframe = None
+            next_due_at = None
+        schedules[key] = {
+            "enabled": enabled,
+            "timeframe": timeframe,
+            "next_due_at": next_due_at,
+            "last_dispatched_open": served.get(timeframe) if timeframe else None,
+        }
+    return schedules
+
+
 def _payload() -> dict:
     state = autoloop._load_state()
     mode_gates = autoloop.gates()
     return {
         "generated_at": utc_now_iso(),
         "enabled": bool(state["enabled"]) and mode_gates["any_auto_enabled"],
-        "interval_minutes": autoloop._interval_from(state),
+        "schedules": _schedules(),
         "running_cycle": autoloop._cycle_lock.locked(),
         "modes": mode_gates,
         "gates": mode_gates,
@@ -80,7 +114,7 @@ def get_autoloop_cycles(limit: int = 20, symbol: str | None = None):
         },
         "symbols": futures_cycle_store.futures_cycle_symbol_rollup(),
         "enabled": bool(autoloop._load_state().get("enabled", False)),
-        "interval_minutes": autoloop._interval_from(autoloop._load_state()),
+        "schedules": _schedules(),
         "running_cycle": autoloop._cycle_lock.locked(),
         "modes": autoloop.gates(),
         "last_cycle": autoloop._last_cycle_snapshot(),
@@ -95,19 +129,18 @@ def get_autoloop():
 @router.post("/autoloop")
 async def set_autoloop(request: Request):
     body = await json_body(request)
+    # The manual scan interval was removed: cadence follows each mode's
+    # selected Auto candle timeframe (server/autoloop_schedule.py). A stale
+    # client sending the old key fails loudly instead of being ignored.
+    if "interval_minutes" in body:
+        raise ApiError(
+            400, "validation_error",
+            '"interval_minutes" was removed; the scan cadence now follows the '
+            'selected Auto candle timeframe (auto_spot_timeframe / auto_futures_timeframe)',
+        )
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         raise ApiError(400, "validation_error", '"enabled" must be a boolean')
-    interval = body.get("interval_minutes", autoloop.DEFAULT_INTERVAL_MINUTES)
-    if (
-        isinstance(interval, bool)
-        or not isinstance(interval, int)
-        or not autoloop.MIN_INTERVAL_MINUTES <= interval <= autoloop.MAX_INTERVAL_MINUTES
-    ):
-        raise ApiError(
-            400, "validation_error",
-            f'"interval_minutes" must be an integer between {autoloop.MIN_INTERVAL_MINUTES} and {autoloop.MAX_INTERVAL_MINUTES}',
-        )
     with autoloop._state_lock:
         state = autoloop.gates()
         if enabled and not state["any_auto_enabled"]:
@@ -117,17 +150,24 @@ async def set_autoloop(request: Request):
                 {"gates": state},
             )
         enabled = state["any_auto_enabled"]
-        autoloop._save_state({"enabled": enabled, "interval_minutes": interval, "updated_at": utc_now_iso()})
-    audit_log.record("autoloop_updated", enabled=enabled, interval_minutes=interval)
+        # Merge: the per-mode dispatch markers in this payload must survive.
+        persisted = autoloop.control_store.load_autoloop_state()
+        persisted = persisted if isinstance(persisted, dict) else {}
+        autoloop._save_state({
+            **persisted,
+            "enabled": enabled,
+            "updated_at": utc_now_iso(),
+        })
+    audit_log.record("autoloop_updated", enabled=enabled)
     if enabled:
         autoloop.ensure_started()
-    autoloop._wakeup.set()  # a changed interval or enabled flag takes effect on the next wake
+    autoloop._wakeup.set()  # a changed enabled flag takes effect on the next wake
     return _payload()
 
 
 @router.post("/autoloop/run-now", status_code=202)
 async def run_autoloop_now(request: Request):
-    """Run one cycle now on a worker thread if at least one auto mode is on."""
+    """Run one cycle now across every enabled mode if at least one is on."""
     await json_body(request)  # CSRF §0: application/json required, body may be {}
     if not autoloop.gates()["any_auto_enabled"]:
         raise ApiError(409, "mode_closed", "enable Auto Spot or Auto Futures before running a cycle")
@@ -136,6 +176,8 @@ async def run_autoloop_now(request: Request):
     else:
         busy = runs_mod.active_run_id() is not None or daily_mod.active_job_id() is not None
         status = "skipped_busy" if busy else "started"
+        # due=None forces every enabled mode; markers land only on modes that
+        # actually start, so the scheduler never duplicates this manual run.
         autoloop._spawn_cycle()
     return {"generated_at": utc_now_iso(), "status": status}
 

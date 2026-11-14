@@ -6,9 +6,11 @@ import inspect
 import logging
 import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from server import (
+    autoloop_candles,
     autoloop_cycle_records,
     autoloop_execution,
     autoloop_futures_context,
@@ -22,6 +24,7 @@ from server.autoloop_telemetry import CycleTelemetry
 from server.contract import utc_now_iso
 from server.futures_decision_context import build_futures_portfolio, render_futures_decision_context
 from tradingagents.agents.rating import RATINGS_5_TIER, parse_rating
+from tradingagents.dataflows.config import config_key_revision
 from tradingagents.execution import daily as execution_daily, futures_account as futures_accounts
 from tradingagents.execution.auto_authorization import (
     AuthorizationSnapshot,
@@ -88,10 +91,20 @@ def _process_candidate(
     try:
         autoloop_execution.raise_if_mode_disabled(mode, "candidate start", authorization)
         autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} start")
+        execution_context = ""
         futures_context = None
         futures_account = None
         futures_portfolio = None
-        execution_context = ""
+        selected_candle = None
+        timeframe_key = "auto_futures_timeframe" if derivatives is not None else "auto_spot_timeframe"
+        timeframe_revision = config_key_revision(timeframe_key)
+        if asset_type == "crypto" and derivatives is None and mode == AutoMode.SPOT:
+            autoloop_execution.raise_if_mode_disabled(mode, "spot market context", authorization)
+            selected_candle = autoloop_candles.selected_candle(
+                bridge.client(), bridge.symbol_for(ticker),
+                config.get("auto_spot_timeframe", "4h"), as_of=datetime.now(UTC),
+            )
+            result.candle_identity = autoloop_candles.candle_identity(selected_candle)
         if asset_type == "crypto" and derivatives is not None:
             autoloop_execution.raise_if_mode_disabled(mode, "futures market context", authorization)
             if deadline is not None:
@@ -130,6 +143,16 @@ def _process_candidate(
                 futures_account = futures_accounts.read_futures_account(derivatives._bridge, settle=settle)
             if not futures_account.positions_scope_complete:
                 raise ValueError("futures position scope is unverified; analysis deferred")
+            autoloop_execution.raise_if_execution_closed(deadline, cancelled, "selected candle")
+            decision_as_of = datetime.fromisoformat(futures_context["decision_as_of"])
+            selected_candle = autoloop_candles.selected_candle(
+                derivatives._bridge.client(), futures_context["unified_symbol"],
+                config.get("auto_futures_timeframe", "4h"), as_of=decision_as_of,
+            )
+            futures_context["selected_candle"] = selected_candle
+            futures_context["timeframe_revision"] = timeframe_revision
+            futures_context["candle_identity"] = autoloop_candles.candle_identity(selected_candle)
+            result.candle_identity = futures_context["candle_identity"]
             futures_cycle_id, four_hour_open, one_hour_open = futures_cycle_telemetry.cycle_identity(futures_context)
             futures_cycle_timestamps = {"market_context_finished_at": utc_now_iso()}
             futures_caps = futures_cycle_telemetry.effective_caps(
@@ -147,11 +170,14 @@ def _process_candidate(
                 "phase_timestamps": dict(futures_cycle_timestamps),
             }
             autoloop_execution.raise_if_execution_closed(deadline, cancelled, "futures claim")
+            selected_identity = futures_context["candle_identity"]
             if not futures_cycle_telemetry.claim_cycle(
                 futures_cycle_id,
                 symbol=futures_context["unified_symbol"],
                 four_hour_open=four_hour_open,
                 one_hour_open=one_hour_open,
+                timeframe=str(selected_identity["timeframe"]),
+                selected_open=int(selected_identity["open_time"]),
                 payload=futures_cycle_payload,
             ):
                 result.reason = "duplicate futures signal skipped"
@@ -358,14 +384,28 @@ def _process_candidate(
                 plan = _attach_bracket(plan, ticker)
         result.plan = plan
         with telemetry.span("execution_policy", ticker):
+            def guarded_spot_execute(execute: Callable[[], Any]) -> Any:
+                def checked_execute() -> Any:
+                    if selected_candle is not None and plan.side == "buy":
+                        autoloop_candles.require_current(
+                            selected_candle, config_key=timeframe_key, config_revision=timeframe_revision,
+                        )
+                    return execute()
+                return autoloop_execution.execute_with_deadline(
+                    checked_execute, deadline, cancelled, execution_lock, mode, authorization,
+                )
+
+            def check_spot_entry() -> None:
+                autoloop_execution.raise_if_execution_closed(deadline, cancelled, "spot entry submission")
+                if selected_candle is None:
+                    raise ValueError("selected candle identity unavailable")
+                autoloop_candles.require_current(
+                    selected_candle, config_key=timeframe_key, config_revision=timeframe_revision,
+                )
+
             execution_daily._handle_plan(
-                bridge,
-                plan,
-                portfolio,
-                result,
-                execute_guard=lambda execute: autoloop_execution.execute_with_deadline(
-                    execute, deadline, cancelled, execution_lock, mode, authorization
-                ),
+                bridge, plan, portfolio, result, execute_guard=guarded_spot_execute,
+                check_entry_allowed=check_spot_entry if mode == AutoMode.SPOT and plan.side == "buy" else None,
             )
     except (autoloop_execution.AutoModeDisabled, AutoAuthorizationError) as exc:
         if futures_cycle_id is not None and autoloop_execution.cycle_writes_allowed(deadline, cancelled):

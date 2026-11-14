@@ -386,6 +386,8 @@ def build_default_config() -> dict:
         # Active Kronos context is always attempted for eligible Futures
         # candidates. Only its verified model-tokenizer pair is selectable.
         "kronos_active_profile": "small_base",
+        "auto_spot_timeframe": "4h",
+        "auto_futures_timeframe": "4h",
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],
         # L2 runtime gates are config/operator switches only. The operator

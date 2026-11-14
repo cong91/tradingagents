@@ -180,12 +180,13 @@ def _write_stub(tmp_path: Path, mode: str) -> Path:
     return stub
 
 
-def _candles(count: int = 40, step: int = _FOUR_HOUR_MS) -> tuple[Candle, ...]:
+def _candles(count: int = 40, step: int = _FOUR_HOUR_MS, *,
+             symbol: str = "BTC/USDT:USDT", timeframe: str = "4h") -> tuple[Candle, ...]:
     last = 1_800_000_000_000 - (1_800_000_000_000 % step)
     opens = [last - step * (count - 1 - index) for index in range(count)]
     return tuple(
         Candle(
-            symbol="BTC/USDT:USDT", timeframe="4h", open_time=open_time,
+            symbol=symbol, timeframe=timeframe, open_time=open_time,
             close_time=open_time + step, open=99.5, high=101.0, low=99.0,
             close=100.0, volume=10.0, is_closed=True,
         )
@@ -474,7 +475,7 @@ def test_inverted_high_low_is_corrected_and_raw_bounds_are_retained(tmp_path):
 def test_overflowing_price_fails_only_its_symbol_in_a_batch(tmp_path):
     sampler = _sampler(tmp_path, "huge_open")
     first = _request()
-    second = ("ETH/USDT:USDT", *first[1:-1], 5000)
+    second = ("ETH/USDT:USDT", first[1], first[2], _candles(symbol="ETH/USDT:USDT"), 5000)
     try:
         bad, good = sampler.sample([first, second])
     finally:
@@ -632,8 +633,8 @@ def test_mixed_timeframes_and_horizons_are_split_without_reordering(tmp_path, mo
     monkeypatch.setattr(sampler, "_communicate", record_payload)
     requests = [
         ("BTC/USDT:USDT", "4h", 8, _candles(), 1000),
-        ("ETH/USDT:USDT", "1h", 2, _candles(), 2000),
-        ("SOL/USDT:USDT", "4h", 24, _candles(), 3000),
+        ("ETH/USDT:USDT", "1h", 2, _candles(step=3_600_000, symbol="ETH/USDT:USDT", timeframe="1h"), 2000),
+        ("SOL/USDT:USDT", "4h", 24, _candles(symbol="SOL/USDT:USDT"), 3000),
     ]
     try:
         results = sampler.sample(requests)

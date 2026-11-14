@@ -2,7 +2,7 @@
 // Đây là các cấu hình vận hành lưu trong PostgreSQL: chế độ tự động và
 // các trần rủi ro. Chúng nằm ngoài allowlist của /api/settings.
 
-export type OperatorSettingType = "bool" | "float";
+export type OperatorSettingType = "bool" | "float" | "timeframe";
 
 export type OperatorGateKey = "auto_spot_enabled" | "auto_futures_enabled";
 
@@ -20,6 +20,7 @@ export const OPERATOR_GATE_KEYS: readonly OperatorGateKey[] = [
 export type OperatorSettingRow = {
   key: string;
   type: OperatorSettingType;
+  options?: string[] | null;
   group: "gates" | "risk" | string;
   label: string;
   hint: string;
@@ -56,6 +57,7 @@ export type OperatorRiskGroup = "general" | "futures" | "protection" | "advanced
 /** Each operator row belongs to exactly one editable section. */
 export function operatorSection(row: OperatorSettingRow): OperatorSection {
   if (row.group === "forecast") return "forecast";
+  if (row.group === "modes") return "modes";
   return row.gate ? "modes" : "risk";
 }
 

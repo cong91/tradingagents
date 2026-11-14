@@ -6,11 +6,9 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle
-from tradingagents.forecast.artifact import (
-    TIMEFRAME_HOURS,
-    profile_for,
-)
+from tradingagents.forecast.artifact import profile_for
 from tradingagents.forecast.block import CandleSeries, ForecastBlock
 from tradingagents.forecast.cache import ForecastCache, cache_key, content_digest
 from tradingagents.forecast.contract import (
@@ -195,12 +193,9 @@ class KronosForecastService:
         return self._created_at or datetime.now(UTC)
 
     def _first_realized_close(self, series: CandleSeries) -> datetime | None:
-        step_hours = TIMEFRAME_HOURS.get(self.settings.timeframe)
-        if not step_hours:
-            return None
         return datetime.fromtimestamp(
             series.candles[-1].close_time / 1000, UTC,
-        ) + timedelta(hours=step_hours)
+        ) + timedelta(milliseconds=timeframe_ms(self.settings.timeframe))
 
     def forecast(self, series: CandleSeries, *, seed: int) -> ForecastBlock:
         """One symbol's block, from the cache when the identity matches."""
@@ -280,7 +275,7 @@ class KronosForecastService:
         # horizon or a non-finite price is an error, never a small sample.
         problem = _paths_problem(
             sampled.paths, requested_paths=settings.paths,
-            horizon_bars=settings.horizon_hours // TIMEFRAME_HOURS.get(settings.timeframe, 0),
+            horizon_bars=settings.horizon_bars,
         )
         if problem is not None:
             return _failure(series.symbol, STATUS_ERROR, problem)
@@ -288,7 +283,7 @@ class KronosForecastService:
         for index, path in enumerate(sampled.paths):
             normalized = normalize_ohlc_path(
                 path, index=index,
-                horizon_bars=settings.horizon_hours // TIMEFRAME_HOURS.get(settings.timeframe, 0),
+                horizon_bars=settings.horizon_bars,
             )
             if normalized is None:
                 return _failure(series.symbol, STATUS_ERROR, "the sampled OHLC path could not be normalized")
@@ -331,6 +326,7 @@ class KronosForecastService:
             data_open_time=series.candles[-1].open_time,
             as_of=series.as_of.isoformat(),
             horizon_hours=settings.horizon_hours,
+            horizon_bars=settings.horizon_bars,
             timeframe=settings.timeframe,
             paths=len(paths),
             per_path_samples=1,

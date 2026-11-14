@@ -19,6 +19,7 @@ def _json(value) -> str:
 
 def claim_futures_cycle(cycle_id: str, *, symbol: str, four_hour_open: str,
                         one_hour_open: str, strategy_version: str,
+                        timeframe: str, selected_open: int,
                         payload: dict | None = None) -> bool:
     now = _now()
     def normalize(value):
@@ -34,11 +35,11 @@ def claim_futures_cycle(cycle_id: str, *, symbol: str, four_hour_open: str,
         cursor = conn.execute(
             """INSERT INTO futures_cycles
                (cycle_id, symbol, four_hour_open, one_hour_open, strategy_version,
-                status, phase, payload, created_at, updated_at)
-               VALUES (%s, %s, %s, %s, %s, 'claimed', 'scan', %s::jsonb, %s, %s)
+                timeframe, selected_open, status, phase, payload, created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 'claimed', 'scan', %s::jsonb, %s, %s)
                ON CONFLICT (cycle_id) DO NOTHING""",
             (cycle_id, symbol, four_hour_open, one_hour_open, strategy_version,
-             _json(payload), now, now),
+             timeframe, int(selected_open), _json(payload), now, now),
         )
         return cursor.rowcount == 1
 

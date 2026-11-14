@@ -129,8 +129,6 @@ MIN_PATHS = 16
 MAX_PATHS = 32
 MAX_HORIZON_BARS = 72
 
-TIMEFRAME_HOURS = {"1h": 1, "4h": 4}
-
 _HOME = Path(os.path.expanduser("~"))
 _DEFAULT_RESEARCH_DIR = Path(
     os.environ.get("LOCALAPPDATA") or _HOME
@@ -296,7 +294,6 @@ __all__ = [
     "PROFILES",
     "RUNNER_PATH",
     "SOURCE_REVISION",
-    "TIMEFRAME_HOURS",
     "TOKENIZER_REPO",
     "TOKENIZER_REVISION",
     "artifact_digest",

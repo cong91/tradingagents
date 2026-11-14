@@ -70,14 +70,9 @@ def render_forecast_block(block: ForecastBlock) -> str:
 
 
 def _bars(block: ForecastBlock) -> str:
-    if block.horizon_hours is None or block.timeframe is None:
+    if block.horizon_bars is None:
         return "unavailable"
-    from tradingagents.forecast.artifact import TIMEFRAME_HOURS
-
-    hours = TIMEFRAME_HOURS.get(block.timeframe)
-    if not hours:
-        return "unavailable"
-    return str(block.horizon_hours // hours)
+    return str(block.horizon_bars)
 
 
 def _iso(value: int | None) -> str:

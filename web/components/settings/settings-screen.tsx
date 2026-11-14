@@ -33,7 +33,8 @@ export function SettingsScreen() {
   const [area, setArea] = useState<SettingsArea>("automation");
   const [llmDirty, setLlmDirty] = useState(false);
   const [cookiesDirty, setCookiesDirty] = useState(false);
-  const [scheduleDirty, setScheduleDirty] = useState(false);
+  // AutoloopCard is read-only now (cadence derives from the selected
+  // timeframes server-side), so it contributes no unsaved draft.
 
   useEffect(() => {
     const selectHash = () => {
@@ -68,7 +69,7 @@ export function SettingsScreen() {
     }
   }, [controller.saveState, reloadOperator]);
 
-  const unsaved = controller.dirtyCount > 0 || operator.dirtyCount > 0 || llmDirty || cookiesDirty || scheduleDirty;
+  const unsaved = controller.dirtyCount > 0 || operator.dirtyCount > 0 || llmDirty || cookiesDirty;
   useUnsavedNavigation(unsaved, c.leaveUnsaved);
 
   const grouped = useMemo(
@@ -193,7 +194,7 @@ export function SettingsScreen() {
             </div>
             <div id="exec-gates"><OperatorModes controller={operator} /></div>
             <AutoloopHaltControl />
-            <AutoloopCard hideHalt onDirtyChange={setScheduleDirty} />
+            <AutoloopCard hideHalt />
           </section>
           <section id="ai" hidden={area !== "ai"} className="space-y-4">
             {controller.payload ? <LlmConfigCard controller={controller} onDirtyChange={setLlmDirty} /> : null}

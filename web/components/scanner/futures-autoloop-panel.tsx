@@ -62,7 +62,7 @@ function renderCandidates(t: Messages, candidates: FuturesCycleCandidate[] | und
 
 export function FuturesAutoloopPanel() {
   const {
-    cycles, summary, symbols, runningCycle, enabled, intervalMinutes, loading, error, refresh,
+    cycles, summary, symbols, runningCycle, enabled, futuresTimeframe, loading, error, refresh,
   } = useFuturesCycles();
   const t = useT();
   const c = t.scanner.futures;
@@ -82,7 +82,7 @@ export function FuturesAutoloopPanel() {
         </h2>
         <CardDescription>
           {enabled ? c.enabled : c.disabled} · {runningCycle ? c.runningCycle : c.waiting}
-          {intervalMinutes != null ? c.interval(intervalMinutes) : ""}{c.liveData}
+          {futuresTimeframe ? c.timeframe(futuresTimeframe) : ""}{c.liveData}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">

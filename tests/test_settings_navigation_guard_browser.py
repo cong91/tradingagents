@@ -41,7 +41,11 @@ FAKE_API = r"""
       ["reddit", "x"].map(provider => ({provider, configured: false, decryptable: true,
         valid: false, cookie_count: 0, cookie_names: [], updated_at: null, updated_by: null}))},
     "/api/autoloop": {generated_at: "2026-11-09T00:00:00Z", enabled: true,
-      interval_minutes: 60, running_cycle: false,
+      schedules: {auto_spot: {enabled: true, timeframe: "1h",
+        next_due_at: "2026-11-09T01:00:00Z", last_dispatched_open: 1699484400000},
+        auto_futures: {enabled: false, timeframe: null, next_due_at: null,
+          last_dispatched_open: null}},
+      running_cycle: false,
       modes: {auto_spot: true, auto_futures: false, any_auto_enabled: true}, last_cycle: null},
     "/api/health": {audit_log_readable: true, halted_today: false, exec_mode: "dry"},
   };
@@ -142,7 +146,7 @@ async function until(fn, message, timeout = 30000) {
     async function homeToSettings(hash = '') {
       await navigate('/');
       await click('a[href="/settings"]');
-      await wait('location.pathname === "/settings" && document.querySelector("#llm-quick-api-key") && document.querySelector("#operator-risk_max_open_heat_pct") && document.querySelector("#autoloop-interval") && document.querySelector("textarea")', 'settings hydrated');
+      await wait('location.pathname === "/settings" && document.querySelector("#llm-quick-api-key") && document.querySelector("#operator-risk_max_open_heat_pct") && document.querySelector("a[href=\\"#automation\\"]") && document.querySelector("textarea")', 'settings hydrated');
       if (hash) { await click('a[href="#' + hash + '"]'); await wait('location.hash === "#' + hash + '"', 'hash'); }
     }
     async function setValue(selector, value, dirty = true) {
@@ -174,10 +178,11 @@ async function until(fn, message, timeout = 30000) {
     const secret = 'synthetic-private-key-for-guard';
 
     // Real Next Link and each independent draft source trigger exactly one confirmation.
+    // (The autoloop schedule is server-derived and read-only, so the automation
+    // pane has no editable draft of its own any more.)
     for (const [area, selector, value] of [
       ['ai', input, secret], ['connections', 'textarea', 'synthetic-cookie-draft'],
       ['risk', '#operator-risk_max_open_heat_pct', '8'],
-      ['automation', '#autoloop-interval', '90'],
       ['system', '#setting-benchmark_ticker', 'QQQ'],
     ]) {
       await homeToSettings(area);
@@ -223,15 +228,15 @@ async function until(fn, message, timeout = 30000) {
     // Deep link aliases select automation and are retained when editing.
     await navigate('/settings#exec-gates');
     await wait('document.querySelector("a[href=\\"#automation\\"]").getAttribute("aria-current") === "page"', 'deep link selection');
-    await wait('document.querySelector("#autoloop-interval")', 'deep link data');
-    await setValue('#autoloop-interval', '90');
+    await wait('document.querySelector("#operator-risk_max_open_heat_pct")', 'deep link data');
+    await setValue('#operator-risk_max_open_heat_pct', '8');
     check(await get('location.hash') === '#exec-gates', 'deep link changed');
     const unloadPrompts = prompts().length;
     await cmd('Page.navigate', {url: base + '/'});
     await until(() => prompts().length === unloadPrompts + 1, 'native beforeunload');
     check(prompts().at(-1).params.type === 'beforeunload', 'native unload dialog missing');
     check(await get('location.pathname') === '/settings', 'unload cancel left settings');
-    check(await get('document.querySelector("#autoloop-interval").value') === '90', 'unload cancel lost draft');
+    check(await get('document.querySelector("#operator-risk_max_open_heat_pct").value') === '8', 'unload cancel lost draft');
     dialogDecision = true;
     await cmd('Page.navigate', {url: base + '/'});
     await wait('location.pathname === "/"', 'unload accept');
