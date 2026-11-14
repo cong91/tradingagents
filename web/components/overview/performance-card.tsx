@@ -1,6 +1,6 @@
 "use client";
 
-import { RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
+import { LoaderCircleIcon, TriangleAlertIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,20 +15,15 @@ import {
 import { formatDateTime } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 
-import type { PerformanceHistoryPayload, PerformancePayload, PortfolioPayload } from "./contract";
+import type { PerformanceHistoryPayload, PerformancePayload } from "./contract";
 import { PerformanceEvents } from "./performance-events";
 import { PerformanceHistory } from "./performance-history";
-import { PerformancePositions } from "./performance-positions";
 import type { PanelState } from "./use-panel";
 
 export function PerformanceCard({
   state,
   stale,
   onRetry,
-  portfolioState,
-  portfolioStale,
-  futuresStale,
-  onPortfolioRetry,
   historyState,
   historyStale,
   onHistoryRetry,
@@ -36,35 +31,38 @@ export function PerformanceCard({
   state: PanelState<PerformancePayload>;
   stale: boolean;
   onRetry: () => void;
-  portfolioState: PanelState<PortfolioPayload>;
-  portfolioStale: boolean;
-  futuresStale: boolean;
-  onPortfolioRetry: () => void;
   historyState: PanelState<PerformanceHistoryPayload>;
   historyStale: boolean;
   onHistoryRetry: () => void;
 }) {
   const t = useT();
   const c = t.overview.performance;
+  // One primary refresh per page. This card polls two endpoints, so its own
+  // control exists only for recovery (error or stale), where "Retry" refetches
+  // both; in the healthy state it duplicated the page action.
+  const needsRecovery =
+    state.status === "error" || historyState.status === "error" || stale || historyStale;
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{c.title}</CardTitle>
+        <CardTitle as="h2">{c.title}</CardTitle>
         <CardDescription>{c.description}</CardDescription>
         <CardAction>
-          <Button variant="outline" size="sm" className="min-touch" onClick={() => {
-            onPortfolioRetry();
-            onHistoryRetry();
-            onRetry();
-          }}>
-            <RefreshCwIcon aria-hidden="true" /> {t.common.refresh}
-          </Button>
+          {needsRecovery ? (
+            <Button variant="outline" size="sm" className="min-touch" onClick={() => {
+              onHistoryRetry();
+              onRetry();
+            }}>
+              {state.status === "loading" || historyState.status === "loading" ? (
+                <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+              ) : null}
+              {t.common.retry}
+            </Button>
+          ) : null}
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-5">
-        <PerformancePositions portfolioState={portfolioState} stale={portfolioStale} futuresStale={futuresStale} onRetry={onPortfolioRetry} />
-
-        <section className="space-y-2 border-t pt-4" aria-label={c.closedStatsTitle}>
+        <section className="space-y-2" aria-label={c.closedStatsTitle}>
           <h3 className="text-sm font-medium">{c.closedStatsTitle}</h3>
           <p className="text-sm text-muted-foreground">
             {c.closedStatsBody}

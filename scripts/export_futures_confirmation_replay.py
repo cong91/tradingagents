@@ -10,7 +10,7 @@ The production store is transient, so this exporter reads an archived snapshot
 of the ``futures_cycles`` table and writes:
 
 * the outcome funnel (market → confirmation → proposal → entry buckets, the
-  same buckets ``server/job_store.futures_cycle_summary`` classifies), grouped
+  same buckets ``server/futures_cycle_store.futures_cycle_summary`` classifies), grouped
   by signal, 1h/4h candle direction, doji, bracket R:R and intent;
 * the signal × (1h, 4h) direction matrix of every direction-bearing snapshot;
 * one replay row per cycle with every field the gate replay needs — never the
@@ -80,7 +80,7 @@ def export(source: Path) -> dict:
         if rr is not None:
             rrs.append(rr)
 
-        # Funnel buckets mirror server/job_store.futures_cycle_summary.
+        # Funnel buckets mirror server/futures_cycle_store.futures_cycle_summary.
         if status == "completed" and phase == "entry":
             if data.get("execution_status") == "executed":
                 funnel["entered"] += 1

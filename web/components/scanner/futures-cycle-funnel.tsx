@@ -21,6 +21,7 @@ import type {
 const FUNNEL_KEYS = [
   "market_rejected",
   "confirmation_rejected",
+  "forecast_deferred",
   "proposal_rejected",
   "entered",
   "awaiting_approval",
@@ -135,6 +136,19 @@ function failureLabel(c: CyclesCopy, phase: string | null | undefined, reason: s
   return reason ? o.cycleFailedReason(reason) : o.cycleFailed;
 }
 
+function forecastLabel(c: CyclesCopy, payload: FuturesCyclePayload): string | null {
+  const forecast = payload.kronos_forecast;
+  if (!forecast) return null;
+  const status = forecast.status?.trim() || payload.kronos_policy?.trim() || "unknown";
+  const details = [
+    forecast.direction?.trim(),
+    forecast.paths == null ? null : `paths=${forecast.paths}`,
+    forecast.band_spread_ratio == null ? null : `spread=${forecast.band_spread_ratio}`,
+  ].filter((part): part is string => Boolean(part)).join(", ");
+  if (status === "ok") return c.outcome.forecast(status, details);
+  return forecast.reason ? c.outcome.forecast(status, forecast.reason) : c.outcome.forecast(status, details);
+}
+
 function cycleOutcome(c: CyclesCopy, cycle: FuturesCycle): string {
   const payload: FuturesCyclePayload = cycle.payload ?? {};
   if (cycle.status === "completed" && cycle.phase === "entry") {
@@ -146,6 +160,12 @@ function cycleOutcome(c: CyclesCopy, cycle: FuturesCycle): string {
     // Legacy cycles wrote completed/entry before execution_status existed:
     // map the recorded outcome, never infer "entered".
     return executionStatusLabel(c, payload) || c.outcome.legacyCompleted;
+  }
+  if (cycle.status === "rejected" && cycle.phase === "forecast"
+      && payload.kronos_policy === "defer" && payload.execution_status !== "failed") {
+    return payload.kronos_defer_reason
+      ? c.outcome.forecastDeferredReason(payload.kronos_defer_reason)
+      : c.outcome.forecastDeferred;
   }
   if (payload.execution_status) {
     const outcome = executionStatusLabel(c, payload);
@@ -182,6 +202,12 @@ function latestOutcome(c: CyclesCopy, row: FuturesCycleSymbolRollup): string {
       && row.last_executed !== "false") {
     return o.entered;
   }
+  if (row.last_status === "rejected" && row.last_phase === "forecast"
+      && row.last_kronos_policy === "defer" && row.last_execution_status !== "failed") {
+    return row.last_kronos_defer_reason
+      ? o.forecastDeferredReason(row.last_kronos_defer_reason)
+      : o.forecastDeferred;
+  }
   switch (row.last_execution_status) {
     case "awaiting_approval":
       return o.awaitingApproval;
@@ -212,6 +238,7 @@ const BREAKDOWN_KEYS = [
   "proposal_rejected",
   "confirmation_rejected",
   "market_rejected",
+  "forecast_deferred",
   "in_flight",
   "interrupted",
   "other",
@@ -336,6 +363,11 @@ function SymbolRow({ row }: { row: FuturesCycleSymbolRollup }) {
                       <span className="font-medium">{signalLabel(c, cycle.payload?.signal)}</span>
                       <span className="text-muted-foreground">— {cycleOutcome(c, cycle)}</span>
                     </div>
+                    {cycle.payload?.kronos_forecast ? (
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        {forecastLabel(c, cycle.payload)}
+                      </p>
+                    ) : null}
                     <AgentDecisionNote note={cycle.payload?.agent_decision_note} />
                   </li>
                 ))}
@@ -364,7 +396,7 @@ export function FuturesCycleFunnel({
 
   return (
     <div className="space-y-3">
-      <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-8">
+      <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-9">
         {FUNNEL_KEYS.map((key) => (
           <div key={key} className="rounded-lg border p-3">
             <p className="text-lg font-semibold tabular-nums">{summary[key]}</p>

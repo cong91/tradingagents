@@ -2,7 +2,7 @@
 // Đây là các cấu hình vận hành lưu trong PostgreSQL: chế độ tự động và
 // các trần rủi ro. Chúng nằm ngoài allowlist của /api/settings.
 
-export type OperatorSettingType = "bool" | "float";
+export type OperatorSettingType = "bool" | "float" | "timeframe";
 
 export type OperatorGateKey = "auto_spot_enabled" | "auto_futures_enabled";
 
@@ -20,6 +20,7 @@ export const OPERATOR_GATE_KEYS: readonly OperatorGateKey[] = [
 export type OperatorSettingRow = {
   key: string;
   type: OperatorSettingType;
+  options?: string[] | null;
   group: "gates" | "risk" | string;
   label: string;
   hint: string;
@@ -40,6 +41,7 @@ export type OperatorConfigPayload = {
   settings: OperatorSettingRow[];
   gates: OperatorGates;
   effective_exec_mode: string;
+  kronos?: KronosStatus | null;
   allowlist: string[];
   applied_at?: string;
 };
@@ -49,11 +51,13 @@ export type OperatorValue = string | boolean;
 
 export type OperatorDraft = Record<string, OperatorValue>;
 
-export type OperatorSection = "modes" | "risk";
+export type OperatorSection = "modes" | "risk" | "forecast";
 export type OperatorRiskGroup = "general" | "futures" | "protection" | "advanced";
 
 /** Each operator row belongs to exactly one editable section. */
 export function operatorSection(row: OperatorSettingRow): OperatorSection {
+  if (row.group === "forecast") return "forecast";
+  if (row.group === "modes") return "modes";
   return row.gate ? "modes" : "risk";
 }
 
@@ -87,6 +91,31 @@ export function isGateKey(row: OperatorSettingRow): boolean {
 export function isOperatorGateKey(key: string): key is OperatorGateKey {
   return key === OPERATOR_GATE_KEYS[0] || key === OPERATOR_GATE_KEYS[1];
 }
+
+/** Collect server-declared gates for confirmation and audit. */
+export function operatorGateKeys(settings: readonly OperatorSettingRow[]): Set<string> {
+  return new Set(settings.filter((row) => row.gate).map((row) => row.key));
+}
+
+export type KronosProfileId = "small_base" | "mini_2k";
+
+export type KronosStatus = {
+  profile_id: KronosProfileId;
+  timeframe: string;
+  horizon_hours: number | null;
+  lookback_bars: number | null;
+  max_context: number | null;
+  paths: number | null;
+  temperature: number | null;
+  readiness: { status: "ready" | "unavailable"; reason: string | null };
+  model: {
+    source_revision: string;
+    model_revision: string;
+    repo: string;
+    tokenizer_repo: string;
+    tokenizer_revision: string;
+  };
+};
 
 /** Giá trị form ban đầu từ payload: dùng value đang hiệu lực. */
 export function draftFrom(payload: OperatorConfigPayload): OperatorDraft {

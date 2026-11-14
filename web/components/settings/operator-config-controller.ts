@@ -7,6 +7,7 @@ import {
   changedKeys,
   draftFrom,
   isOperatorGateKey,
+  operatorGateKeys,
   operatorSection,
   parseOperatorNumber,
   type OperatorConfigPayload,
@@ -60,8 +61,11 @@ function changedServerKeys(left: OperatorConfigPayload, right: OperatorConfigPay
   return keys;
 }
 
+/** A change on any managed Auto gate row invalidates the previous confirmation
+ * and reason, so the operator must re-confirm against the fresh state. */
 function hasChangedGate(left: OperatorConfigPayload, right: OperatorConfigPayload): boolean {
-  return [...changedServerKeys(left, right)].some(isOperatorGateKey);
+  const gateKeys = operatorGateKeys(right.settings);
+  return [...changedServerKeys(left, right)].some((key) => gateKeys.has(key));
 }
 
 function clearGateAuthorization(
@@ -127,12 +131,10 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
       const previous = payloadRef.current;
       const currentDraft = draftRef.current;
       if (serverAheadRef.current && pendingRef.current) {
-        if (!sameServerConfig(pendingRef.current, next)) {
-          if (hasChangedGate(pendingRef.current, next)) {
-            clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
-          }
-          pendingRef.current = next;
+        if (!sameServerConfig(pendingRef.current, next) && hasChangedGate(pendingRef.current, next)) {
+          clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
         }
+        pendingRef.current = next;
         refreshFailedRef.current = false;
         setRefreshFailed(false);
         setServerAhead(true);
@@ -151,6 +153,8 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
         pendingRef.current = null;
         serverAheadRef.current = false;
         refreshFailedRef.current = false;
+        payloadRef.current = next;
+        setPayload(next);
         setServerAhead(false);
         setRefreshFailed(false);
       } else {
@@ -204,7 +208,7 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
   }, [draft, changed, onDraftChange]);
 
   const sectionChanges = useMemo(() => {
-    const result: Record<OperatorSection, string[]> = { modes: [], risk: [] };
+    const result: Record<OperatorSection, string[]> = { modes: [], risk: [], forecast: [] };
     for (const row of payload?.settings ?? []) {
       if (changed.includes(row.key)) result[operatorSection(row)].push(row.key);
     }
@@ -312,13 +316,19 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
     if (!payload || inFlight.current || refreshing.current || serverAheadRef.current || refreshFailedRef.current) return;
     const keys = sectionChanges[section];
     if (keys.length === 0 || keys.some((key) => invalidKeys.includes(key))) return;
-    if (section === "modes" && (!confirmGateRef.current || !reasonRef.current.trim())) return;
+    const gateKeys = operatorGateKeys(payload.settings);
+    const sectionGateChange = keys.some((key) => gateKeys.has(key));
+    if (sectionGateChange && (!confirmGateRef.current || !reasonRef.current.trim())) return;
 
-    const settings: Record<string, number | boolean> = {};
+    const settings: Record<string, number | boolean | string> = {};
     for (const row of payload.settings) {
       if (!keys.includes(row.key)) continue;
       if (row.type === "bool") {
         settings[row.key] = draft[row.key] === true;
+      } else if (row.type === "timeframe") {
+        const value = draft[row.key];
+        if (typeof value !== "string" || !row.options?.includes(value)) return;
+        settings[row.key] = value;
       } else {
         const value = parseOperatorNumber(draft[row.key]);
         if (value === null) return;
@@ -331,11 +341,11 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
     setFeedback((current) => ({ ...current, [section]: undefined }));
     try {
       const next = await operatorConfigApi.update(settings, {
-        confirm: section === "modes" ? confirmGateRef.current : undefined,
-        reason: section === "modes" ? reasonRef.current.trim() : undefined,
+        confirm: sectionGateChange ? confirmGateRef.current : undefined,
+        reason: sectionGateChange ? reasonRef.current.trim() : undefined,
       });
       const concurrentKeys = [...changedServerKeys(payload, next)].filter((key) => !keys.includes(key));
-      const concurrentGateChange = concurrentKeys.some(isOperatorGateKey);
+      const concurrentGateChange = concurrentKeys.some((key) => gateKeys.has(key));
       const fresh = draftFrom(next);
       for (const key of changedKeys(payload, draftRef.current)) {
         if (!keys.includes(key)) fresh[key] = draftRef.current[key];
@@ -346,10 +356,7 @@ export function useOperatorConfig(options?: { onDraftChange?: (state: DraftChang
         serverAheadRef.current = true;
         setServerAhead(true);
       }
-      if (concurrentGateChange) {
-        clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
-      }
-      if (section === "modes") {
+      if (concurrentGateChange || sectionGateChange) {
         clearGateAuthorization(setConfirmGate, setReason, confirmGateRef, reasonRef);
       }
       setFeedback((current) => ({

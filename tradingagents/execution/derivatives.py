@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import math
 import secrets
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -466,6 +467,9 @@ class DerivativesExecutor:
         order: PlannedOrder,
         confirm: bool = False,
         portfolio: PortfolioContext | None = None,
+        *,
+        on_entry_evidence: Callable[[dict], None] | None = None,
+        check_entry_allowed: Callable[[], None] | None = None,
     ) -> str | None:
         """Execute a derivatives plan behind gates (a)+(b)+(c).
 
@@ -617,7 +621,10 @@ class DerivativesExecutor:
                 "live entry unavailable: authenticated account identity cannot be bound to protective state",
                 phase="execute",
             )
-        return self._execute_live(order, confirm, identity)
+        return self._execute_live(
+            order, confirm, identity,
+            on_entry_evidence=on_entry_evidence, check_entry_allowed=check_entry_allowed,
+        )
 
     # --- internals -----------------------------------------------------------
 
@@ -717,7 +724,11 @@ class DerivativesExecutor:
             stop_loss=stop_loss, take_profit=take_profit,
         )
 
-    def _execute_live(self, order: PlannedOrder, confirm: bool, identity: Any = None) -> str | None:
+    def _execute_live(
+        self, order: PlannedOrder, confirm: bool, identity: Any = None, *,
+        on_entry_evidence: Callable[[dict], None] | None = None,
+        check_entry_allowed: Callable[[], None] | None = None,
+    ) -> str | None:
         exchange = self._bridge.client()
         if not getattr(exchange, "apiKey", "") or not getattr(exchange, "secret", ""):
             self._bridge.audit_plan(
@@ -735,10 +746,15 @@ class DerivativesExecutor:
                 "nothing was sent"
             )
         with operation_lock(order.ccxt_symbol) as guard:
-            return self._execute_live_locked(order, confirm, identity, guard)
+            return self._execute_live_locked(
+                order, confirm, identity, guard, on_entry_evidence=on_entry_evidence,
+                check_entry_allowed=check_entry_allowed,
+            )
 
     def _execute_live_locked(
-        self, order: PlannedOrder, confirm: bool, identity: Any, guard: OperationGuard,
+        self, order: PlannedOrder, confirm: bool, identity: Any, guard: OperationGuard, *,
+        on_entry_evidence: Callable[[dict], None] | None = None,
+        check_entry_allowed: Callable[[], None] | None = None,
     ) -> str | None:
         guard.check()
         exchange = self._bridge.client()
@@ -786,6 +802,15 @@ class DerivativesExecutor:
             raise self._refuse(order, str(exc), phase="execute") from exc
         entry_sent = False
         try:
+            if on_entry_evidence is not None:
+                try:
+                    on_entry_evidence({
+                        "entry_intent_id": intent_id,
+                        "entry_provenance": intent_leg["entry_provenance"],
+                        "execution_status": "uncertain",
+                    })
+                except Exception as exc:
+                    raise RuntimeError("entry intent could not be published") from exc
             guard.check()
             exchange = self._bridge.client()
             api_key = getattr(exchange, "apiKey", "") or ""
@@ -825,6 +850,7 @@ class DerivativesExecutor:
             update_guarded_entry_intent(
                 guard, intent_id, status="submission_uncertain", leg=intent_leg,
                 order_id=None, error="exact rounded entry terms journaled before venue mutation",
+                quantity=float(amount),
             )
 
             if self._bridge.exchange_id == "binance":
@@ -859,6 +885,8 @@ class DerivativesExecutor:
             )
             def create_entry() -> Any:
                 nonlocal entry_sent
+                if check_entry_allowed is not None:
+                    check_entry_allowed()
                 entry_sent = True
                 return exchange.create_order(
                     order.ccxt_symbol, "market", order.side, amount,
@@ -882,6 +910,8 @@ class DerivativesExecutor:
                         guard, intent_id, status="cancelled", leg=intent_leg,
                         order_id=None, error=f"entry not submitted: {type(exc).__name__}",
                     )
+                    if on_entry_evidence is not None:
+                        on_entry_evidence({"execution_status": "not_executed", "executed": False})
                 except Exception:
                     pass
             if isinstance(exc, AutoAuthorizationError):
@@ -913,6 +943,8 @@ class DerivativesExecutor:
                         guard, intent_id, status="cancelled", leg=intent_leg,
                         order_id=None, error=f"entry not submitted: {type(exc).__name__}",
                     )
+                    if on_entry_evidence is not None:
+                        on_entry_evidence({"execution_status": "not_executed", "executed": False})
                 except Exception:
                     pass
             self._bridge.audit_plan(
@@ -924,6 +956,16 @@ class DerivativesExecutor:
             ) from exc
 
         intent_leg.update(status="uncertain", order_id=order_id)
+        # A telemetry callback must not prevent post-ACK protection handling.
+        if on_entry_evidence is not None:
+            with contextlib.suppress(Exception):
+                on_entry_evidence({
+                    "entry_intent_id": intent_id,
+                    "entry_provenance": intent_leg["entry_provenance"],
+                    "execution_status": "uncertain",
+                    "protection_state": "unverified",
+                    "order_id": str(order_id) if order_id is not None else None,
+                })
         response = response if isinstance(response, dict) else {}
         actual_quantity = _positive_number(response.get("filled"))
         actual_entry = _positive_number(response.get("average")) or _positive_number(response.get("price"))

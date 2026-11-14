@@ -94,6 +94,13 @@ _ENV_OVERRIDES = {
     # Safe mode routes Binance to its Demo Trading API; other exchanges use
     # their ccxt sandbox when available. This is safe-direction and env-overridable.
     "TRADINGAGENTS_EXEC_SANDBOX":                      "exec_sandbox",
+    # Outcome-ledger worker knobs (plan §2.6): ingest is off by default; the
+    # worker reads recorded cycles and venue READ history only, never a send.
+    "TRADINGAGENTS_OUTCOME_LEDGER_INGEST_ENABLED": "outcome_ledger_ingest_enabled",
+    "TRADINGAGENTS_OUTCOME_LEDGER_INTERVAL_SECONDS": "outcome_ledger_interval_seconds",
+    # Active Kronos model-tokenizer pair. All other forecast parameters are
+    # derived from the selected pair, the Futures cycle and risk policy.
+    "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE": "kronos_active_profile",
 }
 
 
@@ -371,6 +378,16 @@ def build_default_config() -> dict:
         "exec_base_url": "https://demo-api.binance.com",
         # Route non-Binance exchanges through ccxt sandbox when requested.
         "exec_sandbox": False,
+        # Outcome-ledger worker: ingest off by default (the flag turn-on is the
+        # ingestion start moment; nothing before it is backfilled), poll every
+        # minute. The worker only reads recorded cycles and venue history.
+        "outcome_ledger_ingest_enabled": False,
+        "outcome_ledger_interval_seconds": 60,
+        # Active Kronos context is always attempted for eligible Futures
+        # candidates. Only its verified model-tokenizer pair is selectable.
+        "kronos_active_profile": "small_base",
+        "auto_spot_timeframe": "4h",
+        "auto_futures_timeframe": "4h",
         # Default coin list for the daily runner (pipeline ticker form).
         "exec_watchlist": ["BTC-USD", "ETH-USD"],
         # L2 runtime gates are config/operator switches only. The operator

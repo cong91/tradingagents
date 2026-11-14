@@ -388,6 +388,22 @@ export function useSettings() {
             return;
           }
         }
+        if (err.code === "validation_error") {
+          const fields = err.details?.fields;
+          if (fields !== null && typeof fields === "object" && !Array.isArray(fields)) {
+            const knownKeys = new Set(currentPayload.settings.map((row) => row.key));
+            const fieldErrors = Object.fromEntries(
+              Object.entries(fields).filter(([key, message]) =>
+                knownKeys.has(key) && typeof message === "string"
+              ).map(([key, message]) => [key, saveCopy().serverRejected(message as string)])
+            );
+            if (Object.keys(fieldErrors).length > 0) {
+              setFieldErrors((previous) => ({ ...previous, ...fieldErrors }));
+              setSaveState({ kind: "failed", message: saveCopy().serverRejectedSummary, scope });
+              return;
+            }
+          }
+        }
         const memoryNote = err.code === "internal_error" ? saveCopy().memoryNote : "";
         setSaveState({ kind: "failed", message: saveCopy().failed(`${err.message}${memoryNote}`), scope });
         return;

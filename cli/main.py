@@ -160,6 +160,64 @@ def backtest(
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
 
 
+@app.command("outcomes")
+def outcomes() -> None:
+    """Read-only summary of the reconciled outcome ledger (PostgreSQL).
+
+    An empty or un-ingested ledger prints ``unavailable`` with the reason, not
+    zero. Requires TRADINGAGENTS_DATABASE_URL to point at the control panel's
+    database; this command never sends orders and never changes state.
+    """
+    import json as _json
+    import os
+
+    from server import outcome_report
+
+    if not os.environ.get("TRADINGAGENTS_DATABASE_URL"):
+        console.print(
+            "[red]TRADINGAGENTS_DATABASE_URL is not set; the outcome ledger lives "
+            "in PostgreSQL. Point it at the control panel's database first.[/red]"
+        )
+        raise typer.Exit(code=1)
+    try:
+        summary = outcome_report.summary()
+    except Exception as exc:
+        console.print(f"[red]ledger read failed: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+    # Machine-readable output through plain print: rich would soft-wrap long
+    # values and corrupt the JSON.
+    print(_json.dumps(summary, indent=1, default=str))
+
+
+@app.command("experiments")
+def experiments(limit: int = 50) -> None:
+    """Read-only summary of the experiment registry (PostgreSQL).
+
+    Registered runs and their paired-comparison verdicts — including
+    ``insufficient_evidence_*`` — pass through verbatim. Verdicts are data,
+    never a winner claim; promotion is a separate reviewed change. Requires
+    TRADINGAGENTS_DATABASE_URL; this command never sends orders and never
+    changes state.
+    """
+    import json as _json
+    import os
+
+    from server import experiment_store
+
+    if not os.environ.get("TRADINGAGENTS_DATABASE_URL"):
+        console.print(
+            "[red]TRADINGAGENTS_DATABASE_URL is not set; the experiment registry "
+            "lives in PostgreSQL. Point it at the control panel's database first.[/red]"
+        )
+        raise typer.Exit(code=1)
+    try:
+        summary = experiment_store.summary(limit=limit)
+    except Exception as exc:
+        console.print(f"[red]registry read failed: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+    print(_json.dumps(summary, indent=1, default=str))
+
+
 # The plans `login` and `logout` take: the providers signed in to, not keyed.
 Plan = StrEnum("Plan", {name: name for name in SIGNED_IN_PROVIDERS})
 

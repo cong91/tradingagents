@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from server import job_store
+from server import futures_cycle_store
 from server.contract import utc_now_iso
 from server.futures_decision_context import effective_futures_leverage_cap
 
@@ -58,7 +58,7 @@ def redact_payload(value: Any) -> Any:
     """Recursively omit credential-shaped fields and scrub recognizable values.
 
     Also folds the payload into JSON-safe types: venue data may carry Decimal,
-    datetime, set or bytes, and ``job_store._json`` would raise TypeError on
+    datetime, set or bytes, and ``futures_cycle_store._json`` would raise TypeError on
     them — a crash here would take the whole cycle claim down.
     """
     if isinstance(value, dict):
@@ -99,12 +99,43 @@ def _candle_open(context: dict, timeframe: str) -> datetime:
     return opened.astimezone(UTC)
 
 
+def canonical_cycle_id(
+    *, symbol: str, four_hour_open: str, one_hour_open: str,
+    timeframe: str, open_time: int,
+) -> str:
+    """The one durable Futures cycle identity format.
+
+    ``futures:{symbol}:{4h open ISO}:{1h open ISO}:{strategy}:{timeframe}:{selected open ms}``.
+    The ISO stamps embed ``:`` themselves, so the id is never parsed by
+    splitting — consumers treat it as an opaque key or rebuild it here.
+    """
+    return f"futures:{symbol}:{four_hour_open}:{one_hour_open}:1:{timeframe}:{int(open_time)}"
+
+
 def cycle_identity(context: dict) -> tuple[str, str, str]:
-    """Return durable cycle id and normalized candle-open timestamps."""
+    """Return durable cycle id and normalized candle-open timestamps.
+
+    The operator-selected candle identity is mandatory: a context without it
+    has no per-timeframe claim, so refusing here is the fail-closed contract
+    (the pre-selection rejection path derives the identity from the wall
+    clock + configured timeframe instead — see ``autoloop_cycle_records``).
+    """
     symbol = str(context["unified_symbol"])
     one_hour_open = _candle_open(context, "one_hour").isoformat()
     four_hour_open = _candle_open(context, "four_hour").isoformat()
-    cycle_id = f"futures:{symbol}:{four_hour_open}:{one_hour_open}:1"
+    identity = context.get("candle_identity")
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(identity.get("timeframe"), str)
+        or not identity["timeframe"]
+        or isinstance(identity.get("open_time"), bool)
+        or not isinstance(identity.get("open_time"), int)
+    ):
+        raise ValueError("futures cycle identity requires the selected candle identity")
+    cycle_id = canonical_cycle_id(
+        symbol=symbol, four_hour_open=four_hour_open, one_hour_open=one_hour_open,
+        timeframe=identity["timeframe"], open_time=identity["open_time"],
+    )
     return cycle_id, four_hour_open, one_hour_open
 
 
@@ -146,7 +177,9 @@ def redact_proposal(proposal: Any) -> dict:
         return {}
     allowed = (
         "margin_mode", "leverage", "risk_fraction", "margin_fraction",
-        "entry_price", "stop_loss", "take_profit",
+        "entry_price", "stop_loss", "take_profit", "scale_out_enabled",
+        "scale_out_first_r", "scale_out_first_fraction", "scale_out_second_r",
+        "scale_out_second_fraction",
     )
     sanitized = {}
     for key in allowed:
@@ -154,6 +187,11 @@ def redact_proposal(proposal: Any) -> dict:
         if key == "margin_mode":
             if isinstance(value, str) and value in ("isolated", "cross"):
                 sanitized[key] = value
+        elif key == "scale_out_enabled":
+            if isinstance(value, bool):
+                sanitized[key] = value
+            elif key in proposal and value is None:
+                sanitized[key] = None
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             if math.isfinite(float(value)):
                 sanitized[key] = value
@@ -234,15 +272,19 @@ def claim_cycle(
     symbol: str,
     four_hour_open: str,
     one_hour_open: str,
+    timeframe: str,
+    selected_open: int,
     payload: dict,
     strategy_version: str = "1",
 ) -> bool:
-    return job_store.claim_futures_cycle(
+    return futures_cycle_store.claim_futures_cycle(
         cycle_id,
         symbol=symbol,
         four_hour_open=four_hour_open,
         one_hour_open=one_hour_open,
         strategy_version=strategy_version,
+        timeframe=timeframe,
+        selected_open=int(selected_open),
         payload=redact_payload(payload),
     )
 
@@ -261,7 +303,7 @@ def persist_progress(
     phase_timestamps[f"{phase}_updated_at"] = timestamp
     if terminal or status != "running":
         phase_timestamps[f"{phase}_finished_at"] = timestamp
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id,
         status=status,
         phase=phase,
@@ -276,6 +318,8 @@ def persist_rejection(
     symbol: str,
     four_hour_open: str,
     one_hour_open: str,
+    timeframe: str,
+    selected_open: int,
     phase: str,
     payload: dict,
     status: str = "rejected",
@@ -285,6 +329,8 @@ def persist_rejection(
         symbol=symbol,
         four_hour_open=four_hour_open,
         one_hour_open=one_hour_open,
+        timeframe=timeframe,
+        selected_open=selected_open,
         payload=payload,
     )
     timestamp = utc_now_iso()
@@ -292,7 +338,7 @@ def persist_rejection(
         **dict(payload.get("phase_timestamps") or {}),
         f"{phase}_finished_at": timestamp,
     }
-    job_store.update_futures_cycle(
+    futures_cycle_store.update_futures_cycle(
         cycle_id,
         status=status,
         phase=phase,
@@ -302,6 +348,7 @@ def persist_rejection(
 
 
 __all__ = [
+    "canonical_cycle_id",
     "claim_cycle",
     "cycle_identity",
     "decision_telemetry",

@@ -197,35 +197,80 @@ production cần URL và credentials production. Demo là lệnh live trên tài
 không phải paper/dry-run. Trước khi bật Auto Spot/Futures, xác minh profile venue,
 credentials, RiskGuard và khả năng chịu rủi ro.
 
-### 3.1 Tổng quan lợi nhuận (`/`)
+### 3.1 Tổng quan vận hành (`/`)
 
-Màn mở đầu — nhìn một cái thấy tiền và trạng thái. Tự làm mới: health 15s, audit 10s,
-portfolio 30s, lịch sử 60s (`web/components/overview/dashboard.tsx:36-39`).
+Màn mở đầu — khối đầu trang là **Bản tin vận hành** (brief), trả lời câu hỏi đầu tiên:
+*"hôm nay có gì cần xử lý?"*. Tự làm mới: brief 30s (kèm luôn lần đọc danh mục),
+health 15s, audit 10s, lịch sử 60s, lịch sử khớp lệnh 5 phút
+(`web/components/overview/dashboard.tsx`).
 
-**Banner trên cùng:**
-- Banner đỏ "RiskGuard đã dừng giao dịch hôm nay" — kèm lý do và link "Xem audit"
-  (`dashboard.tsx:229-238`).
-- Banner vàng "N lệnh đang chờ duyệt" — link thẳng sang màn Duyệt lệnh
-  (`dashboard.tsx:240-248`).
+> **Màn này chỉ đọc.** Không có nút nào đặt/huỷ lệnh hay sửa hạn mức rủi ro ở đây.
+> Mọi hành động đặt lệnh nằm ở **Duyệt lệnh**; sửa hạn mức/Auto nằm ở **Cấu hình**.
 
-**Card "Danh mục"** (`portfolio-card.tsx`): 4 số chính — *Tiền mặt*, *Giá trị ước tính*
-(cash + tổng vị thế nhân giá thị trường), *Đã chốt (tổng)*, *Đã chốt hôm nay* (dấu
-+/− rõ ràng). Bảng vị thế: Mã, Khối lượng, Giá vốn, Giá thị trường, Giá trị,
-Lãi/lỗ tạm tính. Chú thích đáng đọc:
+**1. Card "Bản tin vận hành"** (`web/components/overview/brief/`, dữ liệu từ `GET /api/brief`):
+
+- **Cần xử lý** — danh sách ưu tiên (1 Xử lý ngay → 2 Cần chú ý → 3 Theo dõi). Mỗi mục
+  có nhãn mức, lý do nguyên văn và link tới đúng màn (`/audit`, `/cycles`, `/approvals`).
+  Máy chủ đã gộp trùng theo loại, nên **không có banner lặp** cho cùng một sự việc.
+- **Trạng thái** — chế độ (Mô phỏng/Thật), **Tự động Spot** và **Tự động Futures riêng
+  biệt** (không gộp một cờ "Auto"), **Sàn** (Demo Trading / Production — tiền thật),
+  có đang bị dừng đặt lệnh hay không, số lệnh chờ duyệt, tình trạng máy chủ.
+- **Kết quả** — tách hai tầng, đọc kỹ nhãn:
+  - *Đã đối soát*: số từ sổ kết quả nối cycle → lệnh → khớp → thoát, **theo từng loại
+    tiền** (không quy đổi tỷ giá). Cột Phí chỉ trừ vào Ròng khi ngữ nghĩa sàn cho phép;
+    cột Funding ghi "chưa đủ dữ liệu" khi chưa có dòng funding — **thiếu không phải 0**.
+    Kèm **Đối soát & độ phủ**: từng chu kỳ một dòng, có thể chồng lấn nên **không cộng
+    thành một tổng**; sai số đối soát (`Lệch đối soát x%`) và cảnh báo hiện nguyên văn.
+  - *Ước tính (chưa đối soát)*: Spot theo audit log và Futures lãi/lỗ chưa chốt — số
+    **tham khảo**, chưa xác nhận khớp lệnh thực tế.
+  - *Lệnh không xác định được nguồn (ngoài bot)*: khớp lệnh trên sàn không có dấu vết
+    attribution — đếm riêng, **không** tính vào kết quả bot.
+- **Rủi ro** — vị thế đang mở (Spot/Futures; hiện "chưa xác định" khi lần đọc vị thế
+  chưa được chứng minh đầy đủ), **Exposure đang dùng** (% vốn; chỉ hiện khi notional và
+  equity cùng loại tiền), **Heat đang dùng** (luôn "chưa xác định" — risk-at-stop không
+  nằm trong snapshot), **Bảo vệ vị thế** (số lệnh đã vào hôm nay có/thiếu bảo vệ), và
+  **Hạn mức đã cấu hình** trong mục mở rộng (chỉ hiển thị — sửa ở Cấu hình).
+- **Hoạt động hôm nay** — số ứng viên / đã phân tích / đã vào lệnh (theo ngày UTC),
+  **lý do chính không vào lệnh** (top 3, kèm mã chu kỳ mẫu để tra ở Hoạt động bot), và
+  **chu kỳ lỗi đường ống** — nhóm này **tách riêng** khỏi "không có tín hiệu": bot quyết
+  định không vào lệnh là bình thường, pipeline lỗi mới là sự cố.
+- **Dự báo Kronos** — block chỉ đọc của chu kỳ Futures gần nhất. Kronos được chạy
+  trực tiếp trước graph/LLM khi ứng viên đủ điều kiện; operator chỉ chọn cặp
+  model-tokenizer đã xác minh. Thời gian 4h, lookback và horizon được suy ra từ
+  profile và thời gian giữ tối đa. Dự báo hợp lệ được đưa vào context; nếu artifact,
+  dữ liệu, hoặc deadline không sẵn sàng thì ứng viên được hoãn trước lượt gọi LLM.
+  Block này là ngữ cảnh model, không phải lệnh, veto hay xác suất đã hiệu chỉnh.
+- **So sánh phiên bản (ngoài mẫu)** — thí nghiệm đã đăng ký, kèm câu ghi chú rằng so
+  sánh là mô phỏng, có ghép cặp, **không phải kết luận thắng và không tự áp dụng**.
+- **Lọc phạm vi** `Tất cả / Spot / Futures` — thu hẹp cả bản tin lẫn các card bên dưới
+  (Danh mục ẩn phần vị thế không thuộc phạm vi). Lựa chọn được nhớ trong trình duyệt.
+
+Nếu bản tin không đọc được, màn hình vẫn giữ **banner dự phòng** cho hai cảnh báo gấp —
+dừng đặt lệnh và số lệnh chờ duyệt — lấy từ `/api/health`, để cảnh báo không bị mất theo.
+
+**2. Card "Danh mục"** (`portfolio-card.tsx`) — **nhà duy nhất của dữ liệu vị thế**:
+4 số chính — *Tiền mặt*, *Giá trị ước tính* (cash + tổng vị thế nhân giá thị trường),
+*Đã chốt (tổng)*, *Đã chốt hôm nay* (dấu +/− rõ ràng). Bảng vị thế: Mã, Khối lượng,
+Giá vốn, Giá thị trường, Giá trị, Lãi/lỗ tạm tính. Phần **Vị thế Futures** đọc độc lập
+từ sàn, có badge **Demo Trading / Production**. Chú thích đáng đọc:
 - "Đã chốt hôm nay" tính theo **ngày UTC** và chỉ gồm lệnh đã đóng — **khác** con số
   RiskGuard dùng (guard cộng thêm lãi/lỗ tạm tính của vị thế mở trong ngày).
 - Vị thế mở **trước khi audit log bắt đầu** không có giá vốn — hiển thị "—" (không bịa số).
-- Chưa có dữ liệu gì → empty-state: "Số liệu sẽ xuất hiện sau khi pipeline đặt lệnh
-  đầu tiên (qua màn Duyệt lệnh)".
+- Danh sách vị thế chưa chứng minh đầy đủ **không phải** tài khoản phẳng; UI nói rõ.
+- Chưa có dữ liệu gì → empty-state riêng (không phải lỗi).
 
-**Card "Hiệu suất quyết định"**: KPI + biểu đồ alpha (điểm %, lãi luôn `+`, lỗ luôn
+**3. Card "Hiệu suất quyết định"**: KPI + biểu đồ alpha (điểm %, lãi luôn `+`, lỗ luôn
 `−`) của các quyết định trong decision log; quyết định chưa chốt chưa có alpha.
 
-**Card "Lệnh thực thi gần đây"**: bảng rút từ audit log của engine — *"mua là tiền ra
+**4. Card "Hiệu suất giao dịch"**: lịch sử khớp lệnh do sàn cung cấp và nhật ký sự kiện.
+Vị thế không còn lặp ở đây — xem ở card Danh mục.
+
+**5. Card "Lệnh thực thi gần đây"**: bảng rút từ audit log của engine — *"mua là tiền ra
 (−), bán là tiền vào (+)"*.
 
 Mọi card có badge **"Dữ liệu cũ"** khi poll gần nhất lỗi (giữ dữ liệu cũ, không nhảy
-trắng) và nút **Làm mới** toàn trang.
+trắng) và nút **Làm mới** toàn trang. Lỗi của một card không làm sập các card khác.
+
 
 ### 3.2 Agent Pipeline (`/pipeline`)
 
@@ -787,6 +832,14 @@ typecheck frontend sạch; smoke 2 server song song (health, /, /pipeline, /appr
 
 > Các ghi chú rev 2 dưới đây ghi lại hành vi tại thời điểm viết; mô tả nửa env và
 > gate cũ không còn là hướng dẫn vận hành hiện tại. Xem §1.2 và §4.8.
+
+- **rev 4 (2026-11-10)** — `/` nay mở đầu bằng **Bản tin vận hành** (`GET /api/brief`):
+  Cần xử lý / Trạng thái / Kết quả / Rủi ro / Hoạt động, lọc phạm vi Spot–Futures, và
+  tách rõ số *đã đối soát* khỏi *ước tính*. Banner halt/chờ duyệt chuyển vào mục "Cần
+  xử lý" (có banner dự phòng từ `/api/health` khi bản tin lỗi). Vị thế chỉ còn render một
+  nơi (card Danh mục). Chi tiết hợp đồng dữ liệu: `docs/ui-api-contract.md` §18.
+  Đã chạy `tests/browser/test_dashboard_brief_offline.py` (5 kịch bản, offline) trong lần
+  sửa này; **chưa** chạy trên PostgreSQL thật.
 
 - **rev 3 (2026-11-09)** — cập nhật đường dẫn theo năm nhóm Cấu hình, phân biệt các
   phần lưu riêng và chỉ dẫn STOP/gỡ dừng; chỉnh mô tả time stop theo chính sách hiện có.

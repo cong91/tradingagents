@@ -31,6 +31,8 @@ const settingMetaVi = {
   risk_max_total_exposure_pct: { label: "Tổng mức phơi nhiễm tối đa", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Giới hạn lệnh lỗ liên tiếp" },
   risk_max_derivatives_leverage: { label: "Đòn bẩy phái sinh tối đa", unit: "x", hint: "Trần bộ bảo vệ rủi ro. Agent đề xuất đòn bẩy thực tế; vượt trần này lệnh bị từ chối." },
+  auto_spot_timeframe: { label: "Khung nến Auto Spot", hint: "Nến 1m/15m có thể hết hạn trước khi phân tích hoàn tất; khi đó lệnh bị từ chối an toàn." },
+  auto_futures_timeframe: { label: "Khung nến Auto Futures", hint: "Xác nhận Futures vẫn dùng 1h và 4h. Nến 1m/15m có thể hết hạn trước khi phân tích hoàn tất; khi đó lệnh bị từ chối an toàn." },
   risk_max_derivatives_exposure_pct: { label: "Phơi nhiễm phái sinh tối đa", unit: "%", hint: "0 = chặn hoàn toàn giao dịch phái sinh." },
   risk_max_derivatives_exposure_hard_pct: { label: "Phơi nhiễm phái sinh tối đa khi vượt trần", unit: "%", hint: "Trần cứng của cơ chế vượt trần: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này. 0 = tắt." },
   risk_derivatives_override_min_r: { label: "R tối thiểu để vượt trần", hint: "Lời mục tiêu / rủi ro stop tối thiểu của đề xuất để đủ điều kiện vượt trần." },
@@ -65,6 +67,7 @@ const settingMetaVi = {
   exec_quote_currency: { label: "Đồng tiền báo giá", hint: "Ví dụ: USDT." },
   exec_base_url: { label: "URL sàn đang dùng", hint: "Chỉ đọc. Đổi endpoint và đúng cặp API key/secret trong .env rồi khởi động lại backend để chuyển Demo/production." },
   exec_sandbox: { label: "Sandbox cho sàn khác Binance", hint: "Binance chọn Demo hoặc production bằng URL phía trên; chế độ này chỉ áp dụng các sàn khác." },
+  kronos_active_profile: { label: "Cặp model và tokenizer", hint: "Chọn một trong các cặp đã cài đặt. Thay đổi áp dụng từ chu kỳ mới." },
 } satisfies Record<string, Meta>;
 
 const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
@@ -94,6 +97,8 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   risk_max_total_exposure_pct: { label: "Max total exposure", unit: "%" },
   risk_max_consecutive_loss_count: { label: "Consecutive losing orders limit" },
   risk_max_derivatives_leverage: { label: "Max derivatives leverage", unit: "x", hint: "Risk-guard cap. The agent proposes the actual leverage; orders above this cap are rejected." },
+  auto_spot_timeframe: { label: "Auto Spot candle timeframe", hint: "A 1m/15m candle may expire before analysis completes; the order is safely rejected if that happens." },
+  auto_futures_timeframe: { label: "Auto Futures candle timeframe", hint: "Futures confirmation still uses 1h and 4h. A 1m/15m candle may expire before analysis completes; the order is safely rejected if that happens." },
   risk_max_derivatives_exposure_pct: { label: "Max derivatives exposure", unit: "%", hint: "0 = block derivatives trading entirely." },
   risk_max_derivatives_exposure_hard_pct: { label: "Max derivatives exposure when overriding", unit: "%", hint: "Hard cap of the override mechanism: only orders that qualify for the override may push total exposure up to this level. 0 = off." },
   risk_derivatives_override_min_r: { label: "Min R to override", hint: "Minimum target profit / stop risk of the proposal to qualify for the override." },
@@ -128,6 +133,7 @@ const settingMetaEn: { [K in keyof typeof settingMetaVi]: Meta } = {
   exec_quote_currency: { label: "Quote currency", hint: "E.g. USDT." },
   exec_base_url: { label: "Active exchange URL", hint: "Read-only. Change the endpoint and the matching API key/secret in .env, then restart the backend to switch Demo/production." },
   exec_sandbox: { label: "Sandbox for non-Binance exchanges", hint: "Binance picks Demo or production via the URL above; this mode only applies to other exchanges." },
+  kronos_active_profile: { label: "Model and tokenizer pair", hint: "Choose an installed pair. Changes apply to new cycles." },
 };
 
 export const vi = {
@@ -164,6 +170,30 @@ export const vi = {
       description:
         "Sàn, đồng tiền báo giá và thông tin môi trường venue. Binance mặc định dùng Demo; môi trường Demo/production được xác định bởi URL và cặp key/secret trong .env.",
     },
+  },
+  kronos: {
+    staleStatus: "Đây là dữ liệu đã tải trước đó; trạng thái hiện tại có thể đã thay đổi.",
+    readinessLabel: "Tệp mô hình",
+    modelReadyShort: "Sẵn sàng",
+    modelUnavailableShort: "Chưa sẵn sàng",
+    profileLabel: "Cặp model / tokenizer",
+    detailsTitle: "Xem chi tiết kỹ thuật",
+    modelLabel: "Model ghim",
+    profileOptions: {
+      small_base: "Kronos-small + Kronos-Tokenizer-base",
+      mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
+    },
+    scopeLabel: "Phạm vi dự báo",
+    scopeSummary: (timeframe: string, lookback: string, horizon: string, paths: string) =>
+      `Dữ liệu: ${lookback} nến ${timeframe} đã đóng · Dự báo: ${horizon} giờ · ${paths} đường mẫu`,
+    profileStatusMismatch: "Trạng thái này thuộc cặp model khác; hãy làm mới trước khi sử dụng thông tin readiness.",
+    parameterLabel: "Thông số tự suy ra",
+    maxContextLabel: "Context tối đa",
+    temperatureLabel: "Temperature",
+    tokenizerLabel: "Tokenizer ghim",
+    sourceRevisionLabel: "Phiên bản mã nguồn",
+    contextNote:
+      "Kronos luôn được dùng trong phân tích Futures và bổ sung dự báo cho Trader và Portfolio Manager. Nó không lọc ứng viên theo hướng dự báo, không tự đặt lệnh và không nới giới hạn rủi ro. Các thông số dự báo được tự suy ra từ cặp đã chọn.",
   },
   screen: {
     loadingDescription: "Đang tải cài đặt…",
@@ -202,7 +232,7 @@ export const vi = {
     leaveUnsaved: "Bạn có thay đổi chưa lưu. Rời trang sẽ bỏ các thay đổi này. Tiếp tục?",
     automationSummary: "Chọn thị trường tự động và theo dõi lịch chạy.",
     venueReview: "Kiểm tra môi trường Demo/production và thông tin sàn trong mục Sàn & nguồn dữ liệu trước khi bật chế độ tự động.",
-    aiSummary: "Chọn mô hình cho từng tầng phân tích.",
+    aiSummary: "Chọn mô hình cho từng tầng phân tích và dự báo Kronos.",
     riskSummary: "Điều chỉnh giới hạn và cách bảo vệ vị thế.",
     connectionsSummary: "Kiểm tra sàn và nguồn dữ liệu.",
     systemSummary: "Ngôn ngữ, giao diện và thông số ít dùng.",
@@ -324,10 +354,19 @@ export const vi = {
     empty: "Máy chủ không trả về đường dẫn nào.",
   },
   autoloop: {
-    schedulerDescription: "Cấu hình khoảng cách cho các chế độ Auto Spot và Auto Futures đã bật trong cấu hình vận hành.",
+    schedulerDescription:
+      "Chu kỳ quét tự chạy theo boundary nến của khung mỗi mode đã chọn trong cấu hình vận hành (1m/15m/1h/4h); không cần đặt khoảng cách thủ công.",
     schedulerEnabled: "Lịch tự động đã bật",
     schedulerInactive: "Scheduler chưa hoạt động hoặc chưa xác định được trạng thái.",
     statusStale: "Không cập nhật được trạng thái; dữ liệu trước đó có thể đã cũ.",
+    scheduleAria: "Lịch quét theo khung nến",
+    scheduleDue: (timeframe: string | null, nextDue: string | null, lastOpen: number | null) => {
+      const tf = timeframe ?? "?";
+      const next = nextDue ?? "?";
+      const last = lastOpen != null ? ` · nến trước: ${new Date(lastOpen).toISOString()}` : "";
+      return `Khung ${tf} · lần tới: ${next}${last}`;
+    },
+    scheduleOff: "Chưa bật — lịch quét theo khung nến khi mode được arm.",
     clearHaltConfirmTitle: "Xác nhận gỡ HALT",
     clearHaltConfirmDescription: "Gỡ HALT có thể cho phép lệnh mới theo cấu hình hiện tại và các kiểm tra rủi ro. Trạng thái dừng sẽ được kiểm tra lại trước khi gỡ.",
     clearHaltConfirmAction: "Xác nhận gỡ HALT",
@@ -335,7 +374,6 @@ export const vi = {
     runNow: "Chạy ngay",
     runNowHint: "Chạy ngay một chu kỳ. Chu kỳ có thể đặt lệnh thật theo cấu hình hiện tại và các kiểm tra rủi ro.",
     runStarted: "Đã tiếp nhận yêu cầu chạy ngay. Cập nhật trạng thái để kiểm tra chu kỳ.",
-    intervalSaved: "Đã lưu khoảng cách.",
     title: "Chế độ tự động",
     loading: "Đang tải trạng thái vòng tự động…",
     loadFailed: "Không tải được trạng thái vòng tự động.",
@@ -352,12 +390,6 @@ export const vi = {
     } as Record<string, string>,
     modeAvailable: "Có ít nhất một chế độ tự động đang bật",
     noModesEnabled: "Bật Auto Spot hoặc Auto Futures trong cấu hình vận hành để chạy chu kỳ",
-    intervalLabel: "Khoảng cách (phút)",
-    apply: "Áp dụng",
-    intervalError: (min: number, max: number) =>
-      `Khoảng cách phải là số nguyên từ ${min} đến ${max} phút.`,
-    enabledFeedback: (minutes: number) => `Đã bật vòng tự động — chu kỳ chạy mỗi ${minutes} phút.`,
-    disabledFeedback: "Vòng tự động đang tắt.",
     modeClosedWarning: "Bật Auto Spot hoặc Auto Futures trước khi chạy chu kỳ.",
     runStatus: {
       started: "Đã gửi yêu cầu — chu kỳ đang bắt đầu.",
@@ -409,6 +441,7 @@ export const vi = {
     titleFull: "Override vận hành (PostgreSQL)",
     loading: "Đang tải từ PostgreSQL…",
     loadFailed: "Không tải được override vận hành",
+    kronosUnavailable: "Không đọc được trạng thái Kronos từ máy chủ. Hãy thử tải lại.",
     description:
       "Các cổng vận hành và trần rủi ro được lưu trong PostgreSQL, tồn tại qua restart và hiển thị theo trạng thái hiệu lực. Không còn file JSON nào phải sửa tay.",
     groups: {
@@ -416,6 +449,11 @@ export const vi = {
         title: "Chế độ tự động",
         description:
           "Trạng thái Auto Spot và Auto Futures phản ánh cấu hình máy chủ. Thay đổi cần xác nhận và lý do; mọi thay đổi được ghi vào nhật ký thao tác.",
+      },
+      forecast: {
+        title: "Kronos — hỗ trợ phân tích",
+        description:
+          "Thêm dự báo giá từ Kronos vào phân tích Futures.",
       },
       risk: {
         title: "Trần rủi ro vận hành",
@@ -444,6 +482,7 @@ export const vi = {
     overridden: "đã đặt",
     default: "mặc định",
     gate: "chế độ",
+    contextSwitch: "công tắc ngữ cảnh",
     draft: "Bản nháp",
     draftSwitchAria: (label: string) => `Bản nháp ${label}`,
     currentState: (value: string) => `Máy chủ hiện tại: ${value}`,
@@ -455,6 +494,7 @@ export const vi = {
     gateChanges: (keys: string) => `Thay đổi chế độ tự động: ${keys}`,
     gateWarning:
       "Các chế độ này cho phép bot tạo vị thế Spot hoặc Futures mới. Cần xác nhận và lý do; cả hai được ghi vào nhật ký thao tác.",
+    forecastReasonLabel: "Lý do thay đổi công tắc dự báo",
     confirm: "Tôi hiểu và xác nhận thay đổi cổng",
     reasonPlaceholder: "Lý do (bắt buộc, ví dụ: chạy demo theo yêu cầu vận hành)",
     saved: (n: number) => `Đã lưu ${n} thay đổi vào PostgreSQL. Áp dụng cho phiên phân tích mới.`,
@@ -500,6 +540,30 @@ export const en: typeof vi = {
         "Exchange, quote currency and venue environment details. Binance defaults to Demo; the Demo/production environment is determined by the URL and matching key/secret pair in .env.",
     },
   },
+  kronos: {
+    staleStatus: "This is previously loaded data; the current status may have changed.",
+    readinessLabel: "Model files",
+    modelReadyShort: "Ready",
+    modelUnavailableShort: "Not ready",
+    profileLabel: "Model / tokenizer pair",
+    detailsTitle: "View technical details",
+    modelLabel: "Pinned model",
+    profileOptions: {
+      small_base: "Kronos-small + Kronos-Tokenizer-base",
+      mini_2k: "Kronos-mini + Kronos-Tokenizer-2k",
+    },
+    scopeLabel: "Forecast scope",
+    scopeSummary: (timeframe, lookback, horizon, paths) =>
+      `Input: ${lookback} closed ${timeframe} candles · Forecast: ${horizon} hours · ${paths} sample paths`,
+    profileStatusMismatch: "This status belongs to a different model pair; refresh before relying on readiness information.",
+    parameterLabel: "Automatically derived parameters",
+    maxContextLabel: "Maximum context",
+    temperatureLabel: "Temperature",
+    tokenizerLabel: "Pinned tokenizer",
+    sourceRevisionLabel: "Source revision",
+    contextNote:
+      "Kronos is always used in Futures analysis and provides a forecast for the Trader and Portfolio Manager. It does not filter candidates by forecast direction, place orders or relax risk limits. Forecast parameters are derived automatically from the selected pair.",
+  },
   screen: {
     loadingDescription: "Loading settings…",
     errorDescription:
@@ -537,7 +601,7 @@ export const en: typeof vi = {
     leaveUnsaved: "You have unsaved changes. Leaving this page will discard them. Continue?",
     automationSummary: "Choose automated markets and review the schedule.",
     venueReview: "Review the Demo/production environment and exchange details under Exchange & data before enabling automation.",
-    aiSummary: "Choose models for each analysis tier.",
+    aiSummary: "Choose models for each analysis tier and the Kronos forecast.",
     riskSummary: "Adjust limits and position protection.",
     connectionsSummary: "Review the exchange and data sources.",
     systemSummary: "Language, appearance and advanced options.",
@@ -659,10 +723,19 @@ export const en: typeof vi = {
     empty: "The server returned no paths.",
   },
   autoloop: {
-    schedulerDescription: "Configure the interval for the Auto Spot and Auto Futures modes enabled in operator configuration.",
+    schedulerDescription:
+      "The scan cadence follows each enabled mode's selected candle boundary (1m/15m/1h/4h) from operator configuration; there is no manual interval.",
     schedulerEnabled: "Scheduled automation enabled",
     schedulerInactive: "Scheduler is inactive or its status is unknown.",
     statusStale: "Could not refresh status. Previous data may be stale.",
+    scheduleAria: "Scan schedule by candle timeframe",
+    scheduleDue: (timeframe: string | null, nextDue: string | null, lastOpen: number | null) => {
+      const tf = timeframe ?? "?";
+      const next = nextDue ?? "?";
+      const last = lastOpen != null ? ` · last candle: ${new Date(lastOpen).toISOString()}` : "";
+      return `${tf} timeframe · next due: ${next}${last}`;
+    },
+    scheduleOff: "Not armed — the scan follows the candle boundary once the mode is enabled.",
     clearHaltConfirmTitle: "Confirm clearing HALT",
     clearHaltConfirmDescription: "Clearing HALT may allow new orders under the current configuration and risk checks. The halt will be checked again before clearing.",
     clearHaltConfirmAction: "Confirm clear HALT",
@@ -670,7 +743,6 @@ export const en: typeof vi = {
     runNow: "Run now",
     runNowHint: "Run a cycle now. It may place real orders under the current configuration and risk checks.",
     runStarted: "Run-now request accepted. Refresh status to check the cycle.",
-    intervalSaved: "Interval saved.",
     title: "Autoloop",
     loading: "Loading autoloop status from GET /api/autoloop…",
     loadFailed: "Could not load autoloop status.",
@@ -687,11 +759,6 @@ export const en: typeof vi = {
     },
     modeAvailable: "At least one automation mode is enabled",
     noModesEnabled: "Enable Auto Spot or Auto Futures in operator configuration to run a cycle",
-    intervalLabel: "Interval (minutes)",
-    apply: "Apply",
-    intervalError: (min, max) => `Interval must be an integer between ${min} and ${max} minutes.`,
-    enabledFeedback: (minutes) => `Autoloop enabled — a cycle runs every ${minutes} minutes.`,
-    disabledFeedback: "Autoloop is disabled.",
     modeClosedWarning: "Enable Auto Spot or Auto Futures before running a cycle.",
     runStatus: {
       started: "Request sent — the cycle is starting.",
@@ -743,6 +810,7 @@ export const en: typeof vi = {
     titleFull: "Operator overrides (PostgreSQL)",
     loading: "Loading from PostgreSQL…",
     loadFailed: "Could not load operator overrides",
+    kronosUnavailable: "Could not read Kronos status from the server. Try refreshing.",
     description:
       "Operational gates and risk caps are stored in PostgreSQL, survive restarts, and are shown by effective status. There is no JSON file to edit by hand anymore.",
     groups: {
@@ -750,6 +818,11 @@ export const en: typeof vi = {
         title: "Automation modes",
         description:
           "Auto Spot and Auto Futures reflect server configuration. Changes require a confirmation and a reason; every change is recorded in the operator log.",
+      },
+      forecast: {
+        title: "Kronos — analysis support",
+        description:
+          "Add a Kronos price forecast to Futures analysis.",
       },
       risk: {
         title: "Operational risk caps",
@@ -778,6 +851,7 @@ export const en: typeof vi = {
     overridden: "overridden",
     default: "default",
     gate: "mode",
+    contextSwitch: "context switch",
     draft: "Draft",
     draftSwitchAria: (label) => `${label} draft`,
     currentState: (value) => `Current server state: ${value}`,
@@ -789,6 +863,7 @@ export const en: typeof vi = {
     gateChanges: (keys) => `Automation mode changes: ${keys}`,
     gateWarning:
       "These modes allow the bot to create new Spot or Futures positions. A confirmation and reason are required and recorded in the operator log.",
+    forecastReasonLabel: "Reason for changing the forecast switch",
     confirm: "I understand and confirm the gate change",
     reasonPlaceholder: "Reason (required, e.g. demo run requested by operations)",
     saved: (n) => `Saved ${n} ${n === 1 ? "change" : "changes"} to PostgreSQL. Applies to new analysis runs.`,

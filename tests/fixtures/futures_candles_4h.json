@@ -1,0 +1,192 @@
+{
+ "metadata": {
+  "symbol": "ENA/USDT:USDT",
+  "timeframe": "4h",
+  "venue": "synthetic-from-recording",
+  "kind": "synthetic",
+  "note": "decision bars copied from the recorded cycle snapshots for this one symbol; 6 lead-in bars and any bars between decisions are flat, derived, and not venue data",
+  "lead_bars": 6
+ },
+ "candles": [
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792886400000,
+   "close_time": 1792900800000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792900800000,
+   "close_time": 1792915200000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792915200000,
+   "close_time": 1792929600000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792929600000,
+   "close_time": 1792944000000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792944000000,
+   "close_time": 1792958400000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792958400000,
+   "close_time": 1792972800000,
+   "open": 0.2073,
+   "high": 0.2073,
+   "low": 0.2073,
+   "close": 0.2073,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792972800000,
+   "close_time": 1792987200000,
+   "open": 0.2073,
+   "high": 0.2091,
+   "low": 0.2015,
+   "close": 0.2029,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1792987200000,
+   "close_time": 1793001600000,
+   "open": 0.2029,
+   "high": 0.211,
+   "low": 0.2026,
+   "close": 0.2049,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793001600000,
+   "close_time": 1793016000000,
+   "open": 0.2052,
+   "high": 0.2124,
+   "low": 0.204,
+   "close": 0.2059,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793016000000,
+   "close_time": 1793030400000,
+   "open": 0.2059,
+   "high": 0.2123,
+   "low": 0.2026,
+   "close": 0.2102,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793030400000,
+   "close_time": 1793044800000,
+   "open": 0.2102,
+   "high": 0.2127,
+   "low": 0.2059,
+   "close": 0.2089,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793044800000,
+   "close_time": 1793059200000,
+   "open": 0.209,
+   "high": 0.2096,
+   "low": 0.2049,
+   "close": 0.2071,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793059200000,
+   "close_time": 1793073600000,
+   "open": 0.2071,
+   "high": 0.2112,
+   "low": 0.2048,
+   "close": 0.2088,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793073600000,
+   "close_time": 1793088000000,
+   "open": 0.2088,
+   "high": 0.2101,
+   "low": 0.2064,
+   "close": 0.2064,
+   "volume": 1000.0,
+   "closed": true
+  },
+  {
+   "symbol": "ENA/USDT:USDT",
+   "timeframe": "4h",
+   "open_time": 1793088000000,
+   "close_time": 1793102400000,
+   "open": 0.2065,
+   "high": 0.2075,
+   "low": 0.1976,
+   "close": 0.2009,
+   "volume": 1000.0,
+   "closed": true
+  }
+ ]
+}

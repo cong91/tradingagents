@@ -347,6 +347,8 @@ class ExchangeBridge:
         order: PlannedOrder,
         confirm: bool = False,
         portfolio: PortfolioContext | None = None,
+        *,
+        check_entry_allowed: Callable[[], None] | None = None,
     ) -> str | None:
         """Execute ``order``; live requires Auto authorization and confirm=True.
 
@@ -410,7 +412,9 @@ class ExchangeBridge:
             raise PermissionError(f"risk guard refused execution: {decision.reason}")
         if mode == "dry":
             return self._execute_dry(order, confirm)
-        return self._execute_live(order, confirm)
+        if check_entry_allowed is None:
+            return self._execute_live(order, confirm)
+        return self._execute_live(order, confirm, check_entry_allowed=check_entry_allowed)
 
     def sync_portfolio(self) -> PortfolioContext:
         """Read the exchange balance into a broker-neutral PortfolioContext (FR6).
@@ -476,7 +480,9 @@ class ExchangeBridge:
             phase="execute",
         )
 
-    def _execute_live(self, order: PlannedOrder, confirm: bool) -> str | None:
+    def _execute_live(
+        self, order: PlannedOrder, confirm: bool, *, check_entry_allowed: Callable[[], None] | None = None,
+    ) -> str | None:
         if confirm is not True:
             self._audit(
                 action="execute_denied",
@@ -549,13 +555,15 @@ class ExchangeBridge:
                     f"{order.ccxt_symbol} cost {sent_cost:.8g} is below the exchange "
                     f"minimum {min_cost:.8g} after precision truncation; nothing was sent"
                 )
+            def create_order() -> Any:
+                if check_entry_allowed is not None:
+                    check_entry_allowed()
+                return exchange.create_order(order.ccxt_symbol, "market", order.side, amount)
+
             response = snapshot_observer.run(
                 self, exchange,
                 operation="create_spot_order", symbol=order.ccxt_symbol,
-                call=lambda: self._auto_authorization.submit(
-                    AutoMode.SPOT,
-                    lambda: exchange.create_order(order.ccxt_symbol, "market", order.side, amount),
-                ),
+                call=lambda: self._auto_authorization.submit(AutoMode.SPOT, create_order),
             )
             order_id = response.get("id") if isinstance(response, dict) else None
         except AutoAuthorizationError as exc:

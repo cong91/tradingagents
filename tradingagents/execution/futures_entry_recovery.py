@@ -1017,10 +1017,76 @@ def _ensure_state(conn: Any, position_key: str, state: dict[str, Any], identity:
         raise _Rollback("position state already exists with different evidence")
 
 
-def _cas_complete(conn: Any, task: dict[str, Any], status: str) -> None:
+def _cas_complete(
+    conn: Any,
+    task: dict[str, Any],
+    status: str,
+    entry: _EntryEvidence,
+    identity: Any,
+    venue: str,
+) -> None:
+    legs = task.get("legs")
+    if not isinstance(legs, list):
+        raise _Rollback("entry intent legs are unavailable")
+    entry_legs = [
+        leg for leg in legs
+        if isinstance(leg, dict) and leg.get("name") == "entry-intent"
+    ]
+    if len(entry_legs) != 1:
+        raise _Rollback("entry intent leg is ambiguous")
+    existing_order_id = _text(entry_legs[0].get("order_id"))
+    if existing_order_id not in (None, entry.order_id):
+        raise _Rollback("entry order ID changed during reconciliation")
+    placed_ids = task.get("placed_ids")
+    if placed_ids is not None and not isinstance(placed_ids, list):
+        raise _Rollback("entry placed IDs are ambiguous")
+
+    terminal_status = str(_info(entry.item).get("status") or "").upper()
+    status_by_raw = {
+        "CANCELED": "cancelled",
+        "CANCELLED": "cancelled",
+        "EXPIRED": "expired",
+        "EXPIRED_IN_MATCH": "expired_in_match",
+    }
+    normalized_status = status_by_raw.get(terminal_status)
+    entry_order_final = None
+    if normalized_status is not None:
+        account_identity = {
+            "exchange": identity.exchange,
+            "profile": identity.profile,
+            "type": identity.account_type,
+            "hash": identity.identity_hash,
+        }
+        entry_order_final = {
+            "status": normalized_status,
+            "order_id": entry.order_id,
+            "client_order_id": entry.client_order_id,
+            "symbol": task["symbol"],
+            "venue_key": venue,
+            "account_id": (
+                f"{identity.exchange}:{identity.profile}:{identity.identity_hash}"
+            ),
+            "account_identity": account_identity,
+            "original_quantity": str(entry.quantity),
+            "filled_quantity": str(entry.filled),
+        }
+
+    completed_legs = []
+    for leg in legs:
+        completed_leg = dict(leg)
+        if completed_leg.get("name") == "entry-intent":
+            completed_leg["order_id"] = entry.order_id
+            if entry_order_final is not None:
+                completed_leg["entry_order_final"] = entry_order_final
+        completed_legs.append(completed_leg)
+    completed_placed_ids = list(placed_ids or [])
+    if not any(_text(value) == entry.order_id for value in completed_placed_ids):
+        completed_placed_ids.append(entry.order_id)
+
     cursor = conn.execute(
         """UPDATE bracket_recovery_tasks
-           SET status = 'completed', last_error = NULL, updated_at = %s
+           SET status = 'completed', last_error = NULL, updated_at = %s,
+               legs = %s::jsonb, placed_ids = %s::jsonb
            WHERE task_id = %s AND symbol = %s AND entry_order_id = %s
              AND status = %s AND quantity = %s AND updated_at = %s
              AND legs = %s::jsonb AND placed_ids = %s::jsonb
@@ -1030,7 +1096,8 @@ def _cas_complete(conn: Any, task: dict[str, Any], status: str) -> None:
              AND account_identity_hash = %s
              AND (venue_key IS NULL OR venue_key = %s)""",
         (
-            _now(), task["task_id"], task["symbol"], task["entry_order_id"], status,
+            _now(), _json(completed_legs), _json(completed_placed_ids),
+            task["task_id"], task["symbol"], task["entry_order_id"], status,
             task["quantity"], task["updated_at"], _json(task["legs"]),
             _json(task.get("placed_ids") or []), task["account_identity_exchange"],
             task["account_identity_profile"], task["account_identity_type"],
@@ -1112,7 +1179,10 @@ def _finalize(
                 guard.check()
                 _ensure_state(guard.connection, state_data[0], state_data[1], identity)
             guard.check()
-            _cas_complete(guard.connection, task, current_task["status"])
+            _cas_complete(
+                guard.connection, task, current_task["status"], entry, identity,
+                client_evidence.venue_key,
+            )
             guard.check()
             _append_recovery_audit(guard.connection, task, entry, result, client_evidence.venue_key)
     except _Rollback:

@@ -9,6 +9,20 @@ export type AutoloopModes = {
 
 export type AutoloopModeKey = Exclude<keyof AutoloopModes, "any_auto_enabled">;
 
+/**
+ * Lịch derived theo khung nến đã chọn của từng mode
+ * (server/autoloop_schedule.py). Server tự suy chu kỳ quét từ khung nến;
+ * client chỉ hiển thị, không ghi được.
+ */
+export type AutoloopSchedule = {
+  enabled: boolean;
+  timeframe: string | null;
+  next_due_at: string | null;
+  last_dispatched_open: number | null;
+};
+
+export type AutoloopSchedules = Record<AutoloopModeKey, AutoloopSchedule>;
+
 export type AutoloopLastCycleResult = {
   ticker: string;
   signal: string | null;
@@ -76,7 +90,7 @@ export type AutoloopLastCycle = {
 export type AutoloopPayload = {
   generated_at: string;
   enabled: boolean;
-  interval_minutes: number;
+  schedules: AutoloopSchedules;
   running_cycle: boolean;
   modes: AutoloopModes;
   last_cycle: AutoloopLastCycle | null;
@@ -91,11 +105,6 @@ export type AutoloopHaltResponse = {
   generated_at: string;
   halted: boolean;
 };
-
-// Ràng buộc giống server/autoloop.py (MIN/MAX/DEFAULT_INTERVAL_MINUTES).
-export const AUTOLOOP_MIN_INTERVAL = 15;
-export const AUTOLOOP_MAX_INTERVAL = 1440;
-export const AUTOLOOP_DEFAULT_INTERVAL = 1440;
 
 /** Thứ tự hiển thị của các chế độ tự động do server trả về. */
 export const AUTOLOOP_MODE_ROWS: readonly AutoloopModeKey[] = [

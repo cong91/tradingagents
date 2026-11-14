@@ -71,12 +71,16 @@ export const autoloopApi = {
       clearTimeout(timeout);
     }
   },
-  /** POST /api/autoloop — server trả 409 gate_closed khi cổng chưa đủ (fail-closed). */
-  set(enabled: boolean, intervalMinutes: number): Promise<AutoloopPayload> {
+  /**
+   * POST /api/autoloop — chỉ còn công tắc enabled; chu kỳ quét do server tự
+   * suy từ khung nến đã chọn (server/autoloop_schedule.py), không nhận interval.
+   * Server trả 409 mode_closed khi cổng chưa đủ (fail-closed).
+   */
+  set(enabled: boolean): Promise<AutoloopPayload> {
     return requestJson<AutoloopPayload>("/api/autoloop", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ enabled, interval_minutes: intervalMinutes }),
+      body: JSON.stringify({ enabled }),
     });
   },
   runNow(): Promise<AutoloopRunNowResponse> {

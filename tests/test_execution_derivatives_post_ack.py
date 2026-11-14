@@ -1,5 +1,9 @@
 """Post-ACK derivatives entry safety with a fake exchange and isolated PostgreSQL."""
 
+import threading
+import time
+from datetime import datetime
+
 import ccxt
 import psycopg
 import pytest
@@ -450,3 +454,200 @@ def test_public_entry_remains_fail_closed(entry_setup, monkeypatch):
     with pytest.raises(PermissionError):
         executor.execute_order(order, confirm=True, portfolio=book)
     assert _entry_and_exits(exchange) == ([], [])
+
+
+@pytest.mark.parametrize("response", ["ack", "timeout", "preflight", "publish_failure", "cancelled"])
+def test_entry_attempt_reports_exact_journal_provenance(entry_setup, response):
+    """An ACK is evidence of an attempt, not verified bracket protection."""
+    exchange, executor, order, _ = entry_setup
+    evidence = []
+    if response == "ack":
+        exchange.entry_response = {
+            "id": "ack-123", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        }
+    elif response == "timeout":
+        exchange.create_order_error = ccxt.RequestTimeout("request timed out")
+    elif response == "preflight":
+        exchange.hedged = True
+
+    def publish(item):
+        evidence.append(item)
+        if response == "publish_failure" and item.get("entry_provenance"):
+            raise OSError("cycle persistence unavailable")
+
+    def check_entry_allowed():
+        if response == "cancelled":
+            raise TimeoutError("cancelled before submit")
+
+    with pytest.raises(RuntimeError):
+        executor._execute_live(
+            order, True, on_entry_evidence=publish, check_entry_allowed=check_entry_allowed,
+        )
+
+    (intent,) = [
+        task for task in job_store.active_bracket_recoveries()
+        if task["task_id"].startswith("entry-intent:")
+    ] if response in {"ack", "timeout"} else (None,)
+    assert evidence
+    marker = evidence[0]["entry_provenance"]
+    assert evidence[0]["entry_intent_id"] == marker["intent_id"]
+    assert marker["symbol"] == order.ccxt_symbol
+    assert marker["account_identity"]["hash"] == VERIFIED_IDENTITY.identity_hash
+    assert marker["venue_key"]
+    assert evidence[0]["execution_status"] == "uncertain"
+    if intent is not None:
+        assert marker == intent["legs"][0]["entry_provenance"]
+    entries, exits = _entry_and_exits(exchange)
+    assert len(entries) == (1 if response in {"ack", "timeout"} else 0)
+    assert len(exits) == (2 if response == "ack" else 0)
+    if response == "ack":
+        assert evidence[-1]["order_id"] == "ack-123"
+        assert evidence[-1]["protection_state"] == "unverified"
+    else:
+        assert all(item.get("order_id") is None for item in evidence)
+
+
+@pytest.mark.parametrize("response", ["ack", "timeout"])
+def test_timed_out_real_entry_keeps_cycle_and_journal_correlated(
+    entry_setup, monkeypatch, response,
+):
+    from server import autoloop, autoloop_analysis, futures_cycle_store
+    from server.auto_modes import AutoMode
+    from server.autoloop_telemetry import CycleTelemetry
+    from server.futures_cycle_telemetry import canonical_cycle_id
+    from tradingagents.execution import daily
+    from tradingagents.execution.auto_authorization import capture_authorization
+
+    exchange, executor, order, book = entry_setup
+    if response == "ack":
+        exchange.entry_response = {
+            "id": "ack-123", "status": "closed", "filled": order.quantity, "average": 50_100.0,
+        }
+    else:
+        exchange.create_order_error = ccxt.RequestTimeout("request timed out")
+    cancelled = threading.Event()
+    finished = threading.Event()
+    started = threading.Event()
+    original_create = exchange.create_order
+    four_open = "2026-01-01T00:00:00+00:00"
+    four_open_ms = int(datetime.fromisoformat(four_open).timestamp() * 1000)
+    symbol = order.ccxt_symbol
+    cycle_id = canonical_cycle_id(
+        symbol=symbol, four_hour_open=four_open, one_hour_open=four_open,
+        timeframe="4h", open_time=four_open_ms,
+    )
+    assert futures_cycle_store.claim_futures_cycle(
+        cycle_id, symbol=symbol, four_hour_open=four_open,
+        one_hour_open=four_open, strategy_version="1",
+        timeframe="4h", selected_open=four_open_ms,
+        payload={"forecast_started": True, "kronos_forecast": {"status": "ok"}},
+    )
+
+    def block_entry(*args, **kwargs):
+        params = kwargs.get("params") or (args[5] if len(args) > 5 else {})
+        if params.get("clientOrderId", "").startswith("entry-"):
+            started.set()
+            assert cancelled.wait(5)
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(exchange, "create_order", block_entry)
+
+    def execute_order(plan, confirm, portfolio, *, on_entry_evidence, check_entry_allowed):
+        return executor._execute_live(
+            plan, confirm, VERIFIED_IDENTITY, on_entry_evidence=on_entry_evidence,
+            check_entry_allowed=check_entry_allowed,
+        )
+
+    monkeypatch.setattr(executor, "execute_order", execute_order)
+
+    def candidate(*_args, **kwargs):
+        checkpoint = kwargs["on_cycle_checkpoint"]
+        payload = {"forecast_started": True, "kronos_forecast": {"status": "ok"}}
+
+        def publish(evidence):
+            payload.update(evidence)
+            accepted = checkpoint({
+                "cycle_id": cycle_id, "symbol": symbol,
+                "payload": payload,
+                "persist_attempt": "entry_provenance" in evidence and "order_id" not in evidence,
+            })
+            if accepted is False:
+                raise TimeoutError("attempt publication closed")
+
+        checkpoint({"cycle_id": cycle_id, "symbol": symbol, "payload": payload})
+        try:
+            daily._handle_plan(
+                executor, order, book, daily.DailyResult(ticker="BTC-USD"),
+                execute_guard=lambda execute: autoloop.autoloop_execution.execute_with_deadline(
+                    execute, kwargs["deadline"], cancelled, kwargs["execution_lock"],
+                    AutoMode.FUTURES, kwargs["authorization"],
+                ),
+                on_entry_evidence=publish,
+                check_entry_allowed=lambda: autoloop.autoloop_execution.raise_if_execution_closed(
+                    kwargs["deadline"], cancelled, "entry",
+                ),
+            )
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(autoloop_analysis, "_process_candidate", candidate)
+    try:
+        with pytest.raises(TimeoutError):
+            autoloop._run_candidate_with_timeout(
+                None, {"ticker": "BTC-USD"}, {}, lambda *_: None, executor,
+                time.monotonic() + 1.0, cancelled, threading.Lock(), CycleTelemetry(),
+                mode=AutoMode.FUTURES, authorization=capture_authorization(),
+            )
+        assert started.is_set()
+        assert finished.wait(5)
+        row = futures_cycle_store.load_futures_cycle(cycle_id)
+        intent = _active_entry_intent()
+        payload = row["payload"]
+        marker = intent["legs"][0]["entry_provenance"]
+        assert payload["entry_intent_id"] == intent["task_id"] == marker["intent_id"]
+        assert payload["entry_provenance"] == marker
+        assert payload["execution_status"] == "uncertain"
+        assert payload.get("executed") is not False
+        order_id = exchange.entry_response["id"] if response == "ack" else None
+        assert payload.get("order_id") == order_id
+        if response == "ack":
+            assert payload["protection_state"] == "unverified"
+        from server import outcome_ledger
+
+        seen_orders = []
+        ledger_account = outcome_ledger.account_identity_from_marker(marker)
+        entry_fill = {
+            "trade_id": "trade-entry-1", "order_id": "ack-123", "symbol": symbol,
+            "side": order.side, "contracts": str(order.quantity), "price": "50100",
+            "fee": "0.1", "fee_currency": "USDT", "realized_pnl": "0",
+            "realized_pnl_currency": "USDT", "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+
+        def fill_source(account_id, market, start_ms, end_ms):
+            seen_orders.append((account_id, market, start_ms, end_ms))
+            return {"status": "ok", "fills": [entry_fill] if response == "ack" else []}
+
+        ledger_result = outcome_ledger._process_cycle(row, fill_source=fill_source, ingest=True)
+        if response == "ack":
+            assert seen_orders
+            assert ledger_result["result"] != "pending_order_evidence"
+            from server import db
+
+            with db.read() as connection:
+                position = connection.execute(
+                    "SELECT cycle_id, client_order_id, venue_order_id FROM outcome_positions "
+                    "WHERE account_id = %s AND client_order_id = %s",
+                    (ledger_account, marker["client_order_id"]),
+                ).fetchone()
+            assert position["cycle_id"] == cycle_id
+            assert position["venue_order_id"] == "ack-123"
+        else:
+            assert ledger_result["result"] == "pending_order_evidence"
+            assert seen_orders == []
+        entries, exits = _entry_and_exits(exchange)
+        assert len(entries) == 1
+        assert len(exits) == (2 if response == "ack" else 0)
+        assert all(item[5].get("reduceOnly") for item in exits)
+    finally:
+        cancelled.set()
+        assert finished.wait(5)

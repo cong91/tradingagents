@@ -47,7 +47,7 @@ export const operatorConfigApi = {
    * trả 412 gate_confirmation_required hoặc 422 reason_required nếu thiếu.
    */
   update(
-    settings: Record<string, number | boolean>,
+    settings: Record<string, number | boolean | string>,
     options?: { confirm?: boolean; reason?: string; actor?: string }
   ): Promise<OperatorConfigPayload> {
     return requestJson<OperatorConfigPayload>("/api/operator-config", {

@@ -434,6 +434,19 @@ def test_live_with_confirm_places_market_order(tmp_path, monkeypatch):
     assert isinstance(event["qty_precision"], str)
 
 
+def test_live_spot_preflight_runs_inside_submission_before_exchange(tmp_path, monkeypatch):
+    exchange = FakeExchange()
+    bridge = live_bridge(tmp_path, monkeypatch, exchange)
+    order = bridge.plan_order("BTC-USD", "Buy", buy_book(), price=50_000.0)
+
+    def expired():
+        raise ValueError("selected candle expired")
+
+    with pytest.raises(RuntimeError, match="selected candle expired"):
+        bridge.execute_order(order, confirm=True, check_entry_allowed=expired)
+    assert not any(call[0] == "create_order" for call in exchange.calls)
+
+
 def test_live_override_cannot_authorize_closed_process_spot_mode(tmp_path, monkeypatch):
     set_config({"auto_spot_enabled": False})
     exchange = FakeExchange()

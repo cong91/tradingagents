@@ -6,14 +6,70 @@ and the durable futures_cycles row: these tests pin the redaction contract
 and the timestamp/terminal behavior of the persistence helpers.
 """
 
+import json
+from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
-from server import futures_cycle_telemetry as fct
+from server import futures_cycle_store, futures_cycle_telemetry as fct
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution.risk import RiskLimits
+
+
+@pytest.mark.unit
+def test_claim_cycle_normalizes_dataclasses_through_store(monkeypatch):
+    @dataclass
+    class Snapshot:
+        note: str
+        values: tuple[int, ...]
+
+    class Connection:
+        def execute(self, query, params):
+            self.query, self.params = query, params
+            return SimpleNamespace(rowcount=1)
+
+    connection = Connection()
+    monkeypatch.setattr(futures_cycle_store.db, "session", lambda: nullcontext(connection))
+    monkeypatch.setattr(futures_cycle_store, "_now", lambda: "now")
+
+    assert fct.claim_cycle(
+        "cycle", symbol="BTC", four_hour_open="4h", one_hour_open="1h",
+        strategy_version="1", timeframe="1m", selected_open=1,
+        payload={"snapshot": Snapshot("thesis ✓", (1, 2))},
+    )
+    assert "ON CONFLICT (cycle_id) DO NOTHING" in connection.query
+    assert json.loads(connection.params[7]) == {"snapshot": {"note": "thesis ✓", "values": [1, 2]}}
+    assert connection.params[8:] == ("now", "now")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", futures_cycle_store._FUTURES_TERMINAL_STATUSES)
+def test_cycle_store_does_not_overwrite_terminal_status(monkeypatch, status):
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            return SimpleNamespace(fetchone=lambda: {"status": status, "phase": "entry", "payload": {}})
+
+    connection = Connection()
+    monkeypatch.setattr(futures_cycle_store.db, "session", lambda: nullcontext(connection))
+    futures_cycle_store.update_futures_cycle("cycle", status="running", phase="entry")
+    assert len(connection.calls) == 1
+    assert "FOR UPDATE" in connection.calls[0][0]
+
+
+@pytest.mark.unit
+def test_cycle_store_merges_nested_payload_without_erasing_recorded_values():
+    existing = {"signal": "Buy", "nested": {"reason": "recorded", "count": 1}}
+    assert futures_cycle_store._merge_payload(
+        existing, {"signal": None, "nested": {"reason": None, "count": 2}},
+    ) == {"signal": "Buy", "nested": {"reason": "recorded", "count": 2}}
+    assert existing["nested"]["count"] == 1
 
 
 @pytest.mark.unit
@@ -86,7 +142,7 @@ def test_redact_sensitive_text_scrubs_secrets_inside_exception_prose():
 
 @pytest.mark.unit
 def test_redact_payload_folds_non_json_types():
-    """Venue payloads may carry Decimal/datetime/set/bytes; job_store._json
+    """Venue payloads may carry Decimal/datetime/set/bytes; futures_cycle_store._json
     would raise TypeError on them and take the whole cycle claim down."""
     import decimal
 
@@ -194,29 +250,58 @@ def test_decision_telemetry_without_state_falls_back_to_parser():
 
 
 @pytest.mark.unit
-def test_cycle_identity_uses_normalized_candle_opens():
+def test_cycle_identity_uses_normalized_candle_opens_and_selected_identity():
     one_hour = datetime(2026, 10, 27, 12, tzinfo=UTC)
     four_hour = datetime(2026, 10, 27, 8, tzinfo=UTC)
     context = {
         "unified_symbol": "BTC/USDT:USDT",
         "one_hour_open": int(one_hour.timestamp() * 1000),
         "four_hour_open": int(four_hour.timestamp() * 1000),
+        "candle_identity": {"timeframe": "15m", "open_time": 1_792_500_300_000},
     }
     cycle_id, four_open, one_open = fct.cycle_identity(context)
-    assert cycle_id == f"futures:BTC/USDT:USDT:{four_hour.isoformat()}:{one_hour.isoformat()}:1"
+    assert cycle_id == (
+        f"futures:BTC/USDT:USDT:{four_hour.isoformat()}:{one_hour.isoformat()}"
+        ":1:15m:1792500300000"
+    )
     assert (four_open, one_open) == (four_hour.isoformat(), one_hour.isoformat())
 
 
 @pytest.mark.unit
+def test_cycle_identity_requires_the_selected_candle_identity():
+    """The identity-less 5-segment legacy id is gone: a context without the
+    selected candle refuses instead of silently claiming a coarse key."""
+    context = {
+        "unified_symbol": "BTC/USDT:USDT",
+        "one_hour_open": int(datetime(2026, 10, 27, 12, tzinfo=UTC).timestamp() * 1000),
+        "four_hour_open": int(datetime(2026, 10, 27, 8, tzinfo=UTC).timestamp() * 1000),
+    }
+    with pytest.raises(ValueError, match="selected candle identity"):
+        fct.cycle_identity(context)
+
+
+@pytest.mark.unit
+def test_canonical_cycle_id_is_the_single_builder():
+    assert fct.canonical_cycle_id(
+        symbol="BTC/USDT:USDT", four_hour_open="4h-open", one_hour_open="1h-open",
+        timeframe="1m", open_time=42,
+    ) == "futures:BTC/USDT:USDT:4h-open:1h-open:1:1m:42"
+
+
+@pytest.mark.unit
 def test_cycle_identity_requires_candle_opens():
+    context = {
+        "unified_symbol": "BTC/USDT:USDT",
+        "candle_identity": {"timeframe": "1m", "open_time": 1},
+    }
     with pytest.raises(ValueError, match="one_hour"):
-        fct.cycle_identity({"unified_symbol": "BTC/USDT:USDT"})
+        fct.cycle_identity(context)
 
 
 @pytest.mark.unit
 def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
     """Redaction happens inside the persistence helpers: whatever reaches
-    job_store is already stripped of credential-shaped keys."""
+    futures_cycle_store is already stripped of credential-shaped keys."""
     claimed, updates = {}, []
 
     def fake_claim(cycle_id, **kwargs):
@@ -226,12 +311,13 @@ def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     assert fct.claim_cycle(
         "futures:BTC/USDT:USDT:x:y:1",
         symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", selected_open=1,
         payload={"unified_symbol": "BTC/USDT:USDT", "cookie": "session=1"},
     ) is True
     assert claimed["payload"]["unified_symbol"] == "BTC/USDT:USDT"
@@ -249,6 +335,31 @@ def test_persistence_helpers_redact_at_the_boundary(monkeypatch):
 
 
 @pytest.mark.unit
+def test_forecast_paths_survive_cycle_persistence_redaction(monkeypatch):
+    from tradingagents.forecast.block import ForecastBlock
+    from tradingagents.forecast.ohlc import normalize_ohlc_path
+
+    path = normalize_ohlc_path({
+        "opens": [100.0], "highs": [98.0], "lows": [99.0],
+        "closes": [100.0], "seed": 42,
+    }, index=0, horizon_bars=1)
+    assert path is not None
+    block = ForecastBlock(symbol="BTC/USDT:USDT", status="ok", ohlc_paths=(path,))
+    updates = []
+    monkeypatch.setattr(
+        fct.futures_cycle_store, "update_futures_cycle", lambda _cycle_id, **kwargs: updates.append(kwargs),
+    )
+
+    fct.persist_progress(
+        "futures:BTC/USDT:USDT:x:y:1", phase="context",
+        payload={"kronos_forecast": block.as_json(), "api_key": "secret"},
+    )
+
+    assert updates[0]["payload"]["kronos_forecast"]["ohlc_paths"] == [path]
+    assert "api_key" not in updates[0]["payload"]
+
+
+@pytest.mark.unit
 def test_persist_progress_terminal_stamps_finished_at(monkeypatch):
     updates = []
 
@@ -258,8 +369,8 @@ def test_persist_progress_terminal_stamps_finished_at(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     fct.persist_progress(
         "futures:BTC/USDT:USDT:x:y:1", phase="analysis",
@@ -282,12 +393,13 @@ def test_persist_rejection_marks_terminal_and_redacts(monkeypatch):
     def fake_update(cycle_id, **kwargs):
         updates.append(kwargs)
 
-    monkeypatch.setattr(fct.job_store, "claim_futures_cycle", fake_claim)
-    monkeypatch.setattr(fct.job_store, "update_futures_cycle", fake_update)
+    monkeypatch.setattr(fct.futures_cycle_store, "claim_futures_cycle", fake_claim)
+    monkeypatch.setattr(fct.futures_cycle_store, "update_futures_cycle", fake_update)
 
     fct.persist_rejection(
         "futures:BTC/USDT:USDT:x:y:1",
         symbol="BTC/USDT:USDT", four_hour_open="x", one_hour_open="y",
+        timeframe="1h", selected_open=1,
         phase="proposal",
         payload={"signal_reason": "agent_abstained", "authorization": "Bearer zzz"},
         status="rejected",

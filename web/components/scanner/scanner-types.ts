@@ -139,6 +139,17 @@ export interface FuturesCyclePayload {
   confirmation_result?: boolean | null;
   /** aligned_direction | doji_candle | direction_mismatch | ... */
   confirmation_reason?: string | null;
+  /** Redacted active Kronos forecast actually received by this cycle. */
+  kronos_forecast?: {
+    status?: string | null;
+    reason?: string | null;
+    direction?: string | null;
+    paths?: number | null;
+    band_spread_ratio?: number | null;
+  } | null;
+  /** Forecast policy applied before graph/LLM analysis. */
+  kronos_policy?: string | null;
+  kronos_defer_reason?: string | null;
   /** tradeable_signal | signal_not_tradeable */
   signal_reason?: string | null;
   /** Nguyên văn quyết định của Quản lý danh mục (Rating / Thesis / Execution
@@ -218,6 +229,7 @@ export interface FuturesCyclePayload {
 export interface FuturesCycleSummary {
   market_rejected: number;
   confirmation_rejected: number;
+  forecast_deferred: number;
   proposal_rejected: number;
   entered: number;
   awaiting_approval: number;
@@ -242,6 +254,7 @@ export interface FuturesCycleSymbolRollup {
   proposal_rejected: number;
   confirmation_rejected: number;
   market_rejected: number;
+  forecast_deferred: number;
   in_flight: number;
   interrupted: number;
   /** Chu kỳ không rơi vào bucket nào đã đặt tên (legacy mù, tự mâu thuẫn…). */
@@ -256,6 +269,8 @@ export interface FuturesCycleSymbolRollup {
    *  chu kỳ cũ không ghi trường executed; 'false' phủ nhận đã vào lệnh. */
   last_executed: string | null;
   last_execution_reason: string | null;
+  last_kronos_policy: string | null;
+  last_kronos_defer_reason: string | null;
   last_signal: string | null;
   last_signal_reason: string | null;
   last_market_rejection_reason: string | null;
@@ -269,7 +284,13 @@ export interface FuturesCyclesResponse {
   symbols?: FuturesCycleSymbolRollup[];
   running_cycle?: boolean;
   enabled?: boolean;
-  interval_minutes?: number;
+  /** Lịch derived theo khung nến đã chọn; chi tiết ở settings/autoloop-types. */
+  schedules?: Record<string, {
+    enabled: boolean;
+    timeframe: string | null;
+    next_due_at: string | null;
+    last_dispatched_open: number | null;
+  }>;
   last_cycle?: Record<string, unknown> | null;
 }
 

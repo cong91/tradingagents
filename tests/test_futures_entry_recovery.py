@@ -200,7 +200,7 @@ def _leg(name, order_id, status, trigger):
 
 
 def _seed_task(task_id, *, symbol=SYMBOL, entry_order_id=CLIENT_ID, close_side="sell",
-               status="submission_uncertain", quantity=QUANTITY, legs=None):
+               status="submission_uncertain", quantity=QUANTITY, legs=None, placed_ids=None):
     assert job_store.create_bracket_recovery(
         task_id,
         symbol=symbol,
@@ -219,7 +219,7 @@ def _seed_task(task_id, *, symbol=SYMBOL, entry_order_id=CLIENT_ID, close_side="
     job_store.update_bracket_recovery(
         task_id,
         status=status,
-        placed_ids=[ORDER_ID],
+        placed_ids=[ORDER_ID] if placed_ids is None else placed_ids,
         attempts=0,
         last_error=None,
         now=datetime.now(UTC).isoformat(),
@@ -276,20 +276,26 @@ def _setup(tmp_path, monkeypatch, *, position=None, scope_complete=True):
     return exchange, bridge
 
 
-def _add_terminal_bracket(exchange):
+def _add_terminal_bracket(exchange, *, quantity=QUANTITY):
     stop = _leg("stop-loss", "stop-algo", "filled", STOP)
     target = _leg("take-profit", "target-algo", "cancelled", TARGET)
     _seed_task(
         BRACKET_ID,
         entry_order_id=ORDER_ID,
         status="reconciled_stop_loss",
+        quantity=quantity,
         legs=[stop, target],
     )
     exchange.orders["stop-algo"] = _conditional(
-        "stop-algo", "stop-loss", "FINISHED", child_id="stop-child",
+        "stop-algo", "stop-loss", "FINISHED", quantity=quantity,
+        child_id="stop-child", child_quantity=quantity,
     )
-    exchange.orders["stop-child"] = _child_order()
-    exchange.orders["target-algo"] = _conditional("target-algo", "take-profit", "CANCELED")
+    exchange.orders["stop-child"] = _child_order(
+        quantity=quantity, filled=quantity,
+    )
+    exchange.orders["target-algo"] = _conditional(
+        "target-algo", "take-profit", "CANCELED", quantity=quantity,
+    )
 
 
 def _insert_audit(event, path):
@@ -316,6 +322,47 @@ def test_reconciles_filled_entry_after_verified_stop_and_flat_position(tmp_path,
     assert not [call for call in exchange.calls if call[0] in {"create_order", "cancel_order"}]
 
 
+def test_terminal_partial_entry_persists_identity_bound_order_evidence(tmp_path, monkeypatch):
+    exchange, bridge = _setup(tmp_path, monkeypatch)
+    partial_quantity = QUANTITY / 2
+    exchange.orders[ORDER_ID] = _entry_order(
+        status="CANCELED", filled=partial_quantity,
+    )
+    _add_terminal_bracket(exchange, quantity=partial_quantity)
+
+    assert _result(bridge) == "completed"
+    recovered = job_store.load_bracket_recovery(INTENT_ID)
+    entry_leg = next(leg for leg in recovered["legs"] if leg["name"] == "entry-intent")
+    assert entry_leg["entry_order_final"] == {
+        "status": "cancelled",
+        "order_id": ORDER_ID,
+        "client_order_id": CLIENT_ID,
+        "symbol": SYMBOL,
+        "venue_key": VENUE,
+        "account_id": (
+            f"binance:demo:{VERIFIED_IDENTITY.identity_hash}"
+        ),
+        "account_identity": {
+            "exchange": "binance", "profile": "demo", "type": "usds_futures",
+            "hash": VERIFIED_IDENTITY.identity_hash,
+        },
+        "original_quantity": str(QUANTITY),
+        "filled_quantity": str(partial_quantity),
+    }
+    assert not [call for call in exchange.calls if call[0] in {"create_order", "cancel_order"}]
+
+
+def test_filled_entry_does_not_write_terminal_partial_evidence(tmp_path, monkeypatch):
+    exchange, bridge = _setup(tmp_path, monkeypatch)
+    exchange.orders[ORDER_ID] = _entry_order()
+    _add_terminal_bracket(exchange)
+
+    assert _result(bridge) == "completed"
+    recovered = job_store.load_bracket_recovery(INTENT_ID)
+    entry_leg = next(leg for leg in recovered["legs"] if leg["name"] == "entry-intent")
+    assert "entry_order_final" not in entry_leg
+
+
 def test_reconciliation_is_idempotent_and_does_not_duplicate_event(tmp_path, monkeypatch):
     exchange, bridge = _setup(tmp_path, monkeypatch)
     exchange.orders[ORDER_ID] = _entry_order()
@@ -326,6 +373,119 @@ def test_reconciliation_is_idempotent_and_does_not_duplicate_event(tmp_path, mon
     assert _result(bridge) == "already_reconciled"
     assert exchange.calls == first_calls
     assert len(_control_events("futures_entry_reconciled")) == 1
+
+
+def test_recovery_persists_verified_venue_id_for_no_ack_intent(tmp_path, monkeypatch):
+    exchange, bridge = _setup(tmp_path, monkeypatch)
+    intent_leg = {
+        "name": "entry-intent", "status": "uncertain", "order_id": None,
+        "client_order_id": CLIENT_ID, "symbol": SYMBOL, "side": "buy",
+        "type": "market", "quantity": f"{QUANTITY:.3f}", "profile": "demo",
+        "venue_key": VENUE, "entry_provenance": {
+            "version": 1, "kind": "managed_live_entry", "intent_id": INTENT_ID,
+            "client_order_id": CLIENT_ID, "symbol": SYMBOL, "side": "buy",
+            "venue_key": VENUE, "account_identity": {
+                "exchange": "binance", "profile": "demo", "type": "usds_futures",
+                "hash": VERIFIED_IDENTITY.identity_hash,
+            },
+        },
+    }
+    job_store.update_bracket_recovery(
+        INTENT_ID, status="submission_uncertain", placed_ids=[], attempts=0,
+        last_error="no-ACK submission; venue lookup required",
+        now=datetime.now(UTC).isoformat(), legs=[intent_leg],
+    )
+    exchange.orders[CLIENT_ID] = _entry_order()
+    _add_terminal_bracket(exchange)
+
+    assert _result(bridge) == "completed"
+    recovered = job_store.load_bracket_recovery(INTENT_ID)
+    assert recovered["status"] == "completed"
+    assert recovered["entry_order_id"] == CLIENT_ID
+    assert recovered["placed_ids"] == [ORDER_ID]
+    recovered_leg = next(leg for leg in recovered["legs"] if leg["name"] == "entry-intent")
+    assert recovered_leg["order_id"] == ORDER_ID
+    assert recovered_leg["client_order_id"] == CLIENT_ID
+    assert recovered_leg["entry_provenance"] == intent_leg["entry_provenance"]
+    assert not [call for call in exchange.calls if call[0] in {"create_order", "cancel_order"}]
+
+
+
+
+@pytest.mark.parametrize("mutation", ["identity", "ambiguous", "missing"])
+def test_unverified_or_ambiguous_no_ack_never_persists_a_venue_id(
+    tmp_path, monkeypatch, mutation,
+):
+    exchange, bridge = _setup(tmp_path, monkeypatch)
+    intent_leg = {
+        "name": "entry-intent", "status": "uncertain", "order_id": None,
+        "client_order_id": CLIENT_ID, "symbol": SYMBOL, "side": "buy",
+        "type": "market", "quantity": f"{QUANTITY:.3f}", "profile": "demo",
+        "venue_key": VENUE,
+    }
+    job_store.update_bracket_recovery(
+        INTENT_ID, status="submission_uncertain",
+        placed_ids=[] if mutation in {"identity", "missing"} else ["venue-a", "venue-b"],
+        attempts=0, last_error="no-ACK submission; venue lookup required",
+        now=datetime.now(UTC).isoformat(), legs=[intent_leg],
+    )
+    if mutation != "missing":
+        exchange.orders[ORDER_ID] = _entry_order()
+    if mutation == "identity":
+        monkeypatch.setattr(
+            futures_identity, "compare_futures_account_identity",
+            lambda current, stored: futures_identity.IdentityComparison.MISMATCH,
+        )
+
+    before = job_store.load_bracket_recovery(INTENT_ID)
+    expected = {
+        "identity": "account_identity_mismatch",
+        "ambiguous": "entry_ids_ambiguous",
+        "missing": "entry_order_unavailable",
+    }[mutation]
+    assert _result(bridge) == expected
+    after = job_store.load_bracket_recovery(INTENT_ID)
+    assert after["status"] == before["status"] == "submission_uncertain"
+    assert after["placed_ids"] == before["placed_ids"]
+    assert after["legs"] == before["legs"]
+    assert not [call for call in exchange.calls if call[0] in {"create_order", "cancel_order"}]
+
+
+def test_competing_intent_update_cannot_commit_recovered_id(tmp_path, monkeypatch):
+    exchange, bridge = _setup(tmp_path, monkeypatch)
+    intent = job_store.load_bracket_recovery(INTENT_ID)
+    intent_leg = intent["legs"][0]
+    intent_leg["order_id"] = None
+    job_store.update_bracket_recovery(
+        INTENT_ID, status="submission_uncertain", placed_ids=[], attempts=0,
+        last_error="no-ACK submission; venue lookup required",
+        now=datetime.now(UTC).isoformat(), legs=[intent_leg],
+    )
+    exchange.orders[CLIENT_ID] = _entry_order()
+    _add_terminal_bracket(exchange)
+    comparisons = 0
+
+    def compare_with_competing_update(current, expected):
+        nonlocal comparisons
+        comparisons += 1
+        if comparisons == 2:
+            current = job_store.load_bracket_recovery(INTENT_ID)
+            job_store.update_bracket_recovery(
+                INTENT_ID, status=current["status"], placed_ids=current["placed_ids"],
+                attempts=current["attempts"], last_error="competing update",
+                now=datetime.now(UTC).isoformat(), legs=current["legs"],
+            )
+        return futures_identity.IdentityComparison.MATCH
+
+    monkeypatch.setattr(
+        futures_identity, "compare_futures_account_identity", compare_with_competing_update,
+    )
+
+    assert _result(bridge) == "stale_state"
+    recovered = job_store.load_bracket_recovery(INTENT_ID)
+    assert recovered["status"] == "submission_uncertain"
+    assert recovered["placed_ids"] == []
+    assert recovered["legs"][0]["order_id"] is None
 
 
 @pytest.mark.parametrize("identity_result, expected", [

@@ -87,7 +87,13 @@ def entry_journal_leg(
     order: PlannedOrder, client_order_id: str, *, quantity: str, created_at: str,
     identity: Any, venue: str, config: dict,
 ) -> dict:
-    """Capture the exact entry terms and recovery policy before a venue mutation."""
+    """Capture the exact entry terms and recovery policy before a venue mutation.
+
+    The immutable ``managed_live_entry`` provenance marker rides inside the
+    leg itself, so every journal row written through this builder carries the
+    attribution evidence the outcome ledger needs — no caller can produce a
+    marker-less managed entry by forgetting to attach it.
+    """
     return {
         "name": "entry-intent",
         "status": "uncertain",
@@ -105,6 +111,9 @@ def entry_journal_leg(
         "created_at": created_at,
         "profile": identity.profile,
         "venue_key": venue,
+        "entry_provenance": managed_live_provenance(
+            order, client_order_id, identity=identity, venue=venue,
+        ),
         "scale_out_policy": {
             "enabled": config.get("risk_derivatives_scale_out_enabled") is True,
             "first_r": config.get("risk_derivatives_scale_out_first_r", 1.0),
@@ -154,9 +163,15 @@ def create_guarded_entry_intent(
 
 def update_guarded_entry_intent(
     guard: OperationGuard, task_id: str, *, status: str, leg: dict,
-    order_id: str | None, error: str | None,
+    order_id: str | None, error: str | None, quantity: float | None = None,
 ) -> None:
-    """Update the entry journal on the same session that owns the symbol lock."""
+    """Update the entry journal on the same session that owns the symbol lock.
+
+    ``quantity`` carries the exact venue-rounded size once market metadata is
+    loaded; passing it rewrites the task's top-level quantity so the outcome
+    ledger's planned-quantity comparison uses the same amount the venue
+    received, not the pre-precision plan. Omitted updates leave it untouched.
+    """
     guard.check()
     now = datetime.now(UTC).isoformat()
     with guard.connection.transaction():
@@ -164,11 +179,12 @@ def update_guarded_entry_intent(
         cursor = guard.connection.execute(
             """UPDATE bracket_recovery_tasks
                SET status = %s, placed_ids = %s::jsonb, legs = %s::jsonb,
+                   quantity = COALESCE(%s, quantity),
                    attempts = 0, last_error = %s, updated_at = %s
                WHERE task_id = %s AND symbol = %s
                  AND status IN ('submission_uncertain', 'pending')""",
             (status, json.dumps([str(order_id)] if order_id else []),
-             json.dumps([leg]), error, now, task_id, guard.symbol),
+             json.dumps([leg]), quantity, error, now, task_id, guard.symbol),
         )
         if cursor.rowcount != 1:
             raise RuntimeError("durable entry intent changed during guarded update")

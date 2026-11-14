@@ -13,6 +13,10 @@ export const vi = {
       label: "Bị loại ở bước xác nhận nến",
       hint: "Nến đóng 1h/4h chưa cùng hướng với tín hiệu",
     },
+    forecast_deferred: {
+      label: "Hoãn vì dự báo Kronos lỗi",
+      hint: "Dự báo không khả dụng — chưa chạy phân tích",
+    },
     proposal_rejected: {
       label: "Bị loại ở bước đề xuất vào lệnh",
       hint: "Agent phân tích xong nhưng không đề xuất vào lệnh",
@@ -50,6 +54,7 @@ export const vi = {
     claimed: "Đã nhận việc — đang chuẩn bị",
     running: "Đang chạy",
     completed: "Hoàn tất",
+    rejected: "Bị từ chối",
     failed: "Lỗi",
     interrupted: "Bị gián đoạn",
     recovery_pending: "Đang phục hồi",
@@ -72,6 +77,7 @@ export const vi = {
   phases: {
     market: "Quét thị trường",
     confirmation: "Xác nhận nến",
+    forecast: "Dự báo Kronos",
     proposal: "Đề xuất vào lệnh",
     planning: "Lập kế hoạch",
     execution: "Thực thi lệnh",
@@ -81,6 +87,9 @@ export const vi = {
   outcome: {
     entered: "Triển khai được — đã vào lệnh",
     inFlight: "Đang phân tích…",
+    forecastDeferred: "Hoãn vì dự báo Kronos lỗi — chưa phân tích",
+    forecast: (status: string, detail: string) => `Kronos ${status}${detail ? ` — ${detail}` : ""}`,
+    forecastDeferredReason: (reason: string) => `Hoãn vì dự báo Kronos lỗi — chưa phân tích (${reason})`,
     awaitingApproval: "Chờ duyệt — chưa vào lệnh",
     awaitingApprovalReason: (reason: string) => `Chờ duyệt — chưa vào lệnh (${reason})`,
     gateClosed: "cổng duyệt chưa mở",
@@ -110,6 +119,7 @@ export const vi = {
     proposal_rejected: (n: number) => `${n} agent từ chối`,
     confirmation_rejected: (n: number) => `${n} nến chưa xác nhận`,
     market_rejected: (n: number) => `${n} loại từ bước quét`,
+    forecast_deferred: (n: number) => `${n} hoãn vì dự báo lỗi`,
     in_flight: (n: number) => `${n} đang chạy`,
     interrupted: (n: number) => `${n} gián đoạn`,
     other: (n: number) => `${n} khác`,
@@ -138,6 +148,10 @@ export const en: typeof vi = {
     confirmation_rejected: {
       label: "Rejected at candle confirmation",
       hint: "1h/4h closes do not agree with the signal direction yet",
+    },
+    forecast_deferred: {
+      label: "Deferred after Kronos forecast failure",
+      hint: "Forecast unavailable — analysis did not run",
     },
     proposal_rejected: {
       label: "Rejected at entry proposal",
@@ -176,6 +190,7 @@ export const en: typeof vi = {
     claimed: "Picked up — starting",
     running: "Running",
     completed: "Completed",
+    rejected: "Rejected",
     failed: "Failed",
     interrupted: "Interrupted",
     recovery_pending: "Recovering",
@@ -198,6 +213,7 @@ export const en: typeof vi = {
   phases: {
     market: "Market scan",
     confirmation: "Candle confirmation",
+    forecast: "Kronos forecast",
     proposal: "Entry proposal",
     planning: "Planning",
     execution: "Order execution",
@@ -207,6 +223,9 @@ export const en: typeof vi = {
   outcome: {
     entered: "Deployed — position entered",
     inFlight: "Analyzing…",
+    forecastDeferred: "Deferred after Kronos forecast failure — analysis did not run",
+    forecast: (status, detail) => `Kronos ${status}${detail ? ` — ${detail}` : ""}`,
+    forecastDeferredReason: (reason) => `Deferred after Kronos forecast failure — analysis did not run (${reason})`,
     awaitingApproval: "Awaiting approval — not entered",
     awaitingApprovalReason: (reason) => `Awaiting approval — not entered (${reason})`,
     gateClosed: "approval gate closed",
@@ -236,6 +255,7 @@ export const en: typeof vi = {
     proposal_rejected: (n) => `${n} agent rejected`,
     confirmation_rejected: (n) => `${n} candle unconfirmed`,
     market_rejected: (n) => `${n} rejected at scan`,
+    forecast_deferred: (n) => `${n} forecast deferred`,
     in_flight: (n) => `${n} running`,
     interrupted: (n) => `${n} interrupted`,
     other: (n) => `${n} other`,

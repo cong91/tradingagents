@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request
 
 from server import audit as audit_log, auto_modes, control_store, settings_events
 from server.contract import ApiError, json_body, utc_now_iso
+from tradingagents.auto_timeframes import AUTO_TIMEFRAMES, validate_auto_timeframe
 from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -29,6 +30,23 @@ router = APIRouter(prefix="/api", tags=["operator-config"])
 
 # key -> (json type, is an execution gate, group, Vietnamese label, hint)
 _ALLOWED: dict[str, dict] = {
+    "auto_spot_timeframe": {
+        "type": "timeframe", "gate": False, "group": "modes",
+        "label": "Khung nến Auto Spot",
+        "hint": (
+            "Khung nến đóng dùng cho Auto Spot; chu kỳ quét tự chạy theo "
+            "boundary nến của khung này (1m=1 phút, 15m=15 phút, 1h=1 giờ, 4h=4 giờ)."
+        ),
+    },
+    "auto_futures_timeframe": {
+        "type": "timeframe", "gate": False, "group": "modes",
+        "label": "Khung nến Auto Futures",
+        "hint": (
+            "Khung nến dự báo và chu kỳ quét Futures; xác nhận vẫn dùng 1h và 4h. "
+            "Chu kỳ quét tự chạy theo boundary nến của khung này. Nến 1m/15m có "
+            "thể hết hạn trước khi phân tích hoàn tất; khi đó lệnh bị từ chối."
+        ),
+    },
     "auto_spot_enabled": {
         "type": "bool",
         "gate": True,
@@ -245,6 +263,8 @@ _GATE_KEYS = {key for key, meta in _ALLOWED.items() if meta["gate"]}
 def _coerce(key: str, value):
     """Coerce one JSON value to the key's declared type; raises ValueError."""
     expected = _ALLOWED[key]["type"]
+    if expected == "timeframe":
+        return validate_auto_timeframe(value)
     if expected == "bool":
         if isinstance(value, bool):
             return value
@@ -265,6 +285,7 @@ def _row(key: str, stored: dict[str, dict]) -> dict:
     return {
         "key": key,
         "type": meta["type"],
+        "options": list(AUTO_TIMEFRAMES) if meta["type"] == "timeframe" else None,
         "group": meta["group"],
         "label": meta["label"],
         "hint": meta["hint"],
@@ -275,6 +296,62 @@ def _row(key: str, stored: dict[str, dict]) -> dict:
         "stored_value": override["value"] if override else None,
         "updated_at": override["updated_at"] if override else None,
         "updated_by": override["updated_by"] if override else None,
+    }
+
+
+def _kronos_section() -> dict:
+    """Readiness and derived inputs for the selected active Kronos pair."""
+    from tradingagents.forecast.artifact import (
+        isolated_model_dir,
+        isolated_python,
+        isolated_source_dir,
+        profile_for,
+        verify_artifacts,
+    )
+    from tradingagents.forecast.settings import settings_from_config
+
+    settings = settings_from_config(get_config())
+    python = isolated_python()
+    try:
+        profile = profile_for(settings.profile)
+    except ValueError as exc:
+        problem = str(exc)
+        profile = None
+    verified = False
+    if profile is not None and not python.exists():
+        problem = f"the isolated Kronos interpreter is absent ({python})"
+    elif profile is not None:
+        try:
+            problem, _verified = verify_artifacts(
+                isolated_source_dir(), isolated_model_dir(), settings.profile,
+            )
+        except OSError as exc:
+            problem = f"the pinned artifacts could not be inspected: {exc}"
+        else:
+            verified = problem is None
+    settings_problem = settings.settings_problem()
+    if settings_problem is not None:
+        problem = settings_problem
+    return {
+        "profile_id": settings.profile,
+        "timeframe": settings.timeframe,
+        "horizon_hours": settings.horizon_hours,
+        "lookback_bars": settings.lookback_bars,
+        "max_context": profile.max_context if profile is not None else None,
+        "paths": settings.paths,
+        "temperature": settings.temperature,
+        "readiness": {
+            "status": "ready" if problem is None else "unavailable",
+            "reason": problem,
+            "verified": verified,
+        },
+        "model": {
+            "source_revision": profile.source_revision if profile is not None else "",
+            "model_revision": profile.model_revision if profile is not None else "",
+            "repo": profile.model_repo if profile is not None else "",
+            "tokenizer_revision": profile.tokenizer_revision if profile is not None else "",
+            "tokenizer_repo": profile.tokenizer_repo if profile is not None else "",
+        },
     }
 
 
@@ -297,6 +374,7 @@ def _payload() -> dict:
             "any_auto_enabled": any(modes.values()),
         },
         "effective_exec_mode": effective_exec_mode(),
+        "kronos": _kronos_section(),
         "allowlist": sorted(_ALLOWED),
     }
 
@@ -351,7 +429,11 @@ async def put_operator_config(request: Request):
 
     from tradingagents.execution.auto_authorization import mode_update_lock
 
-    affected_modes = [mode for mode, key in auto_modes.MODE_KEYS.items() if key in gate_changes]
+    timeframe_modes = {
+        auto_modes.AutoMode.SPOT if key == "auto_spot_timeframe" else auto_modes.AutoMode.FUTURES
+        for key in validated if key in {"auto_spot_timeframe", "auto_futures_timeframe"}
+    }
+    affected_modes = {mode for mode, key in auto_modes.MODE_KEYS.items() if key in gate_changes} | timeframe_modes
     with mode_update_lock(affected_modes):
         config = get_config()
         previous = {key: config.get(key) for key in validated}
@@ -360,7 +442,14 @@ async def put_operator_config(request: Request):
     if gate_changes:
         from server import autoloop
 
+        # sync_mode_state re-derives enablement and wakes the scheduler.
         autoloop.sync_mode_state()
+    elif timeframe_modes:
+        from server import autoloop
+
+        # A timeframe change re-derives the mode's cadence and may make a new
+        # candle due immediately.
+        autoloop.wake_scheduler()
     settings_events.publish_change("operator_config_updated")
 
     audit_log.record(
@@ -386,7 +475,11 @@ async def delete_operator_config(key: str, request: Request):
     from tradingagents.execution.auto_authorization import mode_update_lock
 
     default = auto_modes.MODE_DEFAULTS.get(key, DEFAULT_CONFIG.get(key))
-    affected_modes = [mode for mode, mode_key in auto_modes.MODE_KEYS.items() if mode_key == key]
+    affected_modes = {mode for mode, mode_key in auto_modes.MODE_KEYS.items() if mode_key == key}
+    if key == "auto_spot_timeframe":
+        affected_modes.add(auto_modes.AutoMode.SPOT)
+    elif key == "auto_futures_timeframe":
+        affected_modes.add(auto_modes.AutoMode.FUTURES)
     with mode_update_lock(affected_modes):
         if key in auto_modes.MODE_DEFAULTS:
             reset = control_store.reset_operator_setting(key, default)
@@ -400,6 +493,10 @@ async def delete_operator_config(key: str, request: Request):
         from server import autoloop
 
         autoloop.sync_mode_state()
+    elif key in {"auto_spot_timeframe", "auto_futures_timeframe"}:
+        from server import autoloop
+
+        autoloop.wake_scheduler()
     settings_events.publish_change("operator_config_reset")
 
     audit_log.record(

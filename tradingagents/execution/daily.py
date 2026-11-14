@@ -86,6 +86,7 @@ class DailyResult(BaseModel):
     executed: bool = False
     order_id: str | None = None
     reason: str | None = None
+    candle_identity: dict[str, Any] | None = None
 
 
 def _today_iso() -> str:
@@ -203,10 +204,20 @@ def _handle_plan(
     portfolio: PortfolioContext,
     result: DailyResult,
     execute_guard: Callable[[Callable[[], Any]], Any] | None = None,
+    on_entry_evidence: Callable[[dict], None] | None = None,
+    check_entry_allowed: Callable[[], None] | None = None,
 ) -> None:
     """Apply the confirm policy to one plan, recording the outcome."""
     def execute() -> Any:
-        return bridge.execute_order(plan, confirm=True, portfolio=portfolio)
+        kwargs = {"confirm": True, "portfolio": portfolio}
+        if on_entry_evidence is not None:
+            kwargs["on_entry_evidence"] = on_entry_evidence
+        if check_entry_allowed is not None:
+            kwargs["check_entry_allowed"] = check_entry_allowed
+        order_id = bridge.execute_order(plan, **kwargs)
+        result.order_id = order_id
+        result.executed = True
+        return order_id
 
     def execute_once() -> Any:
         return execute_guard(execute) if execute_guard is not None else execute()
@@ -220,8 +231,7 @@ def _handle_plan(
         _wait_for_approval(bridge, plan, f"Auto {mode.name.title()} is disabled; plan awaits approval")
         result.reason = "awaiting approval"
         return
-    result.order_id = execute_once()
-    result.executed = True
+    execute_once()
 
 
 def _wait_for_approval(bridge: ExchangeBridge, plan: Any, reason: str) -> None:

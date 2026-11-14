@@ -183,7 +183,7 @@ function text(node) {
 function button(label) {
   return elements().find((node) => typeof node.props.onClick === "function" && text(node).includes(label));
 }
-function input() { return elements().find((node) => node.props.id === "autoloop-interval"); }
+function intervalInput() { return elements().find((node) => node.props && node.props.id === "autoloop-interval"); }
 function click(label) {
   const item = button(label);
   assert.ok(item, `missing button ${label}: ${text()}`);
@@ -194,9 +194,19 @@ const c = settings.autoloop;
 const { AutoloopCard, AutoloopHaltControl } = require(
   path.join(webRoot, "components/settings/autoloop-card.tsx")
 );
-const payload = (interval) => ({
-  generated_at: "2026-11-09T00:00:00Z", enabled: true, interval_minutes: interval,
-  running_cycle: false, modes: { auto_spot: true, auto_futures: false, any_auto_enabled: true },
+// The scan cadence is derived server-side from each mode's selected candle
+// timeframe; the card is read-only for scheduling (no interval input, no
+// apply button, no POST /api/autoloop from this card).
+const payload = () => ({
+  generated_at: "2026-11-09T00:00:00Z", enabled: true,
+  schedules: {
+    auto_spot: { enabled: true, timeframe: "15m",
+      next_due_at: "2026-11-09T00:15:00Z", last_dispatched_open: 1699487400000 },
+    auto_futures: { enabled: false, timeframe: null,
+      next_due_at: null, last_dispatched_open: null },
+  },
+  running_cycle: false,
+  modes: { auto_spot: true, auto_futures: false, any_auto_enabled: true },
   last_cycle: null,
 });
 
@@ -363,57 +373,17 @@ async function unavailableAfterPost() {
   unmount();
 }
 
-async function dirtyInterval() {
-  const dirty = [];
-  enqueue("GET /api/autoloop", response(payload(60)));
-  mount(AutoloopCard, { hideHalt: true, onDirtyChange: (value) => dirty.push(value) });
+async function scheduleDisplay() {
+  enqueue("GET /api/autoloop", response(payload()));
+  mount(AutoloopCard, { hideHalt: true });
   runTimeouts(0);
   await flush();
-  assert.equal(input().props.value, "60");
-  input().props.onChange({ target: { value: "90" } });
-  await flush();
-  assert.deepEqual(dirty, [true]);
-  enqueue("GET /api/autoloop", response(payload(30)));
-  runIntervals(30000);
-  await flush();
-  assert.equal(input().props.value, "90", "poll must not overwrite dirty draft");
-  input().props.onChange({ target: { value: "30" } });
-  await flush();
-  assert.deepEqual(dirty, [true, false]);
-
-  input().props.onChange({ target: { value: "90" } });
-  await flush();
-  const stale = deferred();
-  enqueue("GET /api/autoloop", stale.promise);
-  runIntervals(30000);
-  await flush();
-  enqueue("POST /api/autoloop", response(payload(90)));
-  click(c.apply);
-  await flush();
-  assert.deepEqual(dirty, [true, false, true, false]);
-  assert.equal(input().props.value, "90");
-  stale.resolve(response(payload(30)));
-  await flush();
-  assert.equal(input().props.value, "90", "old poll must not overwrite completed save");
-  assert.deepEqual(JSON.parse(requests.find((r) => r.method === "POST").body), {
-    enabled: true, interval_minutes: 90,
-  });
-  unmount();
-}
-
-async function draftMatchesServer() {
-  const dirty = [];
-  enqueue("GET /api/autoloop", response(payload(60)));
-  mount(AutoloopCard, { hideHalt: true, onDirtyChange: (value) => dirty.push(value) });
-  runTimeouts(0);
-  await flush();
-  input().props.onChange({ target: { value: "90" } });
-  await flush();
-  enqueue("GET /api/autoloop", response(payload(90)));
-  runIntervals(30000);
-  await flush();
-  assert.equal(input().props.value, "90");
-  assert.deepEqual(dirty, [true, false]);
+  // No manual interval control exists any more: the server derives the
+  // cadence from the selected candle timeframes.
+  assert.equal(intervalInput(), undefined, "no manual interval input");
+  assert.ok(text().includes(c.scheduleDue("15m", "2026-11-09T00:15:00Z", 1699487400000)));
+  assert.ok(text().includes(c.scheduleOff));
+  assert.ok(text().includes(c.schedulerDescription));
   unmount();
 }
 
@@ -429,7 +399,7 @@ async function schedulerFailure() {
 }
 
 async function schedulerState() {
-  const state = payload(60);
+  const state = payload();
   state.enabled = test.enabled;
   state.modes = {
     auto_spot: test.mode, auto_futures: false, any_auto_enabled: test.mode,
@@ -442,25 +412,22 @@ async function schedulerState() {
   assert.ok(text().includes(test.enabled ? c.schedulerEnabled : c.schedulerInactive));
   assert.ok(text().includes(c.schedulerDescription));
   assert.equal(text().includes(c.description), false);
-  assert.equal(text().includes(c.enabledFeedback(60)), false);
-  assert.equal(button(c.apply).props.disabled, test.mode && !test.enabled);
+  assert.equal(intervalInput(), undefined);
   assert.equal(button(c.runNow).props.disabled, !test.mode);
+  // Retry shows when a mode is armed but the scheduler state is unknown.
   assert.equal(Boolean(button("Retry")), test.mode && !test.enabled);
   assert.equal(requests.filter((r) => r.method === "POST").length, 0);
   unmount();
 }
 
 async function staleScheduler() {
-  const dirty = [];
-  const initial = payload(60);
+  const initial = payload();
   initial.last_cycle = { started_at: "2026-11-09T00:00:00Z", finished_at: null,
     status: "running", reason: null, error: null, candidates: [], results: [] };
   initial.running_cycle = true;
   enqueue("GET /api/autoloop", response(initial));
-  mount(AutoloopCard, { hideHalt: true, onDirtyChange: (value) => dirty.push(value) });
+  mount(AutoloopCard, { hideHalt: true });
   runTimeouts(0);
-  await flush();
-  input().props.onChange({ target: { value: "90" } });
   await flush();
   enqueue("GET /api/autoloop", new Error("offline"));
   runIntervals(5000);
@@ -470,51 +437,18 @@ async function staleScheduler() {
   assert.equal(text().includes(c.modeAvailable), false);
   assert.equal(text().includes(c.lastCycle), false);
   assert.equal(text().includes(c.schedulerEnabled), false);
-  assert.equal(input().props.value, "90");
-  assert.equal(button(c.apply).props.disabled, true);
   assert.equal(button(c.runNow).props.disabled, true);
-  input().props.onChange({ target: { value: "60" } });
-  await flush();
-  assert.deepEqual(dirty, [true], "a stale snapshot cannot mark a draft clean");
-  input().props.onChange({ target: { value: "90" } });
-  await flush();
-  assert.deepEqual(dirty, [true]);
+  assert.equal(intervalInput(), undefined, "stale state still shows no interval input");
   assert.equal(requests.filter((r) => r.method === "POST").length, 0);
   enqueue("GET /api/autoloop", new Error("offline again"));
   click("Retry");
   await flush();
   assert.ok(text().includes(c.statusStale));
-  assert.equal(input().props.value, "90");
-  enqueue("GET /api/autoloop", response(payload(30)));
+  enqueue("GET /api/autoloop", response(payload()));
   click("Retry");
   await flush();
   assert.equal(text().includes(c.statusStale), false);
   assert.ok(text().includes(c.schedulerEnabled));
-  assert.equal(input().props.value, "90");
-  assert.equal(button(c.apply).props.disabled, false);
-  assert.deepEqual(dirty, [true]);
-  assert.equal(requests.filter((r) => r.method === "POST").length, 0);
-  unmount();
-}
-
-async function saveReturnsInactive() {
-  enqueue("GET /api/autoloop", response(payload(60)));
-  mount(AutoloopCard, { hideHalt: true });
-  runTimeouts(0);
-  await flush();
-  const inactive = payload(90);
-  inactive.enabled = false;
-  enqueue("POST /api/autoloop", response(inactive));
-  input().props.onChange({ target: { value: "90" } });
-  await flush();
-  click(c.apply);
-  await flush();
-  assert.ok(text().includes(c.intervalSaved));
-  assert.ok(text().includes(c.schedulerInactive));
-  assert.equal(text().includes(c.enabledFeedback(90)), false);
-  assert.deepEqual(JSON.parse(requests.find((r) => r.method === "POST").body), {
-    enabled: true, interval_minutes: 90,
-  });
   unmount();
 }
 
@@ -530,7 +464,7 @@ async function fallbackCopy() {
 }
 
 async function fallbackRunCopy() {
-  enqueue("GET /api/autoloop", response(payload(60)));
+  enqueue("GET /api/autoloop", response(payload()));
   mount(AutoloopCard, { hideHalt: true });
   runTimeouts(0);
   await flush();
@@ -543,7 +477,7 @@ async function fallbackRunCopy() {
 }
 
 async function runNowCopy() {
-  enqueue("GET /api/autoloop", response(payload(60)));
+  enqueue("GET /api/autoloop", response(payload()));
   mount(AutoloopCard, { hideHalt: true });
   runTimeouts(0);
   await flush();
@@ -565,12 +499,10 @@ async function runNowCopy() {
   else if (test.scenario === "health-transitions") await healthRefreshTransitions();
   else if (test.scenario === "reset-refresh") await resetRequiresFreshHealth();
   else if (test.scenario === "health-after-post") await unavailableAfterPost();
-  else if (test.scenario === "dirty") await dirtyInterval();
-  else if (test.scenario === "draft-matches-server") await draftMatchesServer();
+  else if (test.scenario === "schedule-display") await scheduleDisplay();
   else if (test.scenario === "scheduler-error") await schedulerFailure();
   else if (test.scenario === "scheduler-state") await schedulerState();
   else if (test.scenario === "scheduler-stale") await staleScheduler();
-  else if (test.scenario === "save-inactive") await saveReturnsInactive();
   else if (test.scenario === "fallback-copy") await fallbackCopy();
   else if (test.scenario === "fallback-run-copy") await fallbackRunCopy();
   else if (test.scenario === "run-now-copy") await runNowCopy();
@@ -637,12 +569,8 @@ def test_stop_remains_available_while_health_refresh_waits():
     _run_node({"scenario": "health-after-post"})
 
 
-def test_interval_dirty_polling_and_inflight_save():
-    _run_node({"scenario": "dirty"})
-
-
-def test_interval_draft_becomes_clean_when_server_matches():
-    _run_node({"scenario": "draft-matches-server"})
+def test_schedule_display_shows_derived_cadence_without_interval_input():
+    _run_node({"scenario": "schedule-display"})
 
 
 def test_scheduler_failure_does_not_remove_stop_control():
@@ -654,12 +582,8 @@ def test_scheduler_status_is_independent_from_modes(enabled, mode):
     _run_node({"scenario": "scheduler-state", "enabled": enabled, "mode": mode})
 
 
-def test_stale_scheduler_can_retry_without_losing_draft_or_posting():
+def test_stale_scheduler_can_retry_without_losing_state_or_posting():
     _run_node({"scenario": "scheduler-stale"})
-
-
-def test_save_response_does_not_claim_scheduler_is_enabled():
-    _run_node({"scenario": "save-inactive"})
 
 
 @pytest.mark.parametrize("locale", ["en", "vi"])
