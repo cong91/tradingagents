@@ -1,15 +1,15 @@
 # Debug: Futures budget sizing and post-fill safety
 
 **Opened:** 2026-11-14
-**Status:** fixing
+**Status:** fixed
 **Reporter:** self-detected through local review
 
 ## Symptoms
 
-- [ ] Venue contract metadata is not carried into the planned order/live amount contract.
-- [ ] Live post-fill safety can use stale equity and can close unresolved partial/unknown entries.
-- [ ] A global 1% per-entry cap was added during review but is not part of the approved sizing contract.
-- [ ] Simulation fill-time behavior can diverge from live fill-time safety.
+- [x] Venue contract metadata is not carried into the planned order/live amount contract.
+- [x] Live post-fill safety can use stale equity and can close unresolved partial/unknown entries.
+- [x] A global 1% per-entry cap was added during review but is not part of the approved sizing contract.
+- [x] Simulation fill-time behavior can diverge from live fill-time safety.
 
 ## Eliminated Hypotheses
 
@@ -39,6 +39,6 @@ The safe contract requires a single explicit unit boundary: budget notional is b
 
 ## Resolution
 
-**Root Cause:** pending.
-**Fix:** pending.
-**Date:** pending.
+**Root Cause:** sizing and protection used one implicit unit (base quantity) while the venue trades contracts, so non-unit contracts mis-sized; the post-fill path acted before full fill identity and before a fresh flat read existed.
+**Fix:** `FuturesContractSpec` validates linear metadata; preflight rounds contracts/prices and re-validates bracket and liquidation geometry before mutation; partial/unknown entries stay unresolved without protection or safety close; closes require exact order identity, amount, fill and a fresh account-wide flat read before legs are cancelled. The unapproved global 1% entry cap was removed.
+**Date:** 2026-11-15 (workflow `dwfrun-b993a272-231a-4dac-aca8-069719db10bc`)
