@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ _ROOT = Path(__file__).parents[1]
 _COMPOSE = _ROOT / "tests" / "postgres-compose.yml"
 _PROJECT = f"ta-migration-test-{os.getpid()}"
 _SERVICE = "postgres-test"
+_HOST_PORT: int | None = None
 
 
 def _docker_available() -> bool:
@@ -35,6 +37,29 @@ def _docker_available() -> bool:
     return result.returncode == 0
 
 
+def _free_host_port() -> int:
+    """Pick an unused host port below the OS ephemeral ranges.
+
+    A listener inside the ephemeral range collides with the source port the OS
+    hands a client, which fails connects with WSAEADDRINUSE/EADDRINUSE.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        for candidate in range(15433, 32000):
+            try:
+                probe.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            return candidate
+    raise RuntimeError("no free host port below the ephemeral range")
+
+
+def _compose_env() -> dict[str, str]:
+    global _HOST_PORT
+    if _HOST_PORT is None:
+        _HOST_PORT = _free_host_port()
+    return {**os.environ, "TRADINGAGENTS_TEST_PG_PORT": str(_HOST_PORT)}
+
+
 def _dsn() -> str:
     result = subprocess.run(
         ["docker", "compose", "-p", _PROJECT, "-f", str(_COMPOSE), "port", _SERVICE, "5432"],
@@ -42,6 +67,7 @@ def _dsn() -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=_compose_env(),
     )
     address, port = result.stdout.strip().rsplit(":", 1)
     host = address.strip("[]")
@@ -58,6 +84,7 @@ def postgres_dsn():
         cwd=_ROOT,
         check=True,
         timeout=180,
+        env=_compose_env(),
     )
     dsn = _dsn()
     try:
@@ -77,6 +104,7 @@ def postgres_dsn():
             cwd=_ROOT,
             check=True,
             timeout=60,
+            env=_compose_env(),
         )
 
 

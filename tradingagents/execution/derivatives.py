@@ -735,6 +735,16 @@ class DerivativesExecutor:
                 confirmed=confirm, phase="execute",
             )
             raise PermissionError(f"futures contract metadata/preflight refused: {exc}") from exc
+        except ccxt.BaseError as exc:
+            # Venue reads inside the preflight (markets, precision, open orders) can fail
+            # before any mutation; keep the refusal on the audit trail like every other
+            # denial instead of letting the error escape unaudited.
+            self._bridge.audit_plan(
+                order, action="derivatives_denied",
+                reason=f"futures venue preflight refused: {exc}",
+                confirmed=confirm, phase="execute",
+            )
+            raise PermissionError(f"futures venue preflight refused: {exc}") from exc
         intent_leg = entry_journal_leg(
             order, entry_client_id, quantity=str(order.quantity),
             contracts=amount, created_at=created_at,

@@ -623,7 +623,7 @@ def test_open_position_reconciles_normal_ack_audit_and_preserves_existing_state(
 
 def test_open_position_requires_unique_correlated_audit_and_resting_bracket(tmp_path, monkeypatch):
     position = FuturesPosition(
-        symbol=SYMBOL, side="long", contracts=QUANTITY, quantity=QUANTITY,
+        symbol=SYMBOL, side="long", contracts=QUANTITY, quantity=0.02,
         entry_price=ENTRY_PRICE, mark_price=ENTRY_PRICE,
     )
     exchange, bridge = _setup(tmp_path, monkeypatch, position=position)
@@ -642,7 +642,11 @@ def test_open_position_requires_unique_correlated_audit_and_resting_bracket(tmp_
     position_key = f"{SYMBOL}:buy:{ORDER_ID}"
     state = job_store.load_position_state(position_key)
     assert state["snapshot"]["entry"] == ENTRY_PRICE
-    assert state["snapshot"]["quantity"] == QUANTITY
+    assert state["snapshot"]["quantity"] == pytest.approx(0.02)
+    assert state["snapshot"]["quantity_unit"] == "base"
+    assert state["snapshot"]["contracts"] == pytest.approx(QUANTITY)
+    assert state["snapshot"]["contract_unit"] == "contracts"
+    assert state["snapshot"]["contract_size"] == pytest.approx(0.01)
     assert state["snapshot"]["initial_stop"] == STOP
     assert state["snapshot"]["targets"] == [TARGET]
     assert state["snapshot"]["opened_at"] == datetime.fromtimestamp(

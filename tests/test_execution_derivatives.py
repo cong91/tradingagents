@@ -674,6 +674,31 @@ def test_fresh_book_refusal_names_the_underlying_cause(tmp_path, monkeypatch):
 
 
 @pytest.mark.usefixtures("enable_auto_futures")
+def test_locked_venue_preflight_error_is_audited_as_denial(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+
+    def fail_market_read():
+        raise ccxt.NetworkError("market metadata unavailable")
+
+    monkeypatch.setattr(exchange, "load_markets", fail_market_read)
+    with pytest.raises(PermissionError, match="futures venue preflight refused"):
+        executor.execute_order(order, confirm=True, portfolio=book)
+
+    denied = [event for event in read_audit(tmp_path) if event["action"] == "derivatives_denied"]
+    assert denied[-1]["reason"] == "futures venue preflight refused: market metadata unavailable"
+    mutation_calls = {"set_margin_mode", "set_leverage", "create_order"}
+    assert not [call for call in exchange.calls if call[0] in mutation_calls]
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
 def test_live_entry_in_hedge_mode_is_refused_before_any_send(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(hedged=True)
     executor = make_executor(

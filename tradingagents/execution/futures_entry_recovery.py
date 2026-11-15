@@ -927,11 +927,24 @@ def _state_payload(
     mark = _positive(getattr(position, "mark_price", None))
     if mark is None:
         raise _Rollback("position mark is unavailable")
+    # ``entry.filled`` is the venue fill in contracts. The durable snapshot keeps the
+    # contract-size-aware base size (funding and risk arithmetic) next to the venue units.
+    base_quantity = _positive(abs(_decimal(getattr(position, "quantity", None)) or Decimal(0)))
+    contracts = _positive(entry.filled)
+    if base_quantity is None or contracts is None:
+        raise _Rollback("position base quantity is unavailable")
+    contract_size = base_quantity / contracts
+    if not math.isfinite(float(contract_size)) or contract_size <= 0:
+        raise _Rollback("position contract size is unavailable")
     snapshot = {
         "position_key": position_key,
         "side": "long" if entry_side == "buy" else "short",
         "entry": float(entry.average),
-        "quantity": float(entry.filled),
+        "quantity": float(base_quantity),
+        "quantity_unit": "base",
+        "contracts": float(contracts),
+        "contract_unit": "contracts",
+        "contract_size": float(contract_size),
         "stop": float(stop),
         "targets": list(targets),
         "mark": float(mark),
