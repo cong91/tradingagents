@@ -49,10 +49,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle, fetch_closed_candles
+from tradingagents.forecast.artifact import MIN_LOOKBACK_BARS
 from tradingagents.forecast.block import CandleSeries, ForecastBlock
 from tradingagents.forecast.contract import (
     GENERATION_RETROSPECTIVE,
@@ -77,6 +80,7 @@ def settings_for(config: dict[str, Any]) -> ForecastSettings:
 
 def history_for(
     exchange: Any, symbol: str, settings: ForecastSettings, *, as_of: datetime,
+    minimum_bars: int | None = None,
 ) -> tuple[Candle, ...]:
     """Closed candles for one symbol, cut at ``as_of``, same venue reader.
 
@@ -91,7 +95,7 @@ def history_for(
     """
     candles = fetch_closed_candles(
         exchange, symbol, settings.timeframe, as_of=as_of,
-        limit=settings.lookback_bars,
+        limit=settings.lookback_bars, minimum_bars=minimum_bars,
     )
     return tuple(candles)
 
@@ -116,15 +120,12 @@ def forecast_for_cycle(
     settings = settings_for(config)
     started = time.perf_counter()
     owned = service is None
-    if owned:
-        budget = None if deadline is None else deadline - time.monotonic()
-        if budget is not None and budget <= 0:
-            logger.info("kronos active: cycle budget spent before inference for %s", symbol)
-            return ForecastBlock(
-                symbol=symbol, status=STATUS_UNAVAILABLE,
-                reason="the cycle deadline was already reached; no inference was started",
-            )
-        service = KronosForecastService.from_config(config, chunk_deadline_seconds=budget)
+    if owned and deadline is not None and deadline - time.monotonic() <= 0:
+        logger.info("kronos active: cycle budget spent before inference for %s", symbol)
+        return ForecastBlock(
+            symbol=symbol, status=STATUS_UNAVAILABLE,
+            reason="the cycle deadline was already reached; no inference was started",
+        )
     try:
         if cancelled is not None and cancelled.is_set():
             return ForecastBlock(
@@ -132,12 +133,15 @@ def forecast_for_cycle(
                 reason="the cycle was cancelled before inference",
             )
         try:
-            candles = history_for(exchange, symbol, settings, as_of=as_of)
+            candles = history_for(
+                exchange, symbol, settings, as_of=as_of,
+                minimum_bars=MIN_LOOKBACK_BARS,
+            )
         except Exception as exc:  # a history read failure is a status, never a crash
             logger.info("kronos active: history read failed for %s (%r)", symbol, exc)
             return ForecastBlock(
                 symbol=symbol,
-                status="unavailable",
+                status=STATUS_UNAVAILABLE,
                 reason=f"closed {settings.timeframe} history could not be read: {exc}",
             )
         if expected_candle is not None and (not candles or candles[-1] != expected_candle):
@@ -145,27 +149,40 @@ def forecast_for_cycle(
                 symbol=symbol, status=STATUS_UNAVAILABLE,
                 reason="forecast history differs from the selected cycle candle",
             )
-        series = CandleSeries(
-            symbol=symbol, candles=candles,
-            as_of=as_of,
-        )
+        if not candles:
+            return ForecastBlock(
+                symbol=symbol, status=STATUS_UNAVAILABLE,
+                reason="closed forecast history is empty",
+            )
+        first_realized_close = datetime.fromtimestamp(
+            candles[-1].close_time / 1000, UTC,
+        ) + timedelta(milliseconds=timeframe_ms(settings.timeframe))
+        if datetime.now(UTC) >= first_realized_close:
+            return ForecastBlock(
+                symbol=symbol,
+                status=STATUS_UNAVAILABLE,
+                reason=(
+                    "the selected candle's first predicted bar already closed before "
+                    "inference started; the forecast would be retrospective"
+                ),
+            )
+        series = CandleSeries(symbol=symbol, candles=candles, as_of=as_of)
         if cancelled is not None and cancelled.is_set():
             return ForecastBlock(
                 symbol=symbol, status=STATUS_UNAVAILABLE,
                 reason="the cycle was cancelled after history was read; no inference was started",
             )
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return ForecastBlock(
-                    symbol=symbol, status=STATUS_UNAVAILABLE,
-                    reason="the cycle deadline was reached after history was read; no inference was started",
-                )
-            if owned:
-                service.close()
-                service = KronosForecastService.from_config(
-                    config, chunk_deadline_seconds=remaining,
-                )
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return ForecastBlock(
+                symbol=symbol, status=STATUS_UNAVAILABLE,
+                reason="the cycle deadline was reached after history was read; no inference was started",
+            )
+        if owned:
+            service = KronosForecastService.from_config(
+                config, chunk_deadline_seconds=remaining,
+                lookback_bars=len(candles),
+            )
         seed = stable_seed(cycle_id, "kronos_active")
         block = service.forecast(series, seed=seed)
         block = _out_of_active_decisions(block, symbol)
@@ -176,7 +193,7 @@ def forecast_for_cycle(
         )
         return block
     finally:
-        if owned:
+        if owned and service is not None:
             service.close()
 
 
@@ -206,8 +223,6 @@ def _with_latency(block: ForecastBlock, measured_ms: float) -> ForecastBlock:
     the interpreter's cold start under scoped ownership — there is no warm
     child to exclude, and a cached hit still paid the history read.
     """
-    from dataclasses import replace
-
     return replace(block, latency_ms=measured_ms)
 
 

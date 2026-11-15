@@ -199,6 +199,43 @@ def test_insufficient_closed_history_is_rejected():
         fetch_closed_candles(exchange, "BTC/USDT:USDT", "1h", as_of=_AS_OF, limit=4)
 
 
+def test_paginated_shortfall_is_accepted_when_minimum_is_met():
+    exchange = _pages_exchange([
+        [_row(4), _row(5)],
+        [_row(6)],
+    ], cap=2)
+
+    candles = fetch_closed_candles(
+        exchange, "BTC/USDT:USDT", "1h", as_of=_AS_OF,
+        limit=4, minimum_bars=2,
+    )
+
+    assert [candle.open_time for candle in candles] == [
+        index * _DURATION for index in (4, 5, 6)
+    ]
+
+
+def test_paginated_shortfall_below_minimum_is_rejected():
+    exchange = _pages_exchange([[_row(4), _row(5)]], cap=2)
+
+    with pytest.raises(ClosedCandlePaginationError, match="minimum 3"):
+        fetch_closed_candles(
+            exchange, "BTC/USDT:USDT", "1h", as_of=_AS_OF,
+            limit=4, minimum_bars=3,
+        )
+
+
+def test_single_page_shortfall_uses_explicit_minimum():
+    exchange = _pages_exchange([[_row(6), _row(7)]], cap=10)
+
+    candles = fetch_closed_candles(
+        exchange, "BTC/USDT:USDT", "1h", as_of=_AS_OF,
+        limit=4, minimum_bars=2,
+    )
+
+    assert [candle.open_time for candle in candles] == [6 * _DURATION, 7 * _DURATION]
+
+
 def test_kronos_context_history_uses_paginated_closed_candles():
     exchange = _pages_exchange([
         [_row(4), _row(5)],

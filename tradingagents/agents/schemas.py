@@ -133,7 +133,12 @@ class FuturesExecutionProposal(BaseModel):
     )
     entry_price: float | None = Field(
         default=None,
-        description="Preferred entry price in quote currency; omit when the setup has no defensible entry level.",
+        description=(
+            "Optional market-entry anchor in quote currency. The autoloop submits a MARKET "
+            "order at the live mark, so omit this field unless it matches the mark shown in "
+            "the context; never use a pullback or limit price. If the setup only works at a "
+            "non-market level, do not authorize this entry."
+        ),
     )
     stop_loss: float | None = Field(
         default=None,

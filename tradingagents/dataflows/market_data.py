@@ -162,6 +162,7 @@ def _single_closed_candles(
     cutoff: int,
     duration: int,
     limit: int,
+    minimum_bars: int | None = None,
 ) -> list[Candle]:
     closed_cutoff = cutoff - cutoff % duration
     query_since = max(0, closed_cutoff - duration * limit)
@@ -180,7 +181,12 @@ def _single_closed_candles(
             if candles and parsed[0] != candles[-1].open_time + duration:
                 raise ClosedCandlePaginationError("closed candle sequence contains a gap, duplicate or disorder")
             candles.append(parsed[1])
-    return candles
+    if minimum_bars is not None and len(candles) < minimum_bars:
+        raise ClosedCandlePaginationError(
+            f"insufficient closed candle history: received {len(candles)}, "
+            f"minimum {minimum_bars}"
+        )
+    return candles[-limit:]
 
 
 def _paginated_closed_candles(
@@ -192,6 +198,7 @@ def _paginated_closed_candles(
     duration: int,
     limit: int,
     venue_limit: int,
+    minimum_bars: int | None = None,
 ) -> list[Candle]:
     closed_cutoff = cutoff - cutoff % duration
     query_since = max(0, closed_cutoff - duration * limit)
@@ -266,32 +273,42 @@ def _paginated_closed_candles(
             raise ClosedCandlePaginationError(
                 f"candle gap: expected open_time {expected}, got {current.open_time}"
             )
-    if len(candles) < limit:
+    if len(candles) < limit and (minimum_bars is None or len(candles) < minimum_bars):
+        required = minimum_bars if minimum_bars is not None else limit
         raise ClosedCandlePaginationError(
-            f"insufficient closed candle history: received {len(candles)}, requested {limit}"
+            f"insufficient closed candle history: received {len(candles)}, "
+            f"requested {limit}, minimum {required}"
         )
-    candles = candles[-limit:]
-    return candles
+    return candles[-limit:]
 
 
 def fetch_closed_candles(exchange: Any, symbol: str, timeframe: str,
-                         *, as_of: datetime, limit: int = 100) -> list[Candle]:
+                         *, as_of: datetime, limit: int = 100,
+                         minimum_bars: int | None = None) -> list[Candle]:
     """Fetch only candles fully closed at ``as_of``; never use the forming bar."""
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("as_of must be timezone-aware")
     if limit < 1:
         raise ValueError("limit must be positive")
+    if minimum_bars is not None and (
+        isinstance(minimum_bars, bool)
+        or not isinstance(minimum_bars, int)
+        or minimum_bars < 1
+        or minimum_bars > limit
+    ):
+        raise ValueError("minimum_bars must be an integer in [1, limit]")
     cutoff = int(as_of.astimezone(UTC).timestamp() * 1000)
     duration = timeframe_ms(timeframe)
     venue_limit = _venue_ohlcv_limit(exchange, timeframe, symbol)
     if venue_limit is None or limit <= venue_limit:
         return _single_closed_candles(
             exchange, symbol, timeframe, as_of=as_of, cutoff=cutoff,
-            duration=duration, limit=limit,
+            duration=duration, limit=limit, minimum_bars=minimum_bars,
         )
+
     return _paginated_closed_candles(
         exchange, symbol, timeframe, cutoff=cutoff, duration=duration,
-        limit=limit, venue_limit=venue_limit,
+        limit=limit, venue_limit=venue_limit, minimum_bars=minimum_bars,
     )
 
 

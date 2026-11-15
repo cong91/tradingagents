@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -145,6 +146,9 @@ class KronosForecastService:
         )
 
         settings = settings_from_config(config)
+        lookback_bars = kwargs.pop("lookback_bars", None)
+        if lookback_bars is not None:
+            settings = replace(settings, lookback_bars=lookback_bars)
         source_dir, model_dir = isolated_source_dir(), isolated_model_dir()
         try:
             profile_for(settings.profile)

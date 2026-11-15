@@ -217,10 +217,13 @@ def render_futures_decision_context(
         "venue-specific liquidation data must be treated as a risk factor.",
         "A FuturesExecutionProposal is required for any entry: margin mode, leverage, "
         "budget_fraction, and an evidence-based rationale. Without one no order is "
-        "placed. If a proposal omits its stop and take-profit (they are proposed "
-        "together), the engine ATR bracket substitutes for those two protective "
-        "levels only and is revalidated; margin mode, leverage, and the budget "
-        "allocation are never substituted — a proposal missing them is refused.",
+        "placed. The autoloop submits a MARKET entry at the live mark: entry_price is "
+        "only an optional anchor for the mark shown in context, so omit it unless it "
+        "matches that mark; a pullback or limit price is unsupported and a setup that "
+        "requires one must not authorize this entry. If a proposal omits its stop and "
+        "take-profit (they are proposed together), the engine ATR bracket substitutes "
+        "for those two protective levels only and is revalidated; margin mode, leverage, "
+        "and the budget allocation are never substituted — a proposal missing them is refused.",
         "",
         "SIZING IS YOUR DECISION. budget_fraction is the share of the TOTAL budget "
         "(the futures equity above) this trade's notional value takes: notional = "
@@ -234,7 +237,9 @@ def render_futures_decision_context(
         "1. Setup direction: the closed 1h and 4h candles above must both confirm the "
         "rating's direction (Buy/Overweight long, Sell/Underweight short); a doji or a "
         "mismatch means the direction fails.",
-        "2. Executable bracket: propose entry/stop/target at prices consistent with the "
+        "2. Executable bracket: the entry is a MARKET order at the live mark; if you "
+        "provide entry_price it is only an anchor for the mark shown above, never a "
+        "pullback or limit level. Propose stop/target at prices consistent with the "
         "mark price and the engine ATR brackets above, stop on the invalidation side; "
         "if the brackets above are unavailable, propose your own stop and take-profit "
         "together (without both protective levels no order is placed) and treat the "

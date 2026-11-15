@@ -598,6 +598,34 @@ def test_from_config_records_the_verified_digest_when_artifacts_match(monkeypatc
     assert service.venue == "binance"
 
 
+def test_from_config_applies_effective_lookback_override(monkeypatch, tmp_path):
+    from tradingagents.forecast import artifact as artifact_module
+    from tradingagents.forecast.service import KronosForecastService
+
+    monkeypatch.setattr(artifact_module, "isolated_python", lambda: Path(sys.executable))
+    monkeypatch.setattr(artifact_module, "isolated_source_dir", lambda: tmp_path / "src")
+    monkeypatch.setattr(artifact_module, "isolated_model_dir", lambda: tmp_path / "models")
+    monkeypatch.setattr(
+        artifact_module,
+        "verify_artifacts",
+        lambda _source, _model, _profile: (
+            None,
+            {**artifact_module.PINNED_SOURCE_HASHES, **artifact_module.PINNED_WEIGHT_HASHES},
+        ),
+    )
+
+    service = KronosForecastService.from_config(
+        {"kronos_active_profile": "mini_2k"}, lookback_bars=201,
+    )
+    try:
+        assert service.settings.profile == "mini_2k"
+        assert service.settings.lookback_bars == 201
+        assert service._sampler is not None
+        assert service._sampler.settings.profile == "mini_2k"
+    finally:
+        service.close()
+
+
 # -- settings bounds -----------------------------------------------------------
 
 

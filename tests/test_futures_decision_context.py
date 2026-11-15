@@ -376,6 +376,8 @@ def test_decision_context_states_symmetric_enter_criteria_and_hard_limits():
     assert "instead of defaulting to abstain" in context
     # The proposal-required contract stays intact.
     assert "A FuturesExecutionProposal is required for any entry" in context
+    assert "MARKET entry at the live mark" in context
+    assert "never a pullback or limit level" in context
     assert "no order is placed" in context
 
 

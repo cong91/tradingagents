@@ -199,7 +199,12 @@ def test_portfolio_manager_surfaces_explicit_enter_with_complete_terms():
     prompt = str(structured.invoke.call_args.args[0])
     assert "fixed 1% of equity" not in prompt
     assert "budget_fraction, leverage, and margin mode" in prompt
+    assert "MARKET entry at the live mark" in prompt
+    assert "never propose a pullback or limit price" in prompt
     assert "Futures equity: 1000 USDT" in prompt
+    entry_description = FuturesExecutionProposal.model_json_schema()["properties"]["entry_price"]["description"]
+    assert "MARKET" in entry_description
+    assert "pullback or limit price" in entry_description
 
 
 @pytest.mark.unit
@@ -652,6 +657,8 @@ class TestTraderAgent:
         assert "Futures equity: 1000 USDT" in user
         assert "ATR: 3.2%" in user
         assert "propose margin mode, leverage, and budget_fraction" in system
+        assert "MARKET order at the live mark" in system
+        assert "never propose a pullback or limit price" in system
 
     def test_empty_market_report_omits_the_section_and_grounding(self):
         # #1167: when the market analyst wasn't selected the report is empty, so

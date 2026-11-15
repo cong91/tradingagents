@@ -10,8 +10,9 @@ import pytest
 
 from tests.test_forecast_sampler import _write_stub
 from tradingagents.dataflows.market_data import Candle
+from tradingagents.forecast.artifact import MIN_LOOKBACK_BARS
 from tradingagents.forecast.block import CandleSeries
-from tradingagents.forecast.sampler import KronosSampler
+from tradingagents.forecast.sampler import KronosSampler, SampledSymbol
 from tradingagents.forecast.service import KronosForecastService
 from tradingagents.forecast.settings import ForecastSettings
 
@@ -80,6 +81,44 @@ def test_mini_2k_payload_keeps_2048_candles_and_six_bar_horizon(tmp_path, monkey
     assert payload["requests"][0]["symbol"] == _SYMBOL
     assert payload["requests"][0]["candles"] == expected_rows
     assert len(payload["requests"][0]["candles"]) == 2048
+
+
+@pytest.mark.parametrize("count", [MIN_LOOKBACK_BARS, 201, 2047, 2048])
+def test_mini_2k_service_forecasts_any_contiguous_context_within_profile(count):
+    candles = _candles(count=count)
+    as_of = datetime.fromtimestamp(candles[-1].close_time / 1000, UTC)
+    settings = ForecastSettings(
+        profile="mini_2k", lookback_bars=count,
+        timeframe="4h", horizon_hours=24,
+    )
+
+    class _RecordingSampler:
+        def __init__(self):
+            self.requests = []
+
+        def sample(self, requests):
+            self.requests.extend(requests)
+            symbol, _timeframe, horizon_hours, history, _seed = requests[0]
+            horizon = int(horizon_hours * 60 / 240)
+            closes = [history[-1].close] * horizon
+            paths = tuple({
+                "opens": closes,
+                "highs": [value + 1.0 for value in closes],
+                "lows": [value - 1.0 for value in closes],
+                "closes": closes,
+                "seed": index,
+            } for index in range(16))
+            return [SampledSymbol(symbol=symbol, status="ok", paths=paths)]
+
+    sampler = _RecordingSampler()
+    service = KronosForecastService(
+        sampler=sampler, settings=settings, artifact_hash="a" * 64, created_at=as_of,
+    )
+    block = service.forecast(CandleSeries(symbol=_SYMBOL, candles=candles, as_of=as_of), seed=7)
+
+    assert block.status == "ok", block.reason
+    assert len(sampler.requests) == 1
+    assert len(sampler.requests[0][3]) == count
 
 
 @pytest.mark.parametrize(

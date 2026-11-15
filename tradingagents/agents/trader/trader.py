@@ -69,7 +69,11 @@ def create_trader(llm):
                     + (
                         "For crypto futures, propose margin mode, leverage, and budget_fraction "
                         "(the share of the TOTAL futures budget this trade's notional takes) in a "
-                        "FuturesExecutionProposal, plus entry/stop/take-profit. You own the sizing "
+                        "FuturesExecutionProposal, plus an optional market-entry anchor, "
+                        "stop, and take-profit. The autoloop submits a MARKET order at the live "
+                        "mark: omit entry_price unless it matches the mark shown in context, "
+                        "never propose a pullback or limit price, and omit the proposal if the "
+                        "setup only works at a non-market level. You own the sizing "
                         "decision: optimize the allocation from the current account, volatility, "
                         "stop distance, funding, and reward/risk — there is no preset allocation. "
                         "The execution layer enforces only the account-level safety limits the "

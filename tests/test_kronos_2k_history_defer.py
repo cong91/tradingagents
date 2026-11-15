@@ -1,7 +1,8 @@
-"""Incomplete mini/2k history must defer a futures candidate before the LLM."""
+"""Invalid mini/2k history must defer a futures candidate before the LLM."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -24,13 +25,8 @@ pytestmark = pytest.mark.unit
 _FOUR_HOUR_MS = 14_400_000
 
 
-@pytest.mark.parametrize(
-    ("history_shape", "expected_reason"),
-    [("missing", "received 2047, requested 2048"), ("gap", "candle gap")],
-)
-def test_missing_or_gap_history_defers_candidate_before_graph_and_llm(
-    monkeypatch, history_shape, expected_reason,
-):
+def test_gap_history_defers_candidate_before_graph_and_llm(monkeypatch):
+    expected_reason = "candle gap"
     graph_builds: list[str] = []
 
     def _graph_builder(*_args, **_kwargs):
@@ -40,10 +36,7 @@ def test_missing_or_gap_history_defers_candidate_before_graph_and_llm(
     step = _FOUR_HOUR_MS
     four_hour_open = 1_800_000_000_000 - (1_800_000_000_000 % step) - step
     opens = [four_hour_open - step * (2047 - index) for index in range(2048)]
-    if history_shape == "missing":
-        opens = opens[-2047:]
-    else:
-        del opens[20]
+    del opens[20]
     rows = [[open_time, 100.0, 101.0, 99.0, 100.0, 10.0] for open_time in opens]
 
     class _HistoryVenue:
@@ -75,9 +68,12 @@ def test_missing_or_gap_history_defers_candidate_before_graph_and_llm(
     venue = _HistoryVenue()
     sampler = _Sampler()
 
-    def _service_from_config(cls, config, **_kwargs):
+    def _service_from_config(cls, config, **kwargs):
+        settings = settings_from_config(config)
+        if "lookback_bars" in kwargs:
+            settings = replace(settings, lookback_bars=kwargs["lookback_bars"])
         return KronosForecastService(
-            sampler=sampler, settings=settings_from_config(config), artifact_hash="a" * 64,
+            sampler=sampler, settings=settings, artifact_hash="a" * 64,
         )
 
     monkeypatch.setattr(

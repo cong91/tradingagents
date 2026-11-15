@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -59,9 +59,11 @@ class _OwnedService:
         self.block = block
         self.raises = raises
         self.closed = False
+        self.forecast_calls = 0
         self.settings = ForecastSettings(lookback_bars=96)
 
     def forecast(self, series: CandleSeries, *, seed: int) -> ForecastBlock:
+        self.forecast_calls += 1
         if self.raises is not None:
             raise self.raises
         return self.block
@@ -70,8 +72,12 @@ class _OwnedService:
         self.closed = True
 
 
-def _candles(count: int = 40, step: int = _FOUR_HOUR_MS) -> tuple[Candle, ...]:
-    last = 1_800_000_000_000 - (1_800_000_000_000 % step)
+def _candles(
+    count: int = 40, step: int = _FOUR_HOUR_MS, *, last: int | None = None,
+) -> tuple[Candle, ...]:
+    if last is None:
+        last = 1_800_000_000_000
+    last -= last % step
     opens = [last - step * (count - 1 - index) for index in range(count)]
     return tuple(
         Candle(
@@ -267,6 +273,24 @@ def test_insufficient_configured_history_is_returned_for_input_validation():
     assert reason is not None and "only 201" in reason and "256" in reason
 
 
+def test_active_forecast_uses_any_contiguous_history_above_floor(monkeypatch):
+    _BuiltService.instances.clear()
+    _BuiltService.from_config_kwargs.clear()
+    monkeypatch.setattr(kronos_context, "KronosForecastService", _BuiltService)
+
+    block = kronos_context.forecast_for_cycle(
+        service=None,
+        exchange=_StubVenue(_candles(count=201)),
+        symbol="BTC/USDT:USDT",
+        config=_CONFIG,
+        as_of=_as_of(),
+        cycle_id="variable-history",
+    )
+
+    assert block is not None and block.status == STATUS_OK
+    assert _BuiltService.from_config_kwargs["lookback_bars"] == 201
+
+
 # -- research output stays out of active decisions -----------------------------
 
 
@@ -287,6 +311,22 @@ def test_an_active_forward_draw_is_accepted():
         config=_CONFIG, as_of=_as_of(), cycle_id="c1",
     )
     assert block is not None and block.status == STATUS_OK
+
+
+def test_a_closed_prediction_window_skips_inference():
+    last = int((datetime.now(UTC) - timedelta(hours=9)).timestamp() * 1000)
+    candles = _candles(last=last)
+    as_of = datetime.fromtimestamp(candles[-1].close_time / 1000, UTC)
+    service = _OwnedService(raises=AssertionError("inference must not start"))
+
+    block = kronos_context.forecast_for_cycle(
+        service=service, exchange=_StubVenue(candles), symbol="BTC/USDT:USDT",
+        config=_CONFIG, as_of=as_of, cycle_id="late-cycle",
+    )
+
+    assert block is not None and block.status == STATUS_UNAVAILABLE
+    assert "already closed" in (block.reason or "")
+    assert service.forecast_calls == 0
 
 
 # -- the failure-policy vocabulary --------------------------------------------
