@@ -7,6 +7,7 @@ from tests.execution_derivatives_support import (
     VERIFIED_IDENTITY,
     bind_identity,
 )
+from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.futures_protection import manage_active_positions
 
 
@@ -141,11 +142,17 @@ class _ProtectionExchange:
         }
 
     def create_order(self, symbol, kind, side, amount, price=None, params=None):
+        params = params or {}
         self.calls.append(("create", symbol, side, amount, params))
         if "stopLossPrice" not in params and "takeProfitPrice" not in params:
-            # A plain reduce-only market close (no conditional algo status):
-            # the venue's confirmed "closed" status proves the fill.
-            return {"id": "close-1", "status": "closed"}
+            # A plain reduce-only market close: it fills completely at the
+            # requested size, reports the exact fill, and flattens the venue
+            # position the post-close account read verifies.
+            self.positions = []
+            return {
+                "id": "close-1", "status": "closed", "amount": amount,
+                "filled": amount, "symbol": symbol, "side": side,
+            }
         order_id = str(len(self.orders) + 1)
         key = "stopLossPrice" if "stopLossPrice" in params else "takeProfitPrice"
         order_type = "STOP_MARKET" if key == "stopLossPrice" else "TAKE_PROFIT_MARKET"
@@ -367,6 +374,137 @@ def test_emergency_bracket_state_is_manual_only(monkeypatch):
     }]
     assert job_store.load_bracket_recovery(task_id)["status"] == "emergency_close_failed"
     assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+@pytest.mark.parametrize("status", [
+    "time_stop_submission_uncertain", "time_stop_unknown_position", "time_stop_failed",
+])
+def test_time_stop_retry_status_is_routed_to_verified_close_retry(monkeypatch, status):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    task = job_store.load_bracket_recovery(task_id)
+    state = job_store.load_position_state(position_key)
+    state["venue_key"] = task["venue_key"]
+    assert job_store.save_position_state(position_key, state["revision"], state)
+    job_store.update_bracket_recovery(
+        task_id, status=status, placed_ids=task["placed_ids"], attempts=1,
+        last_error="retry me", now=datetime.now(UTC).isoformat(),
+    )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 100.0,
+    }])
+    exchange.orders = _resting_leg_orders()
+    bridge = _ProtectionBridge(exchange)
+    close_calls = []
+    original_close = BracketManager.close_position
+
+    def record_close(manager, retry_task_id, *, reason, allow_mutation):
+        close_calls.append((retry_task_id, reason, allow_mutation))
+        return original_close(
+            manager, retry_task_id, reason=reason, allow_mutation=allow_mutation,
+        )
+
+    monkeypatch.setattr(BracketManager, "close_position", record_close)
+
+    result = manage_active_positions(
+        bridge, allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    assert result == [{"position_key": position_key, "status": "time_stop_closed"}]
+    assert close_calls == [(task_id, "time_stop", True)]
+    assert [call[0] for call in exchange.calls].count("create") == 1
+    assert job_store.load_position_state(position_key) is None
+
+
+@pytest.mark.parametrize("mismatch", ["state_identity", "task_identity", "state_venue"])
+def test_time_stop_retry_identity_mismatch_does_not_send_or_cancel(monkeypatch, mismatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    if mismatch == "state_identity":
+        state = job_store.load_position_state(position_key)
+        state["account_identity_hash"] = "0" * 64
+        assert job_store.save_position_state(position_key, state["revision"], state)
+    elif mismatch == "task_identity":
+        job_store.update_bracket_recovery(
+            task_id, status="time_stop_failed", placed_ids=["old-stop", "old-target"],
+            attempts=1, last_error="retry me", now=datetime.now(UTC).isoformat(),
+        )
+        with job_store.db.session() as conn:
+            conn.execute(
+                "UPDATE bracket_recovery_tasks SET account_identity_hash = %s WHERE task_id = %s",
+                ("0" * 64, task_id),
+            )
+    else:
+        state = job_store.load_position_state(position_key)
+        state["venue_key"] = "binance|https://api.binance.com|False"
+        assert job_store.save_position_state(position_key, state["revision"], state)
+    if mismatch != "task_identity":
+        task = job_store.load_bracket_recovery(task_id)
+        job_store.update_bracket_recovery(
+            task_id, status="time_stop_failed", placed_ids=task["placed_ids"], attempts=1,
+            last_error="retry me", now=datetime.now(UTC).isoformat(),
+        )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 100.0,
+    }])
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    expected = "account_identity_mismatch" if mismatch != "state_venue" else "venue_mismatch"
+    assert result == [{"position_key": position_key, "status": expected}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+
+
+def test_time_stop_retry_respects_closed_mutation_gate(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    task = job_store.load_bracket_recovery(task_id)
+    job_store.update_bracket_recovery(
+        task_id, status="time_stop_failed", placed_ids=task["placed_ids"], attempts=1,
+        last_error="retry me", now=datetime.now(UTC).isoformat(),
+    )
+    exchange = _ProtectionExchange(positions=[{
+        "symbol": "TIA/USDT:USDT", "side": "long", "contracts": 1.0,
+        "entryPrice": 100.0, "markPrice": 100.0,
+    }])
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=False,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    assert result == [{"position_key": position_key, "status": "mutation_gated"}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_failed"
+
+
+def test_time_stop_retry_without_position_evidence_stays_unresolved(monkeypatch):
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    position_key, task_id = _linked_position()
+    task = job_store.load_bracket_recovery(task_id)
+    state = job_store.load_position_state(position_key)
+    state["venue_key"] = task["venue_key"]
+    assert job_store.save_position_state(position_key, state["revision"], state)
+    job_store.update_bracket_recovery(
+        task_id, status="time_stop_unknown_position", placed_ids=task["placed_ids"], attempts=1,
+        last_error="position read unavailable", now=datetime.now(UTC).isoformat(),
+    )
+    exchange = _ProtectionExchange(positions=[])
+
+    result = manage_active_positions(
+        _ProtectionBridge(exchange), allow_mutation=True,
+        config={"risk_derivatives_profit_protection_enabled": True},
+    )
+
+    assert result == [{"position_key": position_key, "status": "position_unknown"}]
+    assert not [call for call in exchange.calls if call[0] in {"create", "cancel"}]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_unknown_position"
 
 
 def test_submission_uncertain_uses_verified_venue_reconciliation(monkeypatch):

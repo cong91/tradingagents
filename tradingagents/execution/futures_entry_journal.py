@@ -86,6 +86,7 @@ _ACTIVE_STATUS_SQL = ", ".join(f"'{status}'" for status in _ACTIVE_STATUSES)
 def entry_journal_leg(
     order: PlannedOrder, client_order_id: str, *, quantity: str, created_at: str,
     identity: Any, venue: str, config: dict,
+    contracts: float | str | None = None,
 ) -> dict:
     """Capture the exact entry terms and recovery policy before a venue mutation.
 
@@ -94,6 +95,8 @@ def entry_journal_leg(
     attribution evidence the outcome ledger needs — no caller can produce a
     marker-less managed entry by forgetting to attach it.
     """
+    journal_quantity = contracts if contracts is not None else quantity
+    planned_contracts = contracts if contracts is not None else order.venue_contracts
     return {
         "name": "entry-intent",
         "status": "uncertain",
@@ -102,8 +105,11 @@ def entry_journal_leg(
         "symbol": order.ccxt_symbol,
         "side": order.side,
         "type": "market",
-        "quantity": quantity,
+        "quantity": journal_quantity,
         "planned_quantity": float(order.quantity),
+        "planned_base_quantity": float(order.quantity),
+        "planned_contracts": planned_contracts,
+        "contract_size": order.contract_size,
         "price": None,
         "params": {"clientOrderId": client_order_id},
         "original_stop_loss": order.stop_loss,
@@ -140,9 +146,14 @@ def create_guarded_entry_intent(
         ).fetchone()
         if existing:
             raise PermissionError("existing active task blocks entry")
+        planned_contracts = leg.get("planned_contracts")
+        if planned_contracts is None:
+            planned_contracts = order.venue_contracts
+        if planned_contracts is None:
+            planned_contracts = order.quantity
         values = (
             task_id, order.ccxt_symbol, client_order_id,
-            "sell" if order.side == "buy" else "buy", float(order.quantity),
+            "sell" if order.side == "buy" else "buy", float(planned_contracts),
             json.dumps([leg]), datetime.now(UTC).isoformat(), venue,
             identity.exchange, identity.profile, identity.account_type, identity.identity_hash,
         )

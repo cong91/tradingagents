@@ -72,7 +72,7 @@ def test_post_ack_failure_attempts_confirmed_fill_once(
 ):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "entry-ack", "status": status, "filled": filled, "average": 50_100.0,
+        "id": "entry-ack", "status": status, "filled": filled, "average": 50_000.0,
     }
     create_order = exchange.create_order
     observed_intents = []
@@ -123,19 +123,30 @@ def test_post_ack_failure_attempts_confirmed_fill_once(
         executor._execute_live(order, True)
 
     message = str(excinfo.value).lower()
-    assert "post-ack" in message
-    assert "bracket" in message
     assert "entry-ack" in message
-    if status == "open":
+    if status == "closed":
+        assert "post-ack" in message
+        assert "bracket" in message
+    else:
+        # A partial entry stays an unresolved intent: no bracket is placed
+        # while the remainder is unreconciled, and the error says exactly that.
+        assert "partial or remaining quantity unknown" in message
         assert "residual exposure unresolved" in message
         assert "not cancelled" in message
+        assert "bracket" not in message
     entries, exits = _entry_and_exits(exchange)
     assert len(observed_intents) == len(entries) == 1
-    assert [call[4] for call in exits] == [filled, filled]
-    assert all(call[3] == "sell" and call[5]["reduceOnly"] is True for call in exits)
-    task = job_store.load_bracket_recovery(f"bracket:{order.ccxt_symbol}:entry-ack")
-    assert task["quantity"] == pytest.approx(filled)
-    assert task["status"] == "submission_uncertain"
+    if status == "closed":
+        assert [call[4] for call in exits] == [filled, filled]
+        assert all(call[3] == "sell" and call[5]["reduceOnly"] is True for call in exits)
+        task = job_store.load_bracket_recovery(f"bracket:{order.ccxt_symbol}:entry-ack")
+        assert task["quantity"] == pytest.approx(filled)
+        assert task["status"] == "submission_uncertain"
+    else:
+        assert exits == []
+        assert job_store.load_bracket_recovery(
+            f"bracket:{order.ccxt_symbol}:entry-ack"
+        ) is None
     intent = _active_entry_intent()
     assert intent["legs"][0]["client_order_id"] == entries[0][5]["clientOrderId"]
     assert intent["status"] in {"pending", "submission_uncertain"}
@@ -146,7 +157,7 @@ def test_unknown_fill_and_failed_intent_update_never_use_planned_quantity(
     entry_setup, monkeypatch, filled,
 ):
     exchange, executor, order, _ = entry_setup
-    exchange.entry_response = {"id": "unknown-ack", "filled": filled, "average": 50_100.0}
+    exchange.entry_response = {"id": "unknown-ack", "filled": filled, "average": 50_000.0}
     update = job_store.update_bracket_recovery
 
     def fail_ack_update(task_id, **kwargs):
@@ -164,7 +175,7 @@ def test_unknown_fill_and_failed_intent_update_never_use_planned_quantity(
     assert _active_entry_intent()["legs"][0]["client_order_id"] == entries[0][5]["clientOrderId"]
 
 
-def test_known_fill_unknown_price_still_attempts_bracket_after_intent_error(entry_setup, monkeypatch):
+def test_known_fill_unknown_price_never_attempts_bracket_after_intent_error(entry_setup, monkeypatch):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {"id": "unknown-price", "status": "open", "filled": 0.002}
     update = job_store.update_bracket_recovery
@@ -180,14 +191,54 @@ def test_known_fill_unknown_price_still_attempts_bracket_after_intent_error(entr
 
     entries, exits = _entry_and_exits(exchange)
     assert len(entries) == 1
-    assert [call[4] for call in exits] == [0.002, 0.002]
+    # An unknown fill price cannot validate a bracket, and the remainder is
+    # unresolved: the entry stays an intent until it is reconciled.
+    assert exits == []
+    assert job_store.load_bracket_recovery(
+        f"bracket:{order.ccxt_symbol}:unknown-price"
+    ) is None
     assert _active_entry_intent()["legs"][0]["client_order_id"] == entries[0][5]["clientOrderId"]
+
+
+def test_partial_fill_never_places_bracket_or_safety_close(entry_setup):
+    exchange, executor, order, _ = entry_setup
+    exchange.entry_response = {
+        "id": "partial-no-safety", "status": "open", "filled": 0.002,
+        "average": 50_000.0,
+    }
+
+    with pytest.raises(RuntimeError, match="(?i)residual.*unresolved"):
+        executor._execute_live(order, True)
+
+    entries, exits = _entry_and_exits(exchange)
+    assert len(entries) == 1
+    assert exits == []
+    assert job_store.load_bracket_recovery(
+        f"bracket:{order.ccxt_symbol}:partial-no-safety"
+    ) is None
+    assert _active_entry_intent()["status"] in {"pending", "submission_uncertain"}
+
+
+def test_unknown_entry_order_id_never_creates_mutation_task(entry_setup):
+    exchange, executor, order, _ = entry_setup
+    exchange.entry_response = {
+        "status": "closed", "filled": order.quantity, "average": 50_000.0,
+    }
+
+    with pytest.raises(RuntimeError):
+        executor._execute_live(order, True)
+
+    assert not [
+        task for task in job_store.active_bracket_recoveries()
+        if task["task_id"] == f"bracket:{order.ccxt_symbol}:unknown"
+    ]
+    assert _entry_and_exits(exchange)[1] == []
 
 
 def test_post_ack_database_outage_reports_failed_bracket_attempt(entry_setup, monkeypatch):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "outage-entry", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "outage-entry", "status": "closed", "filled": 0.005, "average": 50_000.0,
     }
     create_order = exchange.create_order
     place_bracket = executor._place_bracket
@@ -230,7 +281,7 @@ def test_post_ack_database_outage_reports_failed_bracket_attempt(entry_setup, mo
 
 def test_scale_out_audit_failure_still_attempts_single_bracket(tmp_path, monkeypatch):
     exchange = FakeDerivExchange(entry_response={
-        "id": "scale-out-ack", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "scale-out-ack", "status": "closed", "filled": 0.005, "average": 50_000.0,
     })
     bind_identity(monkeypatch, VERIFIED_IDENTITY)
     executor = make_executor(
@@ -265,7 +316,7 @@ def test_scale_out_audit_failure_still_attempts_single_bracket(tmp_path, monkeyp
 def test_full_entry_never_marks_intent_completed_before_bracket_verification(entry_setup, monkeypatch):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "completed-ack", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "completed-ack", "status": "closed", "filled": 0.005, "average": 50_000.0,
     }
     update = job_store.update_bracket_recovery
     intent_statuses = []
@@ -288,7 +339,7 @@ def test_full_entry_never_marks_intent_completed_before_bracket_verification(ent
 def test_post_ack_error_fences_retry_without_duplicate_orders(entry_setup, monkeypatch):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "retry-ack", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "retry-ack", "status": "closed", "filled": 0.005, "average": 50_000.0,
     }
     audit = executor._bridge.audit_plan
 
@@ -301,7 +352,10 @@ def test_post_ack_error_fences_retry_without_duplicate_orders(entry_setup, monke
     with pytest.raises(RuntimeError, match="post-ACK"):
         executor._execute_live(order, True)
     calls_before_retry = _entry_and_exits(exchange)
-    with pytest.raises(PermissionError, match="existing active task"):
+    # The retry meets the resting protective legs first (an open order makes a
+    # new entry unsafe); the durable intent is the fence once the venue is
+    # clean. Either refusal proves the retry cannot duplicate the entry.
+    with pytest.raises(PermissionError, match="existing active task|existing open orders"):
         executor._execute_live(order, True)
     assert _entry_and_exits(exchange) == calls_before_retry
     assert len(calls_before_retry[0]) == 1
@@ -309,10 +363,10 @@ def test_post_ack_error_fences_retry_without_duplicate_orders(entry_setup, monke
 
 
 @pytest.mark.parametrize(("filled", "status", "average"), [
-    (0.002, "open", 50_100.0),
+    (0.002, "open", 50_000.0),
     (0.002, "open", None),
-    (None, "open", 50_100.0),
-    (0.002, None, 50_100.0),
+    (None, "open", 50_000.0),
+    (0.002, None, 50_000.0),
 ])
 def test_unverified_account_keeps_residual_active_without_cancel_or_retry(
     entry_setup, monkeypatch, tmp_path, filled, status, average,
@@ -327,10 +381,9 @@ def test_unverified_account_keeps_residual_active_without_cancel_or_retry(
     entries, exits = _entry_and_exits(exchange)
     assert len(entries) == 1
     assert not [call for call in exchange.calls if call[0] in {"cancel_order", "fetch_order"}]
-    if filled is None:
-        assert exits == []
-    else:
-        assert [call[4] for call in exits] == [filled, filled]
+    # Neither a partial nor an unknown fill may place protective legs: the
+    # remainder is unresolved until reconciliation proves the final size.
+    assert exits == []
     intent = _active_entry_intent()
     assert intent["status"] in {"pending", "submission_uncertain"}
     assert intent["legs"][0]["order_id"] == "partial-entry"
@@ -355,7 +408,7 @@ def test_unverified_account_keeps_residual_active_without_cancel_or_retry(
 def test_partial_database_outage_reports_unresolved_without_cancel(entry_setup, monkeypatch):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "outage-partial", "status": "open", "filled": 0.002, "average": 50_100.0,
+        "id": "outage-partial", "status": "open", "filled": 0.002, "average": 50_000.0,
     }
     create_order = exchange.create_order
     original_connect = postgres.connect
@@ -376,7 +429,8 @@ def test_partial_database_outage_reports_unresolved_without_cancel(entry_setup, 
     finally:
         monkeypatch.setattr(postgres, "connect", original_connect)
 
-    assert "bracket attempt failed or unverified" in str(excinfo.value)
+    assert "bracket attempt failed or unverified" not in str(excinfo.value)
+    assert "residual exposure unresolved" in str(excinfo.value).lower()
     entries, exits = _entry_and_exits(exchange)
     assert len(entries) == 1
     assert exits == []
@@ -394,7 +448,7 @@ def test_full_entry_with_unverified_bracket_keeps_intent_active_and_fences_retry
 ):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "full-unverified", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "full-unverified", "status": "closed", "filled": 0.005, "average": 50_000.0,
     }
     exchange.bracket_error = bracket_error
 
@@ -417,7 +471,9 @@ def test_full_entry_with_unverified_bracket_keeps_intent_active_and_fences_retry
         tmp_path, monkeypatch, config=live_config(risk_max_derivatives_exposure_pct=100.0),
         factory=lambda: exchange, env=live_env(),
     )
-    with pytest.raises(PermissionError, match="existing active task"):
+    # Resting protective legs are themselves the first fence for a retry; the
+    # durable intent fences it when the venue reports no open orders.
+    with pytest.raises(PermissionError, match="existing active task|existing open orders"):
         reloaded._execute_live(order, True)
     assert _entry_and_exits(exchange) == (entries, exits)
 
@@ -425,7 +481,7 @@ def test_full_entry_with_unverified_bracket_keeps_intent_active_and_fences_retry
 def test_full_entry_with_existing_bracket_task_stays_unresolved(entry_setup):
     exchange, executor, order, _ = entry_setup
     exchange.entry_response = {
-        "id": "existing-bracket", "status": "closed", "filled": 0.005, "average": 50_100.0,
+        "id": "existing-bracket", "status": "closed", "filled": 0.005, "average": 50_000.0,
     }
     task_id = f"bracket:{order.ccxt_symbol}:existing-bracket"
     assert job_store.create_bracket_recovery(
@@ -463,7 +519,7 @@ def test_entry_attempt_reports_exact_journal_provenance(entry_setup, response):
     evidence = []
     if response == "ack":
         exchange.entry_response = {
-            "id": "ack-123", "status": "closed", "filled": 0.005, "average": 50_100.0,
+            "id": "ack-123", "status": "closed", "filled": 0.005, "average": 50_000.0,
         }
     elif response == "timeout":
         exchange.create_order_error = ccxt.RequestTimeout("request timed out")
@@ -521,7 +577,7 @@ def test_timed_out_real_entry_keeps_cycle_and_journal_correlated(
     exchange, executor, order, book = entry_setup
     if response == "ack":
         exchange.entry_response = {
-            "id": "ack-123", "status": "closed", "filled": order.quantity, "average": 50_100.0,
+            "id": "ack-123", "status": "closed", "filled": order.quantity, "average": 50_000.0,
         }
     else:
         exchange.create_order_error = ccxt.RequestTimeout("request timed out")
@@ -618,7 +674,7 @@ def test_timed_out_real_entry_keeps_cycle_and_journal_correlated(
         ledger_account = outcome_ledger.account_identity_from_marker(marker)
         entry_fill = {
             "trade_id": "trade-entry-1", "order_id": "ack-123", "symbol": symbol,
-            "side": order.side, "contracts": str(order.quantity), "price": "50100",
+            "side": order.side, "contracts": str(order.quantity), "price": "50000",
             "fee": "0.1", "fee_currency": "USDT", "realized_pnl": "0",
             "realized_pnl_currency": "USDT", "timestamp": "2026-01-01T00:00:00+00:00",
         }

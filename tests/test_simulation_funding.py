@@ -28,12 +28,12 @@ def _candles(count=3, *, spacing=HOUR):
     ]
 
 
-def _proposal(side="long", risk=0.01):
+def _proposal(side="long", budget=0.10):
     return Proposal(
         signal="Buy" if side == "long" else "Sell", ticker="BTC-USD",
         ccxt_symbol=SYMBOL, stop_loss=90.0 if side == "long" else 110.0,
         take_profit=150.0 if side == "long" else 50.0,
-        risk_fraction=risk, margin_fraction=0.5, scale_out_enabled=False,
+        budget_fraction=budget, scale_out_enabled=False,
     )
 
 
@@ -72,13 +72,13 @@ def _entry_quantity(result):
     return next(fill["quantity"] for fill in result.fills if fill["kind"] == "entry")
 
 
-@pytest.mark.parametrize(("side", "risk"), [("long", 0.004), ("long", 0.01), ("short", 0.01)])
-def test_settlement_uses_side_remaining_quantity_rate_and_mark(side, risk):
+@pytest.mark.parametrize(("side", "budget"), [("long", 0.10), ("long", 0.10), ("short", 0.10)])
+def test_settlement_uses_side_remaining_quantity_rate_and_mark(side, budget):
     candles = _candles()
     settlement = candles[1].open_time + HOUR // 2
     result = _run(
         candles, _series(candles, rates={settlement: 0.01}, marks={settlement: 120.0}),
-        proposal=_proposal(side, risk),
+        proposal=_proposal(side, budget),
     )
     expected = _entry_quantity(result) * 120.0 * 0.01
     if side == "long":
@@ -198,7 +198,7 @@ def test_funding_after_scale_out_uses_the_remaining_quantity():
     candles = _candles(4)
     candles[1] = replace(candles[1], high=102.5)
     settlement = candles[2].open_time + HOUR // 2
-    proposal = replace(_proposal(risk=0.004), stop_loss=98.0, scale_out_enabled=True)
+    proposal = replace(_proposal(budget=0.10), stop_loss=98.0, scale_out_enabled=True)
     result = _run(
         candles, _series(candles, rates={settlement: 0.01}, marks={settlement: 120.0}),
         proposal=proposal,
@@ -260,7 +260,7 @@ def test_scale_out_open_settlement_uses_pre_exit_size():
     candles = _candles(3)
     candles[1] = replace(candles[1], high=102.5)
     settlement = candles[1].open_time
-    proposal = replace(_proposal(risk=0.004), stop_loss=98.0, scale_out_enabled=True)
+    proposal = replace(_proposal(budget=0.10), stop_loss=98.0, scale_out_enabled=True)
     result = _run(
         candles, _series(candles, rates={settlement: 0.01}, marks={settlement: 120.0}),
         proposal=proposal,
@@ -277,7 +277,7 @@ def test_scale_out_at_open_excludes_closed_quantity_from_later_settlement():
     candles[2] = replace(candles[2], open=102.5, high=103.0, low=102.0, close=102.5)
     exit_open = candles[2].open_time
     settlement = exit_open + HOUR // 2
-    proposal = replace(_proposal(risk=0.004), stop_loss=98.0, scale_out_enabled=True)
+    proposal = replace(_proposal(budget=0.10), stop_loss=98.0, scale_out_enabled=True)
     result = _run(
         candles,
         _series(

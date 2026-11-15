@@ -503,12 +503,17 @@ Các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
   - *Giới hạn lệnh lỗ liên tiếp* (`risk_max_consecutive_loss_count`): đủ N lỗ liên
     tiếp (đếm xuyên mã) → halt trong ngày.
   - *Đòn bẩy phái sinh tối đa / Phơi nhiễm phái sinh tối đa* (0 = chặn hẳn phái sinh).
-  - *Rủi ro tối đa mỗi lệnh* (`risk_derivatives_max_risk_fraction`, mặc định 0.02) và
-    *Ký quỹ tối đa mỗi lệnh* (`risk_derivatives_max_margin_fraction`, mặc định 0.5): trần
-    cứng cho đề xuất của agent. Đề xuất vượt trần bị **từ chối**, không bị tự hạ xuống.
-  - *Rủi ro/Ký quỹ mặc định mỗi lệnh* (`risk_derivatives_risk_fraction` 0.01,
-    `risk_derivatives_margin_fraction` 0.25): chỉ dùng cho lệnh CLI/script không có đề xuất
-    của agent. Autoloop luôn cần `FuturesExecutionProposal` từ Trader/Portfolio Manager.
+  - *Ngân sách giao dịch do agent quyết định*: với entry Auto Futures, agent chọn
+    `budget_fraction` (tỷ lệ tổng futures equity mà notional của lệnh chiếm), margin mode
+    và leverage dựa trên stop, biến động, funding, reward/risk và vị thế đang mở. Không có
+    trần risk-at-stop toàn cục áp dụng cho sizing thông thường; RiskGuard vẫn từ chối các
+    đề xuất vượt leverage, exposure, heat, daily-loss hoặc các điều kiện an toàn khác.
+    Khi cơ chế override soft-cap được bật, `risk_derivatives_override_max_risk_fraction`
+    chỉ áp dụng cho lệnh override đủ điều kiện. Khoảng cách stop cũng không được vượt
+    `0.8 × entry / leverage`; đây chỉ là **heuristic planning envelope**, không phải giá
+    thanh lý của venue và không bảo đảm stop khớp trước thanh lý (không mô hình hóa
+    maintenance-margin tiers, cross collateral, phí hoặc slippage).
+  - *Fallback sizing standalone* (`risk_derivatives_budget_fraction`, mặc định 0.10): chỉ dùng khi đường CLI/script lập kế hoạch không truyền đề xuất agent. Autoloop luôn cần `FuturesExecutionProposal` từ Trader/Portfolio Manager.
   - *Tự khóa lợi nhuận Futures* (`risk_derivatives_profit_protection_enabled`): policy cho
     vị thế bền vững đã xác minh; mặc định bật. Tắt Auto Futures không tự đóng vị thế,
     nhưng không tắt cơ chế bảo vệ đã bật. Khi policy bật, position monitor và bracket
@@ -553,7 +558,7 @@ Các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
     | `risk_derivatives_round_trip_fee_rate` | 0.001 | Phí khứ hồi dùng để nâng SL hòa vốn lên trên entry; `0` = không bù phí |
     | `risk_max_derivatives_exposure_hard_pct` | 0 | Trần cứng cho cơ chế vượt trần phái sinh: chỉ lệnh đạt đủ điều kiện override mới được đẩy tổng phơi nhiễm tới mức này; `0` = tắt |
     | `risk_derivatives_override_min_r` | 2.0 | R tối thiểu (lời mục tiêu / rủi ro stop) của đề xuất để đủ điều kiện vượt trần |
-    | `risk_derivatives_override_max_risk_fraction` | 0.01 | Risk-at-stop tối đa cho lệnh vượt trần (0.01 = 1%), chặt hơn trần thường `risk_derivatives_max_risk_fraction` |
+    | `risk_derivatives_override_max_risk_fraction` | 0.01 | Risk-at-stop tối đa riêng cho lệnh override (0.01 = 1%); chỉ áp dụng cho lệnh override đủ điều kiện |
     | `risk_derivatives_override_max_per_day` | 0 | Ngân sách lệnh vượt trần mỗi ngày UTC; `0` = không bao giờ vượt trần |
     | `risk_max_open_heat_pct` | 0 | Trần tổng rủi ro đang mở (heat): tổng phần equity mất nếu mọi stop khớp cùng lúc; `0` = TẮT (khác các trần anh em), khuyến nghị 6 |
 
@@ -564,7 +569,7 @@ Các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
     định** — mọi điều kiện do executor tự đo, không hỏi LLM: kịch bản có confirmation trên cả
     hai khung 1h và 4h; R của đề xuất (lời mục tiêu / rủi ro stop) đạt
     `risk_derivatives_override_min_r`; risk-at-stop của lệnh gắt hơn
-    `risk_derivatives_override_max_risk_fraction` (chặt hơn trần mỗi lệnh thường); funding
+    `risk_derivatives_override_max_risk_fraction` là trần risk-at-stop riêng cho lệnh override; funding
     không bất lợi; còn ngân sách trong ngày — tối đa `risk_derivatives_override_max_per_day`
     lệnh vượt trần mỗi ngày UTC. Lệnh được duyệt qua cơ chế này được đẩy tổng phơi nhiễm tới
     tối đa nấc cứng, và mỗi lần dùng ghi một sự kiện audit `derivatives_override_used`.
@@ -573,7 +578,7 @@ Các ngưỡng **RiskGuard** dùng để chặn lệnh. Tác động cụ thể:
     **khác các trần anh em**: `0` = **TẮT** (không phải chặn hết), > 0 = bật — khuyến nghị 6.
     Mặc định các khoá mở soft-cap override đều `0` (`hard_pct`, `override_max_per_day`), nên
     cơ chế tắt và hành vi không đổi so với trước; hai ngưỡng điều kiện `override_min_r` /
-    `override_max_risk_fraction` chỉ có tác dụng khi cổng đã mở. Trần heat độc lập cũng mặc
+    `risk_derivatives_override_max_risk_fraction` chỉ giới hạn risk-at-stop khi cơ chế override đã được mở; nó không phải là trần budget sizing thông thường. Trần heat độc lập cũng mặc
     định `0` nên đang tắt.
   - Monitor chỉ mutate khi đọc được position mode và account đang **One-way**; Hedge Mode trả
     `hedge_mode_unsupported` vì Binance không nhận `reduceOnly` ở chế độ đó. Mark được đọc riêng

@@ -358,7 +358,7 @@ def test_decision_context_states_symmetric_enter_criteria_and_hard_limits():
     direction confirmation, executable bracket, reward/risk with funding
     carry, and the effective caps — so a strong setup is not met with an
     unexplained abstain, and Sell/Underweight is a short symmetric to a long."""
-    config = {"risk_derivatives_max_risk_fraction": 0.01}
+    config = {}
     context = render_futures_decision_context(
         _market_context(), _account(), "BTC-USD", config, BRACKETS, max_leverage=3.0,
     )
@@ -369,8 +369,10 @@ def test_decision_context_states_symmetric_enter_criteria_and_hard_limits():
     assert "Engine ATR bracket (long): stop=90.0 target=110.0" in context
     assert "Engine ATR bracket (short): stop=110.0 target=90.0" in context
     assert "Maximum leverage: 3x" in context
-    assert "Maximum risk_fraction: 0.01" in context
-    assert "propose inside the caps, never above them" in context
+    assert "Account-level safety limits" in context
+    assert "SIZING IS YOUR DECISION" in context
+    assert "budget_fraction" in context
+    assert "There is no preset allocation to fit" in context
     assert "instead of defaulting to abstain" in context
     # The proposal-required contract stays intact.
     assert "A FuturesExecutionProposal is required for any entry" in context
@@ -404,7 +406,7 @@ def test_context_discloses_protective_level_substitution():
     )
 
     assert "the engine ATR bracket substitutes for those two protective levels only" in context
-    assert "margin mode, leverage, and budgets are never substituted" in context
+    assert "margin mode, leverage, and the budget allocation are never substituted" in context
     assert "a proposal missing them is refused" in context
 
 
@@ -528,6 +530,7 @@ def test_render_context_reports_current_notional_headroom_override_rules_and_hea
     assert "closed 1h+4h candles confirm the direction" in context
     assert "reward/risk >= 2" in context
     assert "risk-at-stop <= 0.01" in context
+    assert "Hard initial-stop risk" not in context
     assert "funding is not adverse" in context
     assert "daily override budget (1) is not spent" in context
     assert "The executor verifies these mechanically" in context
@@ -650,8 +653,8 @@ def test_candidate_planning_passes_confirmation_and_funding_rate(monkeypatch):
     )
     proposal = {
         "margin_mode": "isolated", "leverage": 3,
-        "risk_fraction": 0.01, "margin_fraction": 0.25,
-        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+        "budget_fraction": 0.10,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 10% budget.",
     }
 
     result = autoloop.DailyResult(ticker="BTC-USD")
@@ -732,8 +735,8 @@ def test_candidate_planning_passes_none_funding_when_the_venue_reports_none(monk
     )
     proposal = {
         "margin_mode": "isolated", "leverage": 3,
-        "risk_fraction": 0.01, "margin_fraction": 0.25,
-        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+        "budget_fraction": 0.10,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 10% budget.",
     }
 
     result = autoloop.DailyResult(ticker="BTC-USD")

@@ -61,10 +61,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "futures_confirmation_replay.json
 # function of these candles, never of wall-clock or venue state.
 AS_OF = datetime(2026, 10, 7, 17, 0, tzinfo=UTC)
 _MARK = 50_000.0
-_CONFIG = {
-    "risk_derivatives_max_risk_fraction": 0.02,
-    "risk_derivatives_max_margin_fraction": 0.5,
-}
+_CONFIG = {}
 
 _TRADEABLE = ("Buy", "Overweight", "Underweight", "Sell")
 
@@ -345,10 +342,10 @@ def test_doji_in_either_closed_candle_rejects(one_dir, four_dir):
 
 def _proposal(**overrides) -> dict:
     proposal = {
-        "margin_mode": "isolated", "leverage": 2, "risk_fraction": 0.01,
-        "margin_fraction": 0.25, "rationale": "aligned candles",
-        "entry_price": _MARK,
+        "margin_mode": "isolated", "leverage": 2, "budget_fraction": 0.10,
+        "rationale": "aligned candles", "entry_price": _MARK,
     }
+
     proposal.update(overrides)
     return proposal
 
@@ -359,13 +356,12 @@ def _proposal(**overrides) -> dict:
     (_proposal(rationale=""), _MARK, "rationale is required"),
     (_proposal(margin_mode="naked"), _MARK, "not isolated/cross"),
     (_proposal(leverage=2.5), _MARK, "must be an integer"),
-    (_proposal(leverage=True), _MARK, "must be an integer"),
-    (_proposal(risk_fraction=float("inf")), _MARK, "must be finite"),
+    (_proposal(leverage=True), _MARK, "must be numeric, not boolean"),
+    (_proposal(budget_fraction=float("inf")), _MARK, "must be finite"),
     (_proposal(leverage=0), _MARK, "outside 1-3"),
     (_proposal(leverage=4), _MARK, "outside 1-3"),
-    (_proposal(risk_fraction=0.0), _MARK, "risk_fraction"),
-    (_proposal(risk_fraction=0.05), _MARK, "risk_fraction"),
-    (_proposal(margin_fraction=0.6), _MARK, "margin_fraction"),
+    (_proposal(budget_fraction=0.0), _MARK, "budget_fraction"),
+    (_proposal(budget_fraction=1.5), _MARK, "budget_fraction"),
     (_proposal(entry_price=_MARK * 1.01), _MARK, "non-market entry_price"),
     (_proposal(entry_price=-1.0), _MARK, "entry_price must be positive"),
     (_proposal(stop_loss=49_000.0), _MARK, "proposed together"),

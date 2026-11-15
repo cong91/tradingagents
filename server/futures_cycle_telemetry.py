@@ -164,10 +164,7 @@ def effective_caps(
         "max_open_heat_pct": float(limits.max_open_heat_pct),
     }
     if config is not None:
-        caps["max_risk_fraction"] = float(config.get("risk_derivatives_max_risk_fraction", 0.02))
-        caps["max_margin_fraction"] = float(
-            config.get("risk_derivatives_max_margin_fraction", 0.5)
-        )
+        caps["max_budget_fraction"] = 1.0  # the structural (0, 1] bound the agent owns
     return caps
 
 
@@ -176,7 +173,7 @@ def redact_proposal(proposal: Any) -> dict:
     if not isinstance(proposal, dict):
         return {}
     allowed = (
-        "margin_mode", "leverage", "risk_fraction", "margin_fraction",
+        "margin_mode", "leverage", "budget_fraction",
         "entry_price", "stop_loss", "take_profit", "scale_out_enabled",
         "scale_out_first_r", "scale_out_first_fraction", "scale_out_second_r",
         "scale_out_second_fraction",

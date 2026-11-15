@@ -440,8 +440,8 @@ def test_timeout_owner_accounts_for_inflight_futures_order(monkeypatch, outcome)
     finished = threading.Event()
     submitted = []
     plan = SimpleNamespace(
-        side="buy", market="derivatives", quantity=1.0, estimated_price=100.0,
-        cost=100.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
+        side="buy", market="derivatives", quantity=0.1, estimated_price=100.0,
+        cost=10.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
         take_profit=110.0, reason=None,
     )
     marker = managed_live_provenance(
@@ -500,7 +500,7 @@ def test_timeout_owner_accounts_for_inflight_futures_order(monkeypatch, outcome)
                 "futures_execution_intent": "enter",
                 "futures_execution_proposal": {
                     "margin_mode": "isolated", "leverage": 2,
-                    "risk_fraction": 0.01, "margin_fraction": 0.2,
+                    "budget_fraction": 0.10,
                     "stop_loss": 90.0, "take_profit": 110.0, "rationale": "test",
                 },
             }, "Buy"
@@ -562,8 +562,8 @@ def test_cycle_persistence_failure_does_not_erase_successful_order(monkeypatch, 
     cancelled = threading.Event()
     executor, _claims, writes = _install(monkeypatch, cancelled, cancel_at="execution")
     executor.plan_order = lambda *_args, **_kwargs: SimpleNamespace(
-        side="buy", market="derivatives", quantity=1.0, estimated_price=100.0,
-        cost=100.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
+        side="buy", market="derivatives", quantity=0.1, estimated_price=100.0,
+        cost=10.0, leverage=2, margin_mode="isolated", stop_loss=90.0,
         take_profit=110.0, reason=None,
     )
     executor.execute_order = lambda *_args, **_kwargs: "venue-456"
@@ -591,8 +591,8 @@ def test_cycle_persistence_failure_does_not_erase_successful_order(monkeypatch, 
     class Graph:
         def propagate(self, *_args, **_kwargs):
             return {"futures_execution_intent": "enter", "futures_execution_proposal": {
-                "margin_mode": "isolated", "leverage": 2, "risk_fraction": 0.01,
-                "margin_fraction": 0.2, "stop_loss": 90.0, "take_profit": 110.0, "rationale": "test",
+                "margin_mode": "isolated", "leverage": 2, "budget_fraction": 0.10,
+                "stop_loss": 90.0, "take_profit": 110.0, "rationale": "test",
             }}, "Buy"
 
     checkpoints = []

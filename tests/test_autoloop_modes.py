@@ -352,8 +352,8 @@ def test_futures_disable_after_portfolio_sync_stops_planning(monkeypatch):
     )
     result = DailyResult(ticker="BTC-USD")
     proposal = {
-        "margin_mode": "isolated", "leverage": 2, "risk_fraction": 0.01,
-        "margin_fraction": 0.25, "rationale": "Aligned signals with bounded risk.",
+        "margin_mode": "isolated", "leverage": 2, "budget_fraction": 0.10,
+        "rationale": "Aligned signals with bounded total-budget allocation.",
     }
     with pytest.raises(autoloop_execution.AutoModeDisabled, match="before futures planning"):
         autoloop_futures_execution._process_futures_candidate(

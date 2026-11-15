@@ -186,8 +186,8 @@ def test_gated_dry_plan_long(tmp_path, monkeypatch):
     assert order.side == "buy"
     assert order.market == "derivatives"
     assert order.leverage == 1.0
-    assert order.cost == pytest.approx(250.0)  # margin cap
-    assert order.quantity == pytest.approx(0.005)  # limited by margin, also within stop risk
+    assert order.cost == pytest.approx(100.0)  # 10% total-budget allocation at 1x
+    assert order.quantity == pytest.approx(0.002)
     assert order.ccxt_symbol == "BTC/USDT:USDT"
 
 
@@ -206,7 +206,7 @@ def test_gated_plan_bearish_rating_opens_a_short_only_with_explicit_entry_intent
     )
     assert order.side == "sell"
     assert order.futures_execution_intent == "enter"
-    assert order.cost == pytest.approx(250.0)
+    assert order.cost == pytest.approx(100.0)
 
 
 def test_gated_plan_leverage_scales_notional_not_margin(tmp_path, monkeypatch):
@@ -221,12 +221,12 @@ def test_gated_plan_leverage_scales_notional_not_margin(tmp_path, monkeypatch):
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0, leverage=5.0,
-        stop_loss=40_000.0, take_profit=60_000.0,
+        stop_loss=45_000.0, take_profit=60_000.0,
         futures_execution_intent="enter",
     )
     assert order.leverage == 5.0
-    assert order.cost == pytest.approx(10.0)  # $50 risk budget at $10,000 stop distance
-    assert order.quantity == pytest.approx(0.001)  # risk budget / 10,000 stop distance
+    assert order.cost == pytest.approx(20.0)  # $100 notional / 5x leverage
+    assert order.quantity == pytest.approx(0.002)  # 10% total-budget allocation
 
 
 def test_plan_hold_and_review_stay_no_orders(tmp_path, monkeypatch):
@@ -267,6 +267,7 @@ def test_plan_order_resolves_off_whitelist_override_through_metadata(tmp_path, m
         "NEAR/USDT:USDT": {
             "base": "NEAR", "quote": "USDT", "settle": "USDT",
             "contract": True, "swap": True, "type": "swap", "active": True,
+            "contractSize": 1.0, "linear": True, "inverse": False,
             "limits": {"cost": {"min": 10.0}},
         }
     }
@@ -353,6 +354,60 @@ def test_plan_within_raised_caps_passes(tmp_path, monkeypatch):
 
 
 # --- execution once the gates are open -----------------------------------------
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_crafted_live_order_without_verified_contract_metadata_is_refused_before_mutation(
+    tmp_path, monkeypatch,
+):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    from tradingagents.execution.sizing import PlannedOrder
+
+    crafted = PlannedOrder(
+        ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", signal="Buy", side="buy",
+        quantity=0.002, estimated_price=50_000.0, cost=100.0, market="derivatives",
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+    )
+
+    with pytest.raises(PermissionError, match="contract metadata"):
+        executor.execute_order(crafted, confirm=True, portfolio=PortfolioContext(cash=1_000.0))
+
+    assert exchange.calls == []
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_rounded_bracket_is_rejected_before_margin_or_leverage_mutation(
+    tmp_path, monkeypatch,
+):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    order = _live_bracket_order(executor, PortfolioContext(cash=1_000.0))
+    original_price_precision = exchange.price_to_precision
+
+    def collapse_stop(symbol, price):
+        if price == order.stop_loss:
+            return original_price_precision(symbol, order.estimated_price)
+        return original_price_precision(symbol, price)
+
+    monkeypatch.setattr(exchange, "price_to_precision", collapse_stop)
+
+    with pytest.raises(PermissionError, match="bracket"):
+        executor.execute_order(order, confirm=True, portfolio=PortfolioContext(cash=1_000.0))
+
+    mutation_calls = {"set_margin_mode", "set_leverage", "create_order"}
+    assert not [call for call in exchange.calls if call[0] in mutation_calls]
 
 
 def test_dry_execute_with_confirm_sends_nothing(tmp_path, monkeypatch):
@@ -455,7 +510,7 @@ def test_live_execute_places_market_order(tmp_path, monkeypatch):
         executor.execute_order(order, confirm=True, portfolio=book)
     entries = [call for call in exchange.calls if call[0] == "create_order" and call[3] == "buy"]
     assert len(entries) == 1
-    assert entries[0][1:5] == ("BTC/USDT:USDT", "market", "buy", "0.005000")
+    assert entries[0][1:5] == ("BTC/USDT:USDT", "market", "buy", "0.002000")
     assert entries[0][5]["clientOrderId"].startswith("entry-")
     order_id = next(
         task["placed_ids"][0] for task in job_store.active_bracket_recoveries()
@@ -547,6 +602,7 @@ def test_fresh_equity_drives_execute_exposure_cap(tmp_path, monkeypatch, equity,
 
     from tradingagents.execution.futures_account import observe_futures_positions
 
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
     exchange = FakeDerivExchange()
     exchange.fetch_balance = lambda params=None: {
         "info": {
@@ -562,7 +618,10 @@ def test_fresh_equity_drives_execute_exposure_cap(tmp_path, monkeypatch, equity,
         ), factory=lambda: exchange, env=live_env(),
     )
     stale = PortfolioContext(cash=1_000.0)
-    order = executor.plan_order("BTC-USD", "Buy", stale, price=50_000.0, **bracket_kwargs())
+    order = executor.plan_order(
+        "BTC-USD", "Buy", stale, price=50_000.0,
+        budget_fraction=0.25, **bracket_kwargs(),
+    )
     monkeypatch.setattr(
         "tradingagents.execution.futures_account.observe_futures_positions",
         lambda bridge: replace(observe_futures_positions(bridge), scope_complete=True),
@@ -678,7 +737,7 @@ def test_live_execute_sets_leverage_before_create_order(tmp_path, monkeypatch):
     book = PortfolioContext(cash=1_000.0)
     order = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=5.0,
-        stop_loss=40_000.0, take_profit=60_000.0,
+        stop_loss=45_000.0, take_profit=60_000.0,
         futures_execution_intent="enter",
     )
     with pytest.raises(RuntimeError, match="durable intent retained"):
@@ -690,70 +749,96 @@ def test_live_execute_sets_leverage_before_create_order(tmp_path, monkeypatch):
 
 
 def test_agent_terms_drive_sizing_and_margin_mode(tmp_path, monkeypatch):
-    """The decision agents' risk/margin budgets and margin mode are what the
-    plan uses -- the configured defaults are only the fallback."""
+    """The agent's total-budget allocation and margin mode drive the plan."""
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(
             risk_max_derivatives_leverage=2.0,
             risk_max_derivatives_exposure_pct=100.0,
-            risk_derivatives_risk_fraction=0.01,
-            risk_derivatives_margin_fraction=0.25,
+            risk_derivatives_budget_fraction=0.10,
         ),
     )
     order = executor.plan_order(
         "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
         leverage=2.0, stop_loss=48_000.0, take_profit=55_000.0,
         futures_execution_intent="enter",
-        risk_fraction=0.002, margin_fraction=0.05, margin_mode="isolated",
+        budget_fraction=0.05, margin_mode="isolated",
     )
 
     assert order.margin_mode == "isolated"
     assert order.leverage == 2.0
-    # risk budget 1000 * 0.002 = 2 over a 2,000 stop distance -> 0.001
-    # margin budget 1000 * 0.05 * 2 / 50,000 -> 0.002; the risk leg is tighter.
+    # 5% of 1,000 = 50 notional; quantity = 50 / 50,000; margin = 50 / 2.
     assert order.quantity == pytest.approx(0.001)
     assert order.cost == pytest.approx(25.0)
 
 
-def test_agent_terms_above_the_hard_caps_are_refused(tmp_path, monkeypatch):
+def test_agent_budget_fraction_outside_structural_bounds_is_refused(tmp_path, monkeypatch):
     executor = make_executor(
         tmp_path, monkeypatch,
         config=gates_config(
             risk_max_derivatives_leverage=2.0,
             risk_max_derivatives_exposure_pct=100.0,
-            risk_derivatives_max_risk_fraction=0.02,
-            risk_derivatives_max_margin_fraction=0.5,
         ),
     )
     book = PortfolioContext(cash=1_000.0)
 
-    over_risk = executor.plan_order(
-        "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
-        stop_loss=48_000.0, take_profit=55_000.0,
-        futures_execution_intent="enter",
-        risk_fraction=0.5,
-    )
-    assert over_risk.side is None
-    assert "hard cap" in (over_risk.reason or "")
-
-    over_margin = executor.plan_order(
-        "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
-        stop_loss=48_000.0, take_profit=55_000.0,
-        futures_execution_intent="enter",
-        margin_fraction=0.9,
-    )
-    assert over_margin.side is None
-    assert "hard cap" in (over_margin.reason or "")
+    for invalid_budget in (0.0, 1.01):
+        order = executor.plan_order(
+            "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
+            stop_loss=48_000.0, take_profit=55_000.0,
+            futures_execution_intent="enter", budget_fraction=invalid_budget,
+        )
+        assert order.side is None
+        assert "outside (0, 1]" in (order.reason or "")
 
     bad_mode = executor.plan_order(
         "BTC-USD", "Buy", book, price=50_000.0, leverage=1.0,
         stop_loss=48_000.0, take_profit=55_000.0,
-        futures_execution_intent="enter",
+        futures_execution_intent="enter", budget_fraction=0.1,
         margin_mode="portfolio",
     )
     assert bad_mode.side is None
     assert "margin_mode" in (bad_mode.reason or "")
+
+
+def test_agent_budget_boolean_or_malformed_value_is_refused_without_conversion_error(
+    tmp_path, monkeypatch,
+):
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=gates_config(
+            risk_max_derivatives_leverage=2.0,
+            risk_max_derivatives_exposure_pct=100.0,
+        ),
+    )
+    for invalid_budget in (True, "not-a-number"):
+        order = executor.plan_order(
+            "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
+            leverage=1.0, stop_loss=48_000.0, take_profit=55_000.0,
+            futures_execution_intent="enter", budget_fraction=invalid_budget,
+        )
+        assert order.side is None
+        assert "sizing refused" in (order.reason or "")
+
+
+def test_agent_budget_above_account_exposure_backstop_is_refused(tmp_path, monkeypatch):
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=gates_config(
+            risk_max_derivatives_leverage=2.0,
+            risk_max_derivatives_exposure_pct=5.0,
+            risk_max_position_pct_per_asset=100.0,
+            risk_max_total_exposure_pct=100.0,
+        ),
+    )
+    order = executor.plan_order(
+        "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
+        leverage=1.0, stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter", budget_fraction=0.10,
+    )
+
+    assert order.side is None
+    assert "derivatives notional" in (order.reason or "")
 
 
 @pytest.mark.usefixtures("enable_auto_futures")
@@ -933,3 +1018,83 @@ def test_exports_expose_the_executor():
     import tradingagents.execution as execution_package
 
     assert execution_package.DerivativesExecutor is DerivativesExecutor
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_contract_metadata_converts_base_budget_to_venue_contracts(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange(contract_size=0.01)
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    order = executor.plan_order(
+        "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
+        stop_loss=48_000.0, take_profit=55_000.0,
+        futures_execution_intent="enter",
+    )
+    assert order.quantity == pytest.approx(0.002)
+    assert order.venue_contracts == pytest.approx(0.2)
+    assert order.contract_size == pytest.approx(0.01)
+    assert order.linear is True and order.inverse is False
+
+
+@pytest.mark.parametrize("contract_size,linear,inverse", [(None, True, False), (0, True, False), (1, True, True), (1, False, False)])
+def test_plan_rejects_missing_or_invalid_contract_metadata(
+    tmp_path, monkeypatch, contract_size, linear, inverse,
+):
+    exchange = FakeDerivExchange(
+        contract_size=contract_size, linear=linear, inverse=inverse,
+    )
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=gates_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange,
+    )
+    order = executor.plan_order(
+        "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
+        **bracket_kwargs(),
+    )
+    assert order.side is None
+    assert "contract metadata" in (order.reason or "").lower()
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_rounded_bracket_geometry_is_rejected_before_live_mutation(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    exchange.price_to_precision = lambda _symbol, value: f"{float(value):.0f}"
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    book = PortfolioContext(cash=1_000.0)
+    order = executor.plan_order(
+        "BTC-USD", "Buy", book, price=50_000.0, stop_loss=49_999.6,
+        take_profit=50_000.4, futures_execution_intent="enter",
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    with pytest.raises(PermissionError, match="bracket"):
+        executor.execute_order(order, confirm=True, portfolio=book)
+    assert not [call for call in exchange.calls if call[0] in {
+        "set_margin_mode", "set_leverage", "create_order",
+    }]
+
+
+@pytest.mark.usefixtures("enable_auto_futures")
+def test_live_execute_uses_fresh_equity_when_portfolio_is_missing(tmp_path, monkeypatch):
+    exchange = FakeDerivExchange()
+    executor = make_executor(
+        tmp_path, monkeypatch,
+        config=live_config(risk_max_derivatives_exposure_pct=100.0),
+        factory=lambda: exchange, env=live_env(),
+    )
+    bind_identity(monkeypatch, VERIFIED_IDENTITY)
+    order = executor.plan_order(
+        "BTC-USD", "Buy", PortfolioContext(cash=1_000.0), price=50_000.0,
+        **bracket_kwargs(),
+    )
+    with pytest.raises(RuntimeError, match="durable intent retained"):
+        executor.execute_order(order, confirm=True, portfolio=None)
+    assert any(call[0] == "create_order" for call in exchange.calls)
+    assert any(item["stage"] == "execute_locked" for item in executor.risk_guard_decisions)

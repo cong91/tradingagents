@@ -2,9 +2,9 @@
 
 The engine walks a strictly increasing sequence of CLOSED candles. At each
 decision candle close it takes a proposal, sizes it through the runtime's
-futures sizing chain (``validate_bracket`` + ``risk_limited_quantity`` plus
-the executor's cap comparisons — the exact math ``DerivativesExecutor._size``
-runs), asks the real ``RiskGuard.check`` for the verdict, and fills the entry
+futures sizing chain (``validate_bracket`` + ``budget_limited_quantity`` plus
+the liquidation buffer — the exact math ``DerivativesExecutor._size`` runs),
+asks the real ``RiskGuard.check`` for the verdict, and fills the entry
 at the next candle's open through the cost model. While a position is open,
 the real ``evaluate_profit_protection`` drives every stop/target phase and
 the real ``plan_scale_out`` drives the tranche exits; the time-stop verdict is
@@ -36,8 +36,9 @@ from tradingagents.dataflows.market_data import Candle, timeframe_ms
 from tradingagents.execution.audit import append_event
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
-    risk_limited_quantity,
+    budget_limited_quantity,
     validate_bracket,
+    validate_liquidation_buffer,
 )
 from tradingagents.execution.profit_protection import evaluate_profit_protection
 from tradingagents.execution.risk import RiskDecision, RiskGuard, RiskLimits
@@ -74,8 +75,7 @@ class Proposal:
     stop_loss: float
     take_profit: float
     leverage: float = 1.0
-    risk_fraction: float = 0.01
-    margin_fraction: float = 0.25
+    budget_fraction: float = 0.10
     margin_mode: Literal["isolated", "cross"] | None = None
     scale_out_enabled: bool = True
     scale_out_first_r: float = 1.0
@@ -86,10 +86,8 @@ class Proposal:
 
 @dataclass(frozen=True)
 class SizingCaps:
-    """The plan-time hard caps ``DerivativesExecutor._size`` compares against."""
+    """The plan-time bounds ``DerivativesExecutor._size`` compares against."""
 
-    max_risk_fraction: float = 0.02
-    max_margin_fraction: float = 0.5
     min_order_cost: float = 10.0
 
 
@@ -142,27 +140,16 @@ def futures_plan(
     side = "buy" if long else "sell"
     if proposal.stop_loss is None or proposal.take_profit is None:
         return no_order("derivatives entry requires explicit stop_loss and take_profit")
-    if proposal.risk_fraction > limits.max_risk_fraction:
-        return no_order(
-            f"proposed risk_fraction {proposal.risk_fraction:g} exceeds the hard "
-            f"cap {limits.max_risk_fraction:g}"
-        )
-    if proposal.margin_fraction > limits.max_margin_fraction:
-        return no_order(
-            f"proposed margin_fraction {proposal.margin_fraction:g} exceeds the hard "
-            f"cap {limits.max_margin_fraction:g}"
-        )
     try:
         validate_bracket(
             side=side, entry=price, stop_loss=proposal.stop_loss,
             take_profit=proposal.take_profit,
         )
         equity = float(book.cash)
-        quantity = risk_limited_quantity(
+        quantity = budget_limited_quantity(
             side=side, equity=equity, entry=price, stop_loss=proposal.stop_loss,
             take_profit=proposal.take_profit, leverage=proposal.leverage,
-            risk_fraction=proposal.risk_fraction,
-            margin_fraction=proposal.margin_fraction,
+            budget_fraction=proposal.budget_fraction,
         )
     except (FuturesPlanError, TypeError, ValueError) as exc:
         return no_order(f"derivatives sizing refused: {exc}")
@@ -456,8 +443,7 @@ def _maybe_open(
             "equity": equity, "stop_loss": proposal.stop_loss,
             "take_profit": proposal.take_profit,
             "leverage": proposal.leverage,
-            "risk_fraction": proposal.risk_fraction,
-            "margin_fraction": proposal.margin_fraction,
+            "budget_fraction": proposal.budget_fraction,
         },
         "output": plan.model_dump(mode="json"),
     })
@@ -506,6 +492,22 @@ def _maybe_open(
             "candle_open_time": next_candle.open_time,
             "decision": "entry_bracket_invalidated_by_gap",
             "reason": "entry fill price does not protect against the planned stop; nothing opened",
+        })
+        return
+    try:
+        validate_bracket(
+            side=plan.side, entry=entry_price, stop_loss=plan.stop_loss,
+            take_profit=plan.take_profit,
+        )
+        validate_liquidation_buffer(
+            entry=entry_price, stop_loss=float(plan.stop_loss),
+            leverage=float(plan.leverage),
+        )
+    except (FuturesPlanError, TypeError, ValueError) as exc:
+        state.result.decisions.append({
+            "candle_open_time": next_candle.open_time,
+            "decision": "entry_fill_invariant_failed",
+            "reason": f"actual entry fill violates futures safety invariant: {exc}",
         })
         return
     fee = model.fee(fill.quantity * entry_price)

@@ -35,6 +35,7 @@ def _override_executor(tmp_path, monkeypatch, *, budget=1):
             risk_max_derivatives_exposure_pct=25.0,
             risk_max_derivatives_exposure_hard_pct=35.0,
             risk_derivatives_override_max_per_day=budget,
+            risk_derivatives_budget_fraction=0.25,
         ),
         env={"TRADINGAGENTS_EXEC_DERIVATIVES": "true"},
     )

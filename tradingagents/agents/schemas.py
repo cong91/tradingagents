@@ -106,22 +106,30 @@ class FuturesExecutionProposal(BaseModel):
     """Agent-authored execution terms for one crypto futures opportunity."""
 
     margin_mode: Literal["isolated", "cross"] = Field(
-        description="Choose isolated or cross margin based on account and position risk; justify the choice.",
+        description=(
+            "Choose isolated or cross margin based on account state, open positions, and "
+            "how this trade's risk should be contained; justify the choice."
+        ),
     )
     leverage: int = Field(
         ge=1,
         le=125,
-        description="Proposed integer leverage based on volatility, stop distance, and available futures margin. Never maximize leverage by default.",
+        description=(
+            "Proposed integer leverage chosen from volatility, stop distance, the "
+            "instrument's leverage tier, available margin, and the liquidation buffer the "
+            "stop requires. Never maximize leverage by default."
+        ),
     )
-    risk_fraction: float = Field(
-        gt=0,
-        le=0.05,
-        description="Maximum account-equity fraction to lose if the stop executes, expressed as a decimal (0.005 means 0.5%).",
-    )
-    margin_fraction: float = Field(
+    budget_fraction: float = Field(
         gt=0,
         le=1,
-        description="Proposed fraction of futures equity to allocate as initial margin, expressed as a decimal.",
+        description=(
+            "Fraction of the TOTAL futures budget (account equity) this trade's notional "
+            "value represents, as a decimal (0.10 means the position is worth 10% of the "
+            "total budget). You own this decision: pick it to optimize the trade's "
+            "expected value given the stop distance, volatility, funding, and the rest "
+            "of the account — not to fit a preset allocation."
+        ),
     )
     entry_price: float | None = Field(
         default=None,
@@ -137,12 +145,28 @@ class FuturesExecutionProposal(BaseModel):
     )
     rationale: str = Field(
         description=(
-            "Explain how evidence, volatility, stop distance, account state, and risk/reward "
-            "support every selected execution term. Cite the closed 1h/4h candles for the "
-            "direction, the mark/ATR bracket levels for the prices, and the funding rate for "
-            "carry; if a context metric was unavailable, name it as a risk factor."
+            "Explain how evidence, volatility, stop distance, the account's total budget, "
+            "and risk/reward support every selected execution term — including why the "
+            "budget_fraction and leverage are the optimal allocation for this "
+            "setup. Cite the closed 1h/4h candles for the direction, the mark/ATR bracket "
+            "levels for the prices, and the funding rate for carry; if a context metric "
+            "was unavailable, name it as a risk factor."
         ),
     )
+
+    @field_validator("budget_fraction", mode="before")
+    @classmethod
+    def _reject_boolean_budget_fraction(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("budget_fraction must be numeric, not boolean")
+        return value
+
+    @field_validator("leverage", mode="before")
+    @classmethod
+    def _reject_boolean_leverage(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("leverage must be numeric, not boolean")
+        return value
 
     @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
     @classmethod
@@ -241,10 +265,10 @@ class TraderProposal(BaseModel):
     futures_execution: FuturesExecutionProposal | None = Field(
         default=None,
         description=(
-            "For a crypto futures trade, propose margin mode, leverage, risk and margin budgets, "
-            "and protective levels. A Buy is a long proposal and a Sell is a short proposal when "
-            "the closed candles confirm the direction. Omit when not trading futures or when a "
-            "required context item is missing; never invent numbers to fill the fields."
+            "For a crypto futures trade, propose margin mode, leverage, budget_fraction, "
+            "and protective levels. A Buy is a long proposal and a Sell is a short proposal "
+            "when the closed candles confirm the direction. Omit when not trading futures or "
+            "when a required context item is missing; never invent numbers to fill the fields."
         ),
     )
     # Required so every proposal states its futures intent explicitly: a
@@ -289,8 +313,7 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
             f"**Futures Take Profit**: {futures.take_profit if futures.take_profit is not None else 'not provided'}",
             f"**Futures Margin Mode**: {futures.margin_mode}",
             f"**Futures Leverage**: {futures.leverage}x",
-            f"**Futures Risk Budget**: {futures.risk_fraction}",
-            f"**Futures Margin Budget**: {futures.margin_fraction}",
+            f"**Futures Budget Allocation**: {futures.budget_fraction} of total budget",
             f"**Futures Execution Rationale**: {futures.rationale}",
         ])
     else:
@@ -377,8 +400,7 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
             "**Final Futures Execution Decision**",
             f"- Margin Mode: {futures.margin_mode}",
             f"- Leverage: {futures.leverage}x",
-            f"- Risk Budget: {futures.risk_fraction}",
-            f"- Margin Budget: {futures.margin_fraction}",
+            f"- Budget Allocation: {futures.budget_fraction} of total budget",
             f"- Entry: {futures.entry_price if futures.entry_price is not None else 'not provided'}",
             f"- Stop Loss: {futures.stop_loss if futures.stop_loss is not None else 'not provided'}",
             f"- Take Profit: {futures.take_profit if futures.take_profit is not None else 'not provided'}",

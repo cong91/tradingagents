@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tradingagents.execution.futures_safety import risk_limited_quantity
+from tradingagents.execution.futures_safety import budget_limited_quantity
 from tradingagents.execution.futures_scheduler import closed_candle_pair
 from tradingagents.execution.futures_signals import FuturesSignalEnvelope
 from tradingagents.execution.position_manager import (
@@ -32,9 +32,9 @@ def test_demo_flow_closed_candles_signal_sizing_and_position_manager(monkeypatch
         confirmation_candle_open=four_hour[0], strategy="demo", strategy_version="1",
     )
     assert FuturesSignalEnvelope.from_json(envelope.to_json()) == envelope
-    qty = risk_limited_quantity(
+    qty = budget_limited_quantity(
         side="sell", equity=1000, entry=100, stop_loss=105, take_profit=95,
-        leverage=2, risk_fraction=0.01, margin_fraction=0.2,
+        leverage=2, budget_fraction=0.20,
     )
     assert qty > 0
     adapter = FakePositionAdapter(PositionSnapshot(

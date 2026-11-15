@@ -157,10 +157,7 @@ def test_risk_and_execution_defaults(monkeypatch):
     assert config["risk_derivatives_override_max_per_day"] == 0
     assert isinstance(config["risk_derivatives_override_max_per_day"], int)
     assert config["risk_max_open_heat_pct"] == 0.0
-    assert config["risk_derivatives_max_risk_fraction"] == 0.02
-    assert config["risk_derivatives_max_margin_fraction"] == 0.5
-    assert config["risk_derivatives_risk_fraction"] == 0.01
-    assert config["risk_derivatives_margin_fraction"] == 0.25
+    assert config["risk_derivatives_budget_fraction"] == 0.10
     assert config["risk_derivatives_profit_protection_enabled"] is True
     assert config["risk_derivatives_break_even_r"] == 0.5
     assert config["risk_derivatives_lock_profit_r"] == 1.0

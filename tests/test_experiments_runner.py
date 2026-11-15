@@ -72,7 +72,7 @@ def _manifest(tmp_path, *, seed=7, repeat=3, variants=("no_trade", "rule")) -> d
         repeat=repeat,
         variants=list(variants),
         data_source="test-candles",
-        config={"risk_derivatives_risk_fraction": 0.01},
+        config={"risk_derivatives_budget_fraction": 0.10},
     )
 
 
@@ -96,7 +96,7 @@ def _trading_variants() -> list[VariantSpec]:
             return Proposal(
                 signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
                 stop_loss=candle.close * 0.98, take_profit=candle.close * 1.04,
-                risk_fraction=0.004, margin_fraction=0.25,
+                budget_fraction=0.10,
             )
 
         source.mode = "test_recorded_proposals"

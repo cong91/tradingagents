@@ -71,7 +71,7 @@ def _record_executed_cycle(cycle_id: str, *, order_id: str | None = ORDER_ID,
         "order_id": order_id,
         "agent_proposal": {
             "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 104.0,
-            "leverage": 1.0, "risk_fraction": 0.01,
+            "leverage": 1.0, "budget_fraction": 0.10,
         },
         "signal": "Buy",
     }

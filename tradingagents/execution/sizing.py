@@ -61,6 +61,14 @@ class PlannedOrder(BaseModel):
     signal: str
     side: Literal["buy", "sell"] | None = None
     quantity: float | None = None
+    # Derivatives plans keep the sizing/risk quantity in base units. Live venue
+    # calls use the verified contract count carried alongside it.
+    quantity_unit: Literal["base"] = "base"
+    venue_contracts: float | None = None
+    contract_size: float | None = None
+    contract_unit: Literal["contracts"] = "contracts"
+    linear: bool | None = None
+    inverse: bool | None = None
     estimated_price: float | None = None
     cost: float | None = None
     mode: Literal["dry", "live"] = "dry"

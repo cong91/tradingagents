@@ -5,9 +5,11 @@ import pytest
 from server import job_store
 from tradingagents.dataflows.market_data import fetch_closed_candles
 from tradingagents.execution.futures_safety import (
+    LIQUIDATION_BUFFER,
     FuturesPlanError,
-    risk_limited_quantity,
+    budget_limited_quantity,
     validate_bracket,
+    validate_liquidation_buffer,
 )
 from tradingagents.execution.futures_scheduler import closed_candle_pair
 
@@ -52,30 +54,64 @@ def test_bracket_geometry_is_fail_closed_for_both_directions():
             validate_bracket(**kwargs)
 
 
-def test_risk_sizing_uses_stop_distance_and_margin_cap():
-    quantity = risk_limited_quantity(
-        equity=1_000, entry=100, stop_loss=95, leverage=3,
-        risk_fraction=0.01, margin_fraction=0.25,
+def test_budget_sizing_scales_with_the_total_budget():
+    """budget_fraction is the agent-owned share of the TOTAL budget:
+    notional = equity x fraction, quantity = notional / entry."""
+    quantity = budget_limited_quantity(
+        equity=1_000, entry=100, stop_loss=95, leverage=3, budget_fraction=0.10,
     )
-    assert quantity == pytest.approx(2.0)
+    assert quantity == pytest.approx(1.0)  # 10% of 1_000 = 100 notional @ 100
     with pytest.raises(FuturesPlanError):
-        risk_limited_quantity(
-            equity=None, entry=100, stop_loss=95, leverage=3,
-            risk_fraction=0.01, margin_fraction=0.25,
+        budget_limited_quantity(
+            equity=None, entry=100, stop_loss=95, leverage=3, budget_fraction=0.10,
         )
 
 
-def test_short_risk_sizing_and_precision_caps():
-    qty = risk_limited_quantity(
+def test_short_budget_sizing_and_amount_step():
+    qty = budget_limited_quantity(
         side="sell", equity=1_000, entry=100, stop_loss=105, take_profit=90,
-        leverage=3, risk_fraction=0.01, margin_fraction=0.25, amount_step=0.01,
+        leverage=3, budget_fraction=0.10, amount_step=0.01,
     )
-    assert qty == pytest.approx(2.0)
+    assert qty == pytest.approx(1.0)  # 10% of 1_000 = 100 notional @ 100
     with pytest.raises(FuturesPlanError):
-        risk_limited_quantity(
+        budget_limited_quantity(
             side="sell", equity=1_000, entry=100, stop_loss=95, take_profit=90,
-            leverage=3, risk_fraction=0.01, margin_fraction=0.25,
+            leverage=3, budget_fraction=0.10,
         )
+
+
+def test_budget_fraction_bounds_are_structural():
+    with pytest.raises(FuturesPlanError, match="outside \\(0, 1\\]"):
+        budget_limited_quantity(
+            equity=1_000, entry=100, stop_loss=95, leverage=3, budget_fraction=0.0,
+        )
+    with pytest.raises(FuturesPlanError, match="outside \\(0, 1\\]"):
+        budget_limited_quantity(
+            equity=1_000, entry=100, stop_loss=95, leverage=3, budget_fraction=1.5,
+        )
+
+
+def test_budget_sizing_allows_agent_budget_above_one_percent_stop_risk():
+    quantity = budget_limited_quantity(
+        equity=1_000, entry=100, stop_loss=98, leverage=2, budget_fraction=1.0,
+    )
+    assert quantity == pytest.approx(10.0)
+
+
+def test_liquidation_buffer_refuses_a_stop_beyond_the_leverage_distance():
+    """The leverage-based planning envelope rejects an excessively distant stop."""
+    assert LIQUIDATION_BUFFER == 0.8
+    entry, stop, leverage = 100.0, 98.0, 10.0
+    validate_liquidation_buffer(entry=entry, stop_loss=stop, leverage=leverage)
+    with pytest.raises(FuturesPlanError, match="liquidation buffer"):
+        validate_liquidation_buffer(entry=entry, stop_loss=91.0, leverage=leverage)
+    with pytest.raises(FuturesPlanError, match="liquidation buffer"):
+        budget_limited_quantity(
+            equity=1_000, entry=100, stop_loss=91.0, leverage=10, budget_fraction=0.10,
+        )
+    validate_liquidation_buffer(entry=100.0, stop_loss=102.0, leverage=10.0)
+    with pytest.raises(FuturesPlanError, match="liquidation buffer"):
+        validate_liquidation_buffer(entry=100.0, stop_loss=109.0, leverage=10.0)
 
 
 def test_signal_claim_is_atomic_terminal_and_expired_lease_recoverable(postgres_schema):

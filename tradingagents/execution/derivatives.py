@@ -36,19 +36,18 @@ from server import job_store, snapshot_observer
 from server.auto_modes import AutoMode
 from tradingagents.agents.rating import RATINGS_5_TIER, is_review
 from tradingagents.dataflows.symbols import futures_base
-from tradingagents.execution import futures_identity
+from tradingagents.execution import bracket_recovery, futures_identity
 from tradingagents.execution.auto_authorization import (
     AuthorizationSnapshot,
     AutoAuthorizationError,
 )
-from tradingagents.execution.bracket_legs import TERMINAL_STATUSES
-from tradingagents.execution.brackets import (
-    BracketManager,
-    stored_account_identity,
-)
+from tradingagents.execution.brackets import BracketManager
 from tradingagents.execution.bridge import ExchangeBridge
 from tradingagents.execution.exchange_client import venue_key
-from tradingagents.execution.futures_account import observe_futures_positions
+from tradingagents.execution.futures_contracts import (
+    FuturesContractError,
+    FuturesContractSpec,
+)
 from tradingagents.execution.futures_entry_journal import (
     create_guarded_entry_intent,
     entry_journal_leg,
@@ -57,173 +56,18 @@ from tradingagents.execution.futures_entry_journal import (
 from tradingagents.execution.futures_operation_lock import (
     OperationGuard,
     operation_lock,
-    require_operation_lock,
 )
 from tradingagents.execution.futures_safety import (
     FuturesPlanError,
-    risk_limited_quantity,
+    budget_limited_quantity,
     validate_bracket,
+    validate_liquidation_buffer,
 )
 from tradingagents.execution.scale_out import plan_scale_out
 from tradingagents.execution.sizing import PlannedOrder, SizingRules
 from tradingagents.portfolio import PortfolioContext
 
 _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
-
-
-def _verified_protection_task(
-    executor_or_bridge: Any, task_id: str, *, expected_symbol: str,
-) -> str | None:
-    """Require a fresh, bound bracket and one complete open venue position."""
-    bridge = getattr(executor_or_bridge, "_bridge", executor_or_bridge)
-    guard = require_operation_lock(expected_symbol)
-    guard.check()
-    task = job_store.load_bracket_recovery(task_id)
-    if task is None or task.get("task_id") != task_id:
-        return "task_unknown"
-    if task_id.startswith("entry-intent:"):
-        return "entry_reconciliation_required"
-    if task.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
-        return "manual_reconciliation_required"
-    symbol = task.get("symbol")
-    if not isinstance(symbol, str) or symbol != expected_symbol:
-        return "bracket_identity_mismatch"
-    entry_order_id = task.get("entry_order_id")
-    if not isinstance(entry_order_id, str) or not entry_order_id or entry_order_id == "unknown":
-        return "bracket_identity_mismatch"
-    if task_id != f"bracket:{symbol}:{entry_order_id}":
-        return "bracket_identity_mismatch"
-    if task.get("venue_key") != venue_key(bridge):
-        return "venue_mismatch"
-
-    legs = task.get("legs")
-    if not isinstance(legs, list) or not legs:
-        return "missing_bracket_legs"
-    names = []
-    for leg in legs:
-        if not isinstance(leg, dict) or not isinstance(leg.get("params"), dict):
-            return "missing_bracket_legs"
-        name = leg.get("name")
-        if not isinstance(name, str) or leg.get("status") not in {
-            "pending", "uncertain", "placed", "filled", "cancelled",
-        }:
-            return "missing_bracket_legs"
-        param = "stopLossPrice" if name == "stop-loss" else (
-            "takeProfitPrice" if name.startswith("take-profit") else None
-        )
-        if param is None or _positive_number(leg["params"].get(param)) is None:
-            return "missing_bracket_legs"
-        if leg.get("status") == "placed" and not leg.get("order_id"):
-            return "missing_bracket_legs"
-        if leg.get("status") == "pending" and not leg.get("client_order_id"):
-            return "missing_bracket_legs"
-        if leg.get("status") == "uncertain" and not leg.get("order_id") and not any(
-            leg.get(key) for key in (
-                "client_order_id", "repair_client_id", "replacement_client_id",
-            )
-        ):
-            return "missing_bracket_legs"
-        names.append(name)
-    if (
-        len(names) != len(set(names))
-        or "stop-loss" not in names
-        or not any(name.startswith("take-profit") for name in names)
-    ):
-        return "missing_bracket_legs"
-
-    task_identity = stored_account_identity(task)
-    if task_identity is None:
-        return "account_identity_unknown"
-    try:
-        client = bridge.client()
-        credentials = (getattr(client, "apiKey", None), getattr(client, "secret", None))
-        comparison = futures_identity.compare_futures_account_identity(bridge, task_identity)
-    except Exception:
-        return "account_identity_unknown"
-    if comparison is futures_identity.IdentityComparison.MISMATCH:
-        return "account_identity_mismatch"
-    if comparison is not futures_identity.IdentityComparison.MATCH:
-        return "account_identity_unknown"
-    if not _protection_client_stable(bridge, client, credentials, task):
-        return "account_identity_unknown"
-
-    states = [
-        state for state in job_store.active_position_states()
-        if state.get("bracket_task_id") == task_id
-    ]
-    if not states:
-        return "missing_position_link"
-    if len(states) != 1:
-        return "ambiguous_position_link"
-    state = states[0]
-    if stored_account_identity(state) != task_identity:
-        return "account_identity_unknown"
-    if state.get("venue_key") != task.get("venue_key"):
-        return "venue_mismatch"
-    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
-    parts = str(state.get("position_key") or "").rsplit(":", 2)
-    if len(parts) != 3 or parts[0] != symbol or parts[2] != entry_order_id:
-        return "bracket_identity_mismatch"
-    expected_side = "long" if parts[1] == "buy" else "short" if parts[1] == "sell" else None
-    if expected_side is None or snapshot.get("side") != expected_side:
-        return "bracket_identity_mismatch"
-    if state.get("entry_order_id") != entry_order_id:
-        return "bracket_identity_mismatch"
-    if task.get("close_side") != ("sell" if expected_side == "long" else "buy"):
-        return "bracket_identity_mismatch"
-
-    try:
-        observation = observe_futures_positions(bridge)
-    except Exception:
-        return "position_unknown"
-    if (
-        not observation.scope_complete
-        or observation.unknown_scope
-        or observation.unknown_symbols
-        or not _protection_client_stable(bridge, client, credentials, task)
-    ):
-        return "position_unknown"
-    symbol_positions = [position for position in observation.positions if position.symbol == symbol]
-    if len(symbol_positions) != 1:
-        return "position_unknown" if not symbol_positions else "ambiguous_net_position"
-    position = symbol_positions[0]
-    if not _valid_open_position(position, expected_side):
-        return "position_unknown"
-    guard.check()
-    return None
-
-
-def _valid_open_position(position: Any, expected_side: str) -> bool:
-    """Require a finite, non-flat current position on the durable side."""
-    try:
-        signed_quantity = float(getattr(position, "quantity", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return False
-    magnitude = abs(signed_quantity)
-    return (
-        getattr(position, "side", None) == expected_side
-        and math.isfinite(signed_quantity)
-        and math.isfinite(magnitude)
-        and magnitude > 0
-        and (
-            (expected_side == "long" and signed_quantity > 0)
-            or (expected_side == "short" and signed_quantity < 0)
-        )
-        and _positive_number(getattr(position, "contracts", None)) is not None
-        and _positive_number(getattr(position, "entry_price", None)) is not None
-        and _positive_number(getattr(position, "mark_price", None)) is not None
-    )
-
-
-def _protection_client_stable(bridge: Any, client: Any, credentials: tuple, task: dict) -> bool:
-    try:
-        return (
-            bridge.client() is client
-            and (getattr(client, "apiKey", None), getattr(client, "secret", None)) == credentials
-            and venue_key(bridge) == task.get("venue_key")
-        )
-    except Exception:
-        return False
 
 
 def _derivatives_gate_open(executor: DerivativesExecutor) -> bool:
@@ -233,7 +77,7 @@ def _derivatives_gate_open(executor: DerivativesExecutor) -> bool:
     )
 
 
-def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrder, exchange: Any) -> None:
+def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrder, exchange: Any) -> PortfolioContext:
     from server.futures_decision_context import build_futures_portfolio
     from tradingagents.execution.futures_account import (
         observe_futures_positions,
@@ -269,6 +113,7 @@ def _refresh_live_risk_context(executor: DerivativesExecutor, order: PlannedOrde
     executor._record_risk_decision("execute_locked", decision)
     if decision.halted or not decision.allowed:
         raise PermissionError(f"risk guard refused execution: {decision.reason}")
+    return portfolio
 
 
 class DerivativesExecutor:
@@ -360,8 +205,7 @@ class DerivativesExecutor:
         leverage: float = 1.0,
         stop_loss: float | None = None,
         take_profit: float | None = None,
-        risk_fraction: float | None = None,
-        margin_fraction: float | None = None,
+        budget_fraction: float | None = None,
         margin_mode: str | None = None,
         futures_execution_intent: str | None = None,
         confirmation_ok: bool | None = None,
@@ -380,9 +224,10 @@ class DerivativesExecutor:
         decision). Underweight/Sell never authorize a short on their own.
         ``Hold``/``REVIEW`` stay no-order plans and need no authorization.
 
-        ``risk_fraction``/``margin_fraction``/``margin_mode`` are the decision
-        agents' terms; ``None`` keeps the configured sizing defaults. The
-        plan refuses (never substitutes) when a term is unusable.
+        ``budget_fraction``/``margin_mode`` are the decision agents' terms (the
+        agent-owned share of the TOTAL budget this trade's notional takes);
+        ``None`` keeps the configured sizing default. The plan refuses (never
+        substitutes) when a term is unusable.
 
         ``confirmation_ok``/``funding_rate`` carry the conditional soft-cap
         override evidence on the plan for the risk guard to measure.
@@ -412,7 +257,21 @@ class DerivativesExecutor:
                 "never authorizes a new futures position; nothing was planned",
                 phase="plan",
             )
-        ccxt_symbol = self.resolve_market(ticker)
+        try:
+            exchange = self._bridge.client()
+            ccxt_symbol, market = self._bridge.futures_market(ticker)
+            if self._bridge.client() is not exchange:
+                raise ValueError("futures client changed while loading markets")
+            contract_spec = FuturesContractSpec.from_market(ccxt_symbol, market)
+        except (FuturesContractError, ValueError, TypeError, AttributeError) as exc:
+            order = shell.model_copy(update={
+                "side": None, "quantity": None, "cost": None,
+                "reason": f"futures contract metadata refused: {exc}",
+            })
+            self._bridge.audit_plan(
+                order, action="no_order", reason=order.reason, phase="plan",
+            )
+            return order
         if price is None:
             price = self._bridge.fetch_price(ticker)
         mode = self._bridge.effective_mode()
@@ -422,7 +281,7 @@ class DerivativesExecutor:
                 signal=signal, ticker=ticker, ccxt_symbol=ccxt_symbol,
                 portfolio=portfolio, price=price, leverage=leverage,
                 stop_loss=None, take_profit=None,
-                risk_fraction=risk_fraction, margin_fraction=margin_fraction,
+                budget_fraction=budget_fraction,
                 margin_mode=margin_mode,
                 futures_execution_intent=authorized,
                 confirmation_ok=confirmation_ok, funding_rate=funding_rate,
@@ -434,11 +293,22 @@ class DerivativesExecutor:
             signal=signal, ticker=ticker, ccxt_symbol=ccxt_symbol,
             portfolio=portfolio, price=price, leverage=leverage,
             stop_loss=stop_loss, take_profit=take_profit,
-            risk_fraction=risk_fraction, margin_fraction=margin_fraction,
+            budget_fraction=budget_fraction,
             margin_mode=margin_mode,
             futures_execution_intent=authorized,
             confirmation_ok=confirmation_ok, funding_rate=funding_rate,
         )
+        if order.side is not None:
+            try:
+                order.venue_contracts = contract_spec.contracts_for_base(order.quantity)
+                order.contract_size = contract_spec.contract_size
+                order.linear = contract_spec.linear
+                order.inverse = contract_spec.inverse
+            except FuturesContractError as exc:
+                order = order.model_copy(update={
+                    "side": None, "quantity": None, "cost": None,
+                    "reason": f"futures contract sizing refused: {exc}",
+                })
         order.mode = mode
         decision = self.risk_guard.check(order, portfolio, self.config["exec_log_path"])
         self._record_risk_decision("plan", decision)
@@ -512,6 +382,10 @@ class DerivativesExecutor:
                 stop_loss=order.stop_loss,
                 take_profit=order.take_profit,
             )
+            validate_liquidation_buffer(
+                entry=float(order.estimated_price), stop_loss=float(order.stop_loss),
+                leverage=float(order.leverage),
+            )
         except FuturesPlanError as exc:
             self._bridge.audit_plan(
                 order, action="derivatives_denied", reason=str(exc),
@@ -525,19 +399,35 @@ class DerivativesExecutor:
                 "nothing was sent",
                 phase="execute",
             )
-        if portfolio is None or (portfolio.cash is None and not portfolio.positions):
-            # Fail-closed on purpose: the guard's percentage caps need equity.
-            # A missing portfolio OR an unmarkable one (no cash, no positions)
-            # would both make _equity return None and silently disarm
-            # risk_max_derivatives_exposure_pct (default 0 blocks all notional).
+        mode = self._bridge.effective_mode()
+        if mode == "live":
+            try:
+                spec = FuturesContractSpec.from_market(order.ccxt_symbol, {
+                    "contractSize": order.contract_size,
+                    "linear": order.linear,
+                    "inverse": order.inverse,
+                })
+                planned_contracts = spec.contracts_for_base(order.quantity)
+                if order.venue_contracts is None or not math.isclose(
+                    planned_contracts, float(order.venue_contracts), rel_tol=1e-9, abs_tol=1e-12,
+                ):
+                    raise FuturesContractError("planned contract amount does not match base quantity")
+            except (FuturesContractError, TypeError, ValueError, OverflowError) as exc:
+                raise self._refuse(
+                    order, f"futures contract metadata is missing or inconsistent: {exc}",
+                    phase="execute",
+                ) from exc
+        if mode != "live" and (
+            portfolio is None or (portfolio.cash is None and not portfolio.positions)
+        ):
+            # Dry execution cannot recover equity from the venue; percentage
+            # RiskGuard limits remain fail-closed without the planning book.
             raise self._refuse(
                 order,
-                "derivatives execution requires a portfolio with computable equity: "
-                "the risk guard's percentage caps fail open without it; "
+                "dry derivatives execution requires a portfolio with computable equity; "
                 "nothing was sent",
                 phase="execute",
             )
-        mode = self._bridge.effective_mode()
         if confirm is not True:
             self._bridge.audit_plan(
                 order, action="derivatives_denied",
@@ -622,7 +512,7 @@ class DerivativesExecutor:
                 phase="execute",
             )
         return self._execute_live(
-            order, confirm, identity,
+            order, confirm, identity, portfolio=portfolio,
             on_entry_evidence=on_entry_evidence, check_entry_allowed=check_entry_allowed,
         )
 
@@ -639,8 +529,7 @@ class DerivativesExecutor:
         leverage: float,
         stop_loss: float | None,
         take_profit: float | None,
-        risk_fraction: float | None = None,
-        margin_fraction: float | None = None,
+        budget_fraction: float | None = None,
         margin_mode: str | None = None,
         futures_execution_intent: str | None = None,
         confirmation_ok: bool | None = None,
@@ -683,32 +572,25 @@ class DerivativesExecutor:
         side = "buy" if long else "sell"
         if stop_loss is None or take_profit is None:
             return no_order("derivatives entry requires explicit stop_loss and take_profit")
-        risk_fraction = (
-            float(risk_fraction) if risk_fraction is not None
-            else float(self.config.get("risk_derivatives_risk_fraction", 0.01))
-        )
-        margin_fraction = (
-            float(margin_fraction) if margin_fraction is not None
-            else float(self.config.get("risk_derivatives_margin_fraction", 0.25))
-        )
-        risk_cap = float(self.config.get("risk_derivatives_max_risk_fraction", 0.02))
-        margin_cap = float(self.config.get("risk_derivatives_max_margin_fraction", 0.5))
-        if risk_fraction > risk_cap:
-            return no_order(
-                f"proposed risk_fraction {risk_fraction:g} exceeds the hard cap {risk_cap:g}"
-            )
-        if margin_fraction > margin_cap:
-            return no_order(
-                f"proposed margin_fraction {margin_fraction:g} exceeds the hard cap {margin_cap:g}"
-            )
+        # The agent owns the sizing decision: budget_fraction is its chosen
+        # share of the TOTAL budget this trade's notional takes. Only the
+        # (0, 1] bound is structural; the account-level caps stay in RiskGuard.
         try:
+            raw_budget = (
+                budget_fraction if budget_fraction is not None
+                else self.config.get("risk_derivatives_budget_fraction", 0.10)
+            )
+            # A bool is an int subclass: converting it first would silently turn
+            # True into a 1.0 budget that the structural bound accepts.
+            if isinstance(raw_budget, bool):
+                raise FuturesPlanError("derivatives sizing parameters must be numeric, not boolean")
+            budget_fraction = float(raw_budget)
             validate_bracket(side=side, entry=price, stop_loss=stop_loss, take_profit=take_profit)
             equity = float(book.cash)
-            quantity = risk_limited_quantity(
+            quantity = budget_limited_quantity(
                 side=side, equity=equity, entry=price, stop_loss=stop_loss,
                 take_profit=take_profit, leverage=leverage,
-                risk_fraction=risk_fraction,
-                margin_fraction=margin_fraction,
+                budget_fraction=budget_fraction,
             )
         except (FuturesPlanError, TypeError, ValueError) as exc:
             return no_order(f"derivatives sizing refused: {exc}")
@@ -726,6 +608,7 @@ class DerivativesExecutor:
 
     def _execute_live(
         self, order: PlannedOrder, confirm: bool, identity: Any = None, *,
+        portfolio: PortfolioContext | None = None,
         on_entry_evidence: Callable[[dict], None] | None = None,
         check_entry_allowed: Callable[[], None] | None = None,
     ) -> str | None:
@@ -747,12 +630,13 @@ class DerivativesExecutor:
             )
         with operation_lock(order.ccxt_symbol) as guard:
             return self._execute_live_locked(
-                order, confirm, identity, guard, on_entry_evidence=on_entry_evidence,
-                check_entry_allowed=check_entry_allowed,
+                order, confirm, identity, guard, portfolio=portfolio,
+                on_entry_evidence=on_entry_evidence, check_entry_allowed=check_entry_allowed,
             )
 
     def _execute_live_locked(
         self, order: PlannedOrder, confirm: bool, identity: Any, guard: OperationGuard, *,
+        portfolio: PortfolioContext | None = None,
         on_entry_evidence: Callable[[dict], None] | None = None,
         check_entry_allowed: Callable[[], None] | None = None,
     ) -> str | None:
@@ -790,8 +674,70 @@ class DerivativesExecutor:
         intent_id = f"entry-intent:{order.ccxt_symbol}:{entry_client_id}"
         created_at = datetime.now(UTC).isoformat()
         selected_venue = venue_key(self._bridge)
+        amount: str
+        try:
+            guard.check()
+            markets = exchange.load_markets()
+            if self._bridge.client() is not exchange:
+                raise ValueError("futures client changed while loading markets")
+            resolved_symbol = self._bridge.futures_symbol_for(order.ticker, markets=markets)
+            if resolved_symbol != order.ccxt_symbol:
+                raise ValueError(
+                    f"futures market changed from {order.ccxt_symbol!r} to "
+                    f"{resolved_symbol!r}; nothing was sent"
+                )
+            contract_spec = FuturesContractSpec.from_market(
+                order.ccxt_symbol, markets.get(order.ccxt_symbol),
+            )
+            requested_contracts = contract_spec.contracts_for_base(order.quantity)
+            amount = exchange.amount_to_precision(order.ccxt_symbol, requested_contracts)
+            rounded_contracts = float(amount)
+            rounded_base = contract_spec.base_for_contracts(rounded_contracts)
+            rounded_entry = float(
+                exchange.price_to_precision(order.ccxt_symbol, order.estimated_price)
+            )
+            rounded_stop = float(
+                exchange.price_to_precision(order.ccxt_symbol, order.stop_loss)
+            )
+            rounded_target = float(
+                exchange.price_to_precision(order.ccxt_symbol, order.take_profit)
+            )
+            validate_bracket(
+                side=order.side, entry=rounded_entry,
+                stop_loss=rounded_stop, take_profit=rounded_target,
+            )
+            validate_liquidation_buffer(
+                entry=rounded_entry, stop_loss=rounded_stop,
+                leverage=float(order.leverage),
+            )
+            order = order.model_copy(update={
+                "quantity": rounded_base,
+                "estimated_price": rounded_entry,
+                "stop_loss": rounded_stop,
+                "take_profit": rounded_target,
+                "cost": rounded_base * rounded_entry / float(order.leverage),
+                "venue_contracts": rounded_contracts,
+                "contract_size": contract_spec.contract_size,
+                "linear": contract_spec.linear,
+                "inverse": contract_spec.inverse,
+            })
+            _refresh_live_risk_context(self, order, exchange)
+        except FuturesPlanError as exc:
+            self._bridge.audit_plan(
+                order, action="derivatives_denied", reason=str(exc),
+                confirmed=confirm, phase="execute",
+            )
+            raise PermissionError(str(exc)) from exc
+        except (FuturesContractError, TypeError, ValueError) as exc:
+            self._bridge.audit_plan(
+                order, action="derivatives_denied",
+                reason=f"futures contract metadata/preflight refused: {exc}",
+                confirmed=confirm, phase="execute",
+            )
+            raise PermissionError(f"futures contract metadata/preflight refused: {exc}") from exc
         intent_leg = entry_journal_leg(
-            order, entry_client_id, quantity=str(order.quantity), created_at=created_at,
+            order, entry_client_id, quantity=str(order.quantity),
+            contracts=amount, created_at=created_at,
             identity=identity, venue=selected_venue, config=self.config,
         )
         try:
@@ -827,31 +773,6 @@ class DerivativesExecutor:
             if futures_identity.compare_futures_account_identity(self._bridge, identity) \
                     is not futures_identity.IdentityComparison.MATCH:
                 raise RuntimeError("futures account identity changed before entry; nothing was sent")
-            guard.check()
-            _refresh_live_risk_context(self, order, exchange)
-
-            # Precision depends on loaded market metadata; journal the exact
-            # venue string before margin, leverage, or order mutations.
-            guard.check()
-            markets = exchange.load_markets()
-            if self._bridge.client() is not exchange:
-                raise ValueError("futures client changed while loading markets")
-            resolved_symbol = self._bridge.futures_symbol_for(order.ticker, markets=markets)
-            if resolved_symbol != order.ccxt_symbol:
-                raise ValueError(
-                    f"futures market changed from {order.ccxt_symbol!r} to "
-                    f"{resolved_symbol!r}; nothing was sent"
-                )
-            amount = exchange.amount_to_precision(order.ccxt_symbol, order.quantity)
-            intent_leg = entry_journal_leg(
-                order, entry_client_id, quantity=str(amount), created_at=created_at,
-                identity=identity, venue=selected_venue, config=self.config,
-            )
-            update_guarded_entry_intent(
-                guard, intent_id, status="submission_uncertain", leg=intent_leg,
-                order_id=None, error="exact rounded entry terms journaled before venue mutation",
-                quantity=float(amount),
-            )
 
             if self._bridge.exchange_id == "binance":
                 guard.check()
@@ -967,13 +888,22 @@ class DerivativesExecutor:
                     "order_id": str(order_id) if order_id is not None else None,
                 })
         response = response if isinstance(response, dict) else {}
-        actual_quantity = _positive_number(response.get("filled"))
+        actual_contracts = _positive_number(response.get("filled"))
         actual_entry = _positive_number(response.get("average")) or _positive_number(response.get("price"))
+        actual_quantity = None
+        if actual_contracts is not None:
+            try:
+                actual_quantity = contract_spec.base_for_contracts(actual_contracts)
+            except FuturesContractError:
+                actual_quantity = None
         response_status = str(response.get("status") or "").lower()
         complete = (
-            actual_quantity is not None
+            actual_contracts is not None
+            and actual_entry is not None
+            and isinstance(order_id, (str, int))
+            and str(order_id).strip().lower() not in {"", "unknown", "none", "null"}
             and response_status in {"closed", "filled"}
-            and math.isclose(actual_quantity, float(amount), rel_tol=1e-9, abs_tol=1e-12)
+            and math.isclose(actual_contracts, float(amount), rel_tol=1e-9, abs_tol=1e-12)
         )
         residual_warning = (
             "entry partial or remaining quantity unknown; residual exposure unresolved; "
@@ -990,13 +920,6 @@ class DerivativesExecutor:
         except Exception as exc:
             post_ack_errors.append(("entry intent update", exc))
         if actual_quantity is None or actual_entry is None:
-            if actual_quantity is not None:
-                try:
-                    BracketManager(self._bridge).place(
-                        order.model_copy(update={"quantity": actual_quantity}), confirm, order_id,
-                    )
-                except Exception as exc:
-                    post_ack_errors.append(("bracket attempt failed or unverified", exc))
             try:
                 self._bridge.audit_plan(
                     order, action="entry_uncertain", confirmed=confirm, order_id=order_id,
@@ -1005,27 +928,44 @@ class DerivativesExecutor:
                 )
             except Exception as exc:
                 post_ack_errors.append(("entry audit", exc))
-            if not complete:
-                try:
-                    self._bridge.audit_plan(
-                        order, action="entry_partial_or_unknown", confirmed=confirm,
-                        order_id=order_id, reason=residual_warning, phase="execute",
-                    )
-                except Exception as exc:
-                    post_ack_errors.append(("residual audit", exc))
+            try:
+                self._bridge.audit_plan(
+                    order, action="entry_partial_or_unknown", confirmed=confirm,
+                    order_id=order_id, reason=residual_warning, phase="execute",
+                )
+            except Exception as exc:
+                post_ack_errors.append(("residual audit", exc))
             details = "; ".join(f"{stage}: {type(exc).__name__}" for stage, exc in post_ack_errors)
-            message = "entry fill is unknown; durable intent retained for reconciliation"
-            if not complete:
-                message += f"; {residual_warning}"
-            if actual_quantity is not None:
-                message += "; bracket attempted for confirmed quantity; protection unverified"
+            message = (
+                f"entry order {order_id!r} fill is unknown; residual exposure unresolved; "
+                "durable intent retained for reconciliation"
+            )
             if details:
                 message += f"; post-ACK errors: {details}"
             raise RuntimeError(message) from (post_ack_errors[0][1] if post_ack_errors else None)
+        if not complete:
+            try:
+                self._bridge.audit_plan(
+                    order, action="entry_partial_or_unknown", confirmed=confirm,
+                    order_id=order_id, reason=residual_warning, phase="execute",
+                )
+            except Exception as exc:
+                post_ack_errors.append(("residual audit", exc))
+            details = "; ".join(f"{stage}: {type(exc).__name__}" for stage, exc in post_ack_errors)
+            message = f"entry order {order_id!r}: {residual_warning}; durable intent retained"
+            if actual_contracts is not None:
+                message += "; confirmed fill is not protected while the entry remainder is unresolved"
+            if details:
+                message += f"; post-ACK errors: {details}"
+            raise RuntimeError(message) from (post_ack_errors[0][1] if post_ack_errors else None)
+
         actual_order = order.model_copy(update={
             "quantity": actual_quantity,
+            "venue_contracts": actual_contracts,
+            "cost": actual_quantity * actual_entry / float(order.leverage),
             "estimated_price": actual_entry,
         })
+        post_fill_safety_error: FuturesPlanError | None = None
         try:
             self._bridge.audit_plan(
                 actual_order,
@@ -1038,6 +978,7 @@ class DerivativesExecutor:
             post_ack_errors.append(("entry audit", exc))
         if order.stop_loss is not None or order.take_profit is not None:
             position_key = f"{order.ccxt_symbol}:{order.side}:{order_id or 'unknown'}"
+            rounded_stop = None
             try:
                 rounded_stop = (
                     float(exchange.price_to_precision(order.ccxt_symbol, order.stop_loss))
@@ -1045,10 +986,25 @@ class DerivativesExecutor:
                 )
                 if not math.isfinite(rounded_stop) or rounded_stop <= 0:
                     raise ValueError("rounded stop is not finite and positive")
-                scale_out = self._scale_out_plan(actual_order)
+                try:
+                    validate_bracket(
+                        side=order.side, entry=actual_entry,
+                        stop_loss=rounded_stop, take_profit=rounded_target,
+                    )
+                    validate_liquidation_buffer(
+                        entry=actual_entry, stop_loss=rounded_stop,
+                        leverage=float(actual_order.leverage),
+                    )
+                except FuturesPlanError as exc:
+                    post_fill_safety_error = exc
+                scaled_contract_order = order.model_copy(update={
+                    "quantity": rounded_contracts,
+                    "venue_contracts": rounded_contracts,
+                })
+                scale_out = self._scale_out_plan(scaled_contract_order)
                 target_prices = (
                     [level.price for level in scale_out.levels] if scale_out is not None
-                    else [order.take_profit] if order.take_profit is not None else []
+                    else [rounded_target] if rounded_target is not None else []
                 )
                 persisted = job_store.persist_futures_entry_state(
                     position_key,
@@ -1058,6 +1014,8 @@ class DerivativesExecutor:
                     stop=rounded_stop,
                     targets=[float(exchange.price_to_precision(order.ccxt_symbol, price)) for price in target_prices],
                     mark=actual_entry,
+                    contracts=actual_contracts,
+                    contract_size=contract_spec.contract_size,
                     order_id=str(order_id) if order_id is not None else None,
                     identity=identity,
                 )
@@ -1080,6 +1038,32 @@ class DerivativesExecutor:
                 self._place_bracket(actual_order, confirm, order_id)
             except Exception as exc:
                 post_ack_errors.append(("bracket attempt failed or unverified", exc))
+        if post_fill_safety_error is not None:
+            close_error = None
+            task_id = f"bracket:{order.ccxt_symbol}:{order_id or 'unknown'}"
+            try:
+                if job_store.load_bracket_recovery(task_id) is None:
+                    raise RuntimeError("protective recovery task is unavailable")
+                close_status = BracketManager(self._bridge).close_position(
+                    task_id, reason="post-fill safety invariant failed", allow_mutation=True,
+                )
+                if close_status not in {"emergency_closed", "completed", "time_stop_closed"}:
+                    close_error = RuntimeError(f"post-fill safety close returned {close_status}")
+            except Exception as close_exc:
+                close_error = close_exc
+            self._bridge.audit_plan(
+                actual_order, action="post_fill_safety_refused", confirmed=confirm,
+                order_id=order_id,
+                reason=f"{post_fill_safety_error}; close_error={close_error!r}", phase="execute",
+            )
+            if close_error is not None:
+                raise RuntimeError(
+                    f"post-fill safety invariant failed and position close was not confirmed: "
+                    f"{post_fill_safety_error}"
+                ) from close_error
+            raise RuntimeError(
+                f"post-fill safety invariant failed; position was closed: {post_fill_safety_error}"
+            ) from post_fill_safety_error
         if post_ack_errors:
             details = "; ".join(f"{stage}: {type(exc).__name__}" for stage, exc in post_ack_errors)
             warning = f"; {residual_warning}" if not complete else ""
@@ -1100,16 +1084,20 @@ class DerivativesExecutor:
 
     def _place_bracket(self, order: PlannedOrder, confirm: bool, entry_order_id: str | None) -> None:
         manager = BracketManager(self._bridge)
+        contract_order = order.model_copy(update={
+            "quantity": order.venue_contracts,
+            "venue_contracts": order.venue_contracts,
+        })
         try:
-            plan = self._scale_out_plan(order)
+            plan = self._scale_out_plan(contract_order)
         except Exception:
-            manager.place(order, confirm, entry_order_id)
+            manager.place(contract_order, confirm, entry_order_id)
             raise
         if plan is None:
-            manager.place(order, confirm, entry_order_id)
+            manager.place(contract_order, confirm, entry_order_id)
             return
         manager.place_ladder(
-            order,
+            contract_order,
             [(level.price, level.quantity) for level in plan.levels],
             confirm,
             entry_order_id,
@@ -1145,73 +1133,13 @@ class DerivativesExecutor:
 
     def recover_bracket(self, task_id: str, *, confirm: bool = True) -> str:
         """Repair exits under live mode or verified protection recovery."""
-        if confirm is not True:
-            raise PermissionError("bracket recovery requires confirm=True")
-        task = job_store.load_bracket_recovery(task_id)
-        if task is None:
-            raise KeyError(task_id)
-        if task_id.startswith("entry-intent:"):
-            return self.monitor_bracket(task_id)
-        if not task_id.startswith("bracket:"):
-            raise PermissionError("only regular bracket tasks may be repaired")
-        if not self._bridge._runtime_gate("exec_live") and self.config.get(
-            "risk_derivatives_profit_protection_enabled"
-        ) is not True:
-            raise PermissionError("bracket recovery requires profit protection")
-        with operation_lock(task["symbol"]) as guard:
-            guard.check()
-            current = job_store.load_bracket_recovery(task_id)
-            if current is None:
-                raise KeyError(task_id)
-            if current.get("symbol") != task.get("symbol"):
-                return "bracket_identity_mismatch"
-            if current.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
-                return "manual_reconciliation_required"
-            verdict = _verified_protection_task(
-                self, task_id, expected_symbol=current["symbol"],
-            )
-            if verdict is not None:
-                return verdict
-            guard.check()
-            return BracketManager(self._bridge).reconcile(
-                task_id, repair_missing=True, allow_sibling_cancel=True,
-            )
+        return bracket_recovery.recover_bracket(
+            self._bridge, self.config, task_id, confirm=confirm,
+        )
 
     def monitor_bracket(self, task_id: str) -> str:
         """Inspect protective exits; entry intents use read-only recovery first."""
-        task = job_store.load_bracket_recovery(task_id)
-        if task is None:
-            raise KeyError(task_id)
-        with operation_lock(task["symbol"]) as guard:
-            guard.check()
-            current = job_store.load_bracket_recovery(task_id)
-            if current is None:
-                raise KeyError(task_id)
-            if current.get("symbol") != task.get("symbol"):
-                return "bracket_identity_mismatch"
-            if current["task_id"].startswith("entry-intent:"):
-                from tradingagents.execution.futures_entry_recovery import reconcile_entry
-
-                return reconcile_entry(self._bridge, task_id)
-            if current.get("status") in TERMINAL_STATUSES:
-                return current["status"]
-            if current.get("status") not in {"pending", "submission_uncertain", "monitoring"}:
-                return "manual_reconciliation_required"
-            allow_cancel = (
-                (
-                    self._bridge._runtime_gate("exec_live")
-                    or self.config.get("risk_derivatives_profit_protection_enabled") is True
-                )
-                and current["task_id"].startswith("bracket:")
-                and current.get("status") in {"pending", "submission_uncertain", "monitoring"}
-                and _verified_protection_task(
-                    self, task_id, expected_symbol=current["symbol"],
-                ) is None
-            )
-            guard.check()
-            return BracketManager(self._bridge).reconcile(
-                task_id, repair_missing=False, allow_sibling_cancel=allow_cancel,
-            )
+        return bracket_recovery.monitor_bracket(self._bridge, self.config, task_id)
 
     def effective_mode(self) -> str:
         """Return the entry mode for orchestrators and execution audits."""
@@ -1229,7 +1157,6 @@ class DerivativesExecutor:
         """Audit a gate refusal, then raise (fail-closed with a paper trail)."""
         self._bridge.audit_plan(order, action="derivatives_denied", reason=reason, phase=phase)
         return PermissionError(reason)
-
 
 def _positive_number(value: Any) -> float | None:
     try:

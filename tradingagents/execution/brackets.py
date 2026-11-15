@@ -140,6 +140,87 @@ def stored_account_identity(record: dict) -> futures_identity.FuturesAccountIden
     )
 
 
+def _close_order_confirms_full_fill(
+    response: Any, task: dict, requested_amount: float,
+) -> bool:
+    """Require complete, internally consistent evidence for a full market close."""
+    if not isinstance(response, dict) or isinstance(requested_amount, bool):
+        return False
+    try:
+        expected = float(requested_amount)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if not math.isfinite(expected) or expected <= 0:
+        return False
+
+    if "info" in response and not isinstance(response["info"], dict):
+        return False
+    info = response.get("info") or {}
+    ids = []
+    for source, keys in ((response, ("id", "orderId")), (info, ("orderId",))):
+        for key in keys:
+            if key not in source:
+                continue
+            value = source[key]
+            identifier = str(value).strip() if value is not None else ""
+            if isinstance(value, bool) or identifier.lower() in {"", "0", "none", "null"}:
+                return False
+            ids.append(identifier)
+    if not ids or any(value != ids[0] for value in ids):
+        return False
+
+    statuses = []
+    for source, keys in ((response, ("status",)), (info, ("status", "algoStatus"))):
+        for key in keys:
+            if key not in source:
+                continue
+            value = source[key]
+            if not isinstance(value, str) or not value.strip():
+                return False
+            statuses.append(value.strip().lower())
+    if not statuses or any(value not in {"filled", "closed"} for value in statuses):
+        return False
+
+    def exact_values(sources: tuple[tuple[dict, tuple[str, ...]], ...]) -> bool:
+        found = False
+        for source, keys in sources:
+            for key in keys:
+                if key not in source:
+                    continue
+                value = source[key]
+                if value is None or value == "" or isinstance(value, bool):
+                    return False
+                try:
+                    matches = _same_number(expected, value)
+                except (OverflowError, TypeError, ValueError):
+                    return False
+                if not matches:
+                    return False
+                found = True
+        return found
+
+    if not exact_values(((response, ("amount",)), (info, ("origQty", "quantity", "amount")))):
+        return False
+    if not exact_values(((response, ("filled",)), (info, ("executedQty", "filled")))):
+        return False
+
+    expected_symbol = task["symbol"].split(":", 1)[0].replace("/", "").upper()
+    for source in (response, info):
+        value = source.get("symbol")
+        if "symbol" in source:
+            if not isinstance(value, str) or not value.strip():
+                return False
+            symbol = value.strip().split(":", 1)[0].replace("/", "").upper()
+            if symbol != expected_symbol:
+                return False
+        value = source.get("side")
+        if "side" in source and (
+            not isinstance(value, str) or value.strip().lower() != task["close_side"]
+        ):
+            return False
+    return True
+
+
 class BracketManager:
     """Protective-exit persistence and reconciliation, without an entry-order path."""
 
@@ -746,7 +827,7 @@ class BracketManager:
                 self._save(task, task["status"], "configured venue/profile does not match the venue that placed this bracket")
                 return "venue_mismatch"
             exchange = self.bridge.client()
-            remaining = self._remaining_contracts(task)
+            remaining = self._remaining_contracts(task, allow_flat=True)
             if remaining is None:
                 self._save(task, task["status"], "venue position read failed; no close submitted")
                 return "time_stop_unknown_position"
@@ -774,8 +855,18 @@ class BracketManager:
             except Exception as exc:
                 self._save(task, "time_stop_failed", f"close order failed: {exc!r}")
                 return "time_stop_failed"
-            if not isinstance(response, dict) or _state(response) != "filled":
-                self._save(task, "time_stop_submission_uncertain", "close order was not confirmed filled; inspect before retry")
+            if not _close_order_confirms_full_fill(response, task, remaining):
+                self._save(
+                    task, "time_stop_submission_uncertain",
+                    "close order lacks exact full-fill evidence; inspect before retry",
+                )
+                return "time_stop_submission_uncertain"
+            flat = self._remaining_contracts(task, allow_flat=True)
+            if flat is None or flat > 0:
+                self._save(
+                    task, "time_stop_submission_uncertain",
+                    "close fill confirmed but account-wide flat position is unverified; inspect before retry",
+                )
                 return "time_stop_submission_uncertain"
             return self._cancel_resting_legs(
                 exchange, task, allow_cancel=True, terminal_status="time_stop_closed",
@@ -1383,7 +1474,7 @@ class BracketManager:
         original size is a reduce-only over-close the venue rejects (-2022),
         which would leave the position without any protection.
         """
-        remaining = self._remaining_contracts(task)
+        remaining = self._remaining_contracts(task, allow_flat=True)
         if remaining is None:
             self._save(
                 task, "emergency_close_failed",
@@ -1405,10 +1496,16 @@ class BracketManager:
                     ),
                 )[1],
             )
-            if not isinstance(response, dict) or _state(response) != "filled":
-                raise ValueError("emergency close was not confirmed filled")
+            if not _close_order_confirms_full_fill(response, task, remaining):
+                raise ValueError("emergency close lacks exact full-fill evidence")
         except OperationLockError:
             raise
         except Exception as exc:
             return self._save(task, "emergency_close_failed", f"protective recovery failed: {error!r}; emergency close failed: {exc!r}")
+        flat = self._remaining_contracts(task, allow_flat=True)
+        if flat is None or flat > 0:
+            return self._save(
+                task, "emergency_close_failed",
+                f"protective recovery failed: {error!r}; emergency close fill confirmed but account-wide flat position is unverified",
+            )
         return self._cancel_resting_legs(exchange, task, allow_cancel=True)

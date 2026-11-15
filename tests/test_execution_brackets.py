@@ -48,15 +48,24 @@ class _Exchange:
         self.cancel_error = None
         self.cancel_response = None
         self.emergency_response = {"id": "exit", "status": "closed"}
+        self._default_emergency_response = self.emergency_response
+
+    def _close_response(self, symbol, side, amount):
+        if self.emergency_response is self._default_emergency_response:
+            if hasattr(self, "contracts"):
+                self.contracts = 0.0
+            return {
+                "id": "exit", "status": "closed", "amount": amount, "filled": amount,
+                "symbol": symbol, "side": side,
+            }
+        return self.emergency_response
 
     def create_order(self, symbol, kind, side, amount, price=None, params=None):
         self.calls.append(("create", symbol, side, amount, params))
         if params.get("clientOrderId", "").startswith("emergency-"):
-            return self.emergency_response
+            return self._close_response(symbol, side, amount)
         if params.get("clientOrderId", "").startswith("timestop-"):
-            # A plain reduce-only market close: no conditional algo status, so
-            # the confirmed "closed" status proves the fill.
-            return {"id": "time-stop-exit", "status": "closed"}
+            return self._close_response(symbol, side, amount)
         if self.create_error:
             raise self.create_error
         # Ids count only the algo orders; filled-child evidence rows never
@@ -555,6 +564,7 @@ class _RawV3Exchange(_Exchange):
         }}
 
     def fapiPrivateV3GetPositionRisk(self, params=None):
+        self.calls.append(("position_read", params))
         if self.raw_position_error is not None:
             raise self.raw_position_error
         return [{
@@ -674,8 +684,8 @@ def test_a_difference_the_precision_layer_cannot_explain_stays_refused():
 
 
 
-def _ladder(contracts=0.005):
-    exchange = _LadderExchange(contracts)
+def _ladder(contracts=0.005, exchange=None):
+    exchange = exchange if exchange is not None else _LadderExchange(contracts)
     bridge = _Bridge(exchange)
     order = PlannedOrder(
         ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT", market="derivatives",
@@ -779,6 +789,64 @@ def test_ladder_uncertain_resize_keeps_persisted_replacement_intent(monkeypatch)
     assert not [call for call in exchange.calls if call[0] == "cancel"]
 
 
+@pytest.mark.parametrize("response", [
+    {"status": "closed", "amount": 0.005, "filled": 0.005},
+    {"id": "time-stop-exit", "status": "closed"},
+    {"id": "time-stop-exit", "status": "closed", "amount": 0.005},
+    {"id": "time-stop-exit", "status": "closed", "amount": 0.005, "filled": 0.004},
+    {"id": "time-stop-exit", "status": "open", "amount": 0.005, "filled": 0.005},
+    {"id": "time-stop-exit", "status": "closed", "amount": 0.005, "filled": 0.005,
+     "symbol": "ETH/USDT:USDT"},
+    {"id": "time-stop-exit", "status": "closed", "amount": 0.005, "filled": 0.005,
+     "side": "buy"},
+    {"id": "time-stop-exit", "status": "closed", "amount": 0.005, "filled": 0.005,
+     "info": {"orderId": "different-id"}},
+])
+def test_close_position_requires_exact_fill_evidence_and_fresh_flat_read(response):
+    manager, _bridge, exchange, task_id = _ladder()
+    exchange.emergency_response = response
+    before = len(exchange.calls)
+
+    assert manager.close_position(task_id, reason="time_stop", allow_mutation=True) == (
+        "time_stop_submission_uncertain"
+    )
+    assert not [call for call in exchange.calls[before:] if call[0] == "cancel"]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_submission_uncertain"
+
+
+def test_close_position_stays_retryable_when_close_fill_is_not_flat():
+    manager, _bridge, exchange, task_id = _ladder()
+    exchange.contracts = 0.001
+    exchange.emergency_response = {
+        "id": "time-stop-exit", "status": "closed", "amount": 0.001, "filled": 0.001,
+        "symbol": "BTC/USDT:USDT", "side": "sell",
+    }
+
+    calls_before = len(exchange.calls)
+    assert manager.close_position(task_id, reason="time_stop", allow_mutation=True) == (
+        "time_stop_submission_uncertain"
+    )
+    new_calls = exchange.calls[calls_before:]
+    assert len([call for call in new_calls if call[0] == "position_read"]) == 2
+    assert not [call for call in new_calls if call[0] == "cancel"]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_submission_uncertain"
+
+
+def test_close_position_stays_retryable_when_fresh_flat_read_fails():
+    exchange = _PositionReadDiesAfterFirstUse()
+    exchange.contracts = 0.005
+    manager, _bridge, exchange, task_id = _ladder(exchange=exchange)
+    calls_before = len(exchange.calls)
+
+    assert manager.close_position(task_id, reason="time_stop", allow_mutation=True) == (
+        "time_stop_submission_uncertain"
+    )
+    new_calls = exchange.calls[calls_before:]
+    assert exchange.position_reads == 2
+    assert not [call for call in new_calls if call[0] == "cancel"]
+    assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_submission_uncertain"
+
+
 def test_close_position_flattens_only_the_remaining_contracts_then_cancels_legs():
     manager, _bridge, exchange, task_id = _ladder()
     exchange.contracts = 0.00335  # a tranche already filled; 0.005 is stale
@@ -798,14 +866,17 @@ def test_close_position_flattens_only_the_remaining_contracts_then_cancels_legs(
     assert amount == pytest.approx(0.00335)
     assert params["reduceOnly"] is True
     assert params["clientOrderId"].startswith("timestop-")
+    position_reads = [index for index, call in enumerate(new_calls) if call[0] == "position_read"]
+    assert len(position_reads) == 2
     assert set(cancels) == resting_ids
+    assert position_reads[1] < new_calls.index(next(call for call in new_calls if call[0] == "cancel"))
     assert new_calls.index(creates[0]) < new_calls.index(
         next(call for call in new_calls if call[0] == "cancel")
     )
     assert job_store.load_bracket_recovery(task_id)["status"] == "time_stop_closed"
 
 
-def test_close_position_only_cancels_legs_when_the_venue_is_already_flat():
+def test_close_position_cancels_legs_when_the_venue_is_verified_flat():
     manager, _bridge, exchange, task_id = _ladder(contracts=0.0)
     # Flatness is never inferred: with the position book unreadable the close
     # refuses instead of cancelling legs.

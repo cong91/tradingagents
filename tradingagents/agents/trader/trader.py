@@ -67,10 +67,12 @@ def create_trader(llm):
                     "or a range; convert a percentage distance to the price level it "
                     "implies, or omit the field if you cannot state a number. "
                     + (
-                        "For crypto futures, propose margin mode, leverage, risk budget, and "
-                        "margin budget in a FuturesExecutionProposal, plus entry/stop/take-profit. "
-                        "Justify the choice using the current account, volatility, stop distance, "
-                        "funding, and reward/risk; keep every term inside the hard limits the "
+                        "For crypto futures, propose margin mode, leverage, and budget_fraction "
+                        "(the share of the TOTAL futures budget this trade's notional takes) in a "
+                        "FuturesExecutionProposal, plus entry/stop/take-profit. You own the sizing "
+                        "decision: optimize the allocation from the current account, volatility, "
+                        "stop distance, funding, and reward/risk — there is no preset allocation. "
+                        "The execution layer enforces only the account-level safety limits the "
                         "account context lists. A Buy/Overweight plan is a long proposal and a "
                         "Sell/Underweight plan is a short proposal when the closed candles confirm "
                         "the direction. Do not maximize leverage; if a required context item is "
@@ -103,8 +105,8 @@ def create_trader(llm):
                     "- **Reasoning**: why, against the plan and the price structure\n"
                     "- **Entry Price**, **Stop Loss**, **Position Sizing**: when you can state them"
                     + (
-                        "\n- **Futures Execution Proposal**: margin mode, leverage, risk_fraction, "
-                        "margin_fraction, entry, stop, target, and evidence-based rationale"
+                        "\n- **Futures Execution Proposal**: margin mode, leverage, "
+                        "budget_fraction, entry, stop, target, and evidence-based rationale"
                         if futures_context else ""
                     )
                 ),

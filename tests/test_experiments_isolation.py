@@ -148,7 +148,7 @@ def test_runner_writes_the_risk_audit_into_the_sandbox(tmp_path):
             return Proposal(
                 signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
                 stop_loss=candle.close * 0.98, take_profit=candle.close * 1.04,
-                risk_fraction=0.004,
+                budget_fraction=0.10,
             )
         return source
 

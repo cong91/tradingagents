@@ -394,9 +394,9 @@ def test_run_cycle_derivatives_off_whitelist_near_plans_and_prices_through_unifi
     # around THAT price, not the BTC stub price, or the protective check fails.
     monkeypatch.setattr(autoloop_futures_context, '_bracket_prices',
                         lambda ticker, direction="long": (4.0, 6.0))
-    _StubOffWhitelistDerivVenue.tickers_fetched = []
-
-    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph("Buy"))
+    results = autoloop_mod._run_cycle(lambda config, analysts: _FakeGraph(
+        "Buy", proposal=_agent_proposal(budget_fraction=0.05),
+    ))
 
     (near,) = results
     assert near.signal == "Buy"
@@ -534,6 +534,7 @@ def test_risk_guard_decisions_belong_to_their_own_candidate(tmp_path, monkeypatc
 
     def _two_contracts(self):
         contract = {"base": "X", "quote": "USDT", "settle": "USDT", "linear": True,
+                    "inverse": False, "contractSize": 1.0,
                     "contract": True, "swap": True, "type": "swap", "active": True}
         markets = {}
         for base, symbol in (("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")):

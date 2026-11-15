@@ -72,33 +72,31 @@ def _proposal_terms(
         return None, "agent_proposal_rejected: rationale is required"
     if margin_mode not in ("isolated", "cross"):
         return None, f"agent_proposal_rejected: margin_mode {margin_mode!r} is not isolated/cross"
+    leverage_raw = proposal.get("leverage")
+    budget_raw = proposal.get("budget_fraction")
+    if isinstance(leverage_raw, bool) or isinstance(budget_raw, bool):
+        return None, "agent_proposal_rejected: leverage and budget_fraction must be numeric, not boolean"
     try:
-        leverage_raw = proposal["leverage"]
         leverage = float(leverage_raw)
-        risk_fraction = float(proposal["risk_fraction"])
-        margin_fraction = float(proposal["margin_fraction"])
-    except (KeyError, TypeError, ValueError):
-        return None, "agent_proposal_rejected: leverage, risk_fraction and margin_fraction are required"
-    if not isinstance(leverage_raw, int) or isinstance(leverage_raw, bool):
+        budget_fraction = float(budget_raw)
+    except (TypeError, ValueError):
+        return None, "agent_proposal_rejected: leverage and budget_fraction are required"
+    if not isinstance(leverage_raw, int):
         return None, "agent_proposal_rejected: leverage must be an integer"
-    if not all(math.isfinite(value) for value in (leverage, risk_fraction, margin_fraction)):
+    if not all(math.isfinite(value) for value in (leverage, budget_fraction)):
         return None, "agent_proposal_rejected: numeric terms must be finite"
     if leverage < 1 or leverage > MAX_AUTO_LEVERAGE:
         return None, (
             f"agent_proposal_rejected: leverage {leverage:g}x is outside "
             f"1-{MAX_AUTO_LEVERAGE:g}x"
         )
-    risk_cap = float(config.get("risk_derivatives_max_risk_fraction", 0.02))
-    margin_cap = float(config.get("risk_derivatives_max_margin_fraction", 0.5))
-    if not 0 < risk_fraction <= risk_cap:
+    # The agent owns the sizing decision; only the structural (0, 1] bound is
+    # checked here. Account-level safety (per-asset/total exposure, heat,
+    # daily loss) stays in RiskGuard as outcome-based backstops.
+    if not 0 < budget_fraction <= 1:
         return None, (
-            f"agent_proposal_rejected: risk_fraction {risk_fraction:g} is outside "
-            f"0-{risk_cap:g}"
-        )
-    if not 0 < margin_fraction <= margin_cap:
-        return None, (
-            f"agent_proposal_rejected: margin_fraction {margin_fraction:g} is outside "
-            f"0-{margin_cap:g}"
+            f"agent_proposal_rejected: budget_fraction {budget_fraction:g} is "
+            f"outside (0, 1] of the total budget"
         )
     entry = proposal.get("entry_price")
     if entry is not None:
@@ -138,8 +136,7 @@ def _proposal_terms(
         stop_value = take_value = None
     return {
         "leverage": leverage,
-        "risk_fraction": risk_fraction,
-        "margin_fraction": margin_fraction,
+        "budget_fraction": budget_fraction,
         "margin_mode": margin_mode,
         "stop_loss": stop_value,
         "take_profit": take_value,
@@ -443,8 +440,7 @@ def _process_futures_candidate(
             "stop_loss": stop,
             "take_profit": take,
             "leverage": terms["leverage"],
-            "risk_fraction": terms["risk_fraction"],
-            "margin_fraction": terms["margin_fraction"],
+            "budget_fraction": terms["budget_fraction"],
             "margin_mode": terms["margin_mode"],
         },
     })
@@ -481,8 +477,7 @@ def _process_futures_candidate(
             plan = derivatives.plan_order(
                 ticker, signal, portfolio=book, price=mark,
                 leverage=terms["leverage"], stop_loss=stop, take_profit=take,
-                risk_fraction=terms["risk_fraction"],
-                margin_fraction=terms["margin_fraction"],
+                budget_fraction=terms["budget_fraction"],
                 margin_mode=terms["margin_mode"],
                 futures_execution_intent=intent,
                 # Soft-cap override evidence: measured mechanically by the

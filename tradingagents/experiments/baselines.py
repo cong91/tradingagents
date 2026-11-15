@@ -120,14 +120,14 @@ def _proposal_from_terms(terms: dict[str, Any], symbol: str) -> Proposal | None:
     signal = terms.get("signal")
     if not signal or is_review(signal) or signal not in ("Buy", "Overweight", "Sell", "Underweight"):
         return None
-    names = ("price", "stop_loss", "take_profit", "leverage", "risk_fraction", "margin_fraction")
+    names = ("price", "stop_loss", "take_profit", "leverage", "budget_fraction")
     try:
         if any(isinstance(terms.get(name), bool) for name in names):
             return None
-        price, stop, target, leverage, risk, margin = (float(terms[name]) for name in names)
+        price, stop, target, leverage, budget = (float(terms[name]) for name in names)
         if not all(math.isfinite(value) and value > 0 for value in (
-            price, stop, target, leverage, risk, margin,
-        )) or not leverage.is_integer() or leverage < 1 or risk > 1 or margin > 1:
+            price, stop, target, leverage, budget,
+        )) or not leverage.is_integer() or leverage < 1 or budget > 1:
             return None
         margin_mode = terms.get("margin_mode")
         if margin_mode not in ("isolated", "cross") or not isinstance(
@@ -141,7 +141,7 @@ def _proposal_from_terms(terms: dict[str, Any], symbol: str) -> Proposal | None:
         return Proposal(
             signal=signal, ticker=str(terms.get("ticker") or symbol),
             ccxt_symbol=symbol, stop_loss=stop, take_profit=target,
-            leverage=leverage, risk_fraction=risk, margin_fraction=margin,
+            leverage=leverage, budget_fraction=budget,
             margin_mode=margin_mode, scale_out_enabled=terms["scale_out_enabled"],
         )
     except (KeyError, TypeError, ValueError):
@@ -166,8 +166,8 @@ def _proposal_terms(payload: dict) -> dict[str, Any] | None:
     # These values must have been emitted by the agent; the replay may not
     # manufacture a bracket or entry estimate from a candle.
     required = (
-        "entry_price", "stop_loss", "take_profit", "leverage", "risk_fraction",
-        "margin_fraction", "margin_mode", "scale_out_enabled",
+        "entry_price", "stop_loss", "take_profit", "leverage", "budget_fraction",
+        "margin_mode", "scale_out_enabled",
     )
     if any(terms.get(key) is None for key in required):
         return None

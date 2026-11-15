@@ -17,7 +17,7 @@ from tests.execution_derivatives_support import (
 )
 from tests.test_execution_bridge import FakeExchange
 from tradingagents.dataflows.config import get_config, run_config, set_config
-from tradingagents.execution import derivatives as executor_module
+from tradingagents.execution import bracket_recovery
 from tradingagents.execution.auto_authorization import (
     AutoAuthorizationError,
     capture_authorization,
@@ -41,13 +41,14 @@ class _Guard:
 @pytest.fixture(autouse=True)
 def offline_futures(monkeypatch):
     """No production database or network is used by these tests."""
-    from tradingagents.execution import derivatives, futures_account
+    from tradingagents.execution import bracket_recovery, derivatives, futures_account
 
     @contextmanager
     def lock(_symbol):
         yield _Guard()
 
     monkeypatch.setattr(derivatives, "operation_lock", lock)
+    monkeypatch.setattr(bracket_recovery, "operation_lock", lock)
     monkeypatch.setattr(derivatives, "create_guarded_entry_intent", lambda *a, **k: None)
     monkeypatch.setattr(derivatives, "update_guarded_entry_intent", lambda *a, **k: None)
     monkeypatch.setattr(derivatives, "_refresh_live_risk_context", lambda *a, **k: None)
@@ -87,6 +88,11 @@ def _order(mode):
         ccxt_symbol="BTC/USDT:USDT" if futures else "BTC/USDT",
         signal="Buy", side="buy", quantity=0.005, estimated_price=50_000.0, cost=250.0,
         market="derivatives" if futures else "spot",
+        quantity_unit="base" if futures else "base",
+        venue_contracts=0.005 if futures else None,
+        contract_size=1.0 if futures else None,
+        linear=True if futures else None,
+        inverse=False if futures else None,
         stop_loss=48_000.0 if futures else None,
         take_profit=55_000.0 if futures else None,
         futures_execution_intent="enter" if futures else None,
@@ -380,9 +386,9 @@ def test_managed_executor_rejects_missing_protection_task_before_manager(tmp_pat
     _enable_both()
     _, snapshot = capture_process_config()
     executor = _executor(AutoMode.FUTURES, _venue(AutoMode.FUTURES), tmp_path, authorization=snapshot, live=False)
-    monkeypatch.setattr(executor_module.job_store, "load_bracket_recovery", lambda _task_id: None)
+    monkeypatch.setattr(bracket_recovery.job_store, "load_bracket_recovery", lambda _task_id: None)
     monkeypatch.setattr(
-        executor_module, "BracketManager",
+        bracket_recovery, "BracketManager",
         lambda *_: pytest.fail("missing protection task must fail before manager construction"),
     )
     assert executor.effective_mode() == "live"
@@ -403,11 +409,11 @@ def test_futures_protection_does_not_require_entry_mode(tmp_path, monkeypatch):
         "symbol": "BTC/USDT:USDT",
         "status": "monitoring",
     }
-    monkeypatch.setattr(executor_module.job_store, "load_bracket_recovery", lambda _task_id: task)
-    monkeypatch.setattr(executor_module, "_verified_protection_task", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bracket_recovery.job_store, "load_bracket_recovery", lambda _task_id: task)
+    monkeypatch.setattr(bracket_recovery, "_verified_protection_task", lambda *_args, **_kwargs: None)
     calls = []
     monkeypatch.setattr(
-        executor_module, "BracketManager",
+        bracket_recovery, "BracketManager",
         lambda bridge: SimpleNamespace(
             reconcile=lambda current_id, **kwargs: calls.append(current_id) or "protected",
         ),

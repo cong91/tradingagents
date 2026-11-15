@@ -160,9 +160,8 @@ def _agent_proposal(**overrides) -> dict:
     proposal = {
         "margin_mode": "isolated",
         "leverage": 3,
-        "risk_fraction": 0.01,
-        "margin_fraction": 0.25,
-        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 1% risk.",
+        "budget_fraction": 0.10,
+        "rationale": "Aligned closed 1h/4h candles, isolated collateral, 10% of the budget.",
     }
     proposal.update(overrides)
     return proposal
@@ -218,7 +217,7 @@ class _StubDerivVenue(_StubVenue):
             "BTC/USDT:USDT": {
                 "base": "BTC", "quote": "USDT", "settle": "USDT",
                 "contract": True, "swap": True, "type": "swap", "active": True,
-                "linear": True,
+                "contractSize": 1.0, "linear": True, "inverse": False,
             }
         }
 
@@ -345,6 +344,7 @@ class _StubOffWhitelistDerivVenue(_StubDerivVenue):
         markets["NEAR/USDT:USDT"] = {
             "base": "NEAR", "quote": "USDT", "settle": "USDT",
             "contract": True, "swap": True, "type": "swap", "active": True,
+            "contractSize": 1.0, "linear": True, "inverse": False,
         }
         return markets
 

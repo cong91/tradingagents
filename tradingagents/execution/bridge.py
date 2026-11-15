@@ -243,6 +243,16 @@ class ExchangeBridge:
             return symbol
         raise ValueError(f"no active {quote}-settled futures contract for {ticker!r}")
 
+    def futures_market(self, ticker: str) -> tuple[str, dict[str, Any]]:
+        """Resolve an active futures symbol and return its verified market record."""
+        exchange = self._exchange_or_raise()
+        markets = exchange.load_markets()
+        symbol = self.futures_symbol_for(ticker, markets=markets)
+        market = markets.get(symbol) if isinstance(markets, dict) else None
+        if not isinstance(market, dict):
+            raise ValueError(f"futures market metadata unavailable for {symbol!r}")
+        return symbol, market
+
     def symbol_for(self, ticker: str) -> str:
         """Map a pipeline (Yahoo-form) ticker to the ccxt symbol.
 

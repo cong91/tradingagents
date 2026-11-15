@@ -131,19 +131,24 @@ def _bind_state(bridge: Any, state: dict, observation, identity, config: dict) -
 
 
 def _anchors_match(snapshot: dict, venue: Any) -> bool:
-    """Entry price must match; the venue size may only be smaller (partials)."""
+    """Match entry price and compare sizes in one verified unit basis."""
     entry = _finite(snapshot.get("entry"))
     venue_entry = _finite(venue.entry_price)
     if entry is None or venue_entry is None or not math.isclose(
         entry, venue_entry, rel_tol=1e-6, abs_tol=1e-9,
     ):
         return False
-    quantity = _finite(snapshot.get("quantity"))
-    contracts = _finite(venue.contracts)
-    return (
-        quantity is not None and contracts is not None
-        and contracts <= quantity * (1 + 1e-9)
-    )
+
+    snapshot_contracts = _finite(snapshot.get("contracts"))
+    venue_contracts = _finite(venue.contracts)
+    if snapshot_contracts is not None and venue_contracts is not None:
+        return venue_contracts <= snapshot_contracts * (1 + 1e-9)
+
+    snapshot_quantity = _finite(snapshot.get("quantity"))
+    venue_quantity = _finite(venue.quantity)
+    if snapshot_quantity is None or venue_quantity is None:
+        return False
+    return abs(venue_quantity) <= abs(snapshot_quantity) * (1 + 1e-9)
 
 
 def _finite(value: Any) -> float | None:

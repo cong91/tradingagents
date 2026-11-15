@@ -93,9 +93,9 @@ def test_futures_entry_without_agent_proposal_is_refused():
     assert cycle["status"] == "rejected" and cycle["phase"] == "proposal"
 
 
-def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
-    """A complete proposal is passed through verbatim: leverage, risk budget,
-    margin budget and margin mode all come from the agents, not the config."""
+def test_agent_proposal_is_the_source_of_leverage_and_budget(monkeypatch):
+    """A complete proposal passes leverage, total-budget allocation, and
+    margin mode through from the agents, not the config."""
     from tradingagents.execution.sizing import PlannedOrder
 
     captured = {}
@@ -117,15 +117,14 @@ def test_agent_proposal_is_the_source_of_leverage_and_budgets(monkeypatch):
     result = autoloop_mod.DailyResult(ticker="BTC-USD")
     autoloop_futures_execution._process_futures_candidate(
         Derivatives(), "BTC-USD", "Buy", {}, result, context=_market_context(),
-        proposal=_agent_proposal(leverage=2, risk_fraction=0.004, margin_fraction=0.15,
+        proposal=_agent_proposal(leverage=2, budget_fraction=0.15,
                                  margin_mode="cross", stop_loss=90.0, take_profit=110.0),
         intent="enter",
         portfolio=PortfolioContext(cash=1_000.0, currency="USDT"),
     )
 
     assert captured["leverage"] == 2
-    assert captured["risk_fraction"] == 0.004
-    assert captured["margin_fraction"] == 0.15
+    assert captured["budget_fraction"] == 0.15
     assert captured["margin_mode"] == "cross"
 
 
@@ -185,8 +184,7 @@ def test_proposal_above_the_hard_caps_is_refused_not_clamped():
     decision no agent made."""
     for overrides, fragment in (
         ({"leverage": autoloop_futures_execution.MAX_AUTO_LEVERAGE + 1}, "leverage"),
-        ({"risk_fraction": 0.5}, "risk_fraction"),
-        ({"margin_fraction": 0.9}, "margin_fraction"),
+        ({"budget_fraction": True}, "budget_fraction"),
         ({"margin_mode": "portfolio"}, "margin_mode"),
         ({"stop_loss": 120, "take_profit": 80}, "bracket"),
     ):

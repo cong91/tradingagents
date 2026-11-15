@@ -22,7 +22,8 @@ class FakeDerivExchange:
 
     def __init__(self, *, api_key="test-key", secret="test-secret", price=50_000.0,
                  create_order_error=None, bracket_error=None, fail_bracket_calls=0,
-                 entry_response=None, hedged=False):
+                 entry_response=None, hedged=False, contract_size=1.0,
+                 linear=True, inverse=False):
         self.apiKey = api_key
         self.secret = secret
         self.price = price
@@ -31,6 +32,9 @@ class FakeDerivExchange:
         self.fail_bracket_calls = fail_bracket_calls
         self.entry_response = entry_response
         self.hedged = hedged
+        self.contract_size = contract_size
+        self.linear = linear
+        self.inverse = inverse
         self.margin_mode_error = None
         self.calls = []
         self.bracket_calls = []
@@ -67,9 +71,11 @@ class FakeDerivExchange:
         self._markets_loaded = True
         return {
             "BTC/USDT:USDT": {
-                "base": "BTC", "quote": "USDT", "settle": "USDT",
-                "contract": True, "swap": True, "type": "swap", "active": True,
-                "limits": {"cost": {"min": 10.0}},
+            "base": "BTC", "quote": "USDT", "settle": "USDT",
+            "contract": True, "swap": True, "type": "swap", "active": True,
+            "contractSize": self.contract_size, "linear": self.linear, "inverse": self.inverse,
+            "limits": {"cost": {"min": 10.0}},
+
             }
         }
 
@@ -118,14 +124,23 @@ class FakeDerivExchange:
         }]
 
     def market(self, symbol):
-        return {"quote": "USDT", "settle": "USDT", "inverse": False}
+        return {
+            "quote": "USDT", "settle": "USDT", "contractSize": self.contract_size,
+            "linear": self.linear, "inverse": self.inverse,
+        }
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
         self.calls.append(("create_order", symbol, order_type, side, amount, params))
-        if params and params.get("clientOrderId", "").startswith("emergency-"):
+        if params and params.get("clientOrderId", "").startswith(("emergency-", "timestop-")):
             if self.emergency_error is not None:
                 raise self.emergency_error
-            return {"id": f"emergency-{len(self.calls)}", "status": "closed"}
+            # A reduce-only market close flattens the venue position and must
+            # carry the exact fill evidence the close path verifies.
+            self.contracts = 0.0
+            return {
+                "id": f"close-{len(self.calls)}", "status": "closed",
+                "amount": amount, "filled": amount, "symbol": symbol, "side": side,
+            }
         if params and ("stopLossPrice" in params or "takeProfitPrice" in params):
             if self.bracket_error is not None:
                 raise self.bracket_error
@@ -251,7 +266,10 @@ def bracket_kwargs(signal="Buy"):
 
 
 def _live_bracket_order(executor, book):
-    order = executor.plan_order("BTC-USD", "Buy", book, price=50_000.0, **bracket_kwargs())
+    order = executor.plan_order(
+        "BTC-USD", "Buy", book, price=50_000.0,
+        budget_fraction=0.25, **bracket_kwargs(),
+    )
     return order.model_copy(update={"stop_loss": 48_000.0, "take_profit": 55_000.0})
 
 

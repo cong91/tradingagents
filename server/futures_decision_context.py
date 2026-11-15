@@ -152,16 +152,23 @@ def render_futures_decision_context(
         f"Unrealized PnL: {number(account.unrealized_pnl, ' ' + currency if currency else '')}",
     ]
     if account.positions:
-        lines.append("Open futures positions:")
+        lines.append("Open futures positions (their notional and margin consume the budget):")
         for position in account.positions:
             lines.append(
                 f"- {position.symbol} {position.side} contracts={position.contracts} "
                 f"entry={position.entry_price} mark={position.mark_price} "
+                f"notional={number(position.notional)} margin={number(position.margin)} "
                 f"leverage={position.leverage} margin_mode={position.margin_mode} "
+                f"liquidation={number(position.liquidation_price)} "
                 f"uPnL={position.unrealized_pnl}"
             )
     else:
         lines.append("Open futures positions: none")
+    if account.equity is not None and account.equity > 0 and account.available_balance is not None:
+        lines.append(
+            f"Free margin: {account.available_balance / account.equity * 100:.2f}% "
+            "of total budget"
+        )
     lines.extend([
         "",
         f"Instrument: {market.get('unified_symbol')} (requested as {ticker})",
@@ -188,11 +195,10 @@ def render_futures_decision_context(
             lines.append(f"Engine ATR bracket ({side}): unavailable")
     lines.extend([
         "",
-        "Hard limits the execution layer enforces (a proposal outside them is refused, "
-        "not resized):",
+        "Account-level safety limits the execution layer enforces (a proposal that "
+        "breaches one is refused, not resized) — these are emergency backstops, not "
+        "sizing guidance:",
         f"- Maximum leverage: {max_leverage:g}x",
-        f"- Maximum risk_fraction: {float(config.get('risk_derivatives_max_risk_fraction', 0.02)):g}",
-        f"- Maximum margin_fraction: {float(config.get('risk_derivatives_max_margin_fraction', 0.5)):g}",
         f"- Maximum derivatives notional: "
         f"{float(config.get('risk_max_derivatives_exposure_pct', 0.0)):g}% of equity",
         _current_notional_line(account, config),
@@ -205,12 +211,24 @@ def render_futures_decision_context(
         "- One open position per symbol: a symbol that already holds a futures "
         "position (see the list above) is managed by the exit layer; a new entry "
         "on it is refused",
+        "- Liquidation planning envelope: the stop must sit inside 80% of the theoretical "
+        "entry/leverage distance. This is a conservative heuristic, not a venue liquidation "
+        "price; maintenance tiers, cross collateral, fees and slippage can differ, so unknown "
+        "venue-specific liquidation data must be treated as a risk factor.",
         "A FuturesExecutionProposal is required for any entry: margin mode, leverage, "
-        "risk_fraction, margin_fraction, and an evidence-based rationale. Without one "
-        "no order is placed. If a proposal omits its stop and take-profit (they are "
-        "proposed together), the engine ATR bracket substitutes for those two "
-        "protective levels only and is revalidated; margin mode, leverage, and "
-        "budgets are never substituted — a proposal missing them is refused.",
+        "budget_fraction, and an evidence-based rationale. Without one no order is "
+        "placed. If a proposal omits its stop and take-profit (they are proposed "
+        "together), the engine ATR bracket substitutes for those two protective "
+        "levels only and is revalidated; margin mode, leverage, and the budget "
+        "allocation are never substituted — a proposal missing them is refused.",
+        "",
+        "SIZING IS YOUR DECISION. budget_fraction is the share of the TOTAL budget "
+        "(the futures equity above) this trade's notional value takes: notional = "
+        "equity x budget_fraction, margin = notional / leverage. Optimize it from "
+        "the stop distance, volatility, funding carry, the reward/risk of the "
+        "bracket, and what the open positions above already consume — then choose "
+        "the leverage and margin mode that give the best risk-adjusted outcome for "
+        "this setup. There is no preset allocation to fit.",
         "",
         "Enter criteria for this cycle (the bar is symmetric for longs and shorts):",
         "1. Setup direction: the closed 1h and 4h candles above must both confirm the "
@@ -225,9 +243,10 @@ def render_futures_decision_context(
         "distance after the funding cost shown above (positive funding penalizes a "
         "long, negative a short); treat unavailable funding or open interest as a "
         "named risk factor, not a reason to skip the analysis.",
-        "4. Account constraints: available margin, open positions, and the caps above "
-        "must leave room for the proposed leverage and budgets; propose inside the "
-        "caps, never above them.",
+        "4. Account reality: available margin, the open positions above, and the "
+        "safety limits listed above must leave room for the proposed notional and "
+        "leverage; the liquidation planning envelope is only a heuristic and not "
+        "a venue liquidation guarantee.",
         "When all four criteria hold, enter with a complete proposal instead of "
         "defaulting to abstain. When one genuinely fails, abstain and say which one.",
     ])

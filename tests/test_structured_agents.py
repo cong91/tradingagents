@@ -85,8 +85,7 @@ class TestRenderTraderProposal:
             futures_execution=FuturesExecutionProposal(
                 margin_mode="isolated",
                 leverage=2,
-                risk_fraction=0.005,
-                margin_fraction=0.2,
+                budget_fraction=0.20,
                 rationale="A 4% invalidation distance supports 2x within the account cap.",
             ),
             futures_execution_intent="abstain",
@@ -97,8 +96,19 @@ class TestRenderTraderProposal:
         assert "**Take Profit**: 108.0" in rendered
         assert "**Futures Margin Mode**: isolated" in rendered
         assert "**Futures Leverage**: 2x" in rendered
-        assert "**Futures Risk Budget**: 0.005" in rendered
+        assert "**Futures Budget Allocation**: 0.2 of total budget" in rendered
         assert "A 4% invalidation distance" in rendered
+
+
+@pytest.mark.unit
+def test_futures_execution_proposal_rejects_boolean_leverage_before_coercion():
+    with pytest.raises(ValidationError, match="leverage"):
+        FuturesExecutionProposal(
+            margin_mode="isolated",
+            leverage=True,
+            budget_fraction=0.20,
+            rationale="Boolean leverage must not be coerced into 1x.",
+        )
 
 
 @pytest.mark.unit
@@ -158,8 +168,7 @@ def test_portfolio_manager_surfaces_explicit_enter_with_complete_terms():
     proposal = FuturesExecutionProposal(
         margin_mode="isolated",
         leverage=2,
-        risk_fraction=0.005,
-        margin_fraction=0.2,
+        budget_fraction=0.20,
         stop_loss=96,
         take_profit=108,
         rationale="Closed 1h and 4h confirmation, isolated collateral, and 0.5% risk.",
@@ -187,7 +196,10 @@ def test_portfolio_manager_surfaces_explicit_enter_with_complete_terms():
     assert result["futures_execution_proposal"] == proposal.model_dump()
     assert result["futures_execution_intent"] == "enter"
     assert result["futures_execution_status"] == "structured"
-    assert "Futures equity: 1000 USDT" in str(structured.invoke.call_args.args[0])
+    prompt = str(structured.invoke.call_args.args[0])
+    assert "fixed 1% of equity" not in prompt
+    assert "budget_fraction, leverage, and margin mode" in prompt
+    assert "Futures equity: 1000 USDT" in prompt
 
 
 @pytest.mark.unit
@@ -199,8 +211,7 @@ def test_portfolio_manager_sell_rating_with_explicit_enter_is_not_suppressed(rat
     proposal = FuturesExecutionProposal(
         margin_mode="isolated",
         leverage=2,
-        risk_fraction=0.005,
-        margin_fraction=0.2,
+        budget_fraction=0.20,
         stop_loss=108,
         take_profit=96,
         rationale="Bearish 1h/4h confirmation; stop above the ATR bracket; funding carry favors a short.",
@@ -279,8 +290,8 @@ def test_portfolio_manager_missing_or_insufficient_futures_context_defaults_to_a
     have grounded — it falls back to abstain even when the typed decision
     asked to enter."""
     proposal = FuturesExecutionProposal(
-        margin_mode="isolated", leverage=1, risk_fraction=0.005,
-        margin_fraction=0.1, rationale="Only possible with account context.",
+        margin_mode="isolated", leverage=1, budget_fraction=0.10,
+        rationale="Only possible with account context.",
     )
     structured = MagicMock()
     structured.invoke.return_value = PortfolioDecision(
@@ -640,7 +651,7 @@ class TestTraderAgent:
         system = " ".join(m["content"] for m in captured["prompt"] if m["role"] == "system")
         assert "Futures equity: 1000 USDT" in user
         assert "ATR: 3.2%" in user
-        assert "propose margin mode, leverage, risk budget, and" in system
+        assert "propose margin mode, leverage, and budget_fraction" in system
 
     def test_empty_market_report_omits_the_section_and_grounding(self):
         # #1167: when the market analyst wasn't selected the report is empty, so

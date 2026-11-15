@@ -167,8 +167,7 @@ def test_redact_proposal_keeps_only_typed_numeric_terms():
     proposal = {
         "margin_mode": "isolated",
         "leverage": 3,
-        "risk_fraction": 0.01,
-        "margin_fraction": 0.25,
+        "budget_fraction": 0.10,
         "entry_price": None,
         "stop_loss": 80_000.0,
         "take_profit": 86_000.0,
@@ -177,8 +176,8 @@ def test_redact_proposal_keeps_only_typed_numeric_terms():
     }
     redacted = fct.redact_proposal(proposal)
     assert redacted == {
-        "margin_mode": "isolated", "leverage": 3, "risk_fraction": 0.01,
-        "margin_fraction": 0.25, "entry_price": None,
+        "margin_mode": "isolated", "leverage": 3, "budget_fraction": 0.10,
+        "entry_price": None,
         "stop_loss": 80_000.0, "take_profit": 86_000.0,
     }
 
@@ -187,7 +186,7 @@ def test_redact_proposal_keeps_only_typed_numeric_terms():
 def test_redact_proposal_drops_unusable_values():
     assert fct.redact_proposal({
         "margin_mode": "sometimes", "leverage": float("nan"),
-        "risk_fraction": "high", "stop_loss": None,
+        "budget_fraction": "high", "stop_loss": None,
     }) == {"stop_loss": None}  # invalid values dropped, explicit None kept
     assert fct.redact_proposal("prose only") == {}
 
@@ -442,7 +441,7 @@ def test_effective_caps_reports_every_guard_limit():
     assert caps["max_position_pct_per_asset"] == 40.0
     assert caps["max_total_exposure_pct"] == 150.0
     assert caps["max_open_heat_pct"] == 6.0
-    assert caps["max_risk_fraction"] == 0.02 and caps["max_margin_fraction"] == 0.5
+    assert caps["max_budget_fraction"] == 1.0
 
 
 @pytest.mark.unit

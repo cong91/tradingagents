@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "7a1ffe4730d1293856b89f2b3385049a5bd54ff7",
-    "indexed_at": "2026-11-14T01:48:05Z",
+    "commit": "ba9537f3b7f5e5bba8e2cece9957a9e553de91af",
+    "indexed_at": "2026-11-15T06:29:17Z",
     "project": "C-Users-mrc-Documents-projects-TradingAgents",
-    "nodes": 11025,
-    "edges": 56603,
-    "original_size": 66387968,
-    "compressed_size": 10716957,
+    "nodes": 11088,
+    "edges": 57092,
+    "original_size": 66846720,
+    "compressed_size": 10781684,
     "compression_level": 3
 }

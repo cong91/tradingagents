@@ -548,6 +548,8 @@ def delete_position_state(position_key: str, expected_revision: int | None = Non
 def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
                                 quantity: float, stop: float, targets: list[float],
                                 mark: float, order_id: str | None,
+                                contracts: float | None = None,
+                                contract_size: float | None = None,
                                 identity=None) -> bool:
     """Record a live acknowledged entry and its initial protective state."""
     from tradingagents.execution.position_manager import PositionSnapshot
@@ -562,17 +564,22 @@ def persist_futures_entry_state(position_key: str, *, side: str, entry: float,
         mark=mark,
     )
     now = _now()
+    snapshot_data = {
+        **dataclasses.asdict(snapshot),
+        "targets": list(snapshot.targets),
+        "completed_targets": [],
+        "initial_stop": stop,
+        "current_target": targets[0] if targets else None,
+        "phase": "initial",
+        "opened_at": now,
+        "observed_at": now,
+    }
+    if contracts is not None:
+        snapshot_data["contracts"] = contracts
+    if contract_size is not None:
+        snapshot_data["contract_size"] = contract_size
     return save_position_state(position_key, 0, {
-        "snapshot": {
-            **dataclasses.asdict(snapshot),
-            "targets": list(snapshot.targets),
-            "completed_targets": [],
-            "initial_stop": stop,
-            "current_target": targets[0] if targets else None,
-            "phase": "initial",
-            "opened_at": now,
-            "observed_at": now,
-        },
+        "snapshot": snapshot_data,
         "orders": [],
         "entry_order_id": order_id,
     }, identity=identity)

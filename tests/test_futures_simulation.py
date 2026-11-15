@@ -65,11 +65,11 @@ def _candle(open_time: int, open_: float, high: float, low: float, close: float)
     )
 
 
-def _proposal(price: float, risk: float = 0.004) -> Proposal:
+def _proposal(price: float, budget: float = 0.20) -> Proposal:
     return Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=price * 0.98, take_profit=price * 1.04,
-        leverage=1.0, risk_fraction=risk, margin_fraction=0.25,
+        leverage=1.0, budget_fraction=budget,
     )
 
 
@@ -102,7 +102,7 @@ def _flat_proposal_source(price: float = 100.0) -> "Callable[[Candle], Proposal]
         return Proposal(
             signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
             stop_loss=price * 0.98, take_profit=price * 1.4,
-            leverage=1.0, risk_fraction=0.004, margin_fraction=0.25,
+            leverage=1.0, budget_fraction=0.20,
             scale_out_enabled=False,
         )
 
@@ -128,24 +128,20 @@ def test_engine_plan_matches_runtime_size_chain():
     from tradingagents.portfolio import PortfolioContext
 
     executor = DerivativesExecutor(config={
-        "risk_derivatives_risk_fraction": 0.01,
-        "risk_derivatives_margin_fraction": 0.25,
-        "risk_derivatives_max_risk_fraction": 0.02,
-        "risk_derivatives_max_margin_fraction": 0.5,
+        "risk_derivatives_budget_fraction": 0.10,
     })
     book = PortfolioContext(cash=10000.0)
     price = 100.0
     proposal = _proposal(price)
     engine_plan = futures_plan(
         proposal=proposal, portfolio=book, price=price,
-        caps=SizingCaps(max_risk_fraction=0.02, max_margin_fraction=0.5, min_order_cost=10.0),
+        caps=SizingCaps(min_order_cost=10.0),
     )
     runtime_plan = executor._size(
         signal=proposal.signal, ticker=proposal.ticker,
         ccxt_symbol=proposal.ccxt_symbol, portfolio=book, price=price,
         leverage=proposal.leverage, stop_loss=proposal.stop_loss,
-        take_profit=proposal.take_profit, risk_fraction=proposal.risk_fraction,
-        margin_fraction=proposal.margin_fraction,
+        take_profit=proposal.take_profit, budget_fraction=proposal.budget_fraction,
         margin_mode=proposal.margin_mode,
         futures_execution_intent="enter",
     )
@@ -211,7 +207,7 @@ def test_ambiguity_counted_and_worst_first_fills_the_stop():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=104.0, leverage=1.0,
-        risk_fraction=0.004, margin_fraction=0.25, scale_out_enabled=False,
+        budget_fraction=0.20, scale_out_enabled=False,
     )
     proposal_source = lambda candle: proposal if candle.open_time == 1_700_000_000_000 else None  # noqa: E731
 
@@ -254,7 +250,7 @@ def test_gap_through_stop_fills_at_open_not_survived():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=104.0, leverage=1.0,
-        risk_fraction=0.004, margin_fraction=0.25, scale_out_enabled=False,
+        budget_fraction=0.20, scale_out_enabled=False,
     )
     proposal_source = lambda candle: proposal if candle.open_time == 1_700_000_000_000 else None  # noqa: E731
     result = run_simulation(
@@ -287,6 +283,68 @@ def test_entry_gap_below_stop_abandons_the_plan_instead_of_crashing():
     assert result.fills == []
 
 
+def test_entry_fill_long_rejects_actual_fill_liquidation_breach():
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.0),
+        _candle(1_700_003_600_000, 100.0, 106.0, 99.0, 101.0),
+    ]
+    proposal = Proposal(
+        signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=75.0, take_profit=110.0, leverage=3.0,
+        budget_fraction=0.04, scale_out_enabled=False,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        costs=CostModel(slippage_rate=0.05),
+        risk_limits=RiskLimits(
+            max_derivatives_leverage=3.0, max_derivatives_exposure_pct=100.0,
+            max_position_pct_per_asset=100.0, max_total_exposure_pct=100.0,
+        ),
+    )
+    actual_fill = candles[1].open * 1.05
+    assert proposal.stop_loss < actual_fill < proposal.take_profit
+    assert abs(candles[0].close - proposal.stop_loss) <= candles[0].close * 0.8 / proposal.leverage
+    assert abs(actual_fill - proposal.stop_loss) > actual_fill * 0.8 / proposal.leverage
+    assert result.fills == []
+    assert result.net_after_costs["fee_paid"] == pytest.approx(0.0)
+    assert any(
+        decision["decision"] == "entry_fill_invariant_failed"
+        for decision in result.decisions
+    )
+
+
+def test_entry_fill_short_rejects_actual_fill_liquidation_breach():
+    candles = [
+        _candle(1_700_000_000_000, 100.0, 100.5, 99.5, 100.0),
+        _candle(1_700_003_600_000, 100.0, 101.0, 94.0, 99.0),
+    ]
+    proposal = Proposal(
+        signal="Sell", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+        stop_loss=125.0, take_profit=90.0, leverage=3.0,
+        budget_fraction=0.04, scale_out_enabled=False,
+    )
+    result = _run(
+        candles,
+        proposal_source=lambda candle: proposal if candle is candles[0] else None,
+        costs=CostModel(slippage_rate=0.05),
+        risk_limits=RiskLimits(
+            max_derivatives_leverage=3.0, max_derivatives_exposure_pct=100.0,
+            max_position_pct_per_asset=100.0, max_total_exposure_pct=100.0,
+        ),
+    )
+    actual_fill = candles[1].open * 0.95
+    assert proposal.take_profit < actual_fill < proposal.stop_loss
+    assert abs(candles[0].close - proposal.stop_loss) <= candles[0].close * 0.8 / proposal.leverage
+    assert abs(actual_fill - proposal.stop_loss) > actual_fill * 0.8 / proposal.leverage
+    assert result.fills == []
+    assert result.net_after_costs["fee_paid"] == pytest.approx(0.0)
+    assert any(
+        decision["decision"] == "entry_fill_invariant_failed"
+        for decision in result.decisions
+    )
+
+
 def test_gap_through_target_fills_at_open_favorable():
     """A candle that OPENED beyond the resting target fills the exit at the
     open — never skipped (the fill candle's range stays below the target so
@@ -301,7 +359,7 @@ def test_gap_through_target_fills_at_open_favorable():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=104.0, leverage=1.0,
-        risk_fraction=0.004, margin_fraction=0.25, scale_out_enabled=False,
+        budget_fraction=0.20, scale_out_enabled=False,
     )
     result = run_simulation(
         candles,
@@ -340,7 +398,7 @@ def test_scale_out_enabled_never_closes_full_at_the_take_profit():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=104.0,
-        leverage=1.0, risk_fraction=0.004, margin_fraction=0.25,
+        leverage=1.0, budget_fraction=0.20,
         scale_out_enabled=True,
     )
     result = run_simulation(
@@ -436,7 +494,7 @@ def test_final_candle_exposure_settles_before_forced_close():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
-        risk_fraction=0.004, margin_fraction=0.25,
+        budget_fraction=0.20,
     )
     funding = _funding_series(
         candles, rates={candles[-1].open_time + 1: -0.0005},
@@ -466,7 +524,7 @@ def test_intrabar_exit_with_settlement_in_same_candle_marks_funding_unknown():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=101.0, scale_out_enabled=False,
-        risk_fraction=0.004, margin_fraction=0.25,
+        budget_fraction=0.20,
     )
     settlement = candles[1].open_time + 1_800_000
     funding = _funding_series(
@@ -494,7 +552,7 @@ def test_time_stop_uses_current_candle_funding_before_verdict():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
-        risk_fraction=0.004, margin_fraction=0.25,
+        budget_fraction=0.20,
     )
     settlement = candles[1].open_time + 1_800_000
     funding = _funding_series(
@@ -531,7 +589,7 @@ def test_gap_settlement_before_a_pending_exit_is_still_accounted():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=140.0, scale_out_enabled=False,
-        risk_fraction=0.004, margin_fraction=0.25,
+        budget_fraction=0.20,
     )
     funding = _funding_series(
         candles, rates={candles[1].close_time + 60_000: -0.0005},
@@ -566,7 +624,7 @@ def test_funding_after_scale_out_is_prorated_to_remaining_exposure():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=140.0,
-        risk_fraction=0.004, margin_fraction=0.25,
+        budget_fraction=0.20,
     )
     settlement = candles[2].open_time + 1_800_000
     funding = _funding_series(
@@ -710,7 +768,7 @@ result = run_simulation(
     proposal_source=lambda c: Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=104.0, leverage=1.0,
-        risk_fraction=0.004, margin_fraction=0.25),
+        budget_fraction=0.20),
     risk_limits=RiskLimits(max_derivatives_leverage=3.0, max_derivatives_exposure_pct=50.0),
     include_sensitivity=False,
 )
@@ -751,15 +809,23 @@ def test_standalone_replay_script_runs_offline_on_the_real_fixture():
     assert report["decision_disagreements"] == 0
 
 
-def test_hard_capped_proposal_is_refused_by_the_size_chain():
+def test_budget_sized_proposal_is_refused_when_budget_is_out_of_range():
     candles = _rising_candles(3)
     result = _run(
         candles,
-        proposal_source=lambda candle: _proposal(candle.close, risk=0.5),
-        caps=SizingCaps(max_risk_fraction=0.02, max_margin_fraction=0.5),
+        proposal_source=lambda candle: Proposal(
+            signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
+            stop_loss=candle.close * 0.98, take_profit=candle.close * 1.04,
+            leverage=1.0, budget_fraction=1.1,
+        ),
+        caps=SizingCaps(min_order_cost=10.0),
+        risk_limits=RiskLimits(
+            max_derivatives_leverage=3.0, max_derivatives_exposure_pct=100.0,
+            max_position_pct_per_asset=100.0, max_total_exposure_pct=100.0,
+        ),
     )
     refusals = [d for d in result.decisions if d["decision"] == "no_order"]
-    assert refusals and "hard cap" in refusals[0]["reason"]
+    assert refusals and "outside (0, 1]" in refusals[0]["reason"]
     assert result.fills == []
 
 
@@ -815,7 +881,7 @@ def test_funding_r_denominator_is_the_opened_size_not_the_remainder():
     proposal = Proposal(
         signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
         stop_loss=98.0, take_profit=140.0,  # far target: the position survives
-        leverage=1.0, risk_fraction=0.004, margin_fraction=0.25,
+        leverage=1.0, budget_fraction=0.20,
         scale_out_enabled=False,
     )
     opened_quantity = None

@@ -62,10 +62,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_RISK_FRACTION": "risk_derivatives_override_max_risk_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_OVERRIDE_MAX_PER_DAY": "risk_derivatives_override_max_per_day",
     "TRADINGAGENTS_RISK_MAX_OPEN_HEAT_PCT": "risk_max_open_heat_pct",
-    "TRADINGAGENTS_RISK_DERIVATIVES_MAX_RISK_FRACTION": "risk_derivatives_max_risk_fraction",
-    "TRADINGAGENTS_RISK_DERIVATIVES_MAX_MARGIN_FRACTION": "risk_derivatives_max_margin_fraction",
-    "TRADINGAGENTS_RISK_DERIVATIVES_RISK_FRACTION": "risk_derivatives_risk_fraction",
-    "TRADINGAGENTS_RISK_DERIVATIVES_MARGIN_FRACTION": "risk_derivatives_margin_fraction",
+    "TRADINGAGENTS_RISK_DERIVATIVES_BUDGET_FRACTION": "risk_derivatives_budget_fraction",
     "TRADINGAGENTS_RISK_DERIVATIVES_PROFIT_PROTECTION_ENABLED": "risk_derivatives_profit_protection_enabled",
     "TRADINGAGENTS_RISK_DERIVATIVES_BREAK_EVEN_R": "risk_derivatives_break_even_r",
     "TRADINGAGENTS_RISK_DERIVATIVES_LOCK_PROFIT_R": "risk_derivatives_lock_profit_r",
@@ -322,13 +319,13 @@ def build_default_config() -> dict:
         "risk_derivatives_override_max_risk_fraction": 0.01,
         "risk_derivatives_override_max_per_day": 0,
         "risk_max_open_heat_pct": 0.0,
-        # Decisions the futures agents own, and the ceilings the executor enforces
-        # on them. The agent proposes; a proposal above these caps is refused, never
-        # silently clamped to a different size.
-        "risk_derivatives_max_risk_fraction": 0.02,
-        "risk_derivatives_max_margin_fraction": 0.5,
-        "risk_derivatives_risk_fraction": 0.01,
-        "risk_derivatives_margin_fraction": 0.25,
+        # Decisions the futures agents own: the agent picks margin mode, leverage,
+        # and budget_fraction (the share of the TOTAL budget a trade's notional
+        # takes) and optimizes them from the analysis. Only the structural (0, 1]
+        # bound is enforced on budget_fraction; the account-level safety nets stay
+        # in RiskGuard. This fallback sizes orders when no agent proposal is
+        # present (manual daily-job path).
+        "risk_derivatives_budget_fraction": 0.10,
         "risk_derivatives_profit_protection_enabled": True,
         "risk_derivatives_break_even_r": 0.5,
         "risk_derivatives_lock_profit_r": 1.0,

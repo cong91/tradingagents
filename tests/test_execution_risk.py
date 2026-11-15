@@ -960,6 +960,23 @@ def test_derivatives_short_notional_above_cap_is_rejected(tmp_path, monkeypatch)
     assert "derivatives notional" in decision.reason
 
 
+def test_derivatives_risk_guard_does_not_apply_global_entry_risk_cap(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    limits = RiskLimits(
+        max_derivatives_leverage=3.0,
+        max_derivatives_exposure_pct=100.0,
+        max_position_pct_per_asset=100.0,
+        max_total_exposure_pct=100.0,
+    )
+    decision = guard(limits).check(
+        deriv_plan(cost=1_000.0, leverage=1.0, entry=100.0, stop=98.0, target=110.0),
+        PortfolioContext(cash=1_000.0),
+        tmp_path / "audit.jsonl",
+    )
+    assert decision.allowed is True
+    assert "risk-at-stop" not in (decision.reason or "")
+
+
 def test_derivatives_short_within_raised_caps_passes(tmp_path, monkeypatch):
     # Caps are not a blanket short ban: the mirror of the long case passes
     # (per-asset sees the notional: 50 x 3 = 150 = 15% <= 25).
@@ -1456,6 +1473,24 @@ def test_default_limits_keep_the_old_refusal_and_never_use_the_override(
     assert not audit.exists() or override_events(audit) == []
 
 
+def test_derivatives_entry_risk_is_not_a_global_per_entry_cap(tmp_path, monkeypatch):
+    freeze(monkeypatch, FROZEN_NOW)
+    audit = tmp_path / "audit.jsonl"
+    # This order risks 2% of equity at its stop. Account-level exposure limits
+    # are permissive, so the global per-entry cap must not reject it.
+    decision = guard(RiskLimits(
+        max_derivatives_leverage=3.0,
+        max_derivatives_exposure_pct=100.0,
+        max_position_pct_per_asset=100.0,
+        max_total_exposure_pct=100.0,
+    )).check(
+        deriv_plan(cost=250.0, entry=50_000.0, stop=46_000.0, target=70_000.0),
+        PortfolioContext(cash=1_000.0),
+        audit,
+    )
+    assert decision.allowed is True
+
+
 # --- open heat (portfolio heat) cap -------------------------------------------
 
 
@@ -1472,7 +1507,7 @@ def _heat_limits() -> RiskLimits:
 def test_open_heat_at_the_cap_passes_and_a_further_order_refuses(tmp_path, monkeypatch):
     freeze(monkeypatch, FROZEN_NOW)
     audit = tmp_path / "audit.jsonl"
-    # two open positions risking 2% of equity each; the new order risks 2%
+    # two open positions risk 2% of equity each; the new order risks 1%.
     book = PortfolioContext(
         cash=1_000.0, currency="USDT",
         positions=[
@@ -1480,9 +1515,9 @@ def test_open_heat_at_the_cap_passes_and_a_further_order_refuses(tmp_path, monke
             _deriv_position("XPL-USD", notional=100.0, average_price=50.0, stop_loss=40.0),
         ],
     )
-    order = deriv_plan(cost=100.0, entry=50_000.0, stop=40_000.0, target=70_000.0)
+    order = deriv_plan(cost=100.0, entry=50_000.0, stop=45_000.0, target=70_000.0)
     decision = guard(_heat_limits()).check(order, book, audit)
-    assert decision.allowed is True  # 2 + 2 + 2 = 6% == the cap, not above
+    assert decision.allowed is True  # 2 + 2 + 1 = 5% <= the cap
     assert decision.override_used is False
 
     # a third 2%-risk open position (the previous fill) pushes the next order past
@@ -1496,7 +1531,7 @@ def test_open_heat_at_the_cap_passes_and_a_further_order_refuses(tmp_path, monke
     )
     refused = guard(_heat_limits()).check(order, filled, audit)
     assert refused.allowed is False
-    assert "open heat would reach 8.00% of equity, above the limit 6.00%" in refused.reason
+    assert "open heat would reach 7.00% of equity, above the limit 6.00%" in refused.reason
 
 
 def test_open_heat_refuses_fail_closed_when_a_position_has_no_stop(tmp_path, monkeypatch):

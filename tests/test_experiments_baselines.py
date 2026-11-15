@@ -46,7 +46,7 @@ def _recorded_cycle(candle: Candle, signal: str = "Buy", *, confirmed: str | Non
     cycle_payload = dict(payload) if payload is not None else {"agent_proposal": {
         "entry_price": candle.close, "stop_loss": candle.close * 0.98,
         "take_profit": candle.close * 1.04, "leverage": 1.0,
-        "risk_fraction": 0.01, "margin_fraction": 0.25,
+        "budget_fraction": 0.10,
         "margin_mode": "isolated", "scale_out_enabled": False,
     }}
     cycle_payload.setdefault("pm_decision", {"futures_execution_intent": "enter"})
@@ -253,7 +253,7 @@ def test_no_trade_and_rule_run_through_the_identical_engine(tmp_path):
         return Proposal(
             signal="Buy", ticker="BTC-USD", ccxt_symbol="BTC/USDT:USDT",
             stop_loss=candle.close * 0.98, take_profit=candle.close * 1.04,
-            risk_fraction=0.004,
+            budget_fraction=0.10,
         )
 
     cycle = _recorded_cycle(candles[0])
@@ -322,7 +322,7 @@ def _snapshot_cycle(
                     "agent_proposal": {
                         "entry_price": 101.0, "stop_loss": stop_loss,
                         "take_profit": take_profit, "leverage": 1.0,
-                        "risk_fraction": 0.01, "margin_fraction": 0.25,
+                        "budget_fraction": 0.10,
                         "margin_mode": "isolated", "scale_out_enabled": False,
                     }},
     }

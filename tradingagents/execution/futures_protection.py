@@ -10,7 +10,11 @@ from typing import Any
 
 from server import job_store
 from tradingagents.execution import futures_identity
-from tradingagents.execution.brackets import BracketManager, stored_account_identity
+from tradingagents.execution.brackets import (
+    TIME_STOP_RETRY_STATUSES,
+    BracketManager,
+    stored_account_identity,
+)
 from tradingagents.execution.exchange_client import venue_key
 from tradingagents.execution.futures_account import FuturesPosition, observe_futures_positions
 from tradingagents.execution.futures_funding import (
@@ -235,10 +239,49 @@ def _manage_one_with_lease(
     if task.get("symbol") != symbol or task.get("close_side") != ("sell" if side == "long" else "buy"):
         return {"position_key": position_key, "status": "bracket_identity_mismatch"}
     task_status = str(task.get("status") or "")
+    if task_status in TIME_STOP_RETRY_STATUSES:
+        if not allow_mutation:
+            return {"position_key": position_key, "status": "mutation_gated"}
+        state_identity = stored_account_identity(state)
+        task_identity = stored_account_identity(task)
+        if state_identity is None or task_identity is None:
+            return {"position_key": position_key, "status": "account_identity_unknown"}
+        if state_identity != task_identity:
+            return {"position_key": position_key, "status": "account_identity_mismatch"}
+        expected_venue = venue_key(bridge)
+        if state.get("venue_key") != expected_venue or task.get("venue_key") != expected_venue:
+            return {"position_key": position_key, "status": "venue_mismatch"}
+        entry_id = position_key.rsplit(":", 1)[-1]
+        if (
+            task.get("task_id") != f"bracket:{symbol}:{entry_id}"
+            or task.get("symbol") != symbol
+            or task.get("entry_order_id") != entry_id
+            or task.get("close_side") != ("sell" if side == "long" else "buy")
+            or state.get("entry_order_id") != entry_id
+        ):
+            return {"position_key": position_key, "status": "bracket_identity_mismatch"}
+        deferred = _identity_deferred_status(bridge, state)
+        if deferred is not None:
+            return {"position_key": position_key, "status": deferred}
+        venue_position = position_map.get((symbol, side))
+        if venue_position is None:
+            return {"position_key": position_key, "status": "position_unknown"}
+        if (
+            not _valid_position(venue_position)
+            or _positive_or_none(venue_position.contracts) is None
+        ):
+            return {"position_key": position_key, "status": "position_unknown"}
+        return _close_time_stop(
+            bridge, state,
+            symbol=symbol,
+            close_side=task["close_side"],
+            contracts=float(venue_position.contracts),
+            mark=float(venue_position.mark_price),
+            reason="retrying unresolved time-stop close",
+        )
     if task_status in {
         "emergency_close_failed", "emergency_cleanup_pending",
         "replacement_cleanup_pending", "position_cleanup_pending",
-        "time_stop_submission_uncertain", "time_stop_unknown_position", "time_stop_failed",
     }:
         return {"position_key": position_key, "status": "manual_reconciliation_required"}
     if task_status not in {"pending", "monitoring", "submission_uncertain"}:
@@ -249,7 +292,7 @@ def _manage_one_with_lease(
         if isinstance(leg, dict)
     )
     if allow_mutation and task_needs_verified_recovery:
-        from tradingagents.execution.derivatives import _verified_protection_task
+        from tradingagents.execution.bracket_recovery import _verified_protection_task
 
         verdict = _verified_protection_task(
             bridge, bracket_task_id, expected_symbol=symbol,
@@ -425,7 +468,7 @@ def _advance_for_verified_account(
             client = None
         cumulative_funding_r, round_trip_fee_r, funding_note = _time_stop_funding_inputs(
             client, symbol, opened_at, entry, initial_stop,
-            _initial_position_size(task, quantity), config,
+            _initial_position_size(snapshot, quantity), config,
         )
         decision = evaluate_profit_protection(
             **policy_kwargs,
@@ -783,17 +826,16 @@ def _parse_opened_at(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _initial_position_size(task: dict, venue_quantity: float) -> float:
-    """The size the funding accrued on: the bracket's original quantity.
+def _initial_position_size(snapshot: dict, venue_quantity: float) -> float:
+    """Return the original durable base quantity for funding normalization.
 
-    A scale-out tranche shrinks the venue position while the funding history
-    keeps accruing on the size held before it; dividing by the remainder would
-    inflate the rescue and hold the position longer than it earned. The task
-    quantity is the size the bracket opened with and is never resized by the
-    ladder; a missing value falls back to the venue reading.
+    Funding accrues against the base size held before bracket scale-outs. The
+    persisted position snapshot is the durable source for that original size;
+    bracket task quantities remain contract-based and are never mixed into this
+    denominator.
     """
     try:
-        original = float(task["quantity"])
+        original = float(snapshot["quantity"])
     except (KeyError, TypeError, ValueError):
         return venue_quantity
     return original if math.isfinite(original) and original > 0 else venue_quantity
