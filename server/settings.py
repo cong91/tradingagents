@@ -10,7 +10,9 @@ must never arm live trading. ``.env`` is deployment-only configuration and
 is never written at runtime.
 """
 
+import asyncio
 import os
+import threading
 
 from fastapi import APIRouter, Request
 
@@ -22,6 +24,8 @@ from tradingagents.default_config import (
     DEFAULT_CONFIG,
     _coerce,
 )
+
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -166,6 +170,32 @@ def get_settings():
     return _settings_payload()
 
 
+def _apply_settings_change(validated: dict[str, object]) -> None:
+    """Persist and apply one serialized settings write outside the ASGI loop."""
+    from server import forecast_evaluation
+
+    with _SETTINGS_WRITE_LOCK:
+        evaluation_was_enabled = (
+            get_config().get("forecast_evaluation_enabled") is True
+            and forecast_evaluation._enabled()
+        )
+        if validated.get("forecast_evaluation_enabled") is False:
+            forecast_evaluation.pause()
+        if validated.get("forecast_evaluation_enabled") is True:
+            forecast_evaluation.configure(
+                enabled=True, reset_cursor=not evaluation_was_enabled,
+            )
+        try:
+            control_store.set_engine_settings(validated)
+        except Exception:
+            if validated.get("forecast_evaluation_enabled") is True and not evaluation_was_enabled:
+                forecast_evaluation.pause()
+            raise
+        set_config(validated)
+        if validated.get("forecast_evaluation_enabled") is True:
+            forecast_evaluation.start()
+
+
 @router.put("/settings")
 async def put_settings(request: Request):
     from server import audit as audit_log
@@ -203,11 +233,7 @@ async def put_settings(request: Request):
                 {"fields": problems},
             )
 
-    set_config(validated)  # in-memory: effective for runs created after this call
-    # Durable in PostgreSQL (0006_engine_settings.sql), re-applied at boot
-    # between the env layer and the operator overrides — .env is never written
-    # at runtime.
-    control_store.set_engine_settings(validated)
+    await asyncio.to_thread(_apply_settings_change, validated)
     audit_log.record("settings_updated", keys=sorted(validated), persisted="postgresql")
     payload = _settings_payload()
     payload["applied_at"] = utc_now_iso()

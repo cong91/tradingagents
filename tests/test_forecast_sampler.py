@@ -22,11 +22,15 @@ network, no database.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -37,6 +41,7 @@ from tradingagents.forecast.sampler import (
     MAX_BATCH_ROWS,
     KronosSampler,
     SampledSymbol,
+    SamplerError,
     SamplerSettings,
     plan_batches,
     validate_settings,
@@ -298,8 +303,8 @@ def test_a_chunk_deadline_kills_the_real_child_and_reports_timeout(tmp_path, mon
     assert elapsed < 30, "the deadline must bound the wait, not hang the caller"
     assert _RecordingPopen.instances, "the stub child was never started"
     child = _RecordingPopen.instances[-1]
-    assert child.poll() is not None, "the timed-out child must be dead, not abandoned"
     sampler.close()
+    assert child.poll() is not None, "cleanup must reap the timed-out child"
 
 
 def test_close_ends_a_warm_child(tmp_path, monkeypatch):
@@ -315,6 +320,248 @@ def test_close_ends_a_warm_child(tmp_path, monkeypatch):
     while child.poll() is None and time.monotonic() < deadline:
         time.sleep(0.05)
     assert child.poll() == 0, "close must end the owned child"
+
+
+def test_sequential_requests_reuse_one_actual_child(tmp_path):
+    sampler = _sampler(tmp_path, "ok")
+    try:
+        first = sampler.sample([_request()], deadline=time.monotonic() + 10)
+        child = sampler._process
+        request = list(_request())
+        request[-1] = 9000
+        second = sampler.sample([tuple(request)], deadline=time.monotonic() + 20)
+        assert first[0].status == second[0].status == "ok"
+        assert sampler._process is child and child.poll() is None
+        assert sampler._request_counter == 2
+        assert [path["seed"] for path in first[0].paths] == list(range(4242, 4258))
+        assert [path["seed"] for path in second[0].paths] == list(range(9000, 9016))
+    finally:
+        sampler.close()
+    assert child.poll() == 0
+
+
+def test_timed_out_child_is_reaped_and_next_request_starts_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr("tradingagents.forecast.sampler.subprocess.Popen", _RecordingPopen)
+    _RecordingPopen.instances.clear()
+    sampler = _sampler(tmp_path, "hang")
+    try:
+        first = sampler.sample([_request()], deadline=time.monotonic() + 0.2)
+        assert first[0].status == "timeout"
+        old_child = _RecordingPopen.instances[-1]
+        assert sampler._process is None
+        assert sampler._io_thread is None
+        sampler._runner = _write_stub(tmp_path, "ok")
+        second = sampler.sample([_request()], deadline=time.monotonic() + 10)
+        assert second[0].status == "ok", second[0].reason
+        assert old_child.poll() is not None
+        assert all(stream.closed for stream in (old_child.stdin, old_child.stdout, old_child.stderr))
+        assert len(_RecordingPopen.instances) == 2
+        assert sampler._process is _RecordingPopen.instances[-1]
+        assert sampler._process is not old_child
+        assert sampler._request_counter == 2
+        assert sampler.settings.chunk_deadline_seconds == 10
+    finally:
+        sampler.close()
+    assert all(child.poll() is not None for child in _RecordingPopen.instances)
+
+
+def test_sample_lock_wait_expires_without_disturbing_the_active_child(tmp_path):
+    sampler = _sampler(tmp_path, "ok")
+    outcomes = []
+    assert sampler.sample([_request()])[0].status == "ok"
+    child = sampler._process
+
+    def sample():
+        outcomes.extend(sampler.sample([_request()], deadline=time.monotonic() + 0.1))
+
+    worker = threading.Thread(target=sample)
+    try:
+        with sampler._lock:
+            worker.start()
+            worker.join(timeout=2)
+            assert not worker.is_alive(), "sampler lock wait must honor the request deadline"
+            assert len(outcomes) == 1 and outcomes[0].status == "timeout"
+            assert sampler._request_counter == 1
+            assert sampler._process is child and child.poll() is None
+        assert sampler.sample([_request()], deadline=time.monotonic() + 10)[0].status == "ok"
+        assert sampler._process is child
+    finally:
+        worker.join(timeout=2)
+        sampler.close()
+
+
+def test_process_construction_cannot_rebase_the_absolute_deadline(tmp_path, monkeypatch):
+    sampler = _sampler(tmp_path, "ok")
+    clock = [100.0]
+    ensure_process = sampler._ensure_process
+    monkeypatch.setattr("tradingagents.forecast.sampler.time.monotonic", lambda: clock[0])
+
+    def slow_start(*, deadline=None):
+        process = ensure_process(deadline=deadline)
+        clock[0] = 151.0
+        return process
+
+    monkeypatch.setattr(sampler, "_ensure_process", slow_start)
+    try:
+        results = sampler.sample([_request()], deadline=150.0)
+        assert results[0].status == "timeout"
+        assert sampler._process is None
+    finally:
+        sampler.close()
+
+
+def test_no_child_is_started_for_an_already_expired_request(tmp_path, monkeypatch):
+    sampler = _sampler(tmp_path, "ok")
+
+    def no_process(*, deadline=None):
+        pytest.fail("an expired request must not start a child")
+
+    monkeypatch.setattr(sampler, "_ensure_process", no_process)
+    results = sampler.sample([_request()], deadline=time.monotonic() - 1)
+    assert results[0].status == "timeout"
+    assert sampler._request_counter == 0
+
+
+@pytest.mark.parametrize("problem", [None, "hash mismatch"])
+def test_preflight_expiring_the_deadline_never_starts_a_child(tmp_path, monkeypatch, problem):
+    clock = [100.0]
+    starts = []
+    sampler = _sampler(tmp_path, "ok", chunk_deadline_seconds=10)
+
+    def slow_verifier():
+        clock[0] = 106.0
+        return problem
+
+    sampler._artifact_verifier = slow_verifier
+    monkeypatch.setattr("tradingagents.forecast.sampler.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "tradingagents.forecast.sampler.subprocess.Popen",
+        lambda *_args, **_kwargs: starts.append(True),
+    )
+    result = sampler.sample([_request()], deadline=105.0)[0]
+    assert result.status == "timeout"
+    assert starts == []
+    assert sampler._process is None
+
+
+@pytest.mark.parametrize("outcome", ["complete", "expired", "failed"])
+def test_next_chunk_waits_for_prior_timeout_cleanup(tmp_path, monkeypatch, outcome):
+    sampler = _sampler(tmp_path, "ok", max_batch_rows=16)
+    first = _FakeProcess(graceful_wait_times_out=True)
+    second = _FakeProcess(graceful_wait_times_out=True)
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_finished = threading.Event()
+    calls = []
+    results = []
+    deadline = time.monotonic() + (0.3 if outcome == "expired" else 5)
+
+    class PendingCleanup:
+        def join(self, timeout=None):
+            cleanup_started.set()
+            assert release_cleanup.wait(2), "the test must release the cleanup wait"
+
+        def is_alive(self):
+            return outcome == "expired"
+
+    def ensure_process(*, deadline=None):
+        calls.append("start")
+        assert len(calls) == 1 or cleanup_finished.is_set()
+        sampler._process = first if len(calls) == 1 else second
+        return sampler._process
+
+    def communicate(_process, _payload, *, deadline=None):
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired("stub", 1)
+        return {"error": "second chunk reached the child"}
+
+    def defer_kill():
+        sampler._process = None
+        sampler._cleanup_thread = PendingCleanup()
+        if outcome == "failed":
+            sampler._cleanup_error = SamplerError("cleanup failed")
+        if outcome == "complete":
+            cleanup_finished.set()
+
+    monkeypatch.setattr(sampler, "_ensure_process", ensure_process)
+    monkeypatch.setattr(sampler, "_communicate", communicate)
+    monkeypatch.setattr(sampler, "_defer_kill", defer_kill)
+    worker = threading.Thread(target=lambda: results.extend(sampler.sample(
+        [_request(), _request()], deadline=deadline,
+    )))
+    worker.start()
+    try:
+        assert cleanup_started.wait(1), "the next chunk must wait for cleanup"
+        assert calls == ["start"], "a replacement cannot start while cleanup is pending"
+    finally:
+        if outcome == "expired":
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+        release_cleanup.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    expected = {"complete": "error", "expired": "timeout", "failed": "unavailable"}
+    assert [result.status for result in results] == ["timeout", expected[outcome]]
+    assert len(calls) == (2 if outcome == "complete" else 1)
+
+
+def test_failed_deferred_cleanup_can_be_retried_without_losing_child(tmp_path):
+    sampler = _sampler(tmp_path, "ok")
+
+    class RetryProcess(_FakeProcess):
+        def __init__(self):
+            super().__init__(graceful_wait_times_out=True)
+            self.failed_once = False
+
+        def wait(self, timeout=None):
+            if timeout == 0 or not self.failed_once:
+                if timeout != 0:
+                    self.failed_once = True
+                raise subprocess.TimeoutExpired("stub", timeout)
+            return super().wait(timeout=timeout)
+
+    process = RetryProcess()
+    sampler._process = process
+    sampler._defer_kill()
+    sampler._cleanup_thread.join(timeout=2)
+    assert sampler._cleanup_error is not None
+    assert sampler._cleanup_process is process
+
+    sampler.close()
+
+    assert sampler._cleanup_error is None
+    assert sampler._cleanup_process is None
+    assert process.reaped
+    assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
+
+
+def test_timeout_does_not_wait_for_a_blocked_stream_close(tmp_path):
+    sampler = _sampler(tmp_path, "ok")
+    process = _FakeProcess(graceful_wait_times_out=True)
+    close_started = threading.Event()
+    release_close = threading.Event()
+    returned = threading.Event()
+
+    class BlockingClose(_FakeStream):
+        def close(self):
+            close_started.set()
+            assert release_close.wait(2), "the test must release the blocked close"
+            super().close()
+
+    process.stdout = BlockingClose()
+    sampler._process = process
+    worker = threading.Thread(target=lambda: (sampler._defer_kill(), returned.set()))
+    worker.start()
+    try:
+        assert close_started.wait(1)
+        assert returned.wait(0.3), "closing a pipe must not block the deadline path"
+        assert sampler._cleanup_process is process
+    finally:
+        release_close.set()
+        worker.join(timeout=2)
+        sampler.close()
+    assert not worker.is_alive()
+    assert process.reaped
+    assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
 
 
 def test_a_large_payload_to_a_child_that_never_reads_is_bounded(tmp_path):
@@ -376,10 +623,10 @@ def test_partial_writer_budget_leaves_only_the_absolute_deadline_for_reading(tmp
         with pytest.raises(subprocess.TimeoutExpired):
             sampler._communicate(process, {"request_id": 1})
         assert time.monotonic() - started < 0.55
-        assert process.poll() is not None
         assert sampler._io_thread is None
     finally:
         sampler.close()
+    assert process.poll() is not None
 
 
 # -- the answer protocol -------------------------------------------------------
@@ -598,6 +845,140 @@ def test_from_config_records_the_verified_digest_when_artifacts_match(monkeypatc
     assert service.venue == "binance"
 
 
+def test_each_restarted_production_child_reverifies_artifacts_but_warm_reuse_does_not(
+    monkeypatch, tmp_path,
+):
+    """A changed source is refused before the replacement child can import it."""
+    verifier_calls = []
+    source_file = tmp_path / "pinned_source.py"
+    source_file.write_text("pinned", encoding="utf-8")
+    starts = []
+
+    class _Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def kill(self):
+            self.alive = False
+
+        def wait(self, timeout=None):
+            self.alive = False
+            return 0
+
+    def verify():
+        verifier_calls.append(True)
+        return (
+            None
+            if source_file.read_text(encoding="utf-8") == "pinned"
+            else "pinned Kronos source hash mismatch"
+        )
+
+    def start(*_args, **_kwargs):
+        starts.append(True)
+        return _Process()
+
+    sampler = KronosSampler(
+        python=Path(sys.executable), source_dir=tmp_path / "src",
+        model_dir=tmp_path / "models", settings=_settings(),
+        artifact_verifier=verify,
+    )
+    monkeypatch.setattr("tradingagents.forecast.sampler.subprocess.Popen", start)
+    first = sampler._ensure_process()
+    assert first is not None
+    assert sampler._ensure_process() is first
+    assert verifier_calls == [True], "a warm child does not reverify each request"
+    sampler.kill()
+    source_file.write_text("altered", encoding="utf-8")
+    with pytest.raises(SamplerError, match="source hash mismatch"):
+        sampler._ensure_process()
+    assert len(starts) == 1, "the altered source must fail before a replacement spawn"
+    assert verifier_calls == [True, True]
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "service"])
+@pytest.mark.parametrize("tampered", ["source", "model"])
+def test_same_metadata_tampering_is_detected_before_each_production_spawn(
+    monkeypatch, tmp_path, entrypoint, tampered,
+):
+    from tradingagents.forecast import artifact as artifact_module
+    from tradingagents.forecast.service import KronosForecastService
+
+    source_dir, model_dir = tmp_path / "src", tmp_path / "models"
+    source_dir.mkdir()
+    model_dir.mkdir()
+    source = source_dir / "source.py"
+    model = model_dir / "weights.bin"
+    source.write_bytes(b"pinned source")
+    model.write_bytes(b"pinned weight")
+    selected = replace(
+        artifact_module.profile_for(),
+        source_hashes={source.name: hashlib.sha256(source.read_bytes()).hexdigest()},
+        model_hashes={model.name: hashlib.sha256(model.read_bytes()).hexdigest()},
+    )
+    monkeypatch.setattr(artifact_module, "PROFILES", {selected.name: selected})
+    monkeypatch.setattr(artifact_module, "_VERIFY_CACHE", {})
+    hashed = []
+    sha256 = artifact_module._sha256
+
+    def record_hash(path):
+        hashed.append(path)
+        return sha256(path)
+
+    monkeypatch.setattr(artifact_module, "_sha256", record_hash)
+    monkeypatch.setattr(artifact_module, "isolated_source_dir", lambda: source_dir)
+    monkeypatch.setattr(artifact_module, "isolated_model_dir", lambda: model_dir)
+    monkeypatch.setattr(artifact_module, "isolated_python", lambda: Path(sys.executable))
+    starts = []
+
+    def start(*_args, **_kwargs):
+        process = _FakeProcess(graceful_wait_times_out=True)
+        starts.append(process)
+        return process
+
+    monkeypatch.setattr("tradingagents.forecast.sampler.subprocess.Popen", start)
+    if entrypoint == "service":
+        service = KronosForecastService.from_config({})
+        assert service.artifact_problem is None
+        sampler = service._sampler
+    else:
+        assert artifact_module.verify_artifacts(source_dir, model_dir)[0] is None
+        sampler = KronosSampler(
+            python=Path(sys.executable), source_dir=source_dir, model_dir=model_dir,
+            settings=_settings(),
+        )
+    assert sampler is not None
+    assert artifact_module.verify_artifacts(source_dir, model_dir)[0] is None
+    assert hashed == [source, model], "ordinary verification retains its cache"
+    try:
+        first = sampler._ensure_process()
+        first_hash_count = len(hashed)
+        assert sampler._ensure_process() is first
+        assert len(hashed) == first_hash_count, "warm reuse must not hash again"
+        sampler.kill()
+        path = source if tampered == "source" else model
+        stat = path.stat()
+        data = path.read_bytes()
+        path.write_bytes(b"X" + data[1:])
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert (path.stat().st_size, path.stat().st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+        with pytest.raises(SamplerError, match="hash mismatch"):
+            sampler._ensure_process()
+        assert len(starts) == 1, "tampered artifacts cannot reach a replacement child"
+        assert first_hash_count == 4, "each spawn must check actual file contents"
+        assert artifact_module.verify_artifacts(source_dir, model_dir)[0] is not None
+        path.write_bytes(data)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert artifact_module.verify_artifacts(source_dir, model_dir)[0] is None
+    finally:
+        sampler.close()
+
+
 def test_from_config_applies_effective_lookback_override(monkeypatch, tmp_path):
     from tradingagents.forecast import artifact as artifact_module
     from tradingagents.forecast.service import KronosForecastService
@@ -654,9 +1035,9 @@ def test_mixed_timeframes_and_horizons_are_split_without_reordering(tmp_path, mo
     payloads = []
     communicate = sampler._communicate
 
-    def record_payload(process, payload):
+    def record_payload(process, payload, *, deadline=None):
         payloads.append(payload)
-        return communicate(process, payload)
+        return communicate(process, payload, deadline=deadline)
 
     monkeypatch.setattr(sampler, "_communicate", record_payload)
     requests = [

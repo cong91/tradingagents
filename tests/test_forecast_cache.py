@@ -77,7 +77,7 @@ class _FakeSampler:
     def __init__(self) -> None:
         self.calls: list[list[tuple]] = []
 
-    def sample(self, requests: list[tuple]):
+    def sample(self, requests: list[tuple], *, deadline: float | None = None):
         from tradingagents.forecast.sampler import SampledSymbol
 
         self.calls.append(list(requests))
@@ -183,6 +183,21 @@ def test_a_cached_block_is_served_for_the_same_identity_only():
     advanced = _series(end_open=series.candles[-1].open_time + _FOUR_HOUR_MS)
     service.forecast(advanced, seed=3)
     assert len(sampler.calls) == calls + 1
+
+
+def test_request_history_lengths_are_isolated_in_the_warm_service_cache():
+    sampler = _FakeSampler()
+    service = _service(sampler, lookback_bars=512)
+    series = _series(count=201)
+    first = service.forecast(series, seed=3, lookback_bars=201)
+    second = service.forecast(series, seed=3, lookback_bars=96)
+    cached = service.forecast(series, seed=3, lookback_bars=201)
+    assert first.status == second.status == STATUS_OK
+    assert [first.effective_lookback_bars, second.effective_lookback_bars] == [201, 96]
+    assert [len(call[0][3]) for call in sampler.calls] == [201, 96]
+    assert service.settings.lookback_bars == 512
+    assert cached is first
+    assert second is not first
 
 
 def test_an_edited_close_at_the_same_timestamp_misses_the_cache():

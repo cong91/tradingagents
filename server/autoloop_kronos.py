@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
-from server import autoloop_execution, autoloop_futures_context, kronos_context
+from server import (
+    autoloop_execution,
+    autoloop_futures_context,
+    futures_cycle_telemetry,
+    kronos_context,
+    kronos_lifecycle,
+)
 from server.auto_modes import AutoMode
 from server.autoloop_telemetry import CycleTelemetry
 from server.contract import utc_now_iso
@@ -33,6 +40,7 @@ def _prepare_forecast(
     authorization: AuthorizationSnapshot | None,
     on_cycle_checkpoint: Callable[[dict], None] | None,
     persist_progress: Callable[..., None],
+    owner: kronos_lifecycle.KronosForecastOwner | None = None,
 ) -> tuple[str | None, str]:
     """Return a defer reason or the execution context with its forecast."""
     # Mode and budget are checked on both sides of inference. No execution lock
@@ -55,6 +63,7 @@ def _prepare_forecast(
             derivatives, ticker, futures_context, config,
             cycle_id=cycle_id or f"{ticker}:{four_hour_open}",
             deadline=deadline, cancelled=cancelled,
+            **({"owner": owner} if owner is not None else {}),
         )
     autoloop_execution.raise_if_mode_disabled(mode, "kronos forecast", authorization)
     autoloop_execution.raise_if_execution_closed(deadline, cancelled, f"candidate {ticker} kronos forecast")
@@ -65,7 +74,11 @@ def _prepare_forecast(
             reason="the Kronos forecast path returned no block",
         )
     kronos_policy = kronos_context.policy_for(kronos_block)
-    cycle_payload["kronos_forecast"] = kronos_block.as_json()
+    forecast_recorded_at = datetime.now(UTC).isoformat()
+    cycle_payload["kronos_forecast"] = futures_cycle_telemetry.forecast_evidence({
+        **kronos_block.as_json(), "recorded_at": forecast_recorded_at,
+    })
+    cycle_payload["kronos_venue_scope"] = futures_cycle_telemetry.forecast_venue_scope(config)
     cycle_payload["kronos_policy"] = kronos_policy
     cycle_timestamps["kronos_finished_at"] = utc_now_iso()
     cycle_payload["phase_timestamps"] = dict(cycle_timestamps)

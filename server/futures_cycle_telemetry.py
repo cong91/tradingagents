@@ -250,6 +250,38 @@ def decision_telemetry(state: dict, signal: str, rating_parser) -> dict:
     }
 
 
+def forecast_venue_scope(config: dict[str, Any]) -> dict[str, Any]:
+    """Credential-free venue routing needed for later public OHLCV evaluation."""
+    exchange_id = str(config.get("exec_exchange_id") or "binance").strip().lower()
+    scope = {
+        "exchange_id": exchange_id,
+        "sandbox": config.get("exec_sandbox") is True,
+    }
+    if exchange_id == "binance":
+        from tradingagents.execution.exchange_client import _binance_profile
+
+        base_url = str(config.get("exec_base_url") or "https://demo-api.binance.com")
+        scope["venue_profile"] = _binance_profile(base_url)
+    return scope
+
+
+def forecast_evidence(block: dict[str, Any] | None) -> dict[str, Any]:
+    """Return stable, redacted forecast fields for later evaluation."""
+    if not isinstance(block, dict):
+        return {"status": "unavailable", "reason": "forecast block is missing"}
+    fields = (
+        "symbol", "status", "reason", "calibration_label", "distribution_kind",
+        "direction", "direction_counts", "direction_ratio", "band", "band_spread_ratio",
+        "signal_basis", "reference_close",
+        "data_open_time", "as_of", "horizon_hours", "horizon_bars",
+        "effective_lookback_bars", "timeframe", "paths", "generation_kind",
+        "temperature", "profile", "model_revision", "artifact_hash", "latency_ms",
+        "created_at", "per_path_samples", "ohlc_paths", "ohlc_quality", "ohlc_provenance",
+        "recorded_at",
+    )
+    return redact_payload({key: block.get(key) for key in fields if key in block})
+
+
 def snapshot_payload(context: dict) -> dict:
     def encode(value: Any) -> Any:
         if hasattr(value, "__dataclass_fields__"):

@@ -35,6 +35,8 @@ from server import (
     data_source_credentials,
     data_sources,
     experiments_api,
+    forecast_evaluation,
+    forecast_evaluations_api,
     futures_cycle_store,
     health,
     history,
@@ -175,12 +177,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Outcome ledger worker: reads recorded cycles + venue READ history only;
     # no-op while outcome_ledger_ingest_enabled stays False (plan §2.6).
     outcome_ledger.start()
+    # Forecast evaluation is a separate, read-only observer. It is disabled by
+    # default and must never be started merely because the API router is loaded.
+    forecast_evaluation.start_at_boot()
     try:
         yield
     finally:
         autoloop.stop()
         position_monitor.stop()
         bracket_monitor.stop()
+        try:
+            forecast_evaluation.stop()
+        except TimeoutError:
+            logger.warning("forecast evaluation did not stop within its shutdown budget", exc_info=True)
         outcome_ledger.stop()
 
 
@@ -227,6 +236,7 @@ for _router in (
     data_sources.router,
     llm_credentials_api.router,
     outcomes_api.router,
+    forecast_evaluations_api.router,
     experiments_api.router,
     operating_brief.router,
 ):

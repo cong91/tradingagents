@@ -1,14 +1,9 @@
 """Active Kronos context for the futures decision path.
 
-One concern: turn the closed 4h candles the cycle already read into a compact
-typed forecast block and append it to the futures execution context, so the
-Trader and the Portfolio Manager see the model's sample BEFORE they decide.
-This module owns the runtime forecast preparation AND the model lifecycle for
-the active path; the autoloop only calls it.
-
-Forecast process ownership stays here, while scheduler, candidate analysis and
-Futures execution each have their own autoloop module. The caller supplies the
-cycle budget and consumes the forecast without holding execution locks.
+Turn the selected timeframe's closed candles into a forecast block and append
+it to the Futures execution context before the Trader and Portfolio Manager
+decide. Cycle-scoped service ownership lives in ``server.kronos_lifecycle``;
+the caller supplies the cycle budget without holding execution locks.
 
 The boundaries this module holds:
 
@@ -16,24 +11,22 @@ The boundaries this module holds:
   filtered by direction, no plan is altered, no risk limit is touched. The
   failure POLICY below is the only lever, and it acts on failures, not on the
   forecast's direction.
-- **It never holds a lock.** No ``execution_lock`` is passed in or acquired; the
-  inference happens on the candidate's own thread, before the graph is built, so
-  bracket monitoring and position protection are untouched.
+- **It never holds an execution lock.** The owner serializes service leases,
+  but no ``execution_lock`` is passed in or acquired; inference runs before the
+  graph is built, so bracket monitoring and position protection are untouched.
 - **Every candidate gets an attempt.** A missing or failed forecast defers the
   Futures candidate before graph construction and LLM analysis.
-- **Scoped lifecycle ownership.** When no service is supplied, this module
-  builds one for the call and closes it in ``finally`` — on success, on error
-  and on timeout. Nothing is cached across candidates and no global pool
-  exists, so no model child can outlive its owner. The price is honest: every
-  scoped call pays cold start plus inference (measured ~5.6–7.1 s per
-  candidate for 96 closed bars and 16 paths); there is NO warm
-  reuse across candidates in this ownership model.
-- **The inference receives the cycle budget.** A ``deadline`` (monotonic) is
-  turned into a sampler chunk limit when the owned service is constructed.
-  Artifact checks, venue history, process startup and cleanup have their own
-  duration, so this is not an end-to-end cycle deadline. The caller checks
-  ``cancelled`` and the remaining budget again after the forecast returns.
-  Nothing here takes or blocks an execution/protection lock.
+- **Cycle-scoped warm ownership.** One Futures mode cycle owns one lazy service
+  and sampler, reused through exclusive leases across candidates. Closing stops
+  new leases and defers cleanup until the active lease exits. A call without an
+  owner or supplied service builds and closes its own service exactly once.
+  No global pool or cross-cycle reuse exists.
+- **The inference receives the original cycle deadline.** The absolute monotonic
+  ``deadline`` reaches the sampler unchanged, so history, artifact verification,
+  construction and lock waiting all consume the same budget. It never becomes
+  the warm sampler's lifetime chunk limit. Blocking setup and cleanup are not
+  preemptible; cancellation and deadline are rechecked before inference, and
+  the caller checks them again after the forecast returns.
 - **Failure defers the candidate.** ``unavailable``/``timeout``/``error`` are
   recorded on the cycle; the graph and LLM do not run without a forecast.
 - **Research output stays out of active decisions.** A block whose
@@ -49,10 +42,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from server import kronos_lifecycle
 from tradingagents.auto_timeframes import timeframe_ms
 from tradingagents.dataflows.market_data import Candle, fetch_closed_candles
 from tradingagents.forecast.artifact import MIN_LOOKBACK_BARS
@@ -67,11 +62,6 @@ from tradingagents.forecast.service import KronosForecastService
 from tradingagents.forecast.settings import ForecastSettings, settings_from_config
 
 logger = logging.getLogger(__name__)
-
-
-class ActiveForecastUnavailable(RuntimeError):
-    """The active forecast could not be produced; the caller degrades."""
-
 
 def settings_for(config: dict[str, Any]) -> ForecastSettings:
     """The active settings the operator configured (never invented here)."""
@@ -111,16 +101,18 @@ def forecast_for_cycle(
     expected_candle: Candle | None = None,
     deadline: float | None = None,
     cancelled: threading.Event | None = None,
+    owner: kronos_lifecycle.KronosForecastOwner | None = None,
 ) -> ForecastBlock | None:
     """Produce one forecast block, returning a status when inference cannot run.
 
-    A service created here is closed by this call. The remaining cycle budget
-    bounds its sampler, while the caller rechecks cancellation after the call.
+    A locally created service closes exactly once; a warm owner retains its
+    service across calls. The original deadline includes setup and lease wait,
+    while the caller rechecks cancellation after the call.
     """
     settings = settings_for(config)
     started = time.perf_counter()
-    owned = service is None
-    if owned and deadline is not None and deadline - time.monotonic() <= 0:
+    owned = service is None and owner is None
+    if deadline is not None and deadline - time.monotonic() <= 0:
         logger.info("kronos active: cycle budget spent before inference for %s", symbol)
         return ForecastBlock(
             symbol=symbol, status=STATUS_UNAVAILABLE,
@@ -179,12 +171,29 @@ def forecast_for_cycle(
                 reason="the cycle deadline was reached after history was read; no inference was started",
             )
         if owned:
-            service = KronosForecastService.from_config(
-                config, chunk_deadline_seconds=remaining,
-                lookback_bars=len(candles),
-            )
-        seed = stable_seed(cycle_id, "kronos_active")
-        block = service.forecast(series, seed=seed)
+            service = KronosForecastService.from_config(config, lookback_bars=len(candles))
+        lease = owner.lease(deadline, cancelled) if owner is not None else nullcontext(service)
+        try:
+            with lease as active_service:
+                if cancelled is not None and cancelled.is_set():
+                    return ForecastBlock(
+                        symbol=symbol, status=STATUS_UNAVAILABLE,
+                        reason="the cycle was cancelled during service preparation; no inference was started",
+                    )
+                if deadline is not None and time.monotonic() >= deadline:
+                    return ForecastBlock(
+                        symbol=symbol, status=STATUS_UNAVAILABLE,
+                        reason="the cycle deadline was reached during service preparation; no inference was started",
+                    )
+                if active_service is None:
+                    raise RuntimeError("Kronos forecast service is unavailable")
+                seed = stable_seed(cycle_id, "kronos_active")
+                forecast_kwargs = {"seed": seed, "deadline": deadline}
+                if owner is not None or owned:
+                    forecast_kwargs["lookback_bars"] = len(candles)
+                block = active_service.forecast(series, **forecast_kwargs)
+        except kronos_lifecycle.ActiveForecastUnavailable as exc:
+            return ForecastBlock(symbol=symbol, status=STATUS_UNAVAILABLE, reason=str(exc))
         block = _out_of_active_decisions(block, symbol)
         block = _with_latency(block, (time.perf_counter() - started) * 1000.0)
         logger.info(
@@ -217,11 +226,10 @@ def _out_of_active_decisions(block: ForecastBlock, symbol: str) -> ForecastBlock
 
 
 def _with_latency(block: ForecastBlock, measured_ms: float) -> ForecastBlock:
-    """Carry the caller-observed wall time, cold start and sampler included.
+    """Carry total call latency: history, lease wait, setup and inference.
 
-    The number the operator needs is what the cycle actually spent, including
-    the interpreter's cold start under scoped ownership — there is no warm
-    child to exclude, and a cached hit still paid the history read.
+    The first lease pays cold start; later leases reuse the warm child. Both
+    report the time this candidate actually spent, including cached history reads.
     """
     return replace(block, latency_ms=measured_ms)
 
@@ -244,7 +252,6 @@ def policy_for(block: ForecastBlock | None) -> str:
 
 
 __all__ = [
-    "ActiveForecastUnavailable",
     "append_to_context",
     "forecast_for_cycle",
     "history_for",

@@ -394,6 +394,30 @@ def test_owner_timeout_terminalizes_claimed_forecast_cycle(monkeypatch):
     assert "kronos forecast deferred" in terminal["payload"]["kronos_defer_reason"]
 
 
+def test_owner_timeout_records_time_of_synthesized_failure(monkeypatch):
+    writes = []
+    monkeypatch.setattr(futures_cycle_telemetry, "persist_progress", lambda *args, **kwargs: writes.append(kwargs))
+    monkeypatch.setattr(autoloop, "utc_now_iso", lambda: "2026-11-16T12:00:00Z")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 16, 12, 0, 0, 654321, tzinfo=tz)
+
+    monkeypatch.setattr(autoloop, "datetime", Clock)
+    autoloop._terminalize_timed_out_cycle(
+        {
+            "cycle_id": "futures:BTC/USDT:USDT:cutoff:1",
+            "symbol": "BTC/USDT:USDT",
+            "payload": {"forecast_started": True},
+        },
+        reason="forecast timed out", stage="kronos_active_context",
+    )
+    [write] = writes
+    assert write["payload"]["kronos_forecast"]["recorded_at"] == "2026-11-16T12:00:00.654321+00:00"
+    assert write["payload"]["kronos_forecast"]["status"] == "timeout"
+
+
 def test_owner_timeout_after_usable_forecast_marks_execution_uncertain(monkeypatch):
     writes: list[dict] = []
 

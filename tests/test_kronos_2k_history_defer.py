@@ -58,7 +58,7 @@ def test_gap_history_defers_candidate_before_graph_and_llm(monkeypatch):
         def __init__(self):
             self.calls: list[list[tuple]] = []
 
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             self.calls.append(list(requests))
             raise AssertionError("invalid history must be refused before inference")
 

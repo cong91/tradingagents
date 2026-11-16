@@ -7,9 +7,7 @@ import threading
 from datetime import UTC, datetime
 from typing import Any
 
-from server import (
-    kronos_context,
-)
+from server import kronos_context, kronos_lifecycle
 from tradingagents.agents.rating import RATINGS_5_TIER
 from tradingagents.dataflows.market_data import fetch_closed_candles
 from tradingagents.execution.futures_scheduler import closed_candle_pair
@@ -21,6 +19,7 @@ _BUY, _OVERWEIGHT, _HOLD, _UNDERWEIGHT, _SELL = RATINGS_5_TIER
 def _kronos_block_for(
     derivatives: Any, ticker: str, futures_context: dict, config: dict, *, cycle_id: str,
     deadline: float | None = None, cancelled: threading.Event | None = None,
+    owner: kronos_lifecycle.KronosForecastOwner | None = None,
 ):
     """Build the Kronos block from the Futures cycle's resolved symbol and cutoff."""
     symbol = str(futures_context.get("unified_symbol") or futures_context.get("symbol") or ticker)
@@ -33,7 +32,7 @@ def _kronos_block_for(
         block = kronos_context.forecast_for_cycle(
             service=None, exchange=exchange, symbol=symbol, config=config,
             as_of=as_of, cycle_id=cycle_id, expected_candle=futures_context["selected_candle"],
-            deadline=deadline, cancelled=cancelled,
+            deadline=deadline, cancelled=cancelled, owner=owner,
         )
         if block is not None and block.ok and (
             block.symbol != symbol or block.timeframe != identity["timeframe"]

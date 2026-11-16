@@ -48,7 +48,7 @@ def test_2048_bar_sampler_preserves_raw_and_corrected_ohlc_for_active(tmp_path: 
     assert result.ohlc_quality["corrected_path_count"] == 2
 
     class ReplaySampler:
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             return [result]
 
     service = KronosForecastService(
@@ -92,7 +92,7 @@ def test_wide_close_band_label_and_quality_survive_cache_and_context():
     class WideSampler:
         calls = 0
 
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             self.calls += 1
             return [SampledSymbol(symbol=SYMBOL, status="ok", paths=tuple(paths))]
 

@@ -23,6 +23,7 @@ from server import (
     control_store,
     daily as daily_mod,
     futures_cycle_telemetry,
+    kronos_lifecycle,
     runs as runs_mod,
 )
 from server.auto_modes import AutoMode
@@ -402,6 +403,7 @@ def _terminalize_timed_out_cycle(
                 status=STATUS_TIMEOUT,
                 reason=reason,
             ).as_json()
+            forecast["recorded_at"] = datetime.now(UTC).isoformat()
             payload["kronos_forecast"] = forecast
         status = str(forecast.get("status") or STATUS_TIMEOUT)
         forecast_reason = str(forecast.get("reason") or reason)
@@ -439,6 +441,7 @@ def _run_candidate_with_timeout(
     telemetry: CycleTelemetry,
     mode: AutoMode | None = None,
     authorization: AuthorizationSnapshot | None = None,
+    kronos_owner: kronos_lifecycle.KronosForecastOwner | None = None,
 ) -> DailyResult:
     """Run one candidate off-cycle so an LLM stall cannot hold the lock."""
     result_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -499,6 +502,7 @@ def _run_candidate_with_timeout(
                 deadline=deadline, cancelled=cancelled,
                 execution_lock=execution_lock, telemetry=telemetry, mode=mode,
                 authorization=authorization, on_cycle_checkpoint=save_checkpoint,
+                kronos_owner=kronos_owner,
             ))
         except BaseException as exc:
             result_queue.put(exc)
@@ -656,7 +660,7 @@ def _run_mode_cycle(
     results: list[DailyResult],
     authorization: AuthorizationSnapshot,
 ) -> ModeDispatch:
-    """Screen and run one market without extending the enclosing deadline."""
+    """Run one market under the shared deadline, with one warm Futures owner."""
     mode_name = _mode_key(mode)
     mode_summary = summary["modes"][mode_name]
     mode_summary["status"] = "running"
@@ -674,6 +678,10 @@ def _run_mode_cycle(
 
     telemetry = CycleTelemetry(on_change=publish_telemetry)
     publish_telemetry(telemetry.snapshot())
+    kronos_owner = (
+        kronos_lifecycle.KronosForecastOwner(config)
+        if mode is AutoMode.FUTURES else None
+    )
     mode_results: list[DailyResult] = []
     try:
         from tradingagents.dataflows.screening import (
@@ -766,6 +774,7 @@ def _run_mode_cycle(
                 result = _run_candidate_with_timeout(
                     bridge, candidate, config, build_graph, derivatives, deadline, cancelled,
                     _execution_lock, telemetry, mode=mode, authorization=authorization,
+                    kronos_owner=kronos_owner,
                 )
             except autoloop_execution.AutoModeDisabled:
                 mode_summary["status"] = "disabled"
@@ -796,6 +805,20 @@ def _run_mode_cycle(
         summary["error"] = mode_summary["error"]
         audit_log.record("autoloop_cycle_failed", mode=mode.value, error=mode_summary["error"])
     finally:
+        if kronos_owner is not None:
+            cleanup_timeout = max(0.0, deadline - time.monotonic())
+            cleanup_complete = kronos_owner.close(timeout=cleanup_timeout)
+            cleanup_state = kronos_owner.cleanup_state()
+            mode_summary["kronos_cleanup"] = cleanup_state
+            if not cleanup_complete:
+                cleanup_error = f"Kronos cleanup {cleanup_state} after the cycle deadline"
+                existing_error = mode_summary.get("error")
+                mode_summary["error"] = (
+                    f"{existing_error}; {cleanup_error}" if existing_error else cleanup_error
+                )
+                summary["error"] = summary.get("error") or mode_summary["error"]
+                if mode_summary["status"] == "completed":
+                    mode_summary["status"] = "timeout"
         telemetry.close()
         mode_summary["telemetry"] = telemetry.snapshot()
         mode_summary["finished_at"] = utc_now_iso()

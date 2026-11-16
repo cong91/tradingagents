@@ -18,6 +18,7 @@ from server import (
     autoloop_kronos,
     futures_cycle_telemetry,
     job_store,
+    kronos_lifecycle,
 )
 from server.auto_modes import AutoMode
 from server.autoloop_telemetry import CycleTelemetry
@@ -46,6 +47,7 @@ def _process_candidate(
     mode: AutoMode | None = None,
     authorization: AuthorizationSnapshot | None = None,
     on_cycle_checkpoint: Callable[[dict], bool | None] | None = None,
+    kronos_owner: kronos_lifecycle.KronosForecastOwner | None = None,
 ) -> DailyResult:
     """Analyze → plan → the engine's confirm policy for one candidate.
 
@@ -244,6 +246,7 @@ def _process_candidate(
                 deadline=deadline, cancelled=cancelled, telemetry=telemetry,
                 mode=mode, authorization=authorization, on_cycle_checkpoint=on_cycle_checkpoint,
                 persist_progress=persist_progress,
+                **({"owner": kronos_owner} if kronos_owner is not None else {}),
             )
             if defer_reason is not None:
                 result.reason = defer_reason

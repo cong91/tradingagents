@@ -1,6 +1,6 @@
 # Web UI API Contract (`docs/ui-api-contract.md`)
 
-updated: 2026-10-17 (rev 9: Futures currency metadata per account/position field, USD-equivalent Bybit Unified and OKX aggregates, explicit unsupported venue routing, Bybit settleCoin scope, and accurate stale activity timestamps)
+updated: 2026-11-16 (rev 10: warm Kronos theo lượt Futures, effective input, và hợp đồng đánh giá forward forecast tách khỏi outcome ledger)
 audience: frontend + backend implementer của control-panel UI cho TradingAgents
 
 Hợp đồng này bọc engine hiện có **mà không sửa mã lõi `tradingagents/`**. Mọi mapping
@@ -134,6 +134,7 @@ Response 200:
 - `gates_readonly` báo hai chế độ và `any_auto_enabled` là OR của chúng. `effective_exec_mode` được tính bằng bridge standalone; **không dùng giá trị này để suy ra managed entry có gửi tới venue hay không**.
 - `settings[]` phản ánh `_ENV_OVERRIDES`; `exec_base_url` xuất hiện read-only dù được đọc từ `TRADINGAGENTS_EXEC_BASE_URL`. PUT key này → `403 forbidden_key`. `exec_sandbox` chỉ dùng cho sandbox của sàn khác, không chọn Binance venue.
 - Kronos luôn được thử cho ứng viên Futures đủ điều kiện (§19). `kronos_active_profile` là key chọn cặp model-tokenizer được xác minh; PUT profile rỗng hoặc không thuộc registry → `422 validation_error`. `GET /api/operator-config` trả readiness và thông số suy ra trong `kronos`; không còn switch bật/tắt Kronos hoặc policy `pass_through`.
+- Worker đánh giá forecast (§20) có hai engine settings riêng: `forecast_evaluation_enabled` (bool, mặc định `false`; env `TRADINGAGENTS_FORECAST_EVALUATION_ENABLED`) và `forecast_evaluation_interval_seconds` (mặc định `60`; env `TRADINGAGENTS_FORECAST_EVALUATION_INTERVAL_SECONDS`). PUT theo cơ chế persistence ở dưới; chuyển từ tắt sang bật đặt mốc thu thập mới, không backfill lịch sử. Đây là quyền chạy bộ đánh giá chỉ đọc dữ liệu thị trường, không phải công tắc Kronos active hoặc quyền giao dịch (`tradingagents/default_config.py:100`, `tradingagents/default_config.py:387`, `server/settings.py:206`).
 - `settings[]` bao gồm các numeric policy `risk_derivatives_*`: `profit_protection_enabled` (default true, chỉ quản lý state do bot mở), `break_even_r`=1, `lock_profit_r`=2, `trail_start_r`=3, `trail_distance_r`=1, `target_extension_r`=1, `min_stop_move_r`=0.1, `mark_max_age_seconds`=120. Scale-out: `scale_out_enabled`=false, `scale_out_first_r`=1, `scale_out_first_fraction`=0.33, `scale_out_second_r`=2, `scale_out_second_fraction`=0.33. Chúng không thuộc `gates_readonly` và không tự mở gate.
 - Profit-protection thresholds là bội số của R (entry thực tế tới initial stop). Backend yêu cầu các R dương, `break_even < lock_profit < trail_start`; giá trị sai không gọi venue và trả state `invalid_policy_config` ở monitor. `min_stop_move_r` chặn thay SL khi chênh lệch quá nhỏ; `mark_max_age_seconds` khiến mark cũ trả `mark_stale` và không mutate. Monitor cũng từ chối khi account không phải One-way (`hedge_mode_unsupported`) hoặc không đọc được position mode (`position_mode_unavailable`).
 - Với Binance, `exec_base_url` chỉ chấp nhận HTTPS API host Demo hoặc production được allowlist. URL được chọn quyết định credential pair: Demo dùng `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_SECRET`; production dùng `BINANCE_API_KEY`/`BINANCE_SECRET`. Demo là default. Đổi profile cần sửa URL + đúng pair trong `.env` rồi restart; API GET chỉ expose URL và status/mask, PUT không đổi được URL.
@@ -1046,8 +1047,9 @@ Các mô tả chi tiết của các surface gốc nằm ở các mục tương �
 | 43 | GET | `/api/experiments` | registry thí nghiệm read-only (§17) |
 | 44 | GET | `/api/experiments/{run_id}` | manifest, per-repeat rows và comparisons (§17) |
 | 45 | GET | `/api/brief` | operating brief, gồm active Kronos forecast (§18–19) |
+| 46 | GET | `/api/forecast-evaluations` | đọc snapshot đánh giá forward forecast và metrics trên mọi dòng khớp bộ lọc; không gọi venue (§20) |
 
-**endpointCount = 45** (cặp method/path).
+**endpointCount = 46** (cặp method/path).
 
 ---
 
@@ -1069,6 +1071,10 @@ Các mô tả chi tiết của các surface gốc nằm ở các mục tương �
 14. **Portfolio endpoint phụ thuộc seam private của `risk.py`** (`_replay`, `_consecutive_losses`, `_halted_today` — `_halted_today` đã import ở `server/audit.py:74`): engine đổi replay semantics (ví dụ thêm field mới vào audit line) → P&L của UI lệch im lặng. Cân nhắc public hoá helper replay trong engine (M5) thay vì giữ import private.
 15. **Approve với venue không đọc được fail-closed**: `portfolio` không lấy được → server trả `503 exchange_unreachable`, giữ item ở `pending` và không chạy `RiskGuard`/gửi lệnh. Điều này tránh bỏ qua các giới hạn phần trăm khi venue không cung cấp equity; UI/operator có thể thử lại sau khi venue hồi phục.
 16. **Enqueue per-coin giữa job chạy**: mỗi enqueue rewrite cả `approvals.jsonl` (atomic — an toàn), nhưng v1 không có cancel job: job 20 coin có thể sinh tới 20 item; `daily_job_id` trên item (§4) là chìa khoá đối soát queue↔job khi user huỷ muốn dừng chuỗi.
+
+### Changelog rev 10
+
+- §1, §10, §18–§20: cấu hình worker đánh giá mặc định tắt, warm reuse theo lượt Futures, số nến đầu vào thực tế và timeframe Auto đã chọn; bổ sung endpoint đọc snapshot/metrics và giới hạn diễn giải. Các threshold giữ nguyên; quy trình đề nghị chỉnh ngưỡng nằm trong [hướng dẫn đánh giá Kronos](kronos-forecast-evaluation.vi.md).
 
 ### Changelog rev 3 (so với rev 2)
 
@@ -1352,7 +1358,7 @@ Một aggregate **chỉ đọc** cho bản tin vận hành trên dashboard (`/`
 - `GET /api/autoloop/cycles` đếm forecast lỗi ở bucket `forecast_deferred` trong `summary` và từng `symbols[]`; lý do mới nhất nằm ở `last_kronos_defer_reason`, chi tiết từng cycle giữ `payload.kronos_defer_reason`.
 - Forecast hợp lệ phải là quyết định forward-only: block hồi cứu không được đưa vào context active.
 - Khi forecast trả trạng thái lỗi, cycle ghi block và hoãn ứng viên trước graph/LLM nếu cycle còn cho phép ghi; không có fallback/pass-through.
-- Horizon và lookback được suy ra từ max-hold và profile; timeframe cố định là nến Futures 4h đã đóng.
+- `timeframe` của forecast theo `auto_futures_timeframe` đã chọn và đúng identity nến của cycle; horizon suy ra từ max-hold, giới hạn lookback suy ra từ profile. `effective_lookback_bars` là số nến đóng thực tế đưa vào lần dự báo, không phải điểm chất lượng (§19). Cặp xác nhận 1h/4h vẫn có vai trò riêng (§13).
 - `experiments` lấy từ registry (§17); khi rỗng → `unavailable` + lý do; verdict pass-through, **không có promotion**.
 - `portfolio` là **body nguyên vẹn của `/api/portfolio`** (giữ `generated_at`, snapshot metadata, warnings, `positions_read`) để card dùng lại mà không mất hợp đồng/source freshness. Lần đọc danh mục thất bại → `portfolio: null` và chỉ section đó suy giảm; brief vẫn trả 200.
 - `needs_attention[]` được **dedup ở server** theo `kind` (một mục một kind, priority thấp nhất thắng), sắp theo `priority` 1→3, mỗi mục có `message_code` (i18n), `detail` (nguyên văn) và `link` nội bộ. Sổ rỗng **không** sinh mục "ledger unavailable" (đã có ở khối results) — tránh dạy operator bỏ qua danh sách cảnh báo.
@@ -1377,11 +1383,97 @@ block hợp lệ được đưa vào context; artifact, history, timeout hoặc 
 lưu nên có thể là `null` hoặc mang giá trị lịch sử như `pass_through`.
 
 Forecast hợp lệ giữ `signal_basis: "close_only"`, tỷ lệ hướng đi kèm số đường mẫu,
-`band`, `band_spread_ratio`, `horizon_hours`, `timeframe`, `paths`, provenance model,
-độ trễ, và `ohlc_quality`. Tỷ lệ mẫu không phải xác suất đã hiệu chỉnh; block không
-phải lệnh, veto hay kết quả lợi nhuận. Không có state hoặc policy nào để bật/tắt
-Kronos ở đây; operator chỉ chọn profile model-tokenizer đã xác minh trong Cấu hình.
+`band`, `band_spread_ratio`, `horizon_hours`, `horizon_bars`, `timeframe`,
+`effective_lookback_bars`, `paths`, provenance model, độ trễ và `ohlc_quality`.
 
-Dữ liệu lịch sử trong các bảng `shadow_*` và migration `0010_shadow_forecasts.sql`
-được giữ nguyên để bảo toàn lịch sử database, nhưng không còn là API/UI surface của
-ứng dụng hiện tại.
+- **Đầu vào thực tế:** `timeframe` theo `auto_futures_timeframe` đã chọn; nến cuối phải khớp symbol, timeframe và open time của nến cycle. Profile đặt trần số nến yêu cầu (`small_base`: 512, `mini_2k`: 2048); lịch sử ngắn hơn vẫn có thể dùng nếu có ít nhất 32 nến đóng, liên tục, đúng identity và cutoff. `effective_lookback_bars` ghi số nến thực sự được đưa vào lần dự báo. Đây là số đếm, không phải điểm chất lượng hoặc bằng chứng nhiều nến hơn làm dự báo tốt hơn. Thiếu số đếm là chưa xác định, không thay bằng trần của profile. `ohlc_quality` mô tả tính nhất quán/hiệu chỉnh OHLC của **đường dự báo đầu ra**, không chấm chất lượng lịch sử đầu vào (`tradingagents/forecast/settings.py:102`, `server/kronos_context.py:197`, `tradingagents/forecast/service.py:209`, `tradingagents/forecast/ohlc.py:139`).
+- **Warm reuse:** một owner dùng chung service/sampler Kronos giữa các ứng viên trong **một lượt dispatch Auto Futures**; service được tạo khi cần, owner đóng khi lượt đó kết thúc và sau khi lease đang dùng được trả. Lượt Futures tiếp theo có owner mới; không có pool model toàn cục. Mỗi ứng viên vẫn đọc/kiểm tra lịch sử, dùng lookback, seed riêng và chịu deadline chung của cycle. `latency_ms` là wall time quan sát cho lần gọi forecast, gồm đọc lịch sử và khởi tạo nếu có; chưa khẳng định giảm độ trễ cho đến khi có đo đạc vận hành trực tiếp với cùng phạm vi (`server/autoloop.py:679`, `server/autoloop.py:806`, `server/kronos_context.py:76`, `server/kronos_context.py:260`, `server/kronos_context.py:297`).
+- **Snapshot cho đánh giá:** cycle lưu `kronos_forecast` đã redact cùng `kronos_venue_scope` để bộ đánh giá dùng đúng forecast và venue đã ghi; không dựng lại forecast bằng model hiện tại để chấm lịch sử (`server/autoloop_kronos.py:75`, `server/futures_cycle_telemetry.py:253`). Hợp đồng đánh giá nằm ở §20.
+
+Tỷ lệ mẫu không phải xác suất đã hiệu chỉnh; block không phải lệnh, veto hay kết quả
+lợi nhuận. Không có state hoặc policy nào để bật/tắt Kronos ở đây; operator chỉ chọn
+profile model-tokenizer đã xác minh trong Cấu hình. Warm reuse và effective input
+không đổi threshold, luật xác nhận hay hạn mức rủi ro.
+
+Kronos active không có Shadow mode. Các bảng `shadow_*` và migration
+`0010_shadow_forecasts.sql` được giữ để bảo toàn lịch sử database; runtime hiện tại
+không đọc, ghi hoặc xóa dữ liệu đó. Quy trình nghiên cứu dùng snapshot forecast mới
+và báo cáo offline, theo [hướng dẫn đánh giá](kronos-forecast-evaluation.vi.md).
+
+---
+
+## 20. Forecast evaluations — `GET /api/forecast-evaluations`
+
+Endpoint chỉ đọc PostgreSQL, không gọi venue hoặc khởi chạy inference/worker. Nó
+báo cáo độ khớp của forecast với **giá thị trường tại horizon**, độc lập với việc
+cycle có vào lệnh hay không. Worker riêng ghi snapshot vào `forecast_evaluations`
+và cursor vào `forecast_evaluation_state` (migration `0015`); khóa duy nhất
+`(cycle_id, forecast_digest, horizon_key)` ngăn ghi trùng cùng bằng chứng. Snapshot
+giữ venue scope, profile, timeframe, effective input, cutoff/thời điểm tạo, hướng,
+band, giá tham chiếu, kết quả hoặc lý do chưa chấm; không chứa credential.
+
+### Thu thập và điều kiện chấm
+
+- `forecast_evaluation_enabled=false` và `forecast_evaluation_interval_seconds=60` là mặc định (§1). Bật worker đặt mốc bắt đầu thu thập; không chủ động backfill forecast tự khai trước mốc đó. Server khởi động với worker bật cũng đặt mốc mới: forecast chưa thu thập trong thời gian server ngừng bị loại một cách bảo thủ. Tắt dừng polling, không xóa snapshot đã lưu; bật lại đặt mốc mới cho thu thập mới. Endpoint vẫn đọc được dữ liệu đã lưu khi worker tắt.
+- Worker đọc các cycle Futures đã kết thúc có forecast được ghi, và thử lại các evaluation `pending` hoặc `unavailable` có target đến hạn, kể cả snapshot đã thu thập trước lần bật lại. Forecast thất bại không có target không thể thử lại từ snapshot đó. Chỉ dùng client public không credential để đọc market metadata/nến đóng tại venue/profile đã ghi; không đọc balance, vị thế, fill hoặc funding riêng tư, không đặt/hủy lệnh, không đổi graph/PM, Auto hay risk policy.
+- Chỉ forecast hợp lệ `status="ok"`, `generation_kind="forward"`, có identity/thời điểm, giá tham chiếu, p50 và band hợp lệ mới được chấm. Forecast malformed hoặc retrospective là `invalid`, không vào mẫu số metric. Timeframe và nến đầu vào phải khớp identity cycle. Các timestamp `created_at`/`recorded_at` do ứng dụng tự khai; `recorded_at` được tạo trước khi gọi ghi database, không xác nhận commit trước khi nến dự báo đóng. Mỗi row ghi `provenance.timestamp_evidence="self_reported_unverified"` và báo cáo cảnh báo giới hạn này. Nhãn `forward` và metric không chứng minh thứ tự commit độc lập, alpha hay chất lượng out-of-sample.
+- Với `D` là độ dài một nến, `target_as_of = data_open_time + (horizon_bars + 1) × D` (epoch ms). `data_open_time` là open của nến **đầu vào cuối cùng**; một `D` đầu tiên đóng nến đầu vào, các `D` tiếp theo là horizon dự báo. Chưa đến target thì `pending`. Sau target chỉ chấm khi đọc được đúng symbol/timeframe và nến đóng đúng mốc đó; thiếu nến, sai identity hoặc lỗi venue là `unavailable`, giữ lý do và thử lại. Không dùng nến gần nhất/thời điểm poll thay cho nến đích.
+
+| `items[].status` | UI diễn giải | Tham gia metric? |
+|---|---|---|
+| `pending` | Chưa đóng horizon, đang chờ đến hạn | Không |
+| `unavailable` | Chưa có dữ liệu/venue khả dụng; xem `reason`. Snapshot có target sẽ được thử lại; forecast thất bại không có target thì không | Không |
+| `invalid` | Bằng chứng malformed, retrospective hoặc không đủ điều kiện forward | Không |
+| `evaluated` | Đã đối chiếu đúng nến target đóng | Chỉ các trường metric đã xác định |
+
+Các kết quả chưa xác định giữ `null`, không đổi thành sai, lỗ hoặc số 0. Số đếm
+`counts` có thể bằng 0 khi thực sự không có dòng thuộc trạng thái đó; đây không phải
+kết quả forecast bằng 0.
+
+### Query và response
+
+Query tùy chọn: `limit` là số nguyên 1–500, mặc định 100, **chỉ giới hạn `items`**;
+`symbol` lọc đúng unified Futures symbol đã lưu (ví dụ `BTC/USDT:USDT`), không suy ra
+từ pipeline ticker. `limit` ngoài khoảng → `400 validation_error`.
+
+Các trường response:
+
+| Trường | Hợp đồng |
+|---|---|
+| `generated_at`, `disclaimer` | Thời điểm dựng HTTP response và giới hạn diễn giải; không phải lần quan sát venue mới |
+| `status` | `unavailable` khi không có dòng khớp; `complete` khi mọi dòng khớp đã `evaluated` và không có cycle thiếu thời điểm ghi trong phạm vi kiểm tra; còn lại `partial`. `complete` không chứng minh đầy đủ mọi forecast/tài khoản hoặc lợi nhuận |
+| `total_count`, `counts` | Tổng số dòng khớp và số dòng `pending`, `evaluated`, `unavailable`, `invalid` |
+| `coverage` | Object chứa `total_count`, `evaluated_count`, `pending_count`, `unavailable_count`, `invalid_count`, `nonretryable_unavailable_count`, `unproven_recording_time_count` và `metrics_scope: "all_matching_rows"`. `nonretryable_unavailable_count` đếm forecast thất bại không có target nên snapshot không thể thử lại. Trường `unproven_recording_time_count` đếm riêng cycle terminal cập nhật từ cutover hiện hành nhưng snapshot thiếu hoặc sai định dạng `recorded_at`; chúng bị loại khỏi metrics vì chưa xác định được forecast có sau cutover hay không. |
+| `coverage_warnings` | Luôn cảnh báo timestamp tự khai chưa chứng minh commit trước nến đóng; thêm cảnh báo cho cycle không xác định thời điểm ghi, chưa có dòng, horizon còn chờ, dữ liệu unavailable và bằng chứng invalid; hiển thị cùng metrics |
+| `sample_count` | Số dòng `evaluated`, không phải số lệnh hoặc số đường mô phỏng |
+| `directional_sample_count`, `band_sample_count` | Mẫu số riêng của accuracy/containment; chỉ đếm dòng `evaluated` có kết quả tương ứng khác `null` |
+| `directional_accuracy`, `band_containment` | Tỷ lệ 0–1 trên mẫu số riêng; `null` khi mẫu số bằng 0 |
+| `metrics_scope` | `"all_matching_rows"`: metrics và counts dùng **mọi dòng khớp bộ lọc symbol**, độc lập `limit` và số item trả về |
+| `items_page_limit`, `items` | Giới hạn chi tiết được yêu cầu và snapshot evaluation đã lưu; mới nhất theo `forecast_as_of` (null cuối), tiếp theo `created_at` |
+
+### Công thức và giới hạn diễn giải
+
+- `predicted_close = band.p50`: median của giá đóng ở cuối các đường mô phỏng; không phải trung bình và không dùng low/high thay p50.
+- `absolute_error = abs(target_close - predicted_close)`; `absolute_error_pct = absolute_error / abs(predicted_close) × 100`. Mẫu số phần trăm là **`predicted_close`**, được ghi trong `provenance.error_pct_denominator`.
+- `target_return = (target_close - reference_close) / reference_close`, dạng tỷ lệ (0.16 là 16%); đây là biến động thị trường từ giá tham chiếu, không phải return của vị thế.
+- `directional_correct` so hướng `up`/`down`/`flat` với thay đổi từ `reference_close` tới `target_close`. `unclear` giữ `null` và bị loại khỏi mẫu số accuracy; vẫn có thể đo lỗi giá và containment.
+- `band_contains_target` kiểm tra `band.low <= target_close <= band.high`. Band là phân vị 10–90% của mẫu model, không phải cam kết xác suất được hiệu chỉnh.
+
+UI phải hiển thị `coverage`, `coverage_warnings`, số mẫu và lý do chưa chấm cùng
+metrics; `items[].warnings` giữ cảnh báo của từng snapshot. Phân biệt loading,
+rỗng/`unavailable`, `partial` và lỗi request. GET mới không có nghĩa worker
+đã quan sát thị trường mới: dùng `forecast_as_of`, `target_as_of`, `last_attempted_at`
+và `evaluated_at` của snapshot để giải thích tuổi dữ liệu.
+
+Endpoint này không trả net PnL, phí, funding, slippage, win rate giao dịch hoặc bằng
+chứng alpha. Kết quả giao dịch thực và giới hạn đối soát thuộc `/api/outcomes`
+(§16): giữ riêng từng currency, coverage và các giá trị `null` khi chưa đủ bằng
+chứng. Không đổi accuracy/containment hoặc `target_return` thành “lợi nhuận”. Muốn
+đề nghị chỉnh threshold phải có holdout theo thời gian, baseline và kết quả sau
+chi phí trong [quy trình đánh giá](kronos-forecast-evaluation.vi.md); các threshold
+hiện tại giữ nguyên.
+
+Nguồn: `server/forecast_evaluations_api.py:11`,
+`server/forecast_evaluation_store.py:148`, `server/forecast_evaluation_store.py:236`,
+`server/forecast_evaluation_scoring.py:144`, `server/forecast_evaluation_venue.py:20`,
+`server/migrations/0015_forecast_evaluations.sql:4`.

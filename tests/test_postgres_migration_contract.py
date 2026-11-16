@@ -57,6 +57,7 @@ def test_dry_run_loads_files_without_opening_database(monkeypatch):
         "0012_outcome_event_identity.sql",
         "0013_futures_cycle_timeframe_identity.sql",
         "0014_futures_cycle_identity_standardization.sql",
+        "0015_forecast_evaluations.sql",
     ]
 
 

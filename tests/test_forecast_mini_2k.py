@@ -53,9 +53,9 @@ def test_mini_2k_payload_keeps_2048_candles_and_six_bar_horizon(tmp_path, monkey
     payloads: list[dict] = []
     communicate = sampler._communicate
 
-    def record_payload(process, payload):
+    def record_payload(process, payload, *, deadline=None):
         payloads.append(payload)
-        return communicate(process, payload)
+        return communicate(process, payload, deadline=deadline)
 
     monkeypatch.setattr(sampler, "_communicate", record_payload)
     try:
@@ -96,7 +96,7 @@ def test_mini_2k_service_forecasts_any_contiguous_context_within_profile(count):
         def __init__(self):
             self.requests = []
 
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             self.requests.extend(requests)
             symbol, _timeframe, horizon_hours, history, _seed = requests[0]
             horizon = int(horizon_hours * 60 / 240)
@@ -117,6 +117,7 @@ def test_mini_2k_service_forecasts_any_contiguous_context_within_profile(count):
     block = service.forecast(CandleSeries(symbol=_SYMBOL, candles=candles, as_of=as_of), seed=7)
 
     assert block.status == "ok", block.reason
+    assert block.effective_lookback_bars == count
     assert len(sampler.requests) == 1
     assert len(sampler.requests[0][3]) == count
 
@@ -132,7 +133,7 @@ def test_lookback_over_profile_context_fails_before_inference(profile, lookback,
     calls: list[list[tuple]] = []
 
     class _RecordingSampler:
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             calls.append(requests)
             raise AssertionError("an invalid profile window must not reach inference")
 

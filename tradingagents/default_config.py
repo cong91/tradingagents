@@ -95,6 +95,10 @@ _ENV_OVERRIDES = {
     # worker reads recorded cycles and venue READ history only, never a send.
     "TRADINGAGENTS_OUTCOME_LEDGER_INGEST_ENABLED": "outcome_ledger_ingest_enabled",
     "TRADINGAGENTS_OUTCOME_LEDGER_INTERVAL_SECONDS": "outcome_ledger_interval_seconds",
+    # Forecast evaluation is an opt-in, read-only observer. It never changes
+    # execution decisions and starts collecting only after it is enabled.
+    "TRADINGAGENTS_FORECAST_EVALUATION_ENABLED": "forecast_evaluation_enabled",
+    "TRADINGAGENTS_FORECAST_EVALUATION_INTERVAL_SECONDS": "forecast_evaluation_interval_seconds",
     # Active Kronos model-tokenizer pair. All other forecast parameters are
     # derived from the selected pair, the Futures cycle and risk policy.
     "TRADINGAGENTS_KRONOS_ACTIVE_PROFILE": "kronos_active_profile",
@@ -380,6 +384,10 @@ def build_default_config() -> dict:
         # minute. The worker only reads recorded cycles and venue history.
         "outcome_ledger_ingest_enabled": False,
         "outcome_ledger_interval_seconds": 60,
+        # Forward Kronos outcome evaluation is disabled until explicitly enabled;
+        # enabling it establishes a no-backfill cursor at that moment.
+        "forecast_evaluation_enabled": False,
+        "forecast_evaluation_interval_seconds": 60,
         # Active Kronos context is always attempted for eligible Futures
         # candidates. Only its verified model-tokenizer pair is selectable.
         "kronos_active_profile": "small_base",

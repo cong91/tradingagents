@@ -107,7 +107,9 @@ class _FakeSampler:
         self.symbol = symbol
         self.calls: list[list[tuple]] = []
 
-    def sample(self, requests: list[tuple]) -> list[SampledSymbol]:
+    def sample(
+        self, requests: list[tuple], *, deadline: float | None = None,
+    ) -> list[SampledSymbol]:
         self.calls.append(list(requests))
         if self.status != STATUS_OK:
             return [
@@ -152,6 +154,31 @@ def _service(sampler=None, **overrides) -> KronosForecastService:
 
 
 # -- the decision moment -----------------------------------------------------
+
+
+def test_service_does_not_sample_after_the_original_deadline(monkeypatch):
+    sampler = _FakeSampler()
+    service = _service(sampler)
+    monkeypatch.setattr("tradingagents.forecast.service.time.monotonic", lambda: 151.0)
+    block = service.forecast(_series(), seed=1, deadline=150.0)
+    assert block.status == "timeout"
+    assert "deadline" in block.reason
+    assert sampler.calls == []
+
+
+def test_service_passes_the_absolute_deadline_unchanged_to_the_sampler(monkeypatch):
+    deadlines = []
+
+    class RecordingSampler(_FakeSampler):
+        def sample(self, requests, *, deadline=None):
+            deadlines.append(deadline)
+            return super().sample(requests, deadline=deadline)
+
+    service = _service(RecordingSampler())
+    monkeypatch.setattr("tradingagents.forecast.service.time.monotonic", lambda: 140.0)
+    block = service.forecast(_series(), seed=1, deadline=150.0)
+    assert block.status == STATUS_OK
+    assert deadlines == [150.0]
 
 
 def test_a_naive_cutoff_is_refused():
@@ -394,8 +421,8 @@ def test_a_short_horizon_or_bad_price_is_refused_before_status_ok():
     sampler = _FakeSampler()
     original = sampler.sample
 
-    def with_short(requests):
-        results = original(requests)
+    def with_short(requests, *, deadline=None):
+        results = original(requests, deadline=deadline)
         return [
             SampledSymbol(
                 symbol=row.symbol, status=STATUS_OK, duration_ms=row.duration_ms,
@@ -413,8 +440,8 @@ def test_a_short_horizon_or_bad_price_is_refused_before_status_ok():
     sampler2 = _FakeSampler()
     original2 = sampler2.sample
 
-    def with_nan(requests):
-        results = original2(requests)
+    def with_nan(requests, *, deadline=None):
+        results = original2(requests, deadline=deadline)
         fixed = []
         for row in results:
             paths = []
@@ -482,7 +509,7 @@ def test_a_sampler_failure_is_a_status_with_no_numbers(status):
 
 def test_a_raising_sampler_becomes_an_error_block_not_an_exception():
     class _Boom(_FakeSampler):
-        def sample(self, requests):
+        def sample(self, requests, *, deadline=None):
             raise RuntimeError("child died")
 
     service = _service(_Boom())

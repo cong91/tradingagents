@@ -38,6 +38,7 @@ import math
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -172,9 +173,9 @@ def plan_batches(count: int, *, max_batch_rows: int, paths: int) -> list[tuple[i
 class KronosSampler:
     """A warm isolated child that answers batched forecasts, bounded per call.
 
-    Not thread-safe by design: one sampler belongs to one caller at a time, and
-    the decision path calls it from the candidate thread that owns the cycle's
-    budget. Concurrent use would interleave JSON lines on the same pipe.
+    Calls serialize on the sampler lock so JSON lines cannot interleave. The
+    cycle owner also leases the service exclusively and defers close until its
+    active caller exits; close/kill must not race a sample from another thread.
     """
 
     def __init__(
@@ -185,6 +186,7 @@ class KronosSampler:
         model_dir: Any,
         settings: SamplerSettings | None = None,
         runner: Any = None,
+        artifact_verifier: Callable[[], str | None] | None = None,
     ) -> None:
         self._python = python
         self._source_dir = source_dir
@@ -193,6 +195,10 @@ class KronosSampler:
         # whole pipe handshake against a stub child; production callers leave it
         # at the real runner.
         self._runner = runner if runner is not None else RUNNER_PATH
+        self._artifact_verifier = artifact_verifier
+        self._verify_on_spawn = (
+            runner is None or str(self._runner) == str(RUNNER_PATH)
+        )
         self.settings = settings or SamplerSettings()
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
@@ -200,12 +206,35 @@ class KronosSampler:
         self._request_counter = 0
         self._io_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_error: Exception | None = None
+        self._cleanup_process: subprocess.Popen[str] | None = None
 
     # -- process lifecycle --------------------------------------------------
 
-    def _ensure_process(self) -> subprocess.Popen[str]:
+    def _ensure_process(self, *, deadline: float | None = None) -> subprocess.Popen[str]:
         if self._process is not None and self._process.poll() is None:
             return self._process
+        if self._process is not None:
+            self.kill()
+        if self._cleanup_thread is not None:
+            raise SamplerError("the previous Kronos child is still being cleaned up")
+        if self._cleanup_error is not None:
+            raise SamplerError("the previous Kronos child could not be cleaned up") from self._cleanup_error
+        if self._artifact_verifier is not None:
+            problem = self._artifact_verifier()
+        elif self._verify_on_spawn:
+            from tradingagents.forecast.artifact import verify_artifacts
+
+            problem, _verified = verify_artifacts(
+                self._source_dir, self._model_dir, self.settings.profile, use_cache=False,
+            )
+        else:
+            problem = None
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(str(self._python), self.settings.chunk_deadline_seconds)
+        if problem is not None:
+            raise SamplerError(problem)
         command = [str(self._python), "-I", str(self._runner)]
         try:
             self._process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
@@ -251,48 +280,140 @@ class KronosSampler:
         ``self._process`` — now None — and returned without stopping anything,
         leaving a warm model child alive after every close.
         """
+        cleanup = self._cleanup_thread
+        if cleanup is not None:
+            cleanup.join()
+            self._cleanup_thread = None
+        if self._cleanup_error is not None:
+            process = self._cleanup_process
+            if process is None:
+                raise SamplerError("the Kronos child could not be cleaned up") from self._cleanup_error
+            try:
+                self._stop(process, graceful=False)
+            except Exception as exc:
+                self._cleanup_error = exc
+                raise
+            self._cleanup_error = None
+            self._cleanup_process = None
         process, self._process = self._process, None
         if process is None:
             return
-        self._stop(process, graceful=True)
+        self._cleanup_process = process
+        try:
+            self._stop(process, graceful=True)
+        except Exception as exc:
+            self._cleanup_error = exc
+            raise
+        else:
+            self._cleanup_process = None
 
     def kill(self) -> None:
         """Force-stop the child; same capture discipline as ``close``."""
         process, self._process = self._process, None
         if process is None:
             return
-        self._stop(process, graceful=False)
+        self._cleanup_process = process
+        try:
+            self._stop(process, graceful=False)
+        except Exception as exc:
+            self._cleanup_error = exc
+            raise
+        else:
+            self._cleanup_process = None
+
+    def _defer_kill(self) -> None:
+        """Kill a timed-out child, then finish pipe cleanup off the deadline path."""
+        process, self._process = self._process, None
+        if process is None:
+            return
+        self._cleanup_process = process
+        io_thread = self._io_thread
+        stderr_thread = self._stderr_thread
+        self._io_thread = None
+        self._stderr_thread = None
+        with contextlib.suppress(OSError):
+            process.kill()
+        # Reap only when the child has already exited; the deadline path never
+        # waits for a slow process. The cleanup worker performs the bounded wait.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+        # A stream close can itself block behind an I/O worker. Leave it to the
+        # cleanup thread so a timed-out caller never waits for that lock.
+        def cleanup() -> None:
+            try:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    raise SamplerError("the stopped Kronos child was not reaped") from exc
+                if io_thread is not None:
+                    io_thread.join(timeout=5)
+                    if io_thread.is_alive():
+                        self._close_streams(process)
+                        io_thread.join(timeout=5)
+                    if io_thread.is_alive():
+                        raise SamplerError("the stopped Kronos child did not release its pipe worker")
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5)
+                    if stderr_thread.is_alive():
+                        self._close_streams(process)
+                        stderr_thread.join(timeout=5)
+                    if stderr_thread.is_alive():
+                        raise SamplerError("the stopped Kronos child did not release its stderr worker")
+                self._close_streams(process)
+            except Exception as exc:
+                self._io_thread = io_thread
+                self._stderr_thread = stderr_thread
+                self._cleanup_error = exc
+            else:
+                self._cleanup_process = None
+
+        self._cleanup_thread = threading.Thread(
+            target=cleanup, name="kronos-sampler-cleanup", daemon=True,
+        )
+        self._cleanup_thread.start()
+
+    @staticmethod
+    def _close_streams(process: subprocess.Popen[str]) -> None:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                if stream is not None:
+                    stream.close()
 
     def _stop(self, process: subprocess.Popen[str], *, graceful: bool) -> None:
-        """Stop the child before closing any pipe held by an I/O worker."""
+        """Stop and reap the child before closing pipes held by workers."""
         io_thread = self._io_thread
         active_io = io_thread is not None and io_thread.is_alive()
-        try:
-            if graceful and not active_io:
-                if process.stdin is not None:
-                    with contextlib.suppress(OSError, ValueError):
-                        process.stdin.close()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=10)
-            if process.poll() is None:
-                with contextlib.suppress(OSError):
-                    process.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=5)
-            if io_thread is not None:
-                io_thread.join(timeout=5)
-                if io_thread.is_alive():
-                    raise SamplerError("the stopped Kronos child did not release its pipe worker")
-            stderr_thread = self._stderr_thread
-            if stderr_thread is not None:
-                stderr_thread.join(timeout=5)
-        finally:
-            for stream in (process.stdin, process.stdout, process.stderr):
+        if graceful and not active_io:
+            if process.stdin is not None:
                 with contextlib.suppress(OSError, ValueError):
-                    if stream is not None:
-                        stream.close()
-            self._io_thread = None
-            self._stderr_thread = None
+                    process.stdin.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=10)
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise SamplerError("the Kronos child did not terminate after being killed") from exc
+        if io_thread is not None:
+            io_thread.join(timeout=5)
+            if io_thread.is_alive():
+                self._close_streams(process)
+                io_thread.join(timeout=5)
+            if io_thread.is_alive():
+                raise SamplerError("the stopped Kronos child did not release its pipe worker")
+        stderr_thread = self._stderr_thread
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=5)
+            if stderr_thread.is_alive():
+                self._close_streams(process)
+                stderr_thread.join(timeout=5)
+            if stderr_thread.is_alive():
+                raise SamplerError("the stopped Kronos child did not release its stderr worker")
+        self._close_streams(process)
+        self._io_thread = None
+        self._stderr_thread = None
 
     def __enter__(self) -> KronosSampler:
         return self
@@ -305,16 +426,18 @@ class KronosSampler:
     def sample(
         self,
         requests: list[tuple[str, str, int, tuple[Candle, ...], int]],
+        *,
+        deadline: float | None = None,
     ) -> list[SampledSymbol]:
         """Forecast every ``(symbol, timeframe, horizon_hours, candles, seed)``.
 
         Chunked so no single child request exceeds ``max_batch_rows`` or mixes
         timeframes or horizons. A chunk that overruns its deadline kills the
         child (the work is not interruptible from outside) and yields ``timeout``
-        for that chunk's symbols; the next
-        chunk starts a fresh child. A chunk that fails for any other reason
-        yields ``error`` with the child's stderr tail. No chunk is retried
-        inside this call — the caller's cycle budget decides whether to retry.
+        for that chunk's symbols. The next chunk waits for cleanup before starting
+        a fresh child, subject to its own limit and the optional cycle deadline.
+        No chunk is retried inside this call. The optional absolute monotonic
+        deadline includes lock wait, cleanup, payload preparation and startup.
         """
         if not requests:
             return []
@@ -326,35 +449,84 @@ class KronosSampler:
             paths=self.settings.paths,
         )
         results: list[SampledSymbol] = []
-        with self._lock:
+        if deadline is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            return [
+                self._failed(symbol, "timeout", "the cycle deadline was reached waiting for the sampler lock")
+                for symbol, *_ in requests
+            ]
+        try:
             for start, stop in batches:
                 while start < stop:
                     end = start + 1
                     while end < stop and requests[end][1:3] == requests[start][1:3]:
                         end += 1
-                    results.extend(self._sample_chunk(requests[start:end]))
+                    results.extend(
+                        self._sample_chunk(requests[start:end], deadline=deadline)
+                    )
                     start = end
+        finally:
+            self._lock.release()
         return results
 
     def _sample_chunk(
         self, chunk: list[tuple[str, str, int, tuple[Candle, ...], int]],
+        *, deadline: float | None = None,
     ) -> list[SampledSymbol]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return [
+                self._failed(symbol, "timeout", "the cycle deadline was reached before inference")
+                for symbol, *_ in chunk
+            ]
+        deadline = min(
+            time.monotonic() + self.settings.chunk_deadline_seconds,
+            deadline if deadline is not None else float("inf"),
+        )
+        cleanup = self._cleanup_thread
+        if cleanup is not None:
+            cleanup.join(timeout=max(0.0, deadline - time.monotonic()))
+            if cleanup.is_alive():
+                return [
+                    self._failed(symbol, "timeout", "the previous Kronos child is still being cleaned up")
+                    for symbol, *_ in chunk
+                ]
+            self._cleanup_thread = None
+        if self._cleanup_error is not None:
+            return [
+                self._failed(symbol, "unavailable", "the previous Kronos child could not be cleaned up")
+                for symbol, *_ in chunk
+            ]
+        if time.monotonic() >= deadline:
+            return [
+                self._failed(symbol, "timeout", "the cycle or chunk deadline was reached during cleanup")
+                for symbol, *_ in chunk
+            ]
         pred_len = self._pred_len(chunk[0][1], chunk[0][2])
         payload = self._payload(chunk)
+        if time.monotonic() >= deadline:
+            return [
+                self._failed(symbol, "timeout", "the cycle or chunk deadline was reached preparing inference")
+                for symbol, *_ in chunk
+            ]
         try:
-            process = self._ensure_process()
+            process = self._ensure_process(deadline=deadline)
+        except subprocess.TimeoutExpired:
+            return [
+                self._failed(symbol, "timeout", "the cycle or chunk deadline was reached before the child started")
+                for symbol, *_ in chunk
+            ]
         except SamplerError as exc:
             return [self._failed(symbol, "unavailable", str(exc)) for symbol, *_ in chunk]
         try:
-            answer = self._communicate(process, payload)
+            answer = self._communicate(process, payload, deadline=deadline)
         except subprocess.TimeoutExpired:
-            # The deadline expired with the stream state unknown: the child is
-            # killed (never reused) so a late answer cannot land on the NEXT
-            # request and be read as its result.
-            self.kill()
+            # The retired stream cannot be reused while its child is stopped.
+            self._defer_kill()
             reason = (
-                f"Kronos inference exceeded its {self.settings.chunk_deadline_seconds:.0f}s "
-                "chunk deadline; the child was killed and the chunk is a timeout"
+                "Kronos inference exceeded its cycle or chunk deadline "
+                f"({self.settings.chunk_deadline_seconds:g}s chunk limit); "
+                "the child is being stopped and the chunk is a timeout"
             )
             return [self._failed(symbol, "timeout", reason) for symbol, *_ in chunk]
         except OSError as exc:
@@ -481,9 +653,16 @@ class KronosSampler:
 
     def _communicate(
         self, process: subprocess.Popen[str], payload: dict[str, Any],
+        *, deadline: float | None = None,
     ) -> dict[str, Any] | _StreamDead:
         assert process.stdin is not None and process.stdout is not None
-        deadline = time.monotonic() + self.settings.chunk_deadline_seconds
+        deadline = min(
+            time.monotonic() + self.settings.chunk_deadline_seconds,
+            deadline if deadline is not None else float("inf"),
+        )
+        if time.monotonic() >= deadline:
+            self._defer_kill()
+            raise subprocess.TimeoutExpired(str(self._python), self.settings.chunk_deadline_seconds)
         request_id = payload["request_id"]
         stdin, stdout = process.stdin, process.stdout
         result: list[Any] = []
@@ -521,11 +700,12 @@ class KronosSampler:
         worker = threading.Thread(target=exchange, name="kronos-sampler-io", daemon=True)
         self._io_thread = worker
         worker.start()
-        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        remaining = max(0.0, deadline - time.monotonic())
+        worker.join(timeout=remaining)
         if worker.is_alive() or time.monotonic() > deadline:
-            # Killing first releases a blocked buffered write/read; closing the
-            # pipe first would wait for that worker's lock without a deadline.
-            self.kill()
+            # The cleanup worker kills first, then joins the I/O worker and
+            # closes its pipes. No replacement may start until that finishes.
+            self._defer_kill()
             raise subprocess.TimeoutExpired(
                 str(self._python), self.settings.chunk_deadline_seconds,
             )

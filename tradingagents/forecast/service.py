@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -19,6 +20,7 @@ from tradingagents.forecast.contract import (
     GENERATION_RETROSPECTIVE,
     STATUS_ERROR,
     STATUS_OK,
+    STATUS_TIMEOUT,
     STATUS_UNAVAILABLE,
     direction_of,
 )
@@ -41,9 +43,10 @@ logger = logging.getLogger(__name__)
 
 
 class _Sampler(Protocol):
-
-
-    def sample(self, requests: list[tuple[str, str, int, tuple[Candle, ...], int]]) -> list[SampledSymbol]: ...
+    def sample(
+        self, requests: list[tuple[str, str, int, tuple[Candle, ...], int]],
+        *, deadline: float | None = None,
+    ) -> list[SampledSymbol]: ...
 
 
 def _directions(paths: list[dict[str, Any]], reference: float) -> tuple[dict[str, int], dict[str, float]]:
@@ -161,6 +164,12 @@ class KronosForecastService:
         deadline = kwargs.pop("chunk_deadline_seconds", None)
         sampler = None
         if problem is None:
+            def verify_before_child() -> str | None:
+                current_problem, _current_verified = verify_artifacts(
+                    source_dir, model_dir, settings.profile, use_cache=False,
+                )
+                return current_problem
+
             sampler_settings = settings.sampler_settings()
             if deadline is not None:
                 sampler_settings = SamplerSettings(
@@ -172,6 +181,7 @@ class KronosForecastService:
             sampler = KronosSampler(
                 python=isolated_python(), source_dir=source_dir,
                 model_dir=model_dir, settings=sampler_settings,
+                artifact_verifier=verify_before_child,
             )
         venue = str(config.get("exec_exchange_id") or "")
         return cls(
@@ -183,9 +193,9 @@ class KronosForecastService:
     def close(self) -> None:
         """Stop the sampler's child, if one was ever started.
 
-        Ownership is scoped: whoever builds the service (``forecast_for_cycle``
-        builds one per candidate) closes it on success, on error and on
-        timeout, so no model child outlives its owner.
+        The creator owns cleanup: a Futures mode-cycle owner reuses this service
+        across exclusive candidate leases and closes it after the last lease;
+        standalone callers close their locally built service.
         """
         sampler = self._sampler
         if sampler is not None and hasattr(sampler, "close"):
@@ -196,14 +206,30 @@ class KronosForecastService:
     def _now(self) -> datetime:
         return self._created_at or datetime.now(UTC)
 
-    def _first_realized_close(self, series: CandleSeries) -> datetime | None:
+    def _first_realized_close(
+        self, series: CandleSeries, settings: ForecastSettings,
+    ) -> datetime | None:
         return datetime.fromtimestamp(
             series.candles[-1].close_time / 1000, UTC,
-        ) + timedelta(milliseconds=timeframe_ms(self.settings.timeframe))
+        ) + timedelta(milliseconds=timeframe_ms(settings.timeframe))
 
-    def forecast(self, series: CandleSeries, *, seed: int) -> ForecastBlock:
-        """One symbol's block, from the cache when the identity matches."""
+    def forecast(
+        self, series: CandleSeries, *, seed: int, lookback_bars: int | None = None,
+        deadline: float | None = None,
+    ) -> ForecastBlock:
+        """One symbol's block, from the cache when the identity matches.
+
+        ``lookback_bars`` is a per-request effective window used by the active
+        cycle when a warm service handles candidates with different history
+        lengths. The service's selected profile and sampler remain shared.
+        ``deadline`` is the original absolute monotonic cycle deadline, passed
+        unchanged to the sampler rather than rebased after service construction.
+        """
+        if deadline is not None and time.monotonic() >= deadline:
+            return _failure(series.symbol, STATUS_TIMEOUT, "the cycle deadline was reached before forecasting")
         settings = self.settings
+        if lookback_bars is not None:
+            settings = replace(settings, lookback_bars=lookback_bars)
         symbol = series.symbol
         problem = settings.settings_problem()
         if problem is not None:
@@ -223,11 +249,11 @@ class KronosForecastService:
         # historical (research/replay) decision: nothing created earlier can
         # PROVE it existed at the decision timestamp, so the cache is bypassed
         # entirely and the draw below is labelled retrospective.
-        first_realized_close = self._first_realized_close(series)
+        first_realized_close = self._first_realized_close(series, settings)
         decision_is_historical = (
             first_realized_close is not None and created > first_realized_close
         )
-        key = None if decision_is_historical else self._key(series, seed)
+        key = None if decision_is_historical else self._key(series, seed, settings)
         if key is not None:
             cached = self.cache.get(key)
             if cached is not None:
@@ -238,32 +264,35 @@ class KronosForecastService:
                 symbol, STATUS_UNAVAILABLE, "no Kronos sampler is configured for this process",
             )
         window = series.candles[-settings.lookback_bars:]
+        request = (symbol, settings.timeframe, settings.horizon_hours, window, seed)
         try:
-            sampled = self._sampler.sample([
-                (symbol, settings.timeframe, settings.horizon_hours, window, seed),
-            ])
+            sampled = self._sampler.sample([request], deadline=deadline)
         except Exception as exc:  # a sampler bug is a status, never a crashed cycle
             logger.warning("kronos forecast raised for %s: %r", symbol, exc)
             return _failure(symbol, STATUS_ERROR, f"sampler raised {type(exc).__name__}: {exc}")
         if not sampled:
             return _failure(symbol, STATUS_ERROR, "the sampler returned no result for this symbol")
-        block = self._block_from(series, sampled[0], seed=seed)
+        block = self._block_from(series, sampled[0], seed=seed, settings=settings)
         if block.ok and key is not None:
             self.cache.put(key, block)
         return block
 
-    def _key(self, series: CandleSeries, seed: int) -> str:
+    def _key(
+        self, series: CandleSeries, seed: int, settings: ForecastSettings,
+    ) -> str:
         return cache_key(
-            symbol=series.symbol, timeframe=self.settings.timeframe,
-            data_open_time=series.candles[-1].open_time, settings=self.settings,
+            symbol=series.symbol, timeframe=settings.timeframe,
+            data_open_time=series.candles[-1].open_time, settings=settings,
             model_revision=self.model_revision, artifact_hash=self.artifact_hash, seed=seed,
             venue=self.venue,
             cutoff_ms=int(series.as_of.astimezone(UTC).timestamp() * 1000),
-            data_digest=content_digest(series.candles[-self.settings.lookback_bars:]),
+            data_digest=content_digest(series.candles[-settings.lookback_bars:]),
         )
 
-    def _block_from(self, series: CandleSeries, sampled: SampledSymbol, *, seed: int) -> ForecastBlock:
-        settings = self.settings
+    def _block_from(
+        self, series: CandleSeries, sampled: SampledSymbol, *, seed: int,
+        settings: ForecastSettings,
+    ) -> ForecastBlock:
         if sampled.status != STATUS_OK:
             return _failure(
                 series.symbol, sampled.status, sampled.reason or "no reason reported",
@@ -314,7 +343,7 @@ class KronosForecastService:
         # ``forward`` is a TIMESTAMP claim: the draws happened before the first
         # predicted bar closed. It is not proof the forecast existed at the
         # decision timestamp and never evidence of out-of-sample skill or alpha.
-        first_realized_close = self._first_realized_close(series)
+        first_realized_close = self._first_realized_close(series, settings)
         return ForecastBlock(
             symbol=series.symbol,
             status=STATUS_OK,
@@ -331,6 +360,7 @@ class KronosForecastService:
             as_of=series.as_of.isoformat(),
             horizon_hours=settings.horizon_hours,
             horizon_bars=settings.horizon_bars,
+            effective_lookback_bars=settings.lookback_bars,
             timeframe=settings.timeframe,
             paths=len(paths),
             per_path_samples=1,

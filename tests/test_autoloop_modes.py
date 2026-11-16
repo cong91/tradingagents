@@ -193,8 +193,8 @@ def _install_cycle_stubs(monkeypatch, config):
         return candidates, [], None
 
     def candidate(_bridge, candidate, _config, _builder, _derivatives,
-                  deadline, cancelled, _lock, telemetry, *, mode, authorization):
-        calls.append(("candidate", mode, deadline, cancelled, telemetry, authorization))
+                  deadline, cancelled, _lock, telemetry, *, mode, authorization, kronos_owner):
+        calls.append(("candidate", mode, deadline, cancelled, telemetry, authorization, kronos_owner))
         return DailyResult(ticker=candidate["ticker"], signal="Hold")
 
     monkeypatch.setattr(autoloop_candidates, '_screen_with_timeout', screen)
@@ -232,6 +232,98 @@ def test_cycle_dispatches_only_enabled_modes_in_order(monkeypatch, spot, futures
         item = summary["modes"][f"auto_{mode.value}"]
         assert item["status"] == ("completed" if mode in expected else "disabled")
         assert len(item["results"]) == int(mode in expected)
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "error"])
+def test_warm_owner_is_isolated_per_futures_mode_cycle(monkeypatch, outcome):
+    config = {"auto_spot_enabled": True, "auto_futures_enabled": True}
+    calls = _install_cycle_stubs(monkeypatch, config)
+    original = autoloop._run_candidate_with_timeout
+    owners = []
+    services = []
+
+    class Service:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def build(_config, **kwargs):
+        assert kwargs == {}
+        service = Service()
+        services.append(service)
+        return service
+
+    def candidate(*args, mode, kronos_owner, **kwargs):
+        if mode is AutoMode.SPOT:
+            assert kronos_owner is None
+        else:
+            owners.append(kronos_owner)
+            with kronos_owner.lease(args[5]):
+                pass
+            if outcome == "timeout":
+                raise TimeoutError("forecast timed out")
+            if outcome == "error":
+                raise RuntimeError("forecast failed")
+        return original(*args, mode=mode, kronos_owner=kronos_owner, **kwargs)
+
+    monkeypatch.setattr(
+        autoloop.kronos_lifecycle.KronosForecastService, "from_config", build,
+    )
+    monkeypatch.setattr(autoloop, "_run_candidate_with_timeout", candidate)
+    for _ in range(2):
+        autoloop._run_cycle_locked(lambda *_args: None)
+        assert autoloop._last_cycle["modes"]["auto_spot"]["status"] == "completed"
+        expected = {"success": "completed", "timeout": "timeout", "error": "failed"}[outcome]
+        assert autoloop._last_cycle["modes"]["auto_futures"]["status"] == expected
+    assert len(owners) == len(services) == 2
+    assert owners[0] is not owners[1]
+    assert [service.close_calls for service in services] == [1, 1]
+    assert all(call[6] is None for call in calls if call[0] == "candidate" and call[1] is AutoMode.SPOT)
+    for owner in owners:
+        with pytest.raises(RuntimeError, match="closing"), owner.lease(None):
+            pytest.fail("a completed mode cycle must not grant new leases")
+
+
+def test_futures_teardown_uses_only_the_remaining_deadline_budget(monkeypatch):
+    config = {"auto_futures_enabled": True}
+    _install_cycle_stubs(monkeypatch, config)
+    close_timeouts = []
+
+    class _Owner:
+        def __init__(self, _config):
+            pass
+
+        def close(self, timeout):
+            close_timeouts.append(timeout)
+            return False
+
+        def cleanup_state(self):
+            return "pending"
+
+    monkeypatch.setattr(
+        autoloop.kronos_lifecycle,
+        "KronosForecastOwner",
+        _Owner,
+    )
+    summary = {
+        "modes": {"auto_spot": {"status": "disabled"}, "auto_futures": {
+            "status": "pending", "results": [], "candidates": [],
+        }},
+        "results": [],
+    }
+    authorization = SimpleNamespace(allows=lambda *_args, **_kwargs: True)
+    autoloop._run_mode_cycle(
+        AutoMode.FUTURES, config, lambda *_args: None,
+        time.monotonic() - 1, threading.Event(),
+        summary=summary, results=[], authorization=authorization,
+    )
+
+    assert close_timeouts == [0.0]
+    mode_summary = summary["modes"]["auto_futures"]
+    assert mode_summary["kronos_cleanup"] == "pending"
+    assert mode_summary["status"] == "timeout"
+    assert "cleanup pending" in mode_summary["error"]
 
 
 def test_timeout_in_spot_does_not_cancel_futures_mode(monkeypatch):

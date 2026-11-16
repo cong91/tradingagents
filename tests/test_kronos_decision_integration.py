@@ -91,7 +91,7 @@ class _GoodSampler:
         self.up_share = up_share
         self.calls: list[list[tuple]] = []
 
-    def sample(self, requests):
+    def sample(self, requests, *, deadline=None):
         from tradingagents.forecast.sampler import SampledSymbol
 
         self.calls.append(list(requests))
@@ -174,7 +174,7 @@ def test_the_forecast_text_reaches_the_real_trader_prompt():
     assert "Kronos forecast" in text, "the real Trader prompt has no forecast block"
     assert "NOT a probability" in text
     assert "paths=16" in text and "per_path_samples=1" in text
-    assert "data_open_time=" in text and "horizon=24h" in text
+    assert "data_open_time=" in text and "input_bars=" in text and "horizon=24h" in text
     assert "up=12/16" in text, "the sample ratio must arrive with its counts"
     assert "temperature=0.5" in text
     # The block is data, not an instruction: no order language in it.
@@ -334,7 +334,11 @@ def test_the_block_reaches_the_context_before_the_graph_is_built(monkeypatch):
     assert seen["forecast_kwargs"] == {"cycle_id": before["cycle_id"], "deadline": None, "cancelled": None}
     assert "kronos_forecast" not in before["payload"]
     assert before["payload"]["phase_timestamps"]["forecast_started_at"]
-    assert after["payload"]["kronos_forecast"] == real_block.as_json()
+    assert {
+        key: value for key, value in after["payload"]["kronos_forecast"].items()
+        if key != "recorded_at"
+    } == real_block.as_json()
+    assert after["payload"]["kronos_forecast"]["recorded_at"]
     assert after["payload"]["kronos_policy"] == "use"
     assert after["payload"] is not seen["persist_payload"]
     assert after["payload"]["phase_timestamps"] is seen["persist_timestamps"]

@@ -172,23 +172,23 @@ def _profile_cache_key(profile: str) -> tuple[str, str, str]:
 
 def verify_artifacts(
     source_dir: Path, model_dir: Path, profile: str = DEFAULT_PROFILE,
+    *, use_cache: bool = True,
 ) -> tuple[str | None, dict[str, str]]:
     """Check the selected profile's pinned files by content.
 
-    The result is memoized against each file's (size, mtime) signature: hashing
-    the weights on every API request would be wasteful, but a swapped or
-    re-downloaded file changes that signature and is re-hashed before use.
+    Ordinary preflights may reuse a (size, mtime) signature, which is not proof
+    of unchanged content. A child spawn must set ``use_cache=False`` to hash
+    every pinned file again; that fresh result also replaces the cached one.
     """
     selected = profile_for(profile)
     cache_key = _profile_cache_key(selected.name)
     signature = _signature(source_dir, model_dir, selected)
-    cached = _VERIFY_CACHE.get((cache_key, str(source_dir), str(model_dir)))
-    if cached is not None and cached[0] == signature:
+    key = (cache_key, str(source_dir), str(model_dir))
+    cached = _VERIFY_CACHE.get(key)
+    if use_cache and cached is not None and cached[0] == signature and cached[1] is None:
         return cached[1], cached[2]
     problem, verified = _verify_uncached(source_dir, model_dir, selected)
-    _VERIFY_CACHE[(cache_key, str(source_dir), str(model_dir))] = (
-        signature, problem, verified,
-    )
+    _VERIFY_CACHE[key] = (signature, problem, verified)
     return problem, verified
 
 

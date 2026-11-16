@@ -33,6 +33,7 @@ class ForecastBlock:
     as_of: str | None = None
     horizon_hours: float | None = None
     horizon_bars: int | None = None
+    effective_lookback_bars: int | None = None
     timeframe: str | None = None
     paths: int | None = None
     per_path_samples: int = 1
@@ -86,6 +87,7 @@ class ForecastBlock:
             "as_of": self.as_of,
             "horizon_hours": self.horizon_hours,
             "horizon_bars": self.horizon_bars,
+            "effective_lookback_bars": self.effective_lookback_bars,
             "timeframe": self.timeframe,
             "paths": self.paths,
             "per_path_samples": self.per_path_samples,

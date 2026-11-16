@@ -48,6 +48,7 @@ def render_forecast_block(block: ForecastBlock) -> str:
     return "\n".join([
         header,
         f"  symbol={block.symbol} timeframe={block.timeframe} "
+        f"input_bars={block.effective_lookback_bars or 'unavailable'} "
         f"horizon={block.horizon_hours}h bars={_bars(block)}",
         f"  data_open_time={_iso(block.data_open_time)} as_of={block.as_of}",
         f"  generation_kind={block.generation_kind} anchor_close={block.reference_close}",
