@@ -66,11 +66,11 @@ class _Bridge:
 @pytest.mark.parametrize(("notional", "expected_unknown"), [
     ("1", SYMBOL),
     ("-1", SYMBOL),
-    ("1e-400", "BTCUSDT"),
-    ("NaN", "BTCUSDT"),
-    ("Infinity", "BTCUSDT"),
-    (True, "BTCUSDT"),
-    ("1_0", "BTCUSDT"),
+    ("1e-400", SYMBOL),
+    ("NaN", SYMBOL),
+    ("Infinity", SYMBOL),
+    (True, SYMBOL),
+    ("1_0", SYMBOL),
 ])
 def test_zero_size_with_invalid_or_nonzero_notional_is_unknown(monkeypatch, notional, expected_unknown):
     client, _ = _client(

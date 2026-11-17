@@ -141,7 +141,8 @@ def test_invalid_row_fails_scope_but_keeps_held_position(monkeypatch):
     observation = observe_futures_positions(_Bridge(client))
 
     assert observation.scope_complete is False
-    assert observation.unknown_symbols == {"ETHUSDT"}
+    assert observation.unknown_symbols == {"ETH/USDT:USDT"}
+    assert observation.unknown_scope is False
     assert [p.symbol for p in observation.positions] == ["BTC/USDT:USDT"]
 
 
@@ -182,7 +183,8 @@ def test_duplicate_position_rows_fail_scope(monkeypatch):
     observation = observe_futures_positions(_Bridge(client))
 
     assert observation.scope_complete is False
-    assert observation.unknown_symbols == {"BTCUSDT"}
+    assert observation.unknown_symbols == {"BTC/USDT:USDT"}
+    assert observation.unknown_scope is False
     assert observation.positions == ()
 
 
@@ -192,7 +194,8 @@ def test_inconsistent_position_mode_fails_scope(monkeypatch):
     observation = observe_futures_positions(_Bridge(client))
 
     assert observation.scope_complete is False
-    assert observation.unknown_symbols == {"BTCUSDT"}
+    assert observation.unknown_symbols == {"BTC/USDT:USDT"}
+    assert observation.unknown_scope is False
     assert observation.positions == ()
 
 
@@ -202,7 +205,8 @@ def test_invalid_margin_currency_fails_scope(monkeypatch):
     observation = observe_futures_positions(_Bridge(client))
 
     assert observation.scope_complete is False
-    assert observation.unknown_symbols == {"BTCUSDT"}
+    assert observation.unknown_symbols == {"BTC/USDT:USDT"}
+    assert observation.unknown_scope is False
     assert observation.positions == ()
 
 

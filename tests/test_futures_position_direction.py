@@ -79,9 +79,9 @@ def test_normalized_direction_uses_signed_evidence(monkeypatch, row, expected):
 @pytest.mark.parametrize("row,expected_unknown", [
     ({"positionSide": "LONG", "positionAmt": "-1"}, {SYMBOL}),
     ({"positionSide": "SHORT", "positionAmt": "1"}, {SYMBOL}),
-    ({"positionSide": "INVALID"}, {"BTCUSDT"}),
+    ({"positionSide": "INVALID"}, {SYMBOL}),
     ({"positionSide": "BOTH", "positionAmt": None}, {SYMBOL}),
-    ({"positionSide": "BOTH", "positionAmt": True}, {"BTCUSDT"}),
+    ({"positionSide": "BOTH", "positionAmt": True}, {SYMBOL}),
 ])
 def test_conflicting_direction_is_unknown(monkeypatch, row, expected_unknown):
     client, _ = _client(monkeypatch, [_row(**row)])

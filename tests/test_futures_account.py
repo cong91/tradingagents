@@ -483,9 +483,9 @@ def test_read_futures_account_rejects_non_finite_numbers(monkeypatch):
 @pytest.mark.parametrize("changes,expected_unknown", [
     ({"positionSide": "LONG", "positionAmt": "-1"}, {"BTC/USDT:USDT"}),
     ({"positionSide": "SHORT", "positionAmt": "1"}, {"BTC/USDT:USDT"}),
-    ({"positionAmt": True}, {"BTCUSDT"}),
-    ({"positionAmt": "1e-400"}, {"BTCUSDT"}),
-    ({"positionAmt": "1_0"}, {"BTCUSDT"}),
+    ({"positionAmt": True}, {"BTC/USDT:USDT"}),
+    ({"positionAmt": "1e-400"}, {"BTC/USDT:USDT"}),
+    ({"positionAmt": "1_0"}, {"BTC/USDT:USDT"}),
 ])
 def test_invalid_or_conflicting_position_is_unknown(monkeypatch, changes, expected_unknown):
     client, _ = _client(
@@ -507,7 +507,7 @@ def test_ambiguous_market_identity_fails_scope(monkeypatch):
     observation = observe_futures_positions(_Bridge(client))
 
     assert observation.unknown_symbols == {"BTCUSDT"}
-    assert observation.unknown_scope is False
+    assert observation.unknown_scope is True
     assert observation.positions == ()
     assert observation.scope_complete is False
 

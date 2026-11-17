@@ -819,31 +819,108 @@ def _verify_bracket(
     return "ok", target_values
 
 
-def _find_bracket(task: dict[str, Any], entry: _EntryEvidence, current_venue: str):
-    try:
-        from server import job_store
+def _canonical_futures_symbol(value: Any) -> bool:
+    if not isinstance(value, str) or value != value.strip() or value != value.upper():
+        return False
+    pair, separator, settlement = value.partition(":")
+    base, slash, quote = pair.partition("/")
+    return bool(
+        separator and slash and quote == settlement
+        and all(part and part.isascii() and part.isalnum() for part in (base, quote, settlement))
+    )
 
-        rows = job_store.find_bracket_recoveries(task["symbol"], entry.order_id)
-        active = job_store.active_bracket_recoveries()
+
+def _verified_dated_market_id(client: Any, symbol: Any) -> str | None:
+    from tradingagents.execution.futures_account import _binance_market_symbol
+
+    if not isinstance(symbol, str):
+        return None
+    perpetual, separator, expiry = symbol.rpartition("-")
+    if (
+        not separator or not _canonical_futures_symbol(perpetual)
+        or len(expiry) != 6 or not expiry.isascii() or not expiry.isdigit()
+    ):
+        return None
+    markets = getattr(client, "markets", None)
+    market = markets.get(symbol) if isinstance(markets, dict) else None
+    if not isinstance(market, dict) or market.get("future") is not True:
+        return None
+    market_id = market.get("id")
+    if not isinstance(market_id, str) or _binance_market_symbol(client, market_id) != symbol:
+        return None
+    return market_id
+
+
+def _find_bracket(task: dict[str, Any], entry: _EntryEvidence, current_venue: str, client: Any):
+    from tradingagents.execution.futures_account import _binance_market_symbol
+    from tradingagents.execution.futures_entry_journal import _ACTIVE_STATUSES
+    from tradingagents.execution.futures_entry_recovery_snapshot import _read_snapshot
+
+    try:
+        rows = _read_snapshot(task["symbol"], entry.order_id, task["task_id"])
     except Exception:
         return None, "bracket_unavailable"
-    if not isinstance(rows, list) or len(rows) != 1:
+    if not isinstance(rows, list):
+        return None, "bracket_unavailable"
+
+    by_id = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            return None, "bracket_ambiguous"
+        row_id = item.get("task_id")
+        if not isinstance(row_id, str) or not row_id.strip() or row_id != row_id.strip() or row_id in by_id:
+            return None, "bracket_ambiguous"
+        by_id[row_id] = item
+
+    current = by_id.get(task["task_id"])
+    if current != task or current.get("status") not in _ACTIVE_INTENT_STATUSES:
+        return None, "stale_state"
+
+    symbol = task["symbol"]
+    if not _canonical_futures_symbol(symbol):
         return None, "bracket_ambiguous"
-    linked_id = f"bracket:{task['symbol']}:{entry.order_id}"
-    competing = [
-        item for item in active
-        if isinstance(item, dict)
-        and item.get("symbol") == task.get("symbol")
-        and item.get("task_id") not in {task.get("task_id"), linked_id}
+    linked_id = f"bracket:{symbol}:{entry.order_id}"
+    linked = [
+        item for item in rows
+        if item["task_id"] != task["task_id"]
+        and (item["task_id"] == linked_id
+             or item.get("symbol") == symbol and item.get("entry_order_id") == entry.order_id)
     ]
-    if competing:
+    for item in rows:
+        status = item.get("status")
+        if not isinstance(status, str) or not status.strip() or status != status.strip():
+            return None, "bracket_ambiguous"
+        if status not in _ACTIVE_STATUSES or item["task_id"] == task["task_id"]:
+            continue
+        active_symbol = item.get("symbol")
+        active_id = item["task_id"]
+        if not isinstance(active_symbol, str):
+            return None, "bracket_ambiguous"
+        for prefix in ("entry-intent", "bracket"):
+            if active_id.startswith(f"{prefix}:") and not active_id.startswith(
+                f"{prefix}:{active_symbol}:"
+            ):
+                return None, "bracket_ambiguous"
+        if active_id == linked_id:
+            continue
+        if _canonical_futures_symbol(active_symbol):
+            if active_symbol == symbol or _symbol_id(active_symbol) == _symbol_id(symbol):
+                return None, "bracket_ambiguous"
+            if _binance_market_symbol(client, _symbol_id(active_symbol)) != active_symbol:
+                return None, "bracket_ambiguous"
+        else:
+            market_id = _verified_dated_market_id(client, active_symbol)
+            if market_id is None or market_id == _symbol_id(symbol):
+                return None, "bracket_ambiguous"
+
+    if not linked:
+        return None, "bracket_missing"
+    if len(linked) != 1:
         return None, "bracket_ambiguous"
-    bracket = rows[0]
-    if not isinstance(bracket, dict):
+    bracket = linked[0]
+    if bracket.get("task_id") != linked_id:
         return None, "bracket_ambiguous"
-    if bracket.get("task_id") != f"bracket:{task['symbol']}:{entry.order_id}":
-        return None, "bracket_ambiguous"
-    if bracket.get("symbol") != task.get("symbol") or bracket.get("entry_order_id") != entry.order_id:
+    if bracket.get("symbol") != symbol or bracket.get("entry_order_id") != entry.order_id:
         return None, "bracket_ambiguous"
     if task.get("venue_key") not in (None, current_venue):
         return None, "venue_mismatch"
@@ -892,7 +969,7 @@ def entry_allows_exit_cleanup(bridge: Any, bracket: dict[str, Any]) -> bool:
         entry = _validate_entry_order(client, task, item, actual_id, client_id)
         if entry is None:
             return False
-        linked, error = _find_bracket(task, entry, venue)
+        linked, error = _find_bracket(task, entry, venue, client)
         if (
             error is not None or linked is None
             or linked["task_id"] != bracket["task_id"]
@@ -1276,7 +1353,7 @@ def reconcile_entry(bridge: Any, task_id: str) -> str:
         return "entry_order_unverified"
     if not _client_stable(bridge, client_evidence):
         return "client_changed"
-    bracket, bracket_error = _find_bracket(task, entry, venue)
+    bracket, bracket_error = _find_bracket(task, entry, venue, client)
     if bracket_error is not None:
         return bracket_error
     if bracket is None:

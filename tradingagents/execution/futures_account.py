@@ -1,5 +1,7 @@
 """Read-only futures account snapshots for the portfolio API."""
 
+# ai-note: split declined because keeping the diff small was preferred; revisit when position and balance changes diverge.
+
 from __future__ import annotations
 
 import logging
@@ -332,34 +334,105 @@ def _position_rows(bridge, client) -> list:
     return positions
 
 
-def _binance_position_rows(bridge, client) -> tuple[list, bool]:
-    """Read raw V3 position-risk rows for Binance; errors propagate.
+def _binance_market_symbol(reader: Any, market_id: Any) -> str | None:
+    """Resolve one venue ID only when available CCXT market metadata agrees."""
+    from server.binance_futures_positions import _market_for_id
 
-    The V3 endpoint returns every symbol that has an open position or open
-    orders, so a response whose rows are all interpretable certifies the
-    account-wide book. Returns one (mapped_row, raw_row, reason) entry per
-    response row plus whether the bridge still serves the validated client.
-    """
+    if not isinstance(market_id, str) or not market_id or market_id != market_id.strip():
+        return None
+    market = _market_for_id(reader, market_id)
+    if market is None:
+        return None
+    for key in ("symbol", "quote", "settle", "settleId"):
+        value = market.get(key)
+        if key == "settleId" and value is None:
+            continue
+        if (
+            not isinstance(value, str) or not value or not value.isprintable()
+            or any(char.isspace() for char in value)
+        ):
+            return None
+    symbol = market["symbol"]
+    pair, separator, settlement = symbol.partition(":")
+    base, slash, quote = pair.partition("/")
+    if not separator or not slash or not base or quote != market["quote"]:
+        return None
+    if settlement == market["settle"]:
+        suffix = ""
+    elif settlement.startswith(f"{market['settle']}-"):
+        suffix = settlement[len(market["settle"]):]
+    else:
+        return None
+    if suffix and not (
+        market.get("future") is True and len(suffix) == 7 and suffix[0] == "-"
+        and suffix[1:].isdigit()
+    ):
+        return None
+    markets = getattr(reader, "markets", None)
+    reverse = markets.get(symbol) if isinstance(markets, dict) else None
+    if reverse is not None and (
+        not isinstance(reverse, dict) or any(
+            reverse.get(key) != market.get(key)
+            for key in ("id", "symbol", "quote", "settle", "settleId", "contract", "linear", "inverse")
+        )
+    ):
+        return None
+    for other_id, matches in reader.markets_by_id.items():
+        matches = [matches] if isinstance(matches, dict) else matches
+        if not isinstance(matches, list):
+            return None
+        if any(
+            not isinstance(candidate, dict)
+            or candidate.get("symbol") == symbol
+            for candidate in matches
+        ) and other_id != market_id:
+            return None
+    return symbol
+
+
+def _binance_position_rows(bridge, client) -> tuple[list, bool, Any]:
+    """Read raw V3 rows and map rejected identities using the same reader."""
     from server import binance_futures_positions
 
     profile = _venue_profile(bridge)
     base_url = bridge.config.get("exec_base_url") or "https://demo-api.binance.com"
+    credentials = (getattr(client, "apiKey", None), getattr(client, "secret", None))
     binance_futures_positions.validate_client(client, profile, base_url)
     reader = binance_futures_positions.isolated_client(client)
-    # prepare_rows maps venue ids through the client's market metadata; a
-    # client that has not loaded markets yet would fail every row closed.
+    binance_futures_positions.validate_client(reader, profile, base_url)
     if not isinstance(getattr(reader, "markets_by_id", None), dict) or not reader.markets_by_id:
         reader.load_markets()
     raw = reader.fapiPrivateV3GetPositionRisk({})
     if not isinstance(raw, list):
         raise ValueError("exchange returned an invalid futures positions response")
-    if bridge.client() is not client:
-        return [], False
     prepared = binance_futures_positions.prepare_rows(raw, reader)
-    return [
-        (mapped, raw_row, reason)
-        for raw_row, (mapped, _, reason) in zip(raw, prepared, strict=True)
-    ], True
+    entries = []
+    for raw_row, (mapped, _, reason) in zip(raw, prepared, strict=True):
+        market_id = raw_row.get("symbol") if isinstance(raw_row, dict) else None
+        symbol = _binance_market_symbol(reader, market_id)
+        if reason is None and (
+            symbol is None or not isinstance(mapped, dict) or mapped.get("symbol") != symbol
+        ):
+            reason = "unknown_market"
+        if reason is not None:
+            # A cursor signals incomplete account-wide evidence, regardless of
+            # whether the row itself has an identifiable market.
+            symbol = None if reason in {"invalid_row", "missing_symbol"} else symbol
+        entries.append((mapped, raw_row, reason, symbol))
+    if (
+        bridge.client() is not client
+        or str(getattr(bridge, "exchange_id", "")).lower() != "binance"
+        or (bridge.config.get("exec_base_url") or "https://demo-api.binance.com") != base_url
+        or (getattr(client, "apiKey", None), getattr(client, "secret", None)) != credentials
+        or (getattr(reader, "apiKey", None), getattr(reader, "secret", None)) != credentials
+    ):
+        return [], False, reader
+    try:
+        binance_futures_positions.validate_client(client, profile, base_url)
+        binance_futures_positions.validate_client(reader, profile, base_url)
+    except binance_futures_positions.BinanceProfileError:
+        return [], False, reader
+    return entries, True, reader
 
 
 def _observed_size(raw: dict, info: dict) -> float | None:
@@ -417,23 +490,26 @@ def observe_futures_positions(bridge) -> FuturesPositionsObservation:
     unknown_scope = False
     scope_complete = False
     if exchange_id == "binance":
-        entries, scope_complete = _binance_position_rows(bridge, client)
+        entries, scope_complete, position_client = _binance_position_rows(bridge, client)
         if not scope_complete:
             # The bridge rebound its client during the read; the validated
             # route no longer describes the client the rest of the run uses.
             unknown_scope = True
     else:
+        position_client = client
         rows = _position_rows(bridge, client)
-        entries = [(row, row, None) for row in rows]
+        entries = [(row, row, None, None) for row in rows]
     positions = []
     seen: set[tuple[str, str]] = set()
-    for raw, raw_row, reason in entries:
+    for raw, raw_row, reason, resolved_symbol in entries:
         if reason is not None:
-            symbol = raw_row.get("symbol") if isinstance(raw_row, dict) else None
-            if isinstance(symbol, str) and symbol.strip():
-                unknown_symbols.add(symbol)
+            if resolved_symbol is not None:
+                unknown_symbols.add(resolved_symbol)
             else:
                 unknown_scope = True
+                symbol = raw_row.get("symbol") if isinstance(raw_row, dict) else None
+                if isinstance(symbol, str) and symbol.strip():
+                    unknown_symbols.add(symbol)
             continue
         symbol = raw.get("symbol") if isinstance(raw, dict) else None
         if not isinstance(symbol, str) or not symbol.strip():
@@ -456,10 +532,9 @@ def observe_futures_positions(bridge) -> FuturesPositionsObservation:
         side = next(iter(directions), "")
         info_symbol = raw_info.get("symbol")
         if (
-            str(getattr(bridge, "exchange_id", "")).lower() == "binance"
-            and info_symbol and str(info_symbol).upper() != symbol.split(":", 1)[0].replace("/", "").upper()
+            exchange_id == "binance" and info_symbol is not None
+            and _binance_market_symbol(position_client, info_symbol) != symbol
         ):
-            # Either symbol could be the row's real identity.
             unknown_scope = True
             continue
         info_side = str(raw_info.get("positionSide") or "").lower()
@@ -525,7 +600,7 @@ def observe_futures_positions(bridge) -> FuturesPositionsObservation:
         ]
         if not values:
             raw = {**raw, "contracts": contracts}
-        position = _normalize_position({**raw, "side": resolved_side}, client)
+        position = _normalize_position({**raw, "side": resolved_side}, position_client)
         if position is None or position.side not in {"long", "short"}:
             unknown_symbols.add(symbol)
             continue
